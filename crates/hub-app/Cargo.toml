@@ -1,0 +1,51 @@
+[package]
+name = "hub-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[[bin]]
+name = "agent-hub"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+directories.workspace = true
+eframe.workspace = true
+futures.workspace = true
+hub-claude.workspace = true
+hub-core.workspace = true
+hub-telegram.workspace = true
+keyring.workspace = true
+reqwest.workspace = true
+rfd.workspace = true
+self-replace.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "time"] }
+toml.workspace = true
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]
+tray-icon = { workspace = true, features = ["ksni"] }
+
+[target.'cfg(not(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd")))'.dependencies]
+tray-icon.workspace = true
+
+[target.'cfg(windows)'.build-dependencies]
+winresource.workspace = true
+
+[dev-dependencies]
+log = "0.4"
+rstest.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync", "test-util", "time"] }
+
+[lints]
+workspace = true
