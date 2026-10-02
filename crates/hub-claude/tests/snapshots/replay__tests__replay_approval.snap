@@ -1,0 +1,33 @@
+---
+source: crates/hub-claude/tests/replay.rs
+assertion_line: 41
+expression: events
+---
+[
+    SessionStarted(
+        SessionId(
+            "ef94ce04-1898-43fa-9522-5dda40410a65",
+        ),
+    ),
+    ToolCall(
+        ToolUse {
+            tool: "Bash",
+            summary: "echo hello",
+        },
+    ),
+    AssistantText(
+        "Done.",
+    ),
+    Finished(
+        Finished {
+            session: SessionId(
+                "ef94ce04-1898-43fa-9522-5dda40410a65",
+            ),
+            turns: 2,
+            cost: Some(
+                0.08731609999999998,
+            ),
+            background: 0,
+        },
+    ),
+]

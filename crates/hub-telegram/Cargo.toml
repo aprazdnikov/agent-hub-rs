@@ -1,0 +1,28 @@
+[package]
+name = "hub-telegram"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+dunce.workspace = true
+futures.workspace = true
+hub-claude.workspace = true
+hub-core.workspace = true
+teloxide.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, features = ["fs", "macros", "rt", "sync", "time"] }
+tokio-util.workspace = true
+tracing.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+
+[dev-dependencies]
+rstest.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["fs", "macros", "rt", "rt-multi-thread", "sync", "test-util", "time"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,42 @@
+---
+source: crates/hub-claude/tests/replay.rs
+assertion_line: 41
+expression: events
+---
+[
+    SessionStarted(
+        SessionId(
+            "c5e2b049-f5b8-4fa5-b176-0d875573aa3c",
+        ),
+    ),
+    AssistantText(
+        "I'll create the file and then call the send_file tool. Let me start by loading the send_file tool schema since it's a deferred tool.",
+    ),
+    ToolCall(
+        ToolUse {
+            tool: "ToolSearch",
+            summary: "{\"max_results\":1,\"query\":\"select:mcp__agent-hub__send_file\"}",
+        },
+    ),
+    ToolCall(
+        ToolUse {
+            tool: "Write",
+            summary: "/tmp/cc-probe/work/note.txt",
+        },
+    ),
+    AssistantText(
+        "ok",
+    ),
+    Finished(
+        Finished {
+            session: SessionId(
+                "c5e2b049-f5b8-4fa5-b176-0d875573aa3c",
+            ),
+            turns: 4,
+            cost: Some(
+                0.0350262,
+            ),
+            background: 0,
+        },
+    ),
+]
