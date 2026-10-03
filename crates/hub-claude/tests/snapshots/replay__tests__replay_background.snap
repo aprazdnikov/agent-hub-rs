@@ -1,0 +1,54 @@
+---
+source: crates/hub-claude/tests/replay.rs
+assertion_line: 41
+expression: events
+---
+[
+    SessionStarted(
+        SessionId(
+            "f264a2ac-6444-4dfb-a426-945b48c5b6d6",
+        ),
+    ),
+    ToolCall(
+        ToolUse {
+            tool: "Bash",
+            summary: "sleep 3 && echo bg-done",
+        },
+    ),
+    AssistantText(
+        "started",
+    ),
+    Finished(
+        Finished {
+            session: SessionId(
+                "f264a2ac-6444-4dfb-a426-945b48c5b6d6",
+            ),
+            turns: 2,
+            cost: Some(
+                0.0280076,
+            ),
+            background: 1,
+        },
+    ),
+    ToolCall(
+        ToolUse {
+            tool: "Read",
+            summary: "/tmp/claude/tmp-cc-probe-work/f264a2ac-6444-4dfb-a426-945b48c5b6d6/tasks/bvidfb38x.output",
+        },
+    ),
+    AssistantText(
+        "Background task completed. Output: `bg-done`",
+    ),
+    Finished(
+        Finished {
+            session: SessionId(
+                "f264a2ac-6444-4dfb-a426-945b48c5b6d6",
+            ),
+            turns: 2,
+            cost: Some(
+                0.0390287,
+            ),
+            background: 0,
+        },
+    ),
+]

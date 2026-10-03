@@ -1,0 +1,58 @@
+[workspace]
+resolver = "3"
+members = ["crates/hub-core", "crates/hub-claude", "crates/hub-telegram", "crates/hub-app"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.96"
+license = "MIT"
+repository = "https://github.com/aprazdnikov/agent-hub-rs"
+publish = false
+
+[workspace.dependencies]
+hub-core = { path = "crates/hub-core" }
+hub-claude = { path = "crates/hub-claude" }
+hub-telegram = { path = "crates/hub-telegram" }
+anyhow = "1.0"
+directories = "6.0"
+eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+keyring = "4.2"
+rfd = "0.17"
+toml = "1.1"
+tracing-appender = "0.2"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "registry", "std", "tracing-log"] }
+tray-icon = { version = "0.26", default-features = false }
+dunce = "1.0"
+tempfile = "3.27"
+teloxide = { version = "0.17", default-features = false, features = ["rustls"] }
+base64 = "0.23"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+insta = "1.48"
+tokio = "1.53"
+tokio-util = "0.7"
+tracing = "0.1"
+uuid = "1.26"
+which = "8.0"
+pulldown-cmark = { version = "0.13", default-features = false }
+rust_decimal = "1.43"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+self-replace = "1.5"
+winresource = "0.1"
+thiserror = "2.0"
+rstest = "0.27"
+
+[workspace.lints.rust]
+warnings = "deny"
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+pedantic = { level = "deny", priority = -1 }
+missing_errors_doc = "allow"
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
