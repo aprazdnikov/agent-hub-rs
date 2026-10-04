@@ -108,7 +108,7 @@ mod tests {
     use serde_json::{Value, json};
 
     use super::*;
-    use crate::permissions::TOOL_SUMMARY_LIMIT;
+    use hub_agent::tools::TOOL_SUMMARY_LIMIT;
     use crate::wire::parse_line;
 
     fn message(value: &Value) -> Incoming {

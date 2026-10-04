@@ -2,17 +2,17 @@
 //! approvals; a question input that cannot be parsed still reaches the human as an approval.
 
 use hub_core::domain::{
-    Decision, Question, QuestionAnswer, QuestionOption, QuestionsOutcome, Selection, ToolRequest,
+    Decision, Question, QuestionAnswer, QuestionsOutcome, ToolRequest,
 };
 use hub_core::render::truncate;
 use serde_json::{Map, Value, json};
 
+use hub_agent::tools::{TOOL_SUMMARY_LIMIT, parse_questions};
+
 use crate::outgoing::object;
 
 pub const ASK_USER_QUESTION: &str = "AskUserQuestion";
-pub const SEND_FILE: &str = "send_file";
 pub const SEND_FILE_TOOL: &str = "mcp__agent-hub__send_file";
-pub const TOOL_SUMMARY_LIMIT: usize = 600;
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Route {
@@ -36,43 +36,6 @@ pub fn route(tool: &str, input: &Value) -> Route {
         tool: tool.to_owned(),
         summary: summarize_tool_input(tool, input),
     })
-}
-
-#[must_use]
-pub fn parse_questions(input: &Value) -> Option<Vec<Question>> {
-    let raw = input.get("questions")?.as_array()?;
-    if raw.is_empty() {
-        return None;
-    }
-    raw.iter().map(parse_question).collect()
-}
-
-fn parse_question(raw: &Value) -> Option<Question> {
-    let object = raw.as_object()?;
-    let text = object.get("question")?.as_str()?;
-    let header = match object.get("header") {
-        None => "",
-        Some(header) => header.as_str()?,
-    };
-    let options = match object.get("options") {
-        None => Vec::new(),
-        Some(options) => options.as_array()?.iter().map(parse_option).collect::<Option<_>>()?,
-    };
-    let selection = match object.get("multiSelect") {
-        Some(Value::Bool(true)) => Selection::Multiple,
-        Some(_) | None => Selection::Single,
-    };
-    Question::new(text.to_owned(), header.to_owned(), options, selection)
-}
-
-fn parse_option(raw: &Value) -> Option<QuestionOption> {
-    let object = raw.as_object()?;
-    let label = object.get("label")?.as_str().filter(|label| !label.trim().is_empty())?;
-    let description = match object.get("description") {
-        None => "",
-        Some(description) => description.as_str()?,
-    };
-    Some(QuestionOption { label: label.to_owned(), description: description.to_owned() })
 }
 
 /// One human-readable line for the most common tools.
@@ -135,7 +98,7 @@ fn with_answers(input: Value, answers: &[QuestionAnswer]) -> Value {
 
 #[cfg(test)]
 mod tests {
-    use hub_core::domain::Denied;
+    use hub_core::domain::{Denied, QuestionOption, Selection};
     use rstest::rstest;
     use serde_json::json;
 
@@ -170,29 +133,6 @@ mod tests {
             Selection::Single,
         )
         .unwrap()
-    }
-
-    #[test]
-    fn questions_are_parsed() {
-        assert_eq!(parse_questions(&ask_input()), Some(vec![ask_question()]));
-    }
-
-    #[test]
-    fn multi_select_is_recognised() {
-        let input = json!({"questions": [{"question": "q", "options": [], "multiSelect": true}]});
-        let questions = parse_questions(&input).unwrap();
-        assert_eq!(questions.first().map(Question::selection), Some(Selection::Multiple));
-    }
-
-    #[rstest]
-    #[case(json!({}))]
-    #[case(json!({"questions": []}))]
-    #[case(json!({"questions": "x"}))]
-    #[case(json!({"questions": [{"header": "h", "options": []}]}))]
-    #[case(json!({"questions": [{"question": "q", "options": [{"description": "no label"}]}]}))]
-    #[case(json!({"questions": [{"question": "q", "header": 1}]}))]
-    fn malformed_questions_are_rejected(#[case] input: Value) {
-        assert_eq!(parse_questions(&input), None);
     }
 
     #[test]

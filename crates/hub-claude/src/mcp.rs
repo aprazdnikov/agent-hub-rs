@@ -1,16 +1,15 @@
 //! The in-process MCP server `agent-hub` with one tool, `send_file`, spoken as JSON-RPC inside
 //! `mcp_message` control requests.
 
+use hub_agent::tools::{
+    SEND_FILE, SEND_FILE_DESCRIPTION, ToolResult, delivery_result, parse_send_file,
+    send_file_schema,
+};
 use hub_core::domain::{FileDelivery, OutgoingFile};
 use serde_json::{Value, json};
 
 use crate::outgoing::{MCP_SERVER, object};
-use crate::permissions::SEND_FILE;
 
-const DESCRIPTION: &str = "Send a file to the user in their Telegram chat. The user only sees \
-    your text replies, so use this whenever they ask for a file or a file is the natural result \
-    (a PDF report, an archive, an image, a CSV export). `path` is absolute or relative to the \
-    working directory and must stay inside it; `caption` is optional text shown under the file.";
 // Used only if the CLI does not say which protocol version it speaks.
 const FALLBACK_PROTOCOL: &str = "2025-06-18";
 const METHOD_NOT_FOUND: i64 = -32601;
@@ -58,19 +57,15 @@ pub fn handle(server: &str, message: &Value) -> McpStep {
             id,
             json!({"tools": [{
                 "name": SEND_FILE,
-                "description": DESCRIPTION,
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}, "caption": {"type": "string"}},
-                    "required": ["path"],
-                },
+                "description": SEND_FILE_DESCRIPTION,
+                "inputSchema": send_file_schema(),
             }]}),
         )),
         Some("tools/call")
             if message.pointer("/params/name").and_then(Value::as_str) == Some(SEND_FILE) =>
         {
             let arguments = message.pointer("/params/arguments").unwrap_or(&Value::Null);
-            match send_file_args(arguments) {
+            match parse_send_file(arguments) {
                 Ok(file) => McpStep::SendFile { id, file },
                 Err(reason) => McpStep::Reply(result(id, tool_text(&reason, ToolOutcome::Error))),
             }
@@ -83,29 +78,11 @@ pub fn handle(server: &str, message: &Value) -> McpStep {
 /// A failed delivery is a tool error the agent can react to (compress, split, retry).
 #[must_use]
 pub fn send_file_reply(id: Value, path: &str, delivery: FileDelivery) -> Value {
-    let body = match delivery {
-        FileDelivery::Delivered => {
-            tool_text(&format!("Файл {path} отправлен пользователю"), ToolOutcome::Success)
-        }
-        FileDelivery::Denied(denied) => tool_text(&denied.reason, ToolOutcome::Error),
+    let body = match delivery_result(path, delivery) {
+        ToolResult::Success(text) => tool_text(&text, ToolOutcome::Success),
+        ToolResult::Error(text) => tool_text(&text, ToolOutcome::Error),
     };
     result(id, body)
-}
-
-fn send_file_args(arguments: &Value) -> Result<OutgoingFile, String> {
-    let path = arguments.get("path").and_then(Value::as_str).filter(|path| !path.trim().is_empty());
-    let caption = match arguments.get("caption") {
-        None => Some(""),
-        Some(caption) => caption.as_str(),
-    };
-    match (path, caption) {
-        (Some(path), Some(caption)) => {
-            Ok(OutgoingFile { path: path.to_owned(), caption: caption.to_owned() })
-        }
-        (Some(_) | None, Some(_) | None) => {
-            Err("path must be a non-empty string, caption a string".to_owned())
-        }
-    }
 }
 
 fn tool_text(text: &str, outcome: ToolOutcome) -> Value {
