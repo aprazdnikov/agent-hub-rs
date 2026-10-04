@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use hub_core::settings::{Draft, FieldError, Settings, SettingsFile};
+use hub_core::settings::{Draft, FieldError, Keys, Settings, SettingsFile};
 
 use crate::atomic::write_atomic;
 use crate::error::StoreError;
@@ -46,7 +46,8 @@ impl FileSettings {
         let file: SettingsFile =
             toml::from_str(&raw).map_err(|error| corrupt(error.message().to_owned()))?;
         let token = self.secrets.read()?.unwrap_or_default();
-        let draft = file.to_draft(token).map_err(|error| corrupt(error.message))?;
+        let keys = Keys { token, api_key: String::new() };
+        let draft = file.to_draft(keys).map_err(|error| corrupt(error.message))?;
         Ok(match draft.parse(home) {
             Ok(settings) => Loaded::Ready(settings),
             Err(errors) => Loaded::Incomplete { draft, errors },

@@ -40,15 +40,17 @@ impl SessionId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum BackendKind {
     Claude,
+    Codex,
 }
 
 impl BackendKind {
-    pub const ALL: [Self; 1] = [Self::Claude];
+    pub const ALL: [Self; 2] = [Self::Claude, Self::Codex];
 
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Claude => "claude",
+            Self::Codex => "codex",
         }
     }
 
@@ -302,6 +304,8 @@ mod tests {
     #[rstest]
     #[case("claude", Some(BackendKind::Claude))]
     #[case("Claude", Some(BackendKind::Claude))]
+    #[case("codex", Some(BackendKind::Codex))]
+    #[case("CODEX", Some(BackendKind::Codex))]
     #[case("gpt", None)]
     fn backend_kind_parses_case_insensitively(
         #[case] raw: &str,

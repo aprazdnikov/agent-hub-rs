@@ -48,6 +48,13 @@ impl Agents for ClaudeAgents {
                         inbox
                     }
                 },
+                BackendKind::Codex => {
+                    // Replaced by the Codex backend once `hub-codex` exists.
+                    let failed = AgentEvent::Failed("Codex пока не подключён".to_owned());
+                    // Nobody listening means the topic's session is already gone.
+                    let _ = conversation.events.send(failed).await;
+                    inbox
+                }
             }
         })
     }

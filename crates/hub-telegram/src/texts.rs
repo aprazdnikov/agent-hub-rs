@@ -129,7 +129,7 @@ mod tests {
         assert!(text.starts_with("Каждая тема этой группы — отдельная сессия агента."));
         assert!(text.contains(".agent-hub/uploads"));
         assert!(text.contains(&root.as_path().display().to_string()));
-        assert!(text.ends_with("Бэкенды: claude"));
+        assert!(text.ends_with("Бэкенды: claude, codex"));
     }
 
     #[test]

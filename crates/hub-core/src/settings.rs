@@ -9,7 +9,7 @@ use std::time::Duration;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
-use crate::domain::{ChatId, UserId};
+use crate::domain::{BackendKind, ChatId, UserId};
 use crate::workspace::expand_home;
 
 pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_mins(10);
@@ -76,6 +76,82 @@ impl PermissionMode {
     }
 }
 
+/// What the OS lets commands started by Codex touch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sandbox {
+    ReadOnly,
+    WorkspaceWrite,
+    DangerFullAccess,
+}
+
+impl Sandbox {
+    pub const ALL: [Self; 3] = [Self::ReadOnly, Self::WorkspaceWrite, Self::DangerFullAccess];
+
+    #[must_use]
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::ReadOnly => "read-only",
+            Self::WorkspaceWrite => "workspace-write",
+            Self::DangerFullAccess => "danger-full-access",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|sandbox| sandbox.wire() == raw)
+    }
+}
+
+/// When Codex asks the human before acting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Approval {
+    Untrusted,
+    OnRequest,
+    Never,
+}
+
+impl Approval {
+    pub const ALL: [Self; 3] = [Self::Untrusted, Self::OnRequest, Self::Never];
+
+    #[must_use]
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::Untrusted => "untrusted",
+            Self::OnRequest => "on-request",
+            Self::Never => "never",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|approval| approval.wire() == raw)
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ApiKey(String);
+
+impl ApiKey {
+    /// A key is one non-empty word; surrounding whitespace is dropped.
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        let trimmed = raw.trim();
+        (!trimmed.is_empty() && !trimmed.chars().any(char::is_whitespace))
+            .then(|| Self(trimmed.to_owned()))
+    }
+
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for ApiKey {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("ApiKey(***)")
+    }
+}
+
 /// Positive spending cap per task, in USD.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Budget(Decimal);
@@ -108,6 +184,16 @@ pub struct ClaudeSettings {
     pub budget: Option<Budget>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexSettings {
+    pub cli: Option<PathBuf>,
+    pub model: Option<String>,
+    pub sandbox: Sandbox,
+    pub approval: Approval,
+    /// Used only when Codex has no login yet or is logged in with a key.
+    pub api_key: Option<ApiKey>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
     pub approval: Duration,
@@ -119,7 +205,9 @@ pub struct Timeouts {
 pub struct Settings {
     pub telegram: TelegramSettings,
     pub workspace_root: PathBuf,
+    pub default_backend: BackendKind,
     pub claude: ClaudeSettings,
+    pub codex: CodexSettings,
     pub timeouts: Timeouts,
     pub updates: UpdateCheck,
 }
@@ -136,12 +224,57 @@ pub enum Field {
     Budget,
     ApprovalTimeout,
     BackgroundTimeout,
+    DefaultBackend,
+    Codex(CodexField),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CodexField {
+    Cli,
+    Model,
+    Sandbox,
+    Approval,
+    ApiKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FieldError {
     pub field: Field,
     pub message: String,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct CodexDraft {
+    pub cli: String,
+    pub model: String,
+    pub sandbox: Sandbox,
+    pub approval: Approval,
+    pub api_key: String,
+}
+
+impl Default for CodexDraft {
+    fn default() -> Self {
+        Self {
+            cli: String::new(),
+            model: String::new(),
+            sandbox: Sandbox::WorkspaceWrite,
+            approval: Approval::OnRequest,
+            api_key: String::new(),
+        }
+    }
+}
+
+impl fmt::Debug for CodexDraft {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { cli, model, sandbox, approval, api_key: _api_key } = self;
+        f.debug_struct("CodexDraft")
+            .field("cli", cli)
+            .field("model", model)
+            .field("sandbox", sandbox)
+            .field("approval", approval)
+            .field("api_key", &"***")
+            .finish()
+    }
 }
 
 /// The settings form as typed by the user.
@@ -151,10 +284,12 @@ pub struct Draft {
     pub chat: String,
     pub users: String,
     pub workspace_root: String,
+    pub default_backend: BackendKind,
     pub cli: String,
     pub model: String,
     pub permission_mode: PermissionMode,
     pub budget: String,
+    pub codex: CodexDraft,
     pub approval_timeout: String,
     pub background_timeout: String,
     pub updates: UpdateCheck,
@@ -167,10 +302,12 @@ impl Default for Draft {
             chat: String::new(),
             users: String::new(),
             workspace_root: String::new(),
+            default_backend: BackendKind::Claude,
             cli: String::new(),
             model: String::new(),
             permission_mode: PermissionMode::Default,
             budget: String::new(),
+            codex: CodexDraft::default(),
             approval_timeout: DEFAULT_APPROVAL_TIMEOUT.as_secs().to_string(),
             background_timeout: DEFAULT_BACKGROUND_TIMEOUT.as_secs().to_string(),
             updates: UpdateCheck::Enabled,
@@ -185,10 +322,12 @@ impl fmt::Debug for Draft {
             chat,
             users,
             workspace_root,
+            default_backend,
             cli,
             model,
             permission_mode,
             budget,
+            codex,
             approval_timeout,
             background_timeout,
             updates,
@@ -198,10 +337,12 @@ impl fmt::Debug for Draft {
             .field("chat", chat)
             .field("users", users)
             .field("workspace_root", workspace_root)
+            .field("default_backend", default_backend)
             .field("cli", cli)
             .field("model", model)
             .field("permission_mode", permission_mode)
             .field("budget", budget)
+            .field("codex", codex)
             .field("approval_timeout", approval_timeout)
             .field("background_timeout", background_timeout)
             .field("updates", updates)
@@ -220,6 +361,15 @@ impl Draft {
         let cli = check(&mut errors, Field::Cli, parse_cli(&self.cli, home));
         let model = check(&mut errors, Field::Model, parse_model(&self.model));
         let budget = check(&mut errors, Field::Budget, parse_budget(&self.budget));
+        let codex_cli =
+            check(&mut errors, Field::Codex(CodexField::Cli), parse_cli(&self.codex.cli, home));
+        let codex_model =
+            check(&mut errors, Field::Codex(CodexField::Model), parse_model(&self.codex.model));
+        let api_key = check(
+            &mut errors,
+            Field::Codex(CodexField::ApiKey),
+            parse_api_key(&self.codex.api_key),
+        );
         let approval =
             check(&mut errors, Field::ApprovalTimeout, parse_seconds(&self.approval_timeout));
         let background =
@@ -232,16 +382,40 @@ impl Draft {
             Some(cli),
             Some(model),
             Some(budget),
+            Some(codex_cli),
+            Some(codex_model),
+            Some(api_key),
             Some(approval),
             Some(background),
-        ) = (token, chat, users, root, cli, model, budget, approval, background)
+        ) = (
+            token,
+            chat,
+            users,
+            root,
+            cli,
+            model,
+            budget,
+            codex_cli,
+            codex_model,
+            api_key,
+            approval,
+            background,
+        )
         else {
             return Err(errors);
         };
         Ok(Settings {
             telegram: TelegramSettings { token, chat, users },
             workspace_root,
+            default_backend: self.default_backend,
             claude: ClaudeSettings { cli, model, permission_mode: self.permission_mode, budget },
+            codex: CodexSettings {
+                cli: codex_cli,
+                model: codex_model,
+                sandbox: self.codex.sandbox,
+                approval: self.codex.approval,
+                api_key,
+            },
             timeouts: Timeouts { approval, background },
             updates: self.updates,
         })
@@ -260,6 +434,7 @@ impl Draft {
                 .collect::<Vec<_>>()
                 .join(", "),
             workspace_root: settings.workspace_root.display().to_string(),
+            default_backend: settings.default_backend,
             cli: settings
                 .claude
                 .cli
@@ -273,6 +448,23 @@ impl Draft {
                 .budget
                 .map(|budget| budget.amount().to_string())
                 .unwrap_or_default(),
+            codex: CodexDraft {
+                cli: settings
+                    .codex
+                    .cli
+                    .as_ref()
+                    .map(|cli| cli.display().to_string())
+                    .unwrap_or_default(),
+                model: settings.codex.model.clone().unwrap_or_default(),
+                sandbox: settings.codex.sandbox,
+                approval: settings.codex.approval,
+                api_key: settings
+                    .codex
+                    .api_key
+                    .as_ref()
+                    .map(|key| key.expose().to_owned())
+                    .unwrap_or_default(),
+            },
             approval_timeout: settings.timeouts.approval.as_secs().to_string(),
             background_timeout: settings.timeouts.background.as_secs().to_string(),
             updates: settings.updates,
@@ -345,6 +537,14 @@ fn parse_model(raw: &str) -> Result<Option<String>, String> {
     Ok((!trimmed.is_empty()).then(|| trimmed.to_owned()))
 }
 
+/// Empty means no key: Codex uses its own login.
+fn parse_api_key(raw: &str) -> Result<Option<ApiKey>, String> {
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    ApiKey::parse(raw).map(Some).ok_or_else(|| "Ключ не должен содержать пробелов".to_owned())
+}
+
 fn parse_budget(raw: &str) -> Result<Option<Budget>, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -373,7 +573,11 @@ pub struct SettingsFile {
     pub telegram: TelegramFile,
     pub workspace: WorkspaceFile,
     #[serde(default)]
+    pub agents: AgentsFile,
+    #[serde(default)]
     pub claude: ClaudeFile,
+    #[serde(default)]
+    pub codex: CodexFile,
     #[serde(default)]
     pub timeouts: TimeoutsFile,
     #[serde(default)]
@@ -404,6 +608,28 @@ pub struct ClaudeFile {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct AgentsFile {
+    pub default: Option<String>,
+}
+
+/// The API key is kept in the OS keyring, not here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexFile {
+    pub cli: Option<String>,
+    pub model: Option<String>,
+    pub sandbox: Option<String>,
+    pub approval: Option<String>,
+}
+
+/// Secrets the file does not hold, read from the keyring by the caller.
+pub struct Keys {
+    pub token: String,
+    pub api_key: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TimeoutsFile {
     pub approval_seconds: Option<u64>,
     pub background_seconds: Option<u64>,
@@ -424,11 +650,18 @@ impl SettingsFile {
                 users: settings.telegram.users.iter().map(|user| user.0).collect(),
             },
             workspace: WorkspaceFile { root: settings.workspace_root.display().to_string() },
+            agents: AgentsFile { default: Some(settings.default_backend.name().to_owned()) },
             claude: ClaudeFile {
                 cli: settings.claude.cli.as_ref().map(|cli| cli.display().to_string()),
                 model: settings.claude.model.clone(),
                 permission_mode: Some(settings.claude.permission_mode.wire().to_owned()),
                 budget: settings.claude.budget.map(|budget| budget.amount().to_string()),
+            },
+            codex: CodexFile {
+                cli: settings.codex.cli.as_ref().map(|cli| cli.display().to_string()),
+                model: settings.codex.model.clone(),
+                sandbox: Some(settings.codex.sandbox.wire().to_owned()),
+                approval: Some(settings.codex.approval.wire().to_owned()),
             },
             timeouts: TimeoutsFile {
                 approval_seconds: Some(settings.timeouts.approval.as_secs()),
@@ -444,24 +677,54 @@ impl SettingsFile {
     }
 
     /// The file as a form draft, so file and form share one parser.
-    pub fn to_draft(&self, token: String) -> Result<Draft, FieldError> {
-        let permission_mode = match self.claude.permission_mode.as_deref() {
-            None => PermissionMode::Default,
-            Some(raw) => PermissionMode::parse(raw).ok_or_else(|| FieldError {
-                field: Field::PermissionMode,
-                message: format!("Неизвестный режим «{raw}»"),
-            })?,
-        };
+    pub fn to_draft(&self, keys: Keys) -> Result<Draft, FieldError> {
+        let Keys { token, api_key } = keys;
+        let permission_mode = choice(
+            self.claude.permission_mode.as_deref(),
+            PermissionMode::Default,
+            PermissionMode::parse,
+            Field::PermissionMode,
+            "Неизвестный режим",
+        )?;
+        let default_backend = choice(
+            self.agents.default.as_deref(),
+            BackendKind::Claude,
+            BackendKind::parse,
+            Field::DefaultBackend,
+            "Неизвестный бэкенд",
+        )?;
+        let sandbox = choice(
+            self.codex.sandbox.as_deref(),
+            Sandbox::WorkspaceWrite,
+            Sandbox::parse,
+            Field::Codex(CodexField::Sandbox),
+            "Неизвестная песочница",
+        )?;
+        let approval = choice(
+            self.codex.approval.as_deref(),
+            Approval::OnRequest,
+            Approval::parse,
+            Field::Codex(CodexField::Approval),
+            "Неизвестный режим одобрений",
+        )?;
         let defaults = Draft::default();
         Ok(Draft {
             token,
             chat: self.telegram.chat.to_string(),
             users: self.telegram.users.iter().map(u64::to_string).collect::<Vec<_>>().join(", "),
             workspace_root: self.workspace.root.clone(),
+            default_backend,
             cli: self.claude.cli.clone().unwrap_or_default(),
             model: self.claude.model.clone().unwrap_or_default(),
             permission_mode,
             budget: self.claude.budget.clone().unwrap_or_default(),
+            codex: CodexDraft {
+                cli: self.codex.cli.clone().unwrap_or_default(),
+                model: self.codex.model.clone().unwrap_or_default(),
+                sandbox,
+                approval,
+                api_key,
+            },
             approval_timeout: self
                 .timeouts
                 .approval_seconds
@@ -478,6 +741,21 @@ impl SettingsFile {
     }
 }
 
+fn choice<T>(
+    raw: Option<&str>,
+    default: T,
+    parse: fn(&str) -> Option<T>,
+    field: Field,
+    unknown: &str,
+) -> Result<T, FieldError> {
+    match raw {
+        None => Ok(default),
+        Some(raw) => {
+            parse(raw).ok_or_else(|| FieldError { field, message: format!("{unknown} «{raw}»") })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -485,6 +763,7 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+    use crate::domain::BackendKind;
 
     fn home() -> PathBuf {
         PathBuf::from(if cfg!(windows) { r"C:\Users\me" } else { "/home/me" })
@@ -515,6 +794,12 @@ mod tests {
         assert_eq!(settings.claude.budget, None);
         assert_eq!(settings.claude.cli, None);
         assert_eq!(settings.updates, UpdateCheck::Enabled);
+        assert_eq!(settings.default_backend, BackendKind::Claude);
+        assert_eq!(settings.codex.cli, None);
+        assert_eq!(settings.codex.model, None);
+        assert_eq!(settings.codex.sandbox, Sandbox::WorkspaceWrite);
+        assert_eq!(settings.codex.approval, Approval::OnRequest);
+        assert_eq!(settings.codex.api_key, None);
     }
 
     #[test]
@@ -587,7 +872,9 @@ mod tests {
     fn file_round_trips_through_draft() {
         let settings = draft().parse(&home()).unwrap();
         let file = SettingsFile::from_settings(&settings);
-        let restored = file.to_draft(settings.telegram.token.expose().to_owned()).unwrap();
+        let keys =
+            Keys { token: settings.telegram.token.expose().to_owned(), api_key: String::new() };
+        let restored = file.to_draft(keys).unwrap();
         assert_eq!(restored.parse(&home()).unwrap(), settings);
     }
 
@@ -595,7 +882,8 @@ mod tests {
     fn file_with_unknown_permission_mode_is_rejected() {
         let mut file = SettingsFile::from_settings(&draft().parse(&home()).unwrap());
         file.claude.permission_mode = Some("yolo".to_owned());
-        assert_eq!(file.to_draft(String::new()).unwrap_err().field, Field::PermissionMode);
+        let keys = Keys { token: String::new(), api_key: String::new() };
+        assert_eq!(file.to_draft(keys).unwrap_err().field, Field::PermissionMode);
     }
 
     #[test]
@@ -611,5 +899,125 @@ mod tests {
         assert_eq!(names, ["default", "acceptEdits", "plan", "bypassPermissions"]);
         assert_eq!(PermissionMode::parse("plan"), Some(PermissionMode::Plan));
         assert_eq!(PermissionMode::parse("yolo"), None);
+    }
+
+    fn codex_draft() -> Draft {
+        Draft {
+            default_backend: BackendKind::Codex,
+            codex: CodexDraft {
+                cli: "~/bin/codex".to_owned(),
+                model: " gpt-5.5-codex ".to_owned(),
+                sandbox: Sandbox::ReadOnly,
+                approval: Approval::Untrusted,
+                api_key: " sk-test ".to_owned(),
+            },
+            ..draft()
+        }
+    }
+
+    #[test]
+    fn codex_values_are_parsed() {
+        let settings = codex_draft().parse(&home()).unwrap();
+
+        assert_eq!(settings.default_backend, BackendKind::Codex);
+        assert_eq!(settings.codex.cli, Some(home().join("bin/codex")));
+        assert_eq!(settings.codex.model.as_deref(), Some("gpt-5.5-codex"));
+        assert_eq!(settings.codex.sandbox, Sandbox::ReadOnly);
+        assert_eq!(settings.codex.approval, Approval::Untrusted);
+        assert_eq!(settings.codex.api_key.as_ref().map(ApiKey::expose), Some("sk-test"));
+    }
+
+    #[rstest]
+    #[case(CodexDraft { cli: "codex".to_owned(), ..CodexDraft::default() }, CodexField::Cli)]
+    #[case(CodexDraft { model: "a b".to_owned(), ..CodexDraft::default() }, CodexField::Model)]
+    #[case(CodexDraft { api_key: "sk a".to_owned(), ..CodexDraft::default() }, CodexField::ApiKey)]
+    fn invalid_codex_values_are_reported(#[case] codex: CodexDraft, #[case] field: CodexField) {
+        let errors = Draft { codex, ..draft() }.parse(&home()).unwrap_err();
+        assert_eq!(
+            errors.iter().map(|error| error.field).collect::<Vec<_>>(),
+            [Field::Codex(field)]
+        );
+    }
+
+    #[test]
+    fn codex_file_round_trips_through_draft_without_the_key() {
+        let settings = codex_draft().parse(&home()).unwrap();
+        let file = SettingsFile::from_settings(&settings);
+        let keys = Keys {
+            token: settings.telegram.token.expose().to_owned(),
+            api_key: "sk-test".to_owned(),
+        };
+        assert_eq!(file.to_draft(keys).unwrap().parse(&home()).unwrap(), settings);
+        assert!(!toml::to_string(&file).unwrap().contains("sk-test"));
+    }
+
+    #[test]
+    fn old_file_without_agents_and_codex_reads_with_defaults() {
+        let file: SettingsFile = toml::from_str(
+            "[telegram]
+chat = -100
+users = [1]
+
+[workspace]
+root = \"~/w\"
+",
+        )
+        .unwrap();
+        let keys = Keys { token: "1:a".to_owned(), api_key: String::new() };
+        let draft = file.to_draft(keys).unwrap();
+        assert_eq!(draft.default_backend, BackendKind::Claude);
+        assert_eq!(draft.codex, CodexDraft::default());
+    }
+
+    #[rstest]
+    #[case(
+        "[agents]
+default = \"gpt\"
+",
+        Field::DefaultBackend
+    )]
+    #[case(
+        "[codex]
+sandbox = \"yolo\"
+",
+        Field::Codex(CodexField::Sandbox)
+    )]
+    #[case(
+        "[codex]
+approval = \"always\"
+",
+        Field::Codex(CodexField::Approval)
+    )]
+    fn file_with_unknown_choice_is_rejected(#[case] extra: &str, #[case] field: Field) {
+        let text = format!(
+            "[telegram]
+chat = -100
+users = [1]
+
+[workspace]
+root = \"~/w\"
+
+{extra}"
+        );
+        let file: SettingsFile = toml::from_str(&text).unwrap();
+        let keys = Keys { token: String::new(), api_key: String::new() };
+        assert_eq!(file.to_draft(keys).unwrap_err().field, field);
+    }
+
+    #[test]
+    fn debug_output_hides_api_key() {
+        let settings = codex_draft().parse(&home()).unwrap();
+        assert!(!format!("{settings:?}").contains("sk-test"));
+        assert!(!format!("{:?}", codex_draft()).contains("sk-test"));
+    }
+
+    #[test]
+    fn codex_choices_have_wire_names() {
+        let sandboxes: Vec<_> = Sandbox::ALL.into_iter().map(Sandbox::wire).collect();
+        assert_eq!(sandboxes, ["read-only", "workspace-write", "danger-full-access"]);
+        let approvals: Vec<_> = Approval::ALL.into_iter().map(Approval::wire).collect();
+        assert_eq!(approvals, ["untrusted", "on-request", "never"]);
+        assert_eq!(Sandbox::parse("read-only"), Some(Sandbox::ReadOnly));
+        assert_eq!(Approval::parse("yolo"), None);
     }
 }
