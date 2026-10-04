@@ -3,7 +3,10 @@
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
-use hub_core::settings::{Draft, Field, FieldError, PermissionMode, UpdateCheck};
+use hub_core::domain::BackendKind;
+use hub_core::settings::{
+    Approval, CodexField, Draft, Field, FieldError, PermissionMode, Sandbox, UpdateCheck,
+};
 
 use crate::gui::log::LogAction;
 use crate::gui::look::{add_user, telegram_changed, use_chat};
@@ -14,6 +17,7 @@ pub struct SettingsForm {
     draft: Draft,
     synced: Option<Draft>,
     reveal: bool,
+    reveal_key: bool,
     confirming: bool,
 }
 
@@ -89,6 +93,8 @@ impl SettingsForm {
             ui.separator();
             self.agent(ui, &errors);
             ui.separator();
+            self.codex(ui, &errors);
+            ui.separator();
             self.timeouts(ui, &errors);
         });
         ui.separator();
@@ -146,6 +152,19 @@ impl SettingsForm {
     }
 
     fn agent(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
+        ui.heading("Агенты");
+        ui.horizontal(|ui| {
+            ui.label("Агент по умолчанию");
+            egui::ComboBox::from_id_salt("default_backend")
+                .selected_text(self.draft.default_backend.name())
+                .show_ui(ui, |ui| {
+                    for kind in BackendKind::ALL {
+                        ui.selectable_value(&mut self.draft.default_backend, kind, kind.name());
+                    }
+                });
+        });
+        ui.label("Используется в /new без имени агента; /backend меняет агента в теме.");
+        ui.separator();
         ui.heading("Claude Code");
         ui.horizontal(|ui| {
             ui.label("Путь к claude");
@@ -186,6 +205,78 @@ impl SettingsForm {
             ui.add(egui::TextEdit::singleline(&mut self.draft.budget).hint_text("без лимита"));
         });
         messages(ui, errors, Field::Budget);
+    }
+
+    fn codex(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
+        ui.heading("Codex");
+        ui.horizontal(|ui| {
+            ui.label("Путь к codex");
+            ui.add(egui::TextEdit::singleline(&mut self.draft.codex.cli).hint_text("из PATH"));
+            if ui.button("Выбрать…").clicked()
+                && let Some(path) = pick_file(&self.draft.codex.cli)
+            {
+                self.draft.codex.cli = path;
+            }
+        });
+        messages(ui, errors, Field::Codex(CodexField::Cli));
+        ui.horizontal(|ui| {
+            ui.label("Модель");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.draft.codex.model)
+                    .hint_text("из настроек Codex"),
+            );
+        });
+        messages(ui, errors, Field::Codex(CodexField::Model));
+        ui.horizontal(|ui| {
+            ui.label("Песочница");
+            egui::ComboBox::from_id_salt("codex_sandbox")
+                .selected_text(self.draft.codex.sandbox.wire())
+                .show_ui(ui, |ui| {
+                    for sandbox in Sandbox::ALL {
+                        ui.selectable_value(&mut self.draft.codex.sandbox, sandbox, sandbox.wire());
+                    }
+                });
+        });
+        if self.draft.codex.sandbox == Sandbox::DangerFullAccess {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "danger-full-access: команды Codex выполняются без песочницы ОС.",
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.label("Одобрения");
+            egui::ComboBox::from_id_salt("codex_approval")
+                .selected_text(self.draft.codex.approval.wire())
+                .show_ui(ui, |ui| {
+                    for approval in Approval::ALL {
+                        ui.selectable_value(
+                            &mut self.draft.codex.approval,
+                            approval,
+                            approval.wire(),
+                        );
+                    }
+                });
+        });
+        if self.draft.codex.approval == Approval::Never {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "never: Codex ничего не спрашивает перед действиями.",
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.label("API-ключ OpenAI");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.draft.codex.api_key)
+                    .password(!self.reveal_key)
+                    .hint_text("вход через codex login"),
+            );
+            ui.checkbox(&mut self.reveal_key, "показать");
+        });
+        messages(ui, errors, Field::Codex(CodexField::ApiKey));
+        ui.label(
+            "Без ключа используется вход `codex login`. Ключ хранится в системном хранилище \
+                 ключей и не заменяет вход по подписке ChatGPT.",
+        );
     }
 
     fn timeouts(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {

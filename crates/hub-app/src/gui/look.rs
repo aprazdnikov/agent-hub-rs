@@ -1,9 +1,11 @@
 //! Pure presentation decisions shared by the window and the tray.
 
+use hub_codex::protocol::CodexAuth;
+use hub_core::domain::BackendKind;
 use hub_core::settings::Draft;
 use hub_telegram::hub::TopicState;
 
-use crate::supervisor::{BotStatus, Snapshot};
+use crate::supervisor::{AgentState, BotStatus, Snapshot};
 use crate::updater::UpdateState;
 
 const SHORT_SESSION: usize = 8;
@@ -50,6 +52,36 @@ pub fn status_text(status: &BotStatus) -> String {
         BotStatus::Starting => "Подключение…".to_owned(),
         BotStatus::Running { username } => format!("Подключён как @{username}"),
         BotStatus::Failed(reason) => format!("Ошибка: {reason}"),
+    }
+}
+
+#[must_use]
+pub const fn agent_title(kind: BackendKind) -> &'static str {
+    match kind {
+        BackendKind::Claude => "Claude Code",
+        BackendKind::Codex => "Codex",
+    }
+}
+
+#[must_use]
+pub fn agent_line(state: Option<&AgentState>) -> String {
+    match state {
+        None => "—".to_owned(),
+        Some(AgentState::Ready { version, auth: None }) => version.clone(),
+        Some(AgentState::Ready { version, auth: Some(auth) }) => {
+            format!("{version} · вход: {}", auth_text(*auth))
+        }
+        Some(AgentState::Unavailable(reason)) => format!("недоступен: {reason}"),
+    }
+}
+
+const fn auth_text(auth: CodexAuth) -> &'static str {
+    match auth {
+        CodexAuth::ApiKey => "API-ключ",
+        CodexAuth::ChatGpt => "ChatGPT",
+        CodexAuth::Other => "другой способ",
+        CodexAuth::NotRequired => "не требуется",
+        CodexAuth::Missing => "не выполнен — `codex login` или API-ключ",
     }
 }
 
@@ -132,11 +164,13 @@ pub fn update_item(state: &UpdateState) -> (String, bool) {
 
 #[cfg(test)]
 mod tests {
+    use hub_codex::protocol::CodexAuth;
     use hub_core::domain::{AbsolutePath, BackendKind, ChatId, ThreadId, TopicKey, TopicSession};
     use hub_telegram::hub::TopicView;
     use rstest::rstest;
 
     use super::*;
+    use crate::supervisor::AgentState;
 
     fn view(thread: i32, state: TopicState) -> TopicView {
         let root = if cfg!(windows) { r"C:\p" } else { "/p" };
@@ -232,5 +266,22 @@ mod tests {
     fn update_menu_item(#[case] state: UpdateState, #[case] expected: (&str, bool)) {
         let (text, enabled) = update_item(&state);
         assert_eq!((text.as_str(), enabled), expected);
+    }
+
+    #[rstest]
+    #[case(None, "—")]
+    #[case(Some(AgentState::Ready { version: "2.1.287".to_owned(), auth: None }), "2.1.287")]
+    #[case(Some(AgentState::Ready { version: "0.160.0".to_owned(), auth: Some(CodexAuth::ChatGpt) }), "0.160.0 · вход: ChatGPT")]
+    #[case(Some(AgentState::Ready { version: "0.160.0".to_owned(), auth: Some(CodexAuth::ApiKey) }), "0.160.0 · вход: API-ключ")]
+    #[case(Some(AgentState::Ready { version: "0.160.0".to_owned(), auth: Some(CodexAuth::Missing) }), "0.160.0 · вход: не выполнен — `codex login` или API-ключ")]
+    #[case(Some(AgentState::Unavailable("Codex не найден".to_owned())), "недоступен: Codex не найден")]
+    fn agent_lines(#[case] state: Option<AgentState>, #[case] expected: &str) {
+        assert_eq!(agent_line(state.as_ref()), expected);
+    }
+
+    #[test]
+    fn agents_have_titles() {
+        assert_eq!(agent_title(BackendKind::Claude), "Claude Code");
+        assert_eq!(agent_title(BackendKind::Codex), "Codex");
     }
 }

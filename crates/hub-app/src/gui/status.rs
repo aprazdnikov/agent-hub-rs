@@ -2,7 +2,9 @@
 
 use eframe::egui;
 
-use crate::gui::look::{active, status_text};
+use hub_core::domain::BackendKind;
+
+use crate::gui::look::{active, agent_line, agent_title, status_text};
 use crate::supervisor::{BotStatus, Command, Snapshot};
 
 pub fn show(ui: &mut egui::Ui, snapshot: &Snapshot, send: &mut impl FnMut(Command)) {
@@ -26,9 +28,11 @@ pub fn show(ui: &mut egui::Ui, snapshot: &Snapshot, send: &mut impl FnMut(Comman
         ui.label("agent-hub");
         ui.label(env!("CARGO_PKG_VERSION"));
         ui.end_row();
-        for agent in &snapshot.agents {
-            ui.label(agent.kind.name());
-            ui.label(format!("{:?}", agent.state));
+        for kind in BackendKind::ALL {
+            let state =
+                snapshot.agents.iter().find(|agent| agent.kind == kind).map(|agent| &agent.state);
+            ui.label(agent_title(kind));
+            ui.label(agent_line(state));
             ui.end_row();
         }
         ui.label("Активных сессий");
