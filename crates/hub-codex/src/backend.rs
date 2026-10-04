@@ -91,7 +91,12 @@ pub async fn serve(
     conversation: &Conversation,
 ) -> mpsc::Receiver<Prompt> {
     let Link { client, notifications } = link;
-    let thread = match open(client, settings, session).await {
+    let opened = tokio::select! {
+        biased;
+        () = conversation.cancel.cancelled() => return inbox,
+        opened = open(client, settings, session) => opened,
+    };
+    let thread = match opened {
         Ok(thread) => thread,
         Err(error) => {
             tracing::warn!(%error, "codex session did not open");
@@ -156,13 +161,7 @@ async fn open(
     settings: &CodexSettings,
     session: &TopicSession,
 ) -> Result<SessionId, OpenError> {
-    let auth = match handshake(client).await? {
-        CodexAuth::Missing => login(client, settings, CodexAuth::Missing).await?,
-        auth @ (CodexAuth::ApiKey
-        | CodexAuth::ChatGpt
-        | CodexAuth::Other
-        | CodexAuth::NotRequired) => auth,
-    };
+    let auth = probe(client, settings).await?;
     if auth == CodexAuth::Missing {
         return Err(OpenError::NotLoggedIn);
     }
@@ -186,8 +185,9 @@ async fn handshake(client: &RpcClient) -> Result<CodexAuth, RpcError> {
     Ok(auth_state(&client.request(Call::AccountRead.method(), json!({})).await?))
 }
 
-/// The key replaces only a missing or API-key login: logging in rewrites `auth.json`, and a
-/// `ChatGPT` login must survive a key left in the settings.
+/// The key replaces only a missing or API-key login, so a changed key applies from the next
+/// session: logging in rewrites `auth.json`, and a `ChatGPT` login must survive a key left in
+/// the settings.
 async fn login(
     client: &RpcClient,
     settings: &CodexSettings,
@@ -210,8 +210,7 @@ async fn login(
     }
 }
 
-/// How Codex is logged in, logging in with the configured key if it may. Unlike a session,
-/// the probe logs in again over an API-key login, so a rotated key is picked up.
+/// How Codex is logged in, logging in with the configured key if it may.
 pub async fn probe(client: &RpcClient, settings: &CodexSettings) -> Result<CodexAuth, RpcError> {
     let auth = handshake(client).await?;
     login(client, settings, auth).await
@@ -539,19 +538,57 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_key_login_is_not_repeated_in_a_session() {
-        let (_events, seen) = run(
-            settings(Some("sk-test")),
+    async fn a_changed_key_replaces_a_key_login_in_a_session() {
+        let (events, seen) = run(
+            settings(Some("sk-new")),
             session(None),
             vec![
                 ok("initialize", json!({})),
+                ok("account/read", api_key_login()),
+                ok("account/login/start", json!({})),
                 ok("account/read", api_key_login()),
                 ok("thread/start", json!({"thread": {"id": "t-1"}})),
                 ok("turn/start", json!({"turn": {"id": "u-1"}})).then(vec![turn_done("u-1")]),
             ],
         )
         .await;
-        assert!(!methods(&seen).contains(&"account/login/start".to_owned()));
+        assert_eq!(events.first(), Some(&AgentEvent::SessionStarted(thread())));
+        let login = seen
+            .iter()
+            .find(|message| message.get("method") == Some(&json!("account/login/start")))
+            .and_then(|message| message.get("params"));
+        assert_eq!(login, Some(&json!({"type": "apiKey", "apiKey": "sk-new"})));
+    }
+
+    #[tokio::test]
+    async fn stop_while_the_thread_opens_ends_without_a_turn() {
+        let (mut connection, peer) = pair(refusing(), Duration::from_secs(5));
+        let server = tokio::spawn(fake_server(
+            peer,
+            vec![ok("initialize", json!({})), ok("account/read", chatgpt())],
+        ));
+        let (conversation, received) = conversation();
+        let (inbox_in, inbox) = mpsc::channel(4);
+        inbox_in.send(prompt("потом")).await.unwrap();
+        let cancel = conversation.cancel.clone();
+        let stopper = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancel.cancel();
+        });
+        let link =
+            Link { client: &connection.client, notifications: &mut connection.notifications };
+        let outcome = tokio::time::timeout(
+            Duration::from_secs(2),
+            serve(link, &settings(None), &session(None), prompt("hi"), inbox, &conversation),
+        )
+        .await;
+        stopper.await.unwrap();
+        let mut leftover = outcome.expect("serve must return on /stop while thread/start waits");
+        drop(conversation);
+        let (_peer, seen) = server.await.unwrap();
+        assert!(!methods(&seen).contains(&"turn/start".to_owned()));
+        assert!(collect(received).await.is_empty());
+        assert_eq!(leftover.recv().await.map(|p| p.text().to_owned()), Some("потом".to_owned()));
     }
 
     #[rstest]

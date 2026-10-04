@@ -83,10 +83,17 @@ async fn relay<T: Thread>(
     conversation: &Conversation,
 ) -> Result<(), RpcError> {
     let mut queued = VecDeque::new();
-    let mut active = Some(thread.start_turn(&prompt).await?);
+    let mut active = tokio::select! {
+        biased;
+        () = conversation.cancel.cancelled() => return Ok(()),
+        turn = thread.start_turn(&prompt) => Some(turn?),
+    };
     let mut inbox_open = true;
     while active.is_some() || !queued.is_empty() {
         tokio::select! {
+            // A stop must win over a prompt that arrived at the same moment, which then stays
+            // in the inbox.
+            biased;
             () = conversation.cancel.cancelled() => return Ok(()),
             next = inbox.recv(), if inbox_open => match next {
                 Some(prompt) => {
@@ -365,6 +372,23 @@ mod tests {
         assert_eq!(outcome, Ok(()));
         harness.inbox.send(prompt("после стопа")).await.unwrap();
         assert_eq!(inbox.recv().await.map(|p| p.text().to_owned()), Some("после стопа".to_owned()));
+    }
+
+    #[tokio::test]
+    async fn stop_wins_over_a_prompt_that_arrived_at_the_same_moment() {
+        for _ in 0..20 {
+            let harness = start(FakeThread::default());
+            eventually("started", || harness.thread.calls().len() == 1).await;
+            harness.inbox.send(prompt("одновременно")).await.unwrap();
+            harness.cancel.cancel();
+            let (mut inbox, outcome) = harness.done.await.unwrap();
+            assert_eq!(outcome, Ok(()));
+            assert_eq!(harness.thread.calls(), ["start:hi"]);
+            assert_eq!(
+                inbox.recv().await.map(|p| p.text().to_owned()),
+                Some("одновременно".to_owned())
+            );
+        }
     }
 
     #[tokio::test]
