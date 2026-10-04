@@ -29,6 +29,9 @@ pub const NOTHING_SELECTED: &str = "Отметьте хотя бы один ва
 pub const QUEUE_FULL: &str = "⚠️ Слишком много сообщений в очереди — дождитесь ответа агента.";
 pub const APPROVAL_UNSENT: &str = "Не удалось отправить запрос подтверждения в Telegram";
 pub const QUESTION_UNSENT: &str = "Не удалось отправить вопрос в Telegram";
+pub const CURRENT_SESSION: &str = "ℹ️ Текущая сессия";
+pub const BACKEND_ALREADY: &str = "ℹ️ Бэкенд уже выбран";
+pub const BACKEND_SWITCHED: &str = "🔀 Бэкенд изменён";
 const APPROVAL_TEXT_LIMIT: usize = 3500;
 const TOOL_CALL_TEXT_LIMIT: usize = 900;
 const FAILURE_TEXT_LIMIT: usize = 3500;
@@ -36,11 +39,12 @@ const FAILURE_TEXT_LIMIT: usize = 3500;
 #[must_use]
 pub fn help(root: &Path) -> String {
     let uploads = UPLOADS_DIR.join("/");
-    let backends = BackendKind::ALL.iter().map(|kind| kind.name()).collect::<Vec<_>>().join(", ");
+    let backends = backend_names();
     format!(
         "Каждая тема этой группы — отдельная сессия агента.\n\n\
          Просто пишите задачу в теме. Команды:\n\
          /new [backend] [путь] — новая сессия в этой теме (сброс контекста)\n\
+         /backend [claude|codex] — сменить агента в этой теме (сброс контекста)\n\
          /cwd <путь> — сменить рабочую директорию (сброс контекста)\n\
          /reset — начать разговор заново в той же директории\n\
          /stop — прервать текущую задачу\n\
@@ -52,6 +56,15 @@ pub fn help(root: &Path) -> String {
          Бэкенды: {backends}",
         root.display()
     )
+}
+
+#[must_use]
+pub fn unknown_backend(name: &str) -> String {
+    format!("⚠️ Неизвестный бэкенд {name}. Доступны: {}", backend_names())
+}
+
+fn backend_names() -> String {
+    BackendKind::ALL.iter().map(|kind| kind.name()).collect::<Vec<_>>().join(", ")
 }
 
 #[must_use]
@@ -123,6 +136,11 @@ mod tests {
     }
 
     #[test]
+    fn unknown_backend_lists_the_known_ones() {
+        assert_eq!(unknown_backend("gpt"), "⚠️ Неизвестный бэкенд gpt. Доступны: claude, codex");
+    }
+
+    #[test]
     fn help_names_root_uploads_and_backends() {
         let root = absolute("");
         let text = help(root.as_path());
@@ -130,6 +148,9 @@ mod tests {
         assert!(text.contains(".agent-hub/uploads"));
         assert!(text.contains(&root.as_path().display().to_string()));
         assert!(text.ends_with("Бэкенды: claude, codex"));
+        assert!(
+            text.contains("/backend [claude|codex] — сменить агента в этой теме (сброс контекста)")
+        );
     }
 
     #[test]

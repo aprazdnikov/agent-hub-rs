@@ -9,7 +9,8 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use hub_agent::conversation::Conversation;
 use hub_core::commands::{
-    Command, DEFAULT_BACKEND, Input, NewSessionArgs, join_path_args, parse_input, parse_new_args,
+    BackendDecision, Command, Input, NewSessionArgs, decide_backend, join_path_args, parse_input,
+    parse_new_args,
 };
 use hub_core::domain::{
     AbsolutePath, ChatId, MessageId, Prompt, SessionId, TopicKey, TopicSession,
@@ -238,7 +239,8 @@ impl<A: Agents> Hub<A> {
                 self.titles.insert(key, name.clone());
                 match self.root() {
                     Ok(root) => {
-                        let session = TopicSession::fresh(DEFAULT_BACKEND, root);
+                        let default = self.settings.borrow().default_backend;
+                        let session = TopicSession::fresh(default, root);
                         self.put(key, session.clone());
                         self.say(Target::Topic(key), texts::describe(texts::NEW_SESSION, &session));
                     }
@@ -311,7 +313,8 @@ impl<A: Agents> Hub<A> {
                 if self.refuse_if_running(key) {
                     return;
                 }
-                let NewSessionArgs { backend, cwd } = parse_new_args(args);
+                let default = self.settings.borrow().default_backend;
+                let NewSessionArgs { backend, cwd } = parse_new_args(args, default);
                 match self.resolve(cwd.as_deref()) {
                     Ok(cwd) => {
                         let session = TopicSession::fresh(backend, cwd);
@@ -357,6 +360,7 @@ impl<A: Agents> Hub<A> {
                     Err(error) => self.say(Target::Topic(key), texts::warning(&error)),
                 }
             }
+            Command::Backend => self.backend(key, args),
             Command::Stop => match self.running.get(&key) {
                 Some(live) => live.cancel.cancel(),
                 None => self.say(Target::Topic(key), texts::NOTHING_TO_STOP.to_owned()),
@@ -372,6 +376,37 @@ impl<A: Agents> Hub<A> {
                     self.say(Target::Topic(key), texts::describe(state, session));
                 }
             },
+        }
+    }
+
+    fn backend(&mut self, key: TopicKey, args: &[&str]) {
+        let current = match self.session(key) {
+            Ok(current) => current,
+            Err(error) => {
+                self.say(Target::Topic(key), texts::warning(&error));
+                return;
+            }
+        };
+        match decide_backend(args, &current) {
+            BackendDecision::Show(session) => {
+                let text = texts::describe(texts::CURRENT_SESSION, &session);
+                self.say(Target::Topic(key), text);
+            }
+            BackendDecision::Unknown(name) => {
+                self.say(Target::Topic(key), texts::unknown_backend(&name));
+            }
+            BackendDecision::AlreadySelected(session) => {
+                let text = texts::describe(texts::BACKEND_ALREADY, &session);
+                self.say(Target::Topic(key), text);
+            }
+            BackendDecision::Switch(session) => {
+                if self.refuse_if_running(key) {
+                    return;
+                }
+                self.put(key, session.clone());
+                let text = texts::describe(texts::BACKEND_SWITCHED, &session);
+                self.say(Target::Topic(key), text);
+            }
         }
     }
 
@@ -501,7 +536,8 @@ impl<A: Agents> Hub<A> {
         if let Some(session) = self.topics.get(&key) {
             return Ok(session.clone());
         }
-        let session = TopicSession::fresh(DEFAULT_BACKEND, self.root()?);
+        let default = self.settings.borrow().default_backend;
+        let session = TopicSession::fresh(default, self.root()?);
         self.put(key, session.clone());
         tracing::info!(chat = key.chat.0, thread = key.thread.0, "topic bound");
         Ok(session)
@@ -561,7 +597,7 @@ mod tests {
     use std::time::Duration;
 
     use hub_core::domain::{
-        AgentEvent, ChatId, Finished, Question, Selection, ThreadId, Usage, UserId,
+        AgentEvent, BackendKind, ChatId, Finished, Question, Selection, ThreadId, Usage, UserId,
     };
     use hub_core::questions::{Answer, QuestionId};
     use hub_core::settings::Draft;
@@ -669,6 +705,14 @@ mod tests {
     }
 
     fn world_with(agents: FakeAgents, messenger: FakeMessenger) -> World {
+        world_from(agents, messenger, BackendKind::Claude)
+    }
+
+    fn world_from(
+        agents: FakeAgents,
+        messenger: FakeMessenger,
+        default_backend: BackendKind,
+    ) -> World {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("project")).unwrap();
         let settings = Draft {
@@ -677,6 +721,7 @@ mod tests {
             users: "1".to_owned(),
             workspace_root: root.path().display().to_string(),
             approval_timeout: "5".to_owned(),
+            default_backend,
             ..Draft::default()
         }
         .parse(&std::env::temp_dir())
@@ -829,6 +874,61 @@ mod tests {
             .await;
         world.send(text(Some(7), 3, "/status")).await;
         eventually("waiting", || world.texts().iter().any(|t| t.starts_with("💤 ожидает"))).await;
+    }
+
+    #[tokio::test]
+    async fn backend_is_shown_switched_and_validated() {
+        let world = world(FakeAgents::default());
+        world.send(text(Some(7), 1, "/backend")).await;
+        eventually("shown", || {
+            world
+                .texts()
+                .iter()
+                .any(|t| t.starts_with("ℹ️ Текущая сессия") && t.contains("backend: claude"))
+        })
+        .await;
+        world.send(text(Some(7), 2, "/backend claude")).await;
+        eventually("already", || {
+            world.texts().iter().any(|t| t.starts_with("ℹ️ Бэкенд уже выбран"))
+        })
+        .await;
+        world.send(text(Some(7), 3, "/backend gpt")).await;
+        eventually("unknown", || {
+            world.texts().contains(&"⚠️ Неизвестный бэкенд gpt. Доступны: claude, codex".to_owned())
+        })
+        .await;
+        world.send(text(Some(7), 4, "/backend codex")).await;
+        eventually("switched", || {
+            world
+                .texts()
+                .iter()
+                .any(|t| t.starts_with("🔀 Бэкенд изменён") && t.contains("backend: codex"))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn backend_switch_is_refused_while_running() {
+        let world = world(FakeAgents::scripted(vec![Script::UntilStopped]));
+        world.send(text(Some(7), 1, "долго")).await;
+        eventually("running", || world.running()).await;
+        world.send(text(Some(7), 2, "/backend codex")).await;
+        eventually("refused", || world.texts().contains(&texts::ALREADY_RUNNING.to_owned())).await;
+        assert!(!world.texts().iter().any(|t| t.starts_with("🔀")));
+        world.send(HubMessage::Stop(KEY)).await;
+    }
+
+    #[tokio::test]
+    async fn new_without_a_backend_uses_the_default_from_settings() {
+        let world = world_from(FakeAgents::default(), FakeMessenger::default(), BackendKind::Codex);
+        world.send(text(Some(7), 1, "/new project")).await;
+        eventually("new", || {
+            world
+                .texts()
+                .iter()
+                .any(|t| t.starts_with("🆕 Новая сессия") && t.contains("backend: codex"))
+        })
+        .await;
     }
 
     #[tokio::test]
