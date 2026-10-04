@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::FutureExt;
-use hub_claude::session::{Conversation, Limits};
+use hub_agent::conversation::{Conversation, Limits};
 use hub_core::domain::{AbsolutePath, AgentEvent, Prompt, SessionId, TopicKey, TopicSession};
 use hub_core::render::{format_abandoned, format_finished};
 use hub_core::settings::Settings;

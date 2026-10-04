@@ -1733,6 +1733,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6dbf3de79e51f3d586ab4cb9d5c3e2c14aa28ed23d180cf89b4df0454a69cc87"
 
 [[package]]
+name = "hub-agent"
+version = "0.1.0"
+dependencies = [
+ "futures",
+ "hub-core",
+ "rstest",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "which",
+]
+
+[[package]]
 name = "hub-app"
 version = "0.1.0"
 dependencies = [
@@ -1769,6 +1783,7 @@ version = "0.1.0"
 dependencies = [
  "base64 0.23.1",
  "futures",
+ "hub-agent",
  "hub-core",
  "insta",
  "rstest",
@@ -1801,6 +1816,7 @@ version = "0.1.0"
 dependencies = [
  "dunce",
  "futures",
+ "hub-agent",
  "hub-claude",
  "hub-core",
  "rstest",

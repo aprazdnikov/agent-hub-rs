@@ -15,11 +15,11 @@ use tokio::sync::mpsc;
 use tokio::task::{AbortHandle, JoinError, JoinSet};
 use tokio::time::{Instant, sleep_until, timeout};
 use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
-use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::activity::{Phase, SessionActivity};
-use crate::channel::UserChannel;
+use hub_agent::channel::UserChannel;
+use hub_agent::conversation::Conversation;
 use crate::mcp::{self, McpStep};
 use crate::outgoing;
 use crate::permissions::{self, Route};
@@ -32,29 +32,6 @@ const INITIALIZE: &str = "hub-initialize";
 const INTERRUPT: &str = "hub-interrupt";
 const OUTBOX: usize = 64;
 const FLUSH_TIMEOUT: Duration = Duration::from_secs(5);
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Limits {
-    /// How long background tasks may run after the agent's answer.
-    pub background: Duration,
-    /// After a task reports, the CLI starts a turn of its own within this window.
-    pub settle: Duration,
-    pub initialize: Duration,
-}
-
-impl Limits {
-    #[must_use]
-    pub const fn new(background: Duration) -> Self {
-        Self { background, settle: Duration::from_secs(30), initialize: Duration::from_mins(1) }
-    }
-}
-
-pub struct Conversation {
-    pub channel: Arc<dyn UserChannel>,
-    pub events: mpsc::Sender<AgentEvent>,
-    pub cancel: CancellationToken,
-    pub limits: Limits,
-}
 
 enum Flow {
     Continue,

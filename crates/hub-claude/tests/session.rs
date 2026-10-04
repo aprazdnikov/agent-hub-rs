@@ -6,8 +6,9 @@ mod tests {
     use std::time::Duration;
 
     use futures::future::BoxFuture;
-    use hub_claude::channel::UserChannel;
-    use hub_claude::session::{Conversation, Limits, converse};
+    use hub_agent::channel::UserChannel;
+    use hub_agent::conversation::{Conversation, Limits};
+    use hub_claude::session::converse;
     use hub_core::domain::{
         AgentEvent, Decision, Denied, FileDelivery, Finished, OutgoingFile, Prompt, Question,
         QuestionAnswer, QuestionsOutcome, SessionId, ToolRequest,

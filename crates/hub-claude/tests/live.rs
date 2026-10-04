@@ -8,8 +8,8 @@ mod tests {
 
     use futures::future::BoxFuture;
     use hub_claude::backend::ClaudeBackend;
-    use hub_claude::channel::UserChannel;
-    use hub_claude::session::{Conversation, Limits};
+    use hub_agent::channel::UserChannel;
+    use hub_agent::conversation::{Conversation, Limits};
     use hub_claude::version::{check, locate};
     use hub_core::domain::{
         AbsolutePath, AgentEvent, BackendKind, Decision, FileDelivery, OutgoingFile, Prompt,

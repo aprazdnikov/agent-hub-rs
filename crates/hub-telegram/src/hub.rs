@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use hub_claude::session::Conversation;
+use hub_agent::conversation::Conversation;
 use hub_core::commands::{
     Command, DEFAULT_BACKEND, Input, NewSessionArgs, join_path_args, parse_input, parse_new_args,
 };

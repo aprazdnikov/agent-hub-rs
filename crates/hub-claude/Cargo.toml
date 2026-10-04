@@ -9,6 +9,7 @@ publish.workspace = true
 [dependencies]
 base64.workspace = true
 futures.workspace = true
+hub-agent.workspace = true
 hub-core.workspace = true
 rust_decimal.workspace = true
 serde.workspace = true

@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use hub_claude::channel::UserChannel;
+use hub_agent::channel::UserChannel;
 use hub_core::approvals::{ApprovalId, ApprovalRegistry, Verdict, callback_data};
 use hub_core::attachments::MAX_SEND_BYTES;
 use hub_core::domain::{
