@@ -1835,6 +1835,7 @@ dependencies = [
  "futures",
  "hub-agent",
  "hub-claude",
+ "hub-codex",
  "hub-core",
  "rstest",
  "serde_json",

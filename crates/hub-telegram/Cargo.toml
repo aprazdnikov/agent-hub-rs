@@ -11,6 +11,7 @@ dunce.workspace = true
 futures.workspace = true
 hub-agent.workspace = true
 hub-claude.workspace = true
+hub-codex.workspace = true
 hub-core.workspace = true
 teloxide.workspace = true
 thiserror.workspace = true

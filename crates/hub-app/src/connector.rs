@@ -7,7 +7,7 @@ use std::sync::Arc;
 use futures::future::BoxFuture;
 use hub_claude::version::{CliError, check, locate};
 use hub_core::settings::Settings;
-use hub_telegram::agents::ClaudeAgents;
+use hub_telegram::agents::HubAgents;
 use hub_telegram::hub::{self, HubHandle, HubMessage, HubSetup};
 use hub_telegram::paths::{CwdError, workspace_root};
 use hub_telegram::telegram::{self, Connection, Listener};
@@ -62,7 +62,7 @@ impl Connector for TelegramConnector {
                 telegram::connect(&current.telegram.token, current.telegram.chat).await?;
             let HubHandle { mailbox, views, registries: _registries, task } =
                 hub::spawn(HubSetup {
-                    agents: Arc::new(ClaudeAgents::new(settings.clone())),
+                    agents: Arc::new(HubAgents::new(settings.clone())),
                     messenger,
                     settings,
                     topics,
