@@ -2,8 +2,8 @@
 
 use std::path::{Path, PathBuf};
 
-use hub_agent::cli::{self, VersionError};
 pub use hub_agent::cli::Version;
+use hub_agent::cli::{self, VersionError};
 
 /// The protocol features this hub relies on (task messages, result origin, replayed prompts)
 /// were verified against this version.
@@ -73,9 +73,6 @@ mod tests {
     #[tokio::test]
     async fn missing_binary_is_a_spawn_error() {
         let path = std::env::temp_dir().join("definitely-not-claude-binary");
-        assert!(matches!(
-            check(&path).await,
-            Err(CliError::Version(VersionError::Spawn { .. }))
-        ));
+        assert!(matches!(check(&path).await, Err(CliError::Version(VersionError::Spawn { .. }))));
     }
 }

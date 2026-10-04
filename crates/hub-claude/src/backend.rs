@@ -13,9 +13,9 @@ use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, LinesCodec};
 
 use crate::outgoing::{ENTRYPOINT, cli_args};
+use crate::session::converse;
 use hub_agent::cli::hide_window;
 use hub_agent::conversation::Conversation;
-use crate::session::converse;
 
 // After stdin closes the CLI finishes on its own; this bounds the wait before killing it.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);

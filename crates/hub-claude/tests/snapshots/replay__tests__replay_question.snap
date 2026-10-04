@@ -1,6 +1,6 @@
 ---
 source: crates/hub-claude/tests/replay.rs
-assertion_line: 41
+assertion_line: 43
 expression: events
 ---
 [
@@ -17,10 +17,12 @@ expression: events
             session: SessionId(
                 "94a6d47b-ca1f-4dfc-b920-52e078dd4a1f",
             ),
-            turns: 2,
-            cost: Some(
-                0.0281337,
-            ),
+            usage: Claude {
+                turns: 2,
+                cost: Some(
+                    0.0281337,
+                ),
+            },
             background: 0,
         },
     ),

@@ -560,7 +560,9 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::time::Duration;
 
-    use hub_core::domain::{AgentEvent, ChatId, Finished, Question, Selection, ThreadId, UserId};
+    use hub_core::domain::{
+        AgentEvent, ChatId, Finished, Question, Selection, ThreadId, Usage, UserId,
+    };
     use hub_core::questions::{Answer, QuestionId};
     use hub_core::settings::Draft;
 
@@ -723,8 +725,7 @@ mod tests {
     fn finished() -> AgentEvent {
         AgentEvent::Finished(Finished {
             session: SessionId::parse("s-1").unwrap(),
-            turns: 1,
-            cost: None,
+            usage: Usage::Claude { turns: 1, cost: None },
             background: 0,
         })
     }

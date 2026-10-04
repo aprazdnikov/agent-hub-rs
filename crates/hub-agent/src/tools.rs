@@ -144,7 +144,6 @@ pub fn parse_option(raw: &Value) -> Option<QuestionOption> {
     Some(QuestionOption { label: label.to_owned(), description: description.to_owned() })
 }
 
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;

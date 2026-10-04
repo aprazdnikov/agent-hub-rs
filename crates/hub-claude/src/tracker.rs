@@ -2,7 +2,7 @@
 
 use std::str::FromStr;
 
-use hub_core::domain::{AgentEvent, Finished, SessionId, ToolUse};
+use hub_core::domain::{AgentEvent, Finished, SessionId, ToolUse, Usage};
 use rust_decimal::Decimal;
 use serde_json::Number;
 
@@ -87,8 +87,10 @@ fn outcome_event(outcome: &Outcome, background: usize) -> AgentEvent {
     match SessionId::parse(&outcome.session_id) {
         Some(session) => AgentEvent::Finished(Finished {
             session,
-            turns: outcome.num_turns,
-            cost: outcome.total_cost_usd.as_ref().and_then(cost),
+            usage: Usage::Claude {
+                turns: outcome.num_turns,
+                cost: outcome.total_cost_usd.as_ref().and_then(cost),
+            },
             background,
         }),
         None => AgentEvent::Failed(format!("{}: нет session_id", outcome.subtype)),
@@ -103,13 +105,13 @@ fn cost(number: &Number) -> Option<Decimal> {
 
 #[cfg(test)]
 mod tests {
-    use hub_core::domain::{AgentEvent, Finished, SessionId, ToolUse};
+    use hub_core::domain::{AgentEvent, Finished, SessionId, ToolUse, Usage};
     use rust_decimal::Decimal;
     use serde_json::{Value, json};
 
     use super::*;
-    use hub_agent::tools::TOOL_SUMMARY_LIMIT;
     use crate::wire::parse_line;
+    use hub_agent::tools::TOOL_SUMMARY_LIMIT;
 
     fn message(value: &Value) -> Incoming {
         parse_line(&value.to_string()).unwrap()
@@ -163,8 +165,7 @@ mod tests {
                 AgentEvent::SessionStarted(session()),
                 AgentEvent::Finished(Finished {
                     session: session(),
-                    turns: 3,
-                    cost: Some(Decimal::new(1234, 4)),
+                    usage: Usage::Claude { turns: 3, cost: Some(Decimal::new(1234, 4)) },
                     background: 2,
                 }),
             ]
@@ -178,8 +179,7 @@ mod tests {
             events.last(),
             Some(&AgentEvent::Finished(Finished {
                 session: session(),
-                turns: 3,
-                cost: None,
+                usage: Usage::Claude { turns: 3, cost: None },
                 background: 0
             }))
         );
@@ -189,7 +189,10 @@ mod tests {
     fn tiny_cost_in_scientific_notation_is_kept() {
         let events = SessionTracker::default().translate(&result(false, &json!(1e-7)), 0);
         let Some(AgentEvent::Finished(finished)) = events.last() else { panic!("not finished") };
-        assert!(finished.cost.is_some_and(|cost| cost > Decimal::ZERO));
+        assert!(matches!(
+            finished.usage,
+            Usage::Claude { cost: Some(cost), .. } if cost > Decimal::ZERO
+        ));
     }
 
     #[test]

@@ -142,13 +142,12 @@ async fn relay(
             }
             AgentEvent::Finished(finished) => {
                 tracing::info!(
-                    turns = finished.turns,
+                    usage = ?finished.usage,
                     background = finished.background,
                     "turn finished"
                 );
                 bind(mailbox, key, finished.session.clone()).await;
-                let line = format_finished(finished.turns, finished.cost, finished.background);
-                sender.text(Target::Topic(key), &line).await;
+                sender.text(Target::Topic(key), &format_finished(&finished)).await;
             }
             AgentEvent::BackgroundAbandoned(tasks) => {
                 tracing::warn!(tasks = tasks.len(), "background tasks abandoned");

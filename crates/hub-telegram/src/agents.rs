@@ -3,8 +3,8 @@
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
-use hub_claude::backend::ClaudeBackend;
 use hub_agent::conversation::Conversation;
+use hub_claude::backend::ClaudeBackend;
 use hub_claude::version::locate;
 use hub_core::domain::{AgentEvent, BackendKind, Prompt, TopicSession};
 use hub_core::settings::Settings;

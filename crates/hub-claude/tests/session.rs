@@ -11,7 +11,7 @@ mod tests {
     use hub_claude::session::converse;
     use hub_core::domain::{
         AgentEvent, Decision, Denied, FileDelivery, Finished, OutgoingFile, Prompt, Question,
-        QuestionAnswer, QuestionsOutcome, SessionId, ToolRequest,
+        QuestionAnswer, QuestionsOutcome, SessionId, ToolRequest, Usage,
     };
     use rust_decimal::Decimal;
     use serde_json::{Value, json};
@@ -221,8 +221,7 @@ mod tests {
     fn finished(background: usize) -> AgentEvent {
         AgentEvent::Finished(Finished {
             session: session(),
-            turns: 1,
-            cost: Some(Decimal::new(5, 1)),
+            usage: Usage::Claude { turns: 1, cost: Some(Decimal::new(5, 1)) },
             background,
         })
     }

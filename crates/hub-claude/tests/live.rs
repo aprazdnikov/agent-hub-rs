@@ -7,9 +7,9 @@ mod tests {
     use std::time::Duration;
 
     use futures::future::BoxFuture;
-    use hub_claude::backend::ClaudeBackend;
     use hub_agent::channel::UserChannel;
     use hub_agent::conversation::{Conversation, Limits};
+    use hub_claude::backend::ClaudeBackend;
     use hub_claude::version::{check, locate};
     use hub_core::domain::{
         AbsolutePath, AgentEvent, BackendKind, Decision, FileDelivery, OutgoingFile, Prompt,

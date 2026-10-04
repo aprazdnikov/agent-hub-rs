@@ -254,12 +254,18 @@ impl Prompt {
     }
 }
 
+/// What the agent reports about a finished turn: Claude counts turns and cost, Codex tokens.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Usage {
+    Claude { turns: u32, cost: Option<Decimal> },
+    Codex { tokens: Option<u64> },
+}
+
 /// One agent turn ended; `background` tasks keep running and report in later turns.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Finished {
     pub session: SessionId,
-    pub turns: u32,
-    pub cost: Option<Decimal>,
+    pub usage: Usage,
     pub background: usize,
 }
 

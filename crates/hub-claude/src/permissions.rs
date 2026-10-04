@@ -1,9 +1,7 @@
 //! `can_use_tool` decisions: clarifying questions go to the human as questions, the rest as
 //! approvals; a question input that cannot be parsed still reaches the human as an approval.
 
-use hub_core::domain::{
-    Decision, Question, QuestionAnswer, QuestionsOutcome, ToolRequest,
-};
+use hub_core::domain::{Decision, Question, QuestionAnswer, QuestionsOutcome, ToolRequest};
 use hub_core::render::truncate;
 use serde_json::{Map, Value, json};
 

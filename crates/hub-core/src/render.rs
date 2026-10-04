@@ -3,6 +3,8 @@ use std::time::Duration;
 
 use rust_decimal::Decimal;
 
+use crate::domain::{Finished, Usage};
+
 // `NonZeroUsize::new(..).unwrap()` is not allowed by the lints; 1 + 4095 is const and total.
 pub const TELEGRAM_TEXT_LIMIT: NonZeroUsize = NonZeroUsize::MIN.saturating_add(4095);
 
@@ -49,19 +51,44 @@ pub fn truncate(text: &str, limit: usize) -> String {
 }
 
 #[must_use]
-pub fn format_finished(turns: u32, cost: Option<Decimal>, background: usize) -> String {
-    let cost = cost.map_or_else(String::new, |cost| {
+pub fn format_finished(finished: &Finished) -> String {
+    let usage = match &finished.usage {
+        Usage::Claude { turns, cost } => format!(" · ходов: {turns}{}", cost_text(*cost)),
+        Usage::Codex { tokens } => tokens.map_or_else(String::new, |tokens| {
+            format!(" · токенов в сессии: {}", group_thousands(tokens))
+        }),
+    };
+    let pending = if finished.background == 0 {
+        String::new()
+    } else {
+        format!(" · ⏳ в фоне задач: {}, пришлю результат", finished.background)
+    };
+    format!("✅ Готово{usage}{pending}")
+}
+
+fn cost_text(cost: Option<Decimal>) -> String {
+    cost.map_or_else(String::new, |cost| {
         // Banker's rounding, as Python's Decimal.quantize, then always two decimals.
         let mut cents = cost.round_dp(2);
         cents.rescale(2);
         format!(" · ${cents}")
-    });
-    let pending = if background == 0 {
-        String::new()
-    } else {
-        format!(" · ⏳ в фоне задач: {background}, пришлю результат")
-    };
-    format!("✅ Готово · ходов: {turns}{cost}{pending}")
+    })
+}
+
+/// `12345` → `12 345`, as Python's `f"{n:_}".replace("_", " ")`.
+fn group_thousands(number: u64) -> String {
+    let digits = number.to_string();
+    let len = digits.len();
+    digits.chars().enumerate().fold(
+        String::with_capacity(len + len / 3),
+        |mut out, (index, digit)| {
+            if index > 0 && (len - index).is_multiple_of(3) {
+                out.push(' ');
+            }
+            out.push(digit);
+            out
+        },
+    )
 }
 
 #[must_use]
@@ -82,6 +109,7 @@ mod tests {
     use rust_decimal::Decimal;
 
     use super::*;
+    use crate::domain::SessionId;
 
     fn limit(n: usize) -> NonZeroUsize {
         NonZeroUsize::new(n).unwrap()
@@ -127,22 +155,47 @@ mod tests {
         assert_eq!(truncate("абвгд", 3), "аб…");
     }
 
+    fn claude(turns: u32, cost: Option<&str>, background: usize) -> Finished {
+        Finished {
+            session: SessionId::parse("s").unwrap(),
+            usage: Usage::Claude { turns, cost: cost.map(|raw| raw.parse::<Decimal>().unwrap()) },
+            background,
+        }
+    }
+
+    fn codex(tokens: Option<u64>) -> Finished {
+        Finished {
+            session: SessionId::parse("t").unwrap(),
+            usage: Usage::Codex { tokens },
+            background: 0,
+        }
+    }
+
     #[rstest]
     #[case(None, "✅ Готово · ходов: 3")]
     #[case(Some("0.1234"), "✅ Готово · ходов: 3 · $0.12")]
     #[case(Some("2"), "✅ Готово · ходов: 3 · $2.00")]
     #[case(Some("0.125"), "✅ Готово · ходов: 3 · $0.12")]
-    fn finished_line(#[case] cost: Option<&str>, #[case] expected: &str) {
-        let cost = cost.map(|raw| raw.parse::<Decimal>().unwrap());
-        assert_eq!(format_finished(3, cost, 0), expected);
+    fn claude_finished_line(#[case] cost: Option<&str>, #[case] expected: &str) {
+        assert_eq!(format_finished(&claude(3, cost, 0)), expected);
     }
 
     #[test]
     fn finished_mentions_running_background_tasks() {
         assert_eq!(
-            format_finished(3, None, 2),
+            format_finished(&claude(3, None, 2)),
             "✅ Готово · ходов: 3 · ⏳ в фоне задач: 2, пришлю результат"
         );
+    }
+
+    #[rstest]
+    #[case(None, "✅ Готово")]
+    #[case(Some(0), "✅ Готово · токенов в сессии: 0")]
+    #[case(Some(999), "✅ Готово · токенов в сессии: 999")]
+    #[case(Some(12_345), "✅ Готово · токенов в сессии: 12 345")]
+    #[case(Some(1_000_000), "✅ Готово · токенов в сессии: 1 000 000")]
+    fn codex_finished_line(#[case] tokens: Option<u64>, #[case] expected: &str) {
+        assert_eq!(format_finished(&codex(tokens)), expected);
     }
 
     #[test]

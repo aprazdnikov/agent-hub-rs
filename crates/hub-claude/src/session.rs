@@ -18,13 +18,13 @@ use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 use uuid::Uuid;
 
 use crate::activity::{Phase, SessionActivity};
-use hub_agent::channel::UserChannel;
-use hub_agent::conversation::Conversation;
 use crate::mcp::{self, McpStep};
 use crate::outgoing;
 use crate::permissions::{self, Route};
 use crate::tracker::SessionTracker;
 use crate::wire::{self, ControlReply, ControlRequest, Incoming};
+use hub_agent::channel::UserChannel;
+use hub_agent::conversation::Conversation;
 
 // One stream-json message can carry a large tool result.
 const MAX_LINE: usize = 16 * 1024 * 1024;
