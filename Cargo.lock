@@ -1755,6 +1755,7 @@ dependencies = [
  "eframe",
  "futures",
  "hub-claude",
+ "hub-codex",
  "hub-core",
  "hub-telegram",
  "keyring",

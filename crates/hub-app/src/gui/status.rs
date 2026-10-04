@@ -26,9 +26,11 @@ pub fn show(ui: &mut egui::Ui, snapshot: &Snapshot, send: &mut impl FnMut(Comman
         ui.label("agent-hub");
         ui.label(env!("CARGO_PKG_VERSION"));
         ui.end_row();
-        ui.label("Claude Code");
-        ui.label(snapshot.claude.as_deref().unwrap_or("—"));
-        ui.end_row();
+        for agent in &snapshot.agents {
+            ui.label(agent.kind.name());
+            ui.label(format!("{:?}", agent.state));
+            ui.end_row();
+        }
         ui.label("Активных сессий");
         ui.label(active(snapshot).to_string());
         ui.end_row();

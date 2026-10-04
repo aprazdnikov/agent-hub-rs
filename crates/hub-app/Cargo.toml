@@ -16,6 +16,7 @@ directories.workspace = true
 eframe.workspace = true
 futures.workspace = true
 hub-claude.workspace = true
+hub-codex.workspace = true
 hub-core.workspace = true
 hub-telegram.workspace = true
 keyring.workspace = true

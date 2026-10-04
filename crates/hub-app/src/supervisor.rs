@@ -1,6 +1,8 @@
 //! The core behind the window: owns the live settings and the bot, applies commands from the
 //! window, and publishes what the window shows.
 
+use hub_codex::protocol::CodexAuth;
+use hub_core::domain::BackendKind;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -41,9 +43,21 @@ pub enum BotStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AgentState {
+    Ready { version: String, auth: Option<CodexAuth> },
+    Unavailable(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentStatus {
+    pub kind: BackendKind,
+    pub state: AgentState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     pub bot: BotStatus,
-    pub claude: Option<String>,
+    pub agents: Vec<AgentStatus>,
     pub topics: Vec<TopicView>,
     /// The settings as last saved: the form's baseline.
     pub saved: Option<Draft>,
@@ -54,7 +68,7 @@ impl Default for Snapshot {
     fn default() -> Self {
         Self {
             bot: BotStatus::Unconfigured,
-            claude: None,
+            agents: Vec::new(),
             topics: Vec::new(),
             saved: None,
             notice: None,
@@ -91,7 +105,7 @@ pub type Stopper = Box<dyn FnOnce() -> BoxFuture<'static, ()> + Send>;
 
 pub struct Started {
     pub username: String,
-    pub claude: String,
+    pub agents: Vec<AgentStatus>,
     pub mailbox: mpsc::Sender<HubMessage>,
     pub views: watch::Receiver<Vec<TopicView>>,
     pub stop: Stopper,
@@ -318,12 +332,12 @@ impl<C: Connector> Supervisor<C> {
         let receiver = live.subscribe();
         self.status(BotStatus::Starting);
         match self.connector.connect(receiver).await {
-            Ok(Started { username, claude, mailbox, views, stop }) => {
-                tracing::info!(%username, %claude, "bot started");
+            Ok(Started { username, agents, mailbox, views, stop }) => {
+                tracing::info!(%username, "bot started");
                 self.retry = None;
                 self.bot = Some(Bot { mailbox, stop });
                 self.views = Some(views);
-                self.state.claude = Some(claude);
+                self.state.agents = agents;
                 self.refresh_topics();
                 self.status(BotStatus::Running { username });
             }
@@ -480,7 +494,10 @@ mod tests {
                 });
                 Ok(Started {
                     username: "hub_bot".to_owned(),
-                    claude: "2.1.287".to_owned(),
+                    agents: vec![AgentStatus {
+                        kind: BackendKind::Claude,
+                        state: AgentState::Ready { version: "2.1.287".to_owned(), auth: None },
+                    }],
                     mailbox,
                     views: watched,
                     stop,
@@ -632,7 +649,13 @@ mod tests {
         harness.until("running", running).await;
         let snapshot = harness.snapshot.borrow().clone();
         assert_eq!(snapshot.bot, BotStatus::Running { username: "hub_bot".to_owned() });
-        assert_eq!(snapshot.claude.as_deref(), Some("2.1.287"));
+        assert_eq!(
+            snapshot.agents,
+            [AgentStatus {
+                kind: BackendKind::Claude,
+                state: AgentState::Ready { version: "2.1.287".to_owned(), auth: None },
+            }]
+        );
         assert_eq!(snapshot.saved, Some(Draft::from_settings(&settings("-100", ""))));
     }
 
