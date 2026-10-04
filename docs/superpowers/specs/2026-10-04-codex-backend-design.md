@@ -35,7 +35,8 @@ OpenAI Codex — второй агент рядом с Claude, выбираем�
 
 - `channel::UserChannel` — одобрения, вопросы, файлы.
 - `conversation::{Conversation, Limits}` — канал событий, отмена, лимиты.
-- `tools` — `HubTool { SendFile, AskUser }`, описания и JSON-схемы, `ToolResult { Success(String), Error(String) }`, `deliver_file(args, channel)`, `parse_questions`, `parse_option`, `TOOL_SUMMARY_LIMIT`.
+- `tools` — имена `send_file`/`ask_user`, описания и JSON-схемы, `ToolResult { Success(String), Error(String) }`, `parse_send_file`, `deliver_file(args, channel)`, `parse_questions`, `parse_option`, `TOOL_SUMMARY_LIMIT`.
+- `cli` — `Version`, `locate(name, configured)`, `version_output(cli)` (`--version` с тайм-аутом 10 с), `hide_window`; `hub-claude::version` и `hub-codex::version` — тонкие обёртки со своими сообщениями.
 
 `hub-claude` и `hub-telegram` импортируют эти типы из `hub-agent`.
 
@@ -49,9 +50,8 @@ OpenAI Codex — второй агент рядом с Claude, выбираем�
 | `session` | `converse(thread, tracker, prompt, inbox, conversation) -> inbox`. |
 | `backend` | `CodexBackend::run(session, prompt, inbox, conversation) -> inbox` (сигнатура как у `ClaudeBackend::run`), `probe_auth(cli, settings) -> Result<CodexAuth, ProbeError>`. |
 | `version` | `locate(configured) -> Result<PathBuf, CliError>`, `check(cli) -> Result<Version, CliError>`, `MIN_VERSION = 0.160.0`. |
-| `process` | `hide_window` для Windows (как в `hub-claude`). |
 
-Типы: `ThreadId`, `TurnId` — newtype над `String`; `CodexAuth { ApiKey, ChatGpt, Other, NotRequired, Missing }`; `RpcError { Remote { code, message }, Closed, Protocol(String), Timeout }` (`thiserror`).
+Типы: id треда — `SessionId` (он же хранится в теме); `TurnId` — newtype над `String`; `CodexAuth { ApiKey, ChatGpt, Other, NotRequired, Missing }`; `RpcError { Remote { code, message }, Closed, Protocol(String), Timeout }` (`thiserror`).
 
 ### Сессия
 
@@ -129,7 +129,7 @@ OpenAI Codex — второй агент рядом с Claude, выбираем�
   - `protocol`: параметры вызовов — insta-снимки; `auth_state`, `tool_call`, `TurnTracker` — таблицы.
   - `requests`: четыре запроса сервера с поддельным `UserChannel`.
   - `session`: поддельный тред — steer во время хода, отклонённый steer после `turn/completed`, промпт без активного хода, отмена.
-  - `tests/replay.rs`: стенограмма реального `app-server` через `TurnTracker`.
+  - `backend`: поддельный app-server на `duplex` — новая сессия, продолжение, нет входа, вход по ключу, ошибка `thread/resume`, ошибки посреди хода.
   - `tests/live.rs`: живой прогон, `#[ignore]`, `AGENT_HUB_LIVE_CODEX=1`.
 - `hub-core`: `Usage`/`format_finished`, `decide_backend`, `parse_new_args` с бэкендом по умолчанию, `SettingsFile`/`Draft` с `[codex]` и `[agents]`, чтение старого `settings.toml`.
 - `hub-app`: `connector` — обязательный бэкенд по умолчанию и мягкая проверка второго; ключ OpenAI через `MemorySecrets`.
