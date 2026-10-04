@@ -1799,6 +1799,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "hub-codex"
+version = "0.1.0"
+dependencies = [
+ "base64 0.23.1",
+ "futures",
+ "hub-agent",
+ "hub-core",
+ "rstest",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "hub-core"
 version = "0.1.0"
 dependencies = [
@@ -1808,6 +1824,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.21",
+ "toml",
 ]
 
 [[package]]
