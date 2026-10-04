@@ -39,6 +39,8 @@ Telegram (форум-группа)
 - [Claude Code](https://docs.claude.com/en/docs/claude-code) **2.1.280 или новее**, вход
   выполнен (`claude` один раз запущен в терминале). Команда `claude` должна быть в `PATH`, либо
   путь к ней указывается в настройках.
+- Для агента Codex (необязательно): [Codex CLI](https://github.com/openai/codex) **0.160 или
+  новее** (`npm i -g @openai/codex`); вход — `codex login` или API-ключ OpenAI в настройках.
 - Telegram-бот и форум-группа — см. [Первый запуск](#первый-запуск).
 - Windows 10/11 x64, macOS (Apple Silicon или Intel), Linux x64 (glibc 2.35+).
 
@@ -134,7 +136,8 @@ Telegram (форум-группа)
 
 | Команда | Что делает |
 |---|---|
-| `/new [backend] [путь]` | Новая сессия в этой теме: сброс контекста, опционально бэкенд и директория |
+| `/new [backend] [путь]` | Новая сессия в этой теме: сброс контекста, опционально бэкенд и директория (без бэкенда — агент по умолчанию из настроек) |
+| `/backend [claude\|codex]` | Сменить агента в этой теме (контекст сбрасывается); без имени — показать сессию |
 | `/cwd <путь>` | Сменить рабочую директорию (контекст сбрасывается) |
 | `/reset` | Начать разговор заново в той же директории |
 | `/stop` | Прервать выполняющуюся задачу |
@@ -149,6 +152,16 @@ Telegram (форум-группа)
 /new claude ~/Projects/agent-hub
 /cwd shop/frontend
 ```
+
+### Codex
+
+Тема работает с Claude Code или с Codex: `/new codex <путь>` создаёт сессию Codex, `/backend codex` переключает существующую тему (контекст сбрасывается). Агент по умолчанию задаётся в настройках.
+
+Вход в Codex — один из двух способов:
+- подписка ChatGPT: выполните `codex login` в терминале один раз;
+- API-ключ OpenAI: укажите его в «Настройки → Codex». Ключ используется, только если входа нет или это уже вход по ключу; вход по подписке ChatGPT не заменяется (для перехода на ключ — `codex logout`).
+
+Права Codex задаются в «Настройки → Codex»: песочница (`read-only`, `workspace-write` — по умолчанию, `danger-full-access`) и одобрения (`untrusted`, `on-request` — по умолчанию, `never`). Одобрения команд и правок приходят в тему кнопками, как у Claude. В итоге хода Codex показывает число токенов в сессии; фоновых задач у Codex нет.
 
 ### Подтверждение действий
 
@@ -241,13 +254,25 @@ Code: `~/.claude/settings.json`, `.claude/settings.json` и `.claude/settings.lo
 |---|---|---|
 | Токен бота, chat_id группы, разрешённые user_id | — | сразу: бот перезапускается, активные сессии прерываются (окно спросит подтверждение) |
 | Корень рабочих каталогов | — | с новой сессии |
+| Агент по умолчанию (`claude`, `codex`) | `claude` | с новой сессии |
 | Путь к `claude` | из `PATH` | с новой сессии |
 | Модель | из настроек Claude Code | с новой сессии |
 | Режим разрешений (`default`, `acceptEdits`, `plan`, `bypassPermissions`) | `default` | с новой сессии |
 | Лимит расходов на задачу, $ | без лимита | с новой сессии |
+| Путь к `codex` | из `PATH` | с новой сессии |
+| Модель Codex | из настроек Codex | с новой сессии |
+| Песочница Codex (`read-only`, `workspace-write`, `danger-full-access`) | `workspace-write` | с новой сессии |
+| Одобрения Codex (`untrusted`, `on-request`, `never`) | `on-request` | с новой сессии |
+| API-ключ OpenAI | нет (вход `codex login`) | с новой сессии |
 | Ожидание подтверждения, с | 600 | с новой сессии |
 | Фоновые задачи, с | 1800 | с новой сессии |
 | Проверять обновления | да | сразу |
+
+В `settings.toml` это таблицы `[agents]` (`default`) и `[codex]` (`cli`, `model`, `sandbox`,
+`approval`); API-ключ OpenAI хранится в системном хранилище ключей (`agent-hub` /
+`openai-api-key`), не в файле. При запуске бота обязателен только агент по умолчанию; если
+второй недоступен, бот работает, а на вкладке «Статус» видна причина. Там же — версия каждого
+агента и способ входа в Codex.
 
 Если Telegram недоступен при запуске (например, сеть ещё не поднялась), бот повторяет
 подключение сам: через 5 с, затем с удвоением паузы до 5 минут.
@@ -257,7 +282,7 @@ Code: `~/.claude/settings.json`, `.claude/settings.json` и `.claude/settings.lo
 | Что | Windows | macOS | Linux |
 |---|---|---|---|
 | Настройки (`settings.toml`) | `%APPDATA%\agent-hub\config\` | `~/Library/Application Support/agent-hub/` | `~/.config/agent-hub/` |
-| Токен бота | Диспетчер учётных данных | Связка ключей | Secret Service (GNOME Keyring, KWallet) |
+| Токен бота, API-ключ OpenAI | Диспетчер учётных данных | Связка ключей | Secret Service (GNOME Keyring, KWallet) |
 | Привязки тем (`topics.json`) | `%APPDATA%\agent-hub\data\` | `~/Library/Application Support/agent-hub/` | `~/.local/share/agent-hub/` |
 | Логи (`logs/`, 14 дней) | `%APPDATA%\agent-hub\data\logs\` | `~/Library/Application Support/agent-hub/logs/` | `~/.local/share/agent-hub/logs/` |
 
