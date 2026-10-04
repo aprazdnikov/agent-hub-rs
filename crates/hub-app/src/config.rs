@@ -4,11 +4,11 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use hub_core::settings::{Draft, FieldError, Keys, Settings, SettingsFile};
+use hub_core::settings::{ApiKey, Draft, FieldError, Keys, Settings, SettingsFile};
 
 use crate::atomic::write_atomic;
 use crate::error::StoreError;
-use crate::secrets::Secrets;
+use crate::secrets::{Secret, Secrets};
 
 #[derive(Debug)]
 pub enum Loaded {
@@ -45,8 +45,10 @@ impl FileSettings {
         let corrupt = |reason: String| StoreError::Corrupt { path: self.path.clone(), reason };
         let file: SettingsFile =
             toml::from_str(&raw).map_err(|error| corrupt(error.message().to_owned()))?;
-        let token = self.secrets.read()?.unwrap_or_default();
-        let keys = Keys { token, api_key: String::new() };
+        let keys = Keys {
+            token: self.secrets.read(Secret::TelegramToken)?.unwrap_or_default(),
+            api_key: self.secrets.read(Secret::OpenAiKey)?.unwrap_or_default(),
+        };
         let draft = file.to_draft(keys).map_err(|error| corrupt(error.message))?;
         Ok(match draft.parse(home) {
             Ok(settings) => Loaded::Ready(settings),
@@ -60,8 +62,10 @@ impl SettingsStore for FileSettings {
         let write = |error| StoreError::Write { path: self.path.clone(), error };
         let text = toml::to_string_pretty(&SettingsFile::from_settings(settings))
             .map_err(|error| write(io::Error::other(error)))?;
-        // The token goes first: a file pointing at a token that was never stored is worse.
-        self.secrets.write(settings.telegram.token.expose())?;
+        // The secrets go first: a file pointing at a token that was never stored is worse.
+        self.secrets.write(Secret::TelegramToken, Some(settings.telegram.token.expose()))?;
+        self.secrets
+            .write(Secret::OpenAiKey, settings.codex.api_key.as_ref().map(ApiKey::expose))?;
         write_atomic(&self.path, text.as_bytes()).map_err(write)
     }
 }
@@ -140,5 +144,38 @@ mod tests {
         assert!(matches!(error, StoreError::Corrupt { .. }));
         assert!(error.to_string().contains("settings.toml"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "telegram = 5");
+    }
+
+    #[test]
+    fn api_key_goes_to_the_keyring_not_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut form = draft(dir.path());
+        form.codex.api_key = "sk-secret".to_owned();
+        let settings = form.parse(dir.path()).unwrap();
+        let store = store(dir.path());
+        store.save(&settings).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("settings.toml")).unwrap();
+        assert!(!text.contains("sk-secret"));
+        match store.load(dir.path()).unwrap() {
+            Loaded::Ready(loaded) => {
+                assert_eq!(loaded.codex.api_key.as_ref().map(ApiKey::expose), Some("sk-secret"));
+            }
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cleared_api_key_is_removed_from_the_keyring() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut form = draft(dir.path());
+        form.codex.api_key = "sk-secret".to_owned();
+        store.save(&form.parse(dir.path()).unwrap()).unwrap();
+        form.codex.api_key = String::new();
+        store.save(&form.parse(dir.path()).unwrap()).unwrap();
+        match store.load(dir.path()).unwrap() {
+            Loaded::Ready(loaded) => assert_eq!(loaded.codex.api_key, None),
+            other => panic!("expected Ready, got {other:?}"),
+        }
     }
 }
