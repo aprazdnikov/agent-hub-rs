@@ -1,5 +1,7 @@
 # agent-hub
 
+[![Architecture diagram](https://gitdiagram.com/diagram-badge.svg)](https://gitdiagram.com/aprazdnikov/agent-hub-rs?utm_source=readme&utm_medium=badge)
+
 **Каждая тема Telegram-группы — отдельная сессия Claude Code на вашем компьютере.**
 
 Создали тему «Починить тесты в backend» — получили новую сессию агента. Пишете в тему задачу,
