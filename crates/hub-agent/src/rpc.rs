@@ -176,7 +176,8 @@ impl RpcClient {
         self.outbox.send(line).await.map_err(|_| RpcError::Closed)
     }
 
-    /// Closes the peer's input, which is how a stdio agent is told to exit.
+    /// Closes the peer's input after the messages already sent, which is how a stdio agent is
+    /// told to exit.
     pub fn close(&self) {
         self.shutdown.cancel();
     }
@@ -200,8 +201,10 @@ async fn write<W: AsyncWrite + Unpin>(
 ) {
     loop {
         let line = tokio::select! {
-            () = shutdown.cancelled() => break,
+            // What was sent before `close` still goes out, such as a `/stop`'s cancel.
+            biased;
             line = lines.recv() => line,
+            () = shutdown.cancelled() => break,
         };
         let Some(line) = line else { break };
         let written = async {
@@ -514,6 +517,18 @@ mod tests {
         assert_eq!(peer.read().await, Some(json!({"method": "initialized"})));
         connection.client.close();
         assert_eq!(peer.read().await, None);
+    }
+
+    #[tokio::test]
+    async fn close_delivers_what_was_sent_before_it() {
+        for _ in 0..20 {
+            let (connection, mut peer) = pair(refusing(), bare(LONG));
+            // No await in between: the writer wakes with the message and the close both ready.
+            connection.client.notify("session/cancel").await.unwrap();
+            connection.client.close();
+            assert_eq!(peer.read().await, Some(json!({"method": "session/cancel"})));
+            assert_eq!(peer.read().await, None);
+        }
     }
 
     #[tokio::test]

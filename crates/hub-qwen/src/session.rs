@@ -200,6 +200,10 @@ pub(crate) async fn emit(conversation: &Conversation, event: AgentEvent) {
     let _ = conversation.events.send(event).await;
 }
 
+pub(crate) async fn fail(conversation: &Conversation, reason: String) {
+    emit(conversation, AgentEvent::Failed(reason)).await;
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::{Arc, Mutex};
