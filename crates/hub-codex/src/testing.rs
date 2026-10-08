@@ -8,7 +8,7 @@ use tokio::io::{
     AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, ReadHalf, WriteHalf,
 };
 
-use crate::rpc::{Connection, Handler, RequestError, connect};
+use hub_agent::rpc::{Connection, Envelope, Handler, RequestError, Wire, connect};
 
 pub struct Peer {
     lines: Lines<BufReader<ReadHalf<DuplexStream>>>,
@@ -31,7 +31,12 @@ pub fn pair(handler: Handler, timeout: Duration) -> (Connection, Peer) {
     let (ours, theirs) = tokio::io::duplex(1 << 20);
     let (our_read, our_write) = tokio::io::split(ours);
     let (their_read, their_write) = tokio::io::split(theirs);
-    let connection = connect(our_read, our_write, handler, timeout);
+    let connection = connect(
+        our_read,
+        our_write,
+        handler,
+        Wire { peer: "codex app-server", envelope: Envelope::Bare, timeout },
+    );
     (connection, Peer { lines: BufReader::new(their_read).lines(), writer: their_write })
 }
 

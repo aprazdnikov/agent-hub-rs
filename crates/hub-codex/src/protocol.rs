@@ -13,7 +13,7 @@ use hub_core::render::truncate;
 use hub_core::settings::{ApiKey, CodexSettings};
 use serde_json::{Map, Value, json};
 
-use crate::rpc::{Notification, RpcError};
+use hub_agent::rpc::{Notification, RpcError};
 
 // Approvals go to the human in Telegram, never to Codex's own reviewer agent.
 const APPROVALS_REVIEWER: &str = "user";

@@ -10,7 +10,7 @@ use hub_core::render::truncate;
 use serde_json::{Map, Value, json};
 
 use crate::protocol::{PATCH, SHELL, UNNAMED_FILE_CHANGE};
-use crate::rpc::RequestError;
+use hub_agent::rpc::RequestError;
 
 /// Replies to one app-server request on behalf of the human behind `channel`.
 pub async fn answer(

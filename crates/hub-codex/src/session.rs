@@ -14,7 +14,7 @@ use tokio::sync::mpsc;
 use crate::protocol::{
     Call, Translation, TurnId, TurnTracker, parse_turn_id, steer_params, turn_params,
 };
-use crate::rpc::{Notification, RpcClient, RpcError};
+use hub_agent::rpc::{Notification, RpcClient, RpcError};
 
 /// The part of an app-server thread a conversation needs.
 pub trait Thread: Send + Sync {

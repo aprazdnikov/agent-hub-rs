@@ -27,11 +27,11 @@ pub const INVALID_PARAMS: i64 = -32602;
 pub enum RpcError {
     #[error("{message}")]
     Remote { code: i64, message: String },
-    #[error("app-server closed the connection")]
+    #[error("the agent closed the connection")]
     Closed,
-    #[error("unexpected app-server message: {0}")]
+    #[error("unexpected message from the agent: {0}")]
     Protocol(String),
-    #[error("app-server did not answer {method} in time")]
+    #[error("the agent did not answer {method} in time")]
     Timeout { method: String },
 }
 
@@ -52,6 +52,33 @@ pub struct Notification {
 pub type Handler =
     Arc<dyn Fn(String, Value) -> BoxFuture<'static, Result<Value, RequestError>> + Send + Sync>;
 
+/// Codex app-server takes bare messages; ACP agents expect the JSON-RPC 2.0 member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Envelope {
+    Bare,
+    JsonRpc2,
+}
+
+impl Envelope {
+    fn seal(self, message: Value) -> String {
+        match (self, message) {
+            (Self::JsonRpc2, Value::Object(mut fields)) => {
+                fields.insert("jsonrpc".to_owned(), Value::from("2.0"));
+                Value::Object(fields).to_string()
+            }
+            (Self::Bare | Self::JsonRpc2, message) => message.to_string(),
+        }
+    }
+}
+
+/// Who is on the other end: named in the log, and how long a control call may wait.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Wire {
+    pub peer: &'static str,
+    pub envelope: Envelope,
+    pub timeout: Duration,
+}
+
 type Waiters = HashMap<u64, oneshot::Sender<Result<Value, RpcError>>>;
 /// `None` once the peer's output closed: nothing more can be answered.
 type Pending = Arc<Mutex<Option<Waiters>>>;
@@ -61,7 +88,7 @@ pub struct RpcClient {
     outbox: mpsc::Sender<String>,
     pending: Pending,
     next: Arc<AtomicU64>,
-    timeout: Duration,
+    wire: Wire,
     shutdown: CancellationToken,
 }
 
@@ -72,38 +99,62 @@ pub struct Connection {
 }
 
 #[must_use]
-pub fn connect<R, W>(reader: R, writer: W, handler: Handler, timeout: Duration) -> Connection
+pub fn connect<R, W>(reader: R, writer: W, handler: Handler, wire: Wire) -> Connection
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let (outbox, lines) = mpsc::channel(OUTBOX);
-    // Unbounded: a session waiting on a steer reply must not block the reader behind it.
+    // Unbounded: a session waiting on a reply must not block the reader behind it.
     let (notify, notifications) = mpsc::unbounded_channel();
     let pending: Pending = Arc::new(Mutex::new(Some(HashMap::new())));
     let shutdown = CancellationToken::new();
-    tokio::spawn(write(writer, lines, shutdown.clone()));
-    let router = Link { outbox: outbox.clone(), pending: Arc::clone(&pending), notify, handler };
+    tokio::spawn(write(writer, lines, shutdown.clone(), wire.peer));
+    let router = Link {
+        outbox: outbox.clone(),
+        pending: Arc::clone(&pending),
+        notify,
+        handler,
+        peer: wire.peer,
+        envelope: wire.envelope,
+    };
     let reader = tokio::spawn(read(reader, router));
-    let client =
-        RpcClient { outbox, pending, next: Arc::new(AtomicU64::new(1)), timeout, shutdown };
+    let client = RpcClient { outbox, pending, next: Arc::new(AtomicU64::new(1)), wire, shutdown };
     Connection { client, notifications, reader }
 }
 
 impl RpcClient {
     pub async fn request(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        self.call(method, params, Some(self.wire.timeout)).await
+    }
+
+    /// For a call that lasts as long as the agent works, such as a whole ACP turn; it ends
+    /// with the reply, with `/stop` (the caller drops it) or when the agent's output closes.
+    pub async fn request_untimed(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+        self.call(method, params, None).await
+    }
+
+    async fn call(
+        &self,
+        method: &str,
+        params: Value,
+        deadline: Option<Duration>,
+    ) -> Result<Value, RpcError> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let (waiter, reply) = oneshot::channel();
         match lock(&self.pending).as_mut() {
             Some(waiters) => waiters.insert(id, waiter),
             None => return Err(RpcError::Closed),
         };
-        let line = json!({"id": id, "method": method, "params": params}).to_string();
+        let line = self.wire.envelope.seal(json!({"id": id, "method": method, "params": params}));
         if self.outbox.send(line).await.is_err() {
             self.forget(id);
             return Err(RpcError::Closed);
         }
-        let outcome = tokio::time::timeout(self.timeout, reply).await;
+        let outcome = match deadline {
+            Some(deadline) => tokio::time::timeout(deadline, reply).await,
+            None => Ok(reply.await),
+        };
         self.forget(id);
         match outcome {
             Err(_) => Err(RpcError::Timeout { method: method.to_owned() }),
@@ -113,10 +164,19 @@ impl RpcClient {
     }
 
     pub async fn notify(&self, method: &str) -> Result<(), RpcError> {
-        self.outbox.send(json!({"method": method}).to_string()).await.map_err(|_| RpcError::Closed)
+        self.send_notification(json!({"method": method})).await
     }
 
-    /// Closes the peer's input, which is how app-server is told to exit.
+    pub async fn notify_with(&self, method: &str, params: Value) -> Result<(), RpcError> {
+        self.send_notification(json!({"method": method, "params": params})).await
+    }
+
+    async fn send_notification(&self, message: Value) -> Result<(), RpcError> {
+        let line = self.wire.envelope.seal(message);
+        self.outbox.send(line).await.map_err(|_| RpcError::Closed)
+    }
+
+    /// Closes the peer's input, which is how a stdio agent is told to exit.
     pub fn close(&self) {
         self.shutdown.cancel();
     }
@@ -136,6 +196,7 @@ async fn write<W: AsyncWrite + Unpin>(
     mut writer: W,
     mut lines: mpsc::Receiver<String>,
     shutdown: CancellationToken,
+    peer: &'static str,
 ) {
     loop {
         let line = tokio::select! {
@@ -150,12 +211,12 @@ async fn write<W: AsyncWrite + Unpin>(
         }
         .await;
         if let Err(error) = written {
-            tracing::warn!(%error, "app-server input closed");
+            tracing::warn!(peer, %error, "agent input closed");
             return;
         }
     }
     if let Err(error) = writer.shutdown().await {
-        tracing::debug!(%error, "app-server input already closed");
+        tracing::debug!(peer, %error, "agent input already closed");
     }
 }
 
@@ -164,6 +225,8 @@ struct Link {
     pending: Pending,
     notify: mpsc::UnboundedSender<Notification>,
     handler: Handler,
+    peer: &'static str,
+    envelope: Envelope,
 }
 
 async fn read<R: AsyncRead + Unpin>(reader: R, router: Link) {
@@ -174,14 +237,14 @@ async fn read<R: AsyncRead + Unpin>(reader: R, router: Link) {
             line = lines.next() => match line {
                 Some(Ok(line)) => router.dispatch(&line, &mut answering),
                 Some(Err(error)) => {
-                    tracing::warn!(%error, "app-server output unreadable");
+                    tracing::warn!(peer = router.peer, %error, "agent output unreadable");
                     break;
                 }
                 None => break,
             },
             Some(joined) = answering.join_next(), if !answering.is_empty() => {
                 if let Err(error) = joined {
-                    tracing::error!(%error, "server request handler crashed");
+                    tracing::error!(peer = router.peer, %error, "agent request handler crashed");
                 }
             }
         }
@@ -196,7 +259,7 @@ impl Link {
         let message: Value = match serde_json::from_str(line) {
             Ok(message) => message,
             Err(error) => {
-                tracing::warn!(%error, "unparsable app-server line");
+                tracing::warn!(peer = self.peer, %error, "unparsable agent line");
                 return;
             }
         };
@@ -206,20 +269,26 @@ impl Link {
         match (id, message.get("method").and_then(Value::as_str)) {
             (Some(id), Some(method)) => {
                 let reply = (self.handler)(method.to_owned(), params);
-                answering.spawn(answer(id, method.to_owned(), reply, self.outbox.clone()));
+                answering.spawn(answer(
+                    id,
+                    method.to_owned(),
+                    reply,
+                    self.outbox.clone(),
+                    self.envelope,
+                ));
             }
             (None, Some(method)) => {
                 // The session is gone; nobody is left to read it.
                 let _ = self.notify.send(Notification { method: method.to_owned(), params });
             }
             (Some(id), None) => self.resolve(&id, &message),
-            (None, None) => tracing::warn!(%message, "unexpected app-server message"),
+            (None, None) => tracing::warn!(peer = self.peer, %message, "unexpected agent message"),
         }
     }
 
     fn resolve(&self, id: &Value, message: &Value) {
         let Some(id) = id.as_u64() else {
-            tracing::warn!(%id, "reply to a request this client never sent");
+            tracing::warn!(peer = self.peer, %id, "reply to a request this client never sent");
             return;
         };
         let reply = match (message.get("error"), message.get("result")) {
@@ -250,6 +319,7 @@ async fn answer(
     method: String,
     reply: BoxFuture<'static, Result<Value, RequestError>>,
     outbox: mpsc::Sender<String>,
+    envelope: Envelope,
 ) {
     let message = match reply.await {
         Ok(result) => json!({"id": id, "result": result}),
@@ -263,7 +333,7 @@ async fn answer(
         }
     };
     // The peer is gone; there is nobody left to answer.
-    let _ = outbox.send(message.to_string()).await;
+    let _ = outbox.send(envelope.seal(message)).await;
 }
 
 #[cfg(test)]
@@ -274,7 +344,7 @@ mod tests {
     use tokio::sync::oneshot;
 
     use super::*;
-    use crate::testing::{pair, refusing};
+    use crate::testing::{bare, pair, refusing};
 
     const LONG: Duration = Duration::from_secs(5);
 
@@ -284,7 +354,7 @@ mod tests {
 
     #[tokio::test]
     async fn responses_are_matched_by_id() {
-        let (connection, mut peer) = pair(refusing(), LONG);
+        let (connection, mut peer) = pair(refusing(), bare(LONG));
         let first = tokio::spawn({
             let client = connection.client.clone();
             async move { client.request("a", json!({})).await }
@@ -309,7 +379,7 @@ mod tests {
 
     #[tokio::test]
     async fn error_reply_is_a_remote_error() {
-        let (connection, mut peer) = pair(refusing(), LONG);
+        let (connection, mut peer) = pair(refusing(), bare(LONG));
         let request =
             tokio::spawn(async move { connection.client.request("turn/steer", json!({})).await });
         let sent = peer.read().await.unwrap();
@@ -325,7 +395,7 @@ mod tests {
 
     #[tokio::test]
     async fn notifications_arrive_in_order_with_object_params() {
-        let (mut connection, mut peer) = pair(refusing(), LONG);
+        let (mut connection, mut peer) = pair(refusing(), bare(LONG));
         peer.write(json!({"method": "item/started", "params": {"n": 1}})).await;
         peer.write(json!({"method": "turn/completed"})).await;
         assert_eq!(
@@ -350,7 +420,7 @@ mod tests {
                 Ok(json!({"decision": "accept"}))
             })
         });
-        let (connection, mut peer) = pair(handler, LONG);
+        let (connection, mut peer) = pair(handler, bare(LONG));
         peer.write(
             json!({"id": "s-1", "method": "item/commandExecution/requestApproval", "params": {}}),
         )
@@ -376,7 +446,7 @@ mod tests {
                 }
             })
         });
-        let (_connection, mut peer) = pair(handler, LONG);
+        let (_connection, mut peer) = pair(handler, bare(LONG));
         peer.write(json!({"id": 7, "method": "mystery", "params": {}})).await;
         assert_eq!(
             peer.read().await,
@@ -393,7 +463,7 @@ mod tests {
 
     #[tokio::test]
     async fn closed_output_fails_waiting_and_later_requests() {
-        let (mut connection, mut peer) = pair(refusing(), LONG);
+        let (mut connection, mut peer) = pair(refusing(), bare(LONG));
         let request = tokio::spawn({
             let client = connection.client.clone();
             async move { client.request("turn/start", json!({})).await }
@@ -417,7 +487,7 @@ mod tests {
                 Ok(json!({}))
             })
         });
-        let (connection, mut peer) = pair(handler, LONG);
+        let (connection, mut peer) = pair(handler, bare(LONG));
         peer.write(json!({"id": 1, "method": "item/tool/requestUserInput", "params": {}})).await;
         tokio::task::yield_now().await;
         drop(peer);
@@ -427,7 +497,7 @@ mod tests {
 
     #[tokio::test]
     async fn silent_peer_times_out() {
-        let (connection, mut peer) = pair(refusing(), Duration::from_millis(50));
+        let (connection, mut peer) = pair(refusing(), bare(Duration::from_millis(50)));
         let request =
             tokio::spawn(async move { connection.client.request("initialize", json!({})).await });
         peer.read().await.unwrap();
@@ -439,10 +509,57 @@ mod tests {
 
     #[tokio::test]
     async fn close_ends_the_peer_input() {
-        let (connection, mut peer) = pair(refusing(), LONG);
+        let (connection, mut peer) = pair(refusing(), bare(LONG));
         connection.client.notify("initialized").await.unwrap();
         assert_eq!(peer.read().await, Some(json!({"method": "initialized"})));
         connection.client.close();
         assert_eq!(peer.read().await, None);
+    }
+
+    #[tokio::test]
+    async fn untimed_request_outlives_the_timeout() {
+        let (connection, mut peer) = pair(refusing(), bare(Duration::from_millis(50)));
+        let request = tokio::spawn(async move {
+            connection.client.request_untimed("session/prompt", json!({})).await
+        });
+        let sent = peer.read().await.unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        peer.write(json!({"id": id(&sent), "result": {"stopReason": "end_turn"}})).await;
+        assert_eq!(request.await.unwrap(), Ok(json!({"stopReason": "end_turn"})));
+    }
+
+    #[tokio::test]
+    async fn notification_carries_its_params() {
+        let (connection, mut peer) = pair(refusing(), bare(LONG));
+        connection.client.notify_with("session/cancel", json!({"sessionId": "s-1"})).await.unwrap();
+        assert_eq!(
+            peer.read().await,
+            Some(json!({"method": "session/cancel", "params": {"sessionId": "s-1"}}))
+        );
+    }
+
+    #[tokio::test]
+    async fn json_rpc_envelope_marks_every_outgoing_message() {
+        let wire = Wire { peer: "qwen", envelope: Envelope::JsonRpc2, timeout: LONG };
+        let handler: Handler = Arc::new(|_method, _params| Box::pin(async { Ok(json!({})) }));
+        let (connection, mut peer) = pair(handler, wire);
+        connection.client.notify_with("session/cancel", json!({"sessionId": "s-1"})).await.unwrap();
+        let request = tokio::spawn({
+            let client = connection.client.clone();
+            async move { client.request("initialize", json!({})).await }
+        });
+        let notified = peer.read().await.unwrap();
+        let requested = peer.read().await.unwrap();
+        peer.write(json!({"jsonrpc": "2.0", "id": id(&requested), "result": {}})).await;
+        request.await.unwrap().unwrap();
+        peer.write(
+            json!({"jsonrpc": "2.0", "id": 0, "method": "craft/drainMidTurnQueue", "params": {}}),
+        )
+        .await;
+        let answered = peer.read().await.unwrap();
+        assert_eq!(
+            [&notified, &requested, &answered].map(|message| message.get("jsonrpc").cloned()),
+            [Some(json!("2.0")), Some(json!("2.0")), Some(json!("2.0"))]
+        );
     }
 }

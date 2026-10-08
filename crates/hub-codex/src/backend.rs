@@ -24,8 +24,10 @@ use crate::protocol::{
     parse_thread_id,
 };
 use crate::requests;
-use crate::rpc::{self, Connection, Handler, Notification, RequestError, RpcClient, RpcError};
 use crate::session::{RpcThread, converse};
+use hub_agent::rpc::{
+    self, Connection, Envelope, Handler, Notification, RequestError, RpcClient, RpcError, Wire,
+};
 
 // Handshake and thread/turn control only; a turn itself runs until it ends or /stop.
 const REQUEST_TIMEOUT: Duration = Duration::from_mins(1);
@@ -258,8 +260,10 @@ impl AppServer {
             return Err(io::Error::other("app-server started without standard streams"));
         };
         tokio::spawn(log_stderr(stderr));
+        let wire =
+            Wire { peer: "codex app-server", envelope: Envelope::Bare, timeout: REQUEST_TIMEOUT };
         let Connection { client, notifications, reader } =
-            rpc::connect(stdout, stdin, handler, REQUEST_TIMEOUT);
+            rpc::connect(stdout, stdin, handler, wire);
         Ok(Self { client, notifications, reader, child })
     }
 
