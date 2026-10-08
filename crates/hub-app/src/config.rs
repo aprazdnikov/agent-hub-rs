@@ -48,8 +48,7 @@ impl FileSettings {
         let keys = Keys {
             token: self.secrets.read(Secret::TelegramToken)?.unwrap_or_default(),
             api_key: self.secrets.read(Secret::OpenAiKey)?.unwrap_or_default(),
-            // The Qwen key joins in once it has a keyring entry.
-            qwen_key: String::new(),
+            qwen_key: self.secrets.read(Secret::QwenKey)?.unwrap_or_default(),
         };
         let draft = file.to_draft(keys).map_err(|error| corrupt(error.message))?;
         Ok(match draft.parse(home) {
@@ -68,13 +67,15 @@ impl SettingsStore for FileSettings {
         self.secrets.write(Secret::TelegramToken, Some(settings.telegram.token.expose()))?;
         self.secrets
             .write(Secret::OpenAiKey, settings.codex.api_key.as_ref().map(ApiKey::expose))?;
+        let qwen_key = settings.qwen.endpoint.as_ref().map(|endpoint| endpoint.key().expose());
+        self.secrets.write(Secret::QwenKey, qwen_key)?;
         write_atomic(&self.path, text.as_bytes()).map_err(write)
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use hub_core::settings::Field;
+    use hub_core::settings::{Field, QwenField};
 
     use super::*;
     use crate::secrets::MemorySecrets;
@@ -178,6 +179,56 @@ mod tests {
         match store.load(dir.path()).unwrap() {
             Loaded::Ready(loaded) => assert_eq!(loaded.codex.api_key, None),
             other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    fn with_qwen_endpoint(root: &Path) -> Draft {
+        let mut form = draft(root);
+        form.qwen.base_url = "https://dashscope-intl.aliyuncs.com/compatible-mode/v1".to_owned();
+        form.qwen.api_key = "sk-qwen-secret".to_owned();
+        form
+    }
+
+    #[test]
+    fn qwen_key_goes_to_the_keyring_not_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = with_qwen_endpoint(dir.path()).parse(dir.path()).unwrap();
+        let store = store(dir.path());
+        store.save(&settings).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("settings.toml")).unwrap();
+        assert!(!text.contains("sk-qwen-secret") && text.contains("base_url"));
+        match store.load(dir.path()).unwrap() {
+            Loaded::Ready(loaded) => assert_eq!(loaded.qwen, settings.qwen),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cleared_qwen_endpoint_removes_the_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store.save(&with_qwen_endpoint(dir.path()).parse(dir.path()).unwrap()).unwrap();
+        store.save(&draft(dir.path()).parse(dir.path()).unwrap()).unwrap();
+        match store.load(dir.path()).unwrap() {
+            Loaded::Ready(loaded) => assert_eq!(loaded.qwen.endpoint, None),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_stored_key_without_an_address_leaves_the_form_incomplete() {
+        let dir = tempfile::tempdir().unwrap();
+        store(dir.path()).save(&draft(dir.path()).parse(dir.path()).unwrap()).unwrap();
+        let secrets = MemorySecrets::default();
+        secrets.write(Secret::TelegramToken, Some("123:secret-token")).unwrap();
+        secrets.write(Secret::QwenKey, Some("sk-orphan")).unwrap();
+        let store = FileSettings::new(dir.path().join("settings.toml"), Box::new(secrets));
+        match store.load(dir.path()).unwrap() {
+            Loaded::Incomplete { errors, .. } => assert_eq!(
+                errors.iter().map(|e| e.field).collect::<Vec<_>>(),
+                [Field::Qwen(QwenField::BaseUrl)]
+            ),
+            other => panic!("expected Incomplete, got {other:?}"),
         }
     }
 }

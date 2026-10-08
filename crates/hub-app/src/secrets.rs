@@ -6,6 +6,7 @@ const SERVICE: &str = "agent-hub";
 pub enum Secret {
     TelegramToken,
     OpenAiKey,
+    QwenKey,
 }
 
 impl Secret {
@@ -13,6 +14,7 @@ impl Secret {
         match self {
             Self::TelegramToken => "telegram-token",
             Self::OpenAiKey => "openai-api-key",
+            Self::QwenKey => "qwen-api-key",
         }
     }
 }
