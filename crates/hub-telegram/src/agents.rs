@@ -8,6 +8,7 @@ use hub_claude::backend::ClaudeBackend;
 use hub_codex::backend::CodexBackend;
 use hub_core::domain::{AgentEvent, BackendKind, Prompt, TopicSession};
 use hub_core::settings::Settings;
+use hub_qwen::backend::QwenBackend;
 use tokio::sync::{mpsc, watch};
 
 use crate::hub::Agents;
@@ -56,8 +57,14 @@ impl Agents for HubAgents {
                     }
                 }
                 BackendKind::Qwen => {
-                    // Replaced by the Qwen backend once `hub-qwen` exists.
-                    refuse(&conversation, "Qwen пока не подключён".to_owned(), inbox).await
+                    match hub_qwen::version::locate(settings.qwen.cli.as_deref()) {
+                        Ok(cli) => {
+                            QwenBackend::new(cli, settings.qwen.clone())
+                                .run(session, prompt, inbox, conversation)
+                                .await
+                        }
+                        Err(error) => refuse(&conversation, error.to_string(), inbox).await,
+                    }
                 }
             }
         })
@@ -84,7 +91,7 @@ mod tests {
     use hub_core::domain::{
         AbsolutePath, Decision, FileDelivery, OutgoingFile, Question, QuestionsOutcome, ToolRequest,
     };
-    use hub_core::settings::{CodexDraft, Draft};
+    use hub_core::settings::{CodexDraft, Draft, QwenDraft};
     use tokio_util::sync::CancellationToken;
 
     use super::*;
@@ -135,5 +142,39 @@ mod tests {
             received.recv().await,
             Some(AgentEvent::Failed(reason)) if reason.starts_with("Не удалось запустить Codex")
         ));
+    }
+
+    #[tokio::test]
+    async fn qwen_topics_run_the_configured_qwen() {
+        let missing = std::env::temp_dir().join("definitely-not-qwen-binary");
+        let settings = Draft {
+            token: "1:a".to_owned(),
+            chat: "-100".to_owned(),
+            users: "1".to_owned(),
+            workspace_root: std::env::temp_dir().display().to_string(),
+            qwen: QwenDraft { cli: missing.display().to_string(), ..QwenDraft::default() },
+            ..Draft::default()
+        }
+        .parse(&std::env::temp_dir())
+        .unwrap();
+        let agents = HubAgents::new(watch::Sender::new(Arc::new(settings)).subscribe());
+        let cwd = AbsolutePath::new(std::env::temp_dir()).unwrap();
+        let session = TopicSession::fresh(BackendKind::Qwen, cwd);
+        let (events, mut received) = mpsc::channel(4);
+        let conversation = Conversation {
+            channel: Arc::new(Allowing),
+            events,
+            cancel: CancellationToken::new(),
+            limits: Limits::new(Duration::from_secs(1)),
+        };
+        let (_inbox_in, inbox) = mpsc::channel(1);
+        let prompt = Prompt::new("hi".to_owned(), Vec::new()).unwrap();
+
+        let _inbox = agents.run(&session, prompt, inbox, conversation).await;
+
+        assert_eq!(
+            received.recv().await,
+            Some(AgentEvent::Failed(hub_qwen::backend::QWEN_FAILED.to_owned()))
+        );
     }
 }

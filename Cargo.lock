@@ -1867,6 +1867,7 @@ dependencies = [
  "hub-claude",
  "hub-codex",
  "hub-core",
+ "hub-qwen",
  "rstest",
  "serde_json",
  "teloxide",
