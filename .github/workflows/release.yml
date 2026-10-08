@@ -39,7 +39,14 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }} -p hub-app
+      - name: Test macOS bundle packaging
+        if: runner.os == 'macOS'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: bash scripts/test-macos-package.sh "target/${{ matrix.target }}/release/agent-hub" "${RELEASE_TAG#v}"
       - name: Package
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
           name=agent-hub-${{ matrix.target }}
           built=target/${{ matrix.target }}/release/agent-hub${{ matrix.exe }}
@@ -51,6 +58,12 @@ jobs:
             (cd stage && 7z a "../dist/${name}.zip" .)
           else
             tar -czf "dist/${name}.tar.gz" -C stage .
+          fi
+          # Add the Finder application separately; raw binaries and archives are
+          # still published under the names used by the existing self-updater.
+          if [[ "${{ matrix.target }}" == *-apple-darwin ]]; then
+            bash scripts/package-macos.sh "$built" "${RELEASE_TAG#v}" "stage-app/agent-hub.app"
+            ditto -c -k --sequesterRsrc --keepParent "stage-app/agent-hub.app" "dist/${name}.app.zip"
           fi
           cd dist
           for file in *; do

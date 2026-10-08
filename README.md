@@ -59,23 +59,33 @@ Telegram (форум-группа)
    | Платформа | Архив |
    |---|---|
    | Windows | `agent-hub-x86_64-pc-windows-msvc.zip` |
-   | macOS, Apple Silicon | `agent-hub-aarch64-apple-darwin.tar.gz` |
-   | macOS, Intel | `agent-hub-x86_64-apple-darwin.tar.gz` |
+   | macOS, Apple Silicon | `agent-hub-aarch64-apple-darwin.app.zip` |
+   | macOS, Intel | `agent-hub-x86_64-apple-darwin.app.zip` |
    | Linux | `agent-hub-x86_64-unknown-linux-gnu.tar.gz` |
 
 2. Проверьте контрольную сумму (файл `.sha256` рядом с архивом):
 
    ```bash
    sha256sum -c agent-hub-x86_64-unknown-linux-gnu.tar.gz.sha256   # Linux, Git Bash
-   shasum -a 256 -c agent-hub-aarch64-apple-darwin.tar.gz.sha256   # macOS
+   shasum -a 256 -c agent-hub-aarch64-apple-darwin.app.zip.sha256  # macOS
    ```
 
-3. Распакуйте и запустите `agent-hub` (`agent-hub.exe` на Windows).
+3. На macOS распакуйте ZIP, перенесите `agent-hub.app` в `~/Applications` (создайте папку,
+   если её нет) или `/Applications` и запустите двойным щелчком в Finder. Для встроенного
+   обновления приложение должно находиться в папке, доступной вашему пользователю на запись;
+   `~/Applications` не требует прав администратора. На других платформах распакуйте архив
+   и запустите `agent-hub` (`agent-hub.exe` на Windows).
 
-Сборки не подписаны, поэтому система предупредит при первом запуске:
+Для macOS по-прежнему публикуются прежние `.tar.gz` с исполняемым файлом и отдельные
+бинарники `agent-hub-<target>`: они нужны для запуска из терминала и встроенного обновления.
+При запуске из Finder окружение может отличаться от терминала; если CLI агента не найден,
+укажите абсолютный путь к `claude`, `codex` или `qwen` в настройках приложения.
 
-- **macOS (Gatekeeper):** снимите карантин с распакованного файла:
-  `xattr -d com.apple.quarantine agent-hub`.
+Сборки не подписаны сертификатом издателя; на macOS нет Developer ID и нотарификации,
+поэтому система может заблокировать первый запуск. Проверяйте источник загрузки и контрольную сумму:
+
+- **macOS (Gatekeeper):** для доверенной загрузки разрешите запуск в «Системные настройки →
+  Конфиденциальность и безопасность». Не отключайте Gatekeeper для всей системы.
 - **Windows (SmartScreen):** «Подробнее» → «Выполнить в любом случае».
 - **Linux:** значок в трее показывается через StatusNotifierItem — он есть в KDE, Xfce и других
   окружениях; в GNOME нужно расширение AppIndicator. Без него приложение работает, а закрытие
@@ -321,6 +331,12 @@ agent-hub проверяет [Releases](https://github.com/aprazdnikov/agent-hub
 SHA-256 и заменяет себя; затем кнопка «Перезапустить» (если есть активные сессии, окно спросит
 подтверждение). Проверку можно выключить в «Настройках».
 
+На macOS внутри `.app` обновляется только `Contents/MacOS/agent-hub`, без замены всего
+пакета: версия в Finder (`Info.plist`) и иконка останутся от первоначальной установки.
+Чтобы обновить их, скачайте новый `.app.zip` и замените приложение после выхода из него.
+Подписанный пакет потребует отдельного механизма обновления; текущая упаковка не добавляет
+подпись пакета и не меняет путь исполняемого файла или источник обновлений.
+
 Контрольная сумма лежит в том же релизе: она защищает от повреждённой загрузки, но не от
 компрометации GitHub-аккаунта. Подпись релизов пока не делается.
 
@@ -376,9 +392,26 @@ cargo run -p hub-app --bin agent-hub
 
 Иконка рисуется скриптом: `python scripts/make-icon.py` → `assets/agent-hub.ico`.
 
+Локальная упаковка macOS (нужны macOS и Python 3; версия должна совпадать с `Cargo.toml`):
+
+```bash
+cargo build --release --locked -p hub-app
+bash scripts/test-macos-package.sh target/release/agent-hub 0.3.0
+bash scripts/package-macos.sh target/release/agent-hub 0.3.0 dist/agent-hub.app
+open dist/agent-hub.app
+```
+
+Скрипт не перезаписывает существующий `.app`. Smoke-тест проверяет пакет и ZIP без запуска
+приложения и без обращения к пользовательским настройкам. PNG для macOS создаются из того же
+рисунка командой `python3 scripts/make-icon.py --iconset OUTPUT.iconset`; `iconutil` собирает
+из них `.icns`. Бинарник копируется без изменений, без добавления shell-обёртки, подписи
+пакета или нотарификации. Подпись Mach-O от линкера, если она есть, сохраняется, но это не
+подпись всего `.app`: полноценная проверка пакета через `codesign --verify` не проходит.
+
 Выпуск релиза: поднять `version` в корневом `Cargo.toml`, закоммитить и поставить тег
 `vX.Y.Z` — workflow `release.yml` соберёт четыре платформы, архивы, бинарники и `.sha256` и
-опубликует релиз. Тег должен совпадать с версией.
+опубликует релиз. Для macOS дополнительно создаются `.app.zip` и их `.sha256`; прежние
+артефакты сохраняются. Тег должен совпадать с версией.
 
 ## Ограничения
 

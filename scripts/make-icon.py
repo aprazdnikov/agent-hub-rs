@@ -1,7 +1,9 @@
-"""Draws the agent-hub icon (green disc, white ring) into assets/agent-hub.ico.
+"""Draws the agent-hub icon (green disc, white ring).
 
 Run once after changing the design: python scripts/make-icon.py
+For macOS packaging: python3 scripts/make-icon.py --iconset OUTPUT.iconset
 """
+import argparse
 import math
 import struct
 import zlib
@@ -52,7 +54,19 @@ def ico(sizes: list[int]) -> bytes:
 
 
 if __name__ == "__main__":
-    target = Path(__file__).resolve().parent.parent / "assets" / "agent-hub.ico"
-    target.parent.mkdir(exist_ok=True)
-    target.write_bytes(ico([16, 32, 48, 256]))
-    print(f"wrote {target}")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--iconset", type=Path, help="write PNGs for Apple's iconutil")
+    args = parser.parse_args()
+    if args.iconset is not None:
+        args.iconset.mkdir(parents=True, exist_ok=True)
+        for size in (16, 32, 128, 256, 512):
+            for scale in (1, 2):
+                suffix = "@2x" if scale == 2 else ""
+                target = args.iconset / f"icon_{size}x{size}{suffix}.png"
+                target.write_bytes(png(size * scale))
+        print(f"wrote {args.iconset}")
+    else:
+        target = Path(__file__).resolve().parent.parent / "assets" / "agent-hub.ico"
+        target.parent.mkdir(exist_ok=True)
+        target.write_bytes(ico([16, 32, 48, 256]))
+        print(f"wrote {target}")
