@@ -8,17 +8,22 @@ publish.workspace = true
 
 [dependencies]
 futures.workspace = true
+http-body-util.workspace = true
 hub-core.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 serde_json.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 tokio-util = { workspace = true, features = ["codec"] }
 tracing.workspace = true
+uuid = { workspace = true, features = ["v4"] }
 which.workspace = true
 
 [dev-dependencies]
 rstest.workspace = true
-tokio = { workspace = true, features = ["io-util", "macros", "process", "rt", "sync", "time"] }
+tokio = { workspace = true, features = ["io-util", "macros", "net", "process", "rt", "sync", "time"] }
 
 [lints]
 workspace = true
