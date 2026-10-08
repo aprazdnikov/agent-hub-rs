@@ -48,6 +48,8 @@ impl FileSettings {
         let keys = Keys {
             token: self.secrets.read(Secret::TelegramToken)?.unwrap_or_default(),
             api_key: self.secrets.read(Secret::OpenAiKey)?.unwrap_or_default(),
+            // The Qwen key joins in once it has a keyring entry.
+            qwen_key: String::new(),
         };
         let draft = file.to_draft(keys).map_err(|error| corrupt(error.message))?;
         Ok(match draft.parse(home) {

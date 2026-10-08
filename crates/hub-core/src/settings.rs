@@ -152,6 +152,66 @@ impl fmt::Debug for ApiKey {
     }
 }
 
+/// When Qwen asks the human before acting; `auto` (Qwen's own classifier) is not offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QwenApproval {
+    Plan,
+    Default,
+    AutoEdit,
+    Yolo,
+}
+
+impl QwenApproval {
+    pub const ALL: [Self; 4] = [Self::Plan, Self::Default, Self::AutoEdit, Self::Yolo];
+
+    #[must_use]
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Default => "default",
+            Self::AutoEdit => "auto-edit",
+            Self::Yolo => "yolo",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|approval| approval.wire() == raw)
+    }
+}
+
+/// An OpenAI-compatible endpoint for Qwen; the address and the key exist only together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApiEndpoint {
+    base_url: String,
+    key: ApiKey,
+}
+
+impl ApiEndpoint {
+    #[must_use]
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    #[must_use]
+    pub fn key(&self) -> &ApiKey {
+        &self.key
+    }
+
+    /// Plain `http://` to another machine sends the key in clear text; the form warns about it.
+    #[must_use]
+    pub fn is_cleartext_remote(&self) -> bool {
+        let Some(rest) = self.base_url.strip_prefix("http://") else {
+            return false;
+        };
+        let authority = rest.split_once('/').map_or(rest, |(authority, _)| authority);
+        !["localhost", "127.0.0.1", "[::1]"].into_iter().any(|host| {
+            authority == host
+                || authority.strip_prefix(host).is_some_and(|port| port.starts_with(':'))
+        })
+    }
+}
+
 /// Positive spending cap per task, in USD.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Budget(Decimal);
@@ -194,6 +254,15 @@ pub struct CodexSettings {
     pub api_key: Option<ApiKey>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QwenSettings {
+    pub cli: Option<PathBuf>,
+    pub model: Option<String>,
+    pub approval: QwenApproval,
+    /// None: Qwen uses its own setup (`/auth`, `~/.qwen/settings.json`, environment).
+    pub endpoint: Option<ApiEndpoint>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
     pub approval: Duration,
@@ -208,6 +277,7 @@ pub struct Settings {
     pub default_backend: BackendKind,
     pub claude: ClaudeSettings,
     pub codex: CodexSettings,
+    pub qwen: QwenSettings,
     pub timeouts: Timeouts,
     pub updates: UpdateCheck,
 }
@@ -226,6 +296,16 @@ pub enum Field {
     BackgroundTimeout,
     DefaultBackend,
     Codex(CodexField),
+    Qwen(QwenField),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QwenField {
+    Cli,
+    Model,
+    Approval,
+    BaseUrl,
+    ApiKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -277,6 +357,40 @@ impl fmt::Debug for CodexDraft {
     }
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub struct QwenDraft {
+    pub cli: String,
+    pub model: String,
+    pub approval: QwenApproval,
+    pub base_url: String,
+    pub api_key: String,
+}
+
+impl Default for QwenDraft {
+    fn default() -> Self {
+        Self {
+            cli: String::new(),
+            model: String::new(),
+            approval: QwenApproval::Default,
+            base_url: String::new(),
+            api_key: String::new(),
+        }
+    }
+}
+
+impl fmt::Debug for QwenDraft {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let Self { cli, model, approval, base_url, api_key: _api_key } = self;
+        f.debug_struct("QwenDraft")
+            .field("cli", cli)
+            .field("model", model)
+            .field("approval", approval)
+            .field("base_url", base_url)
+            .field("api_key", &"***")
+            .finish()
+    }
+}
+
 /// The settings form as typed by the user.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Draft {
@@ -290,6 +404,7 @@ pub struct Draft {
     pub permission_mode: PermissionMode,
     pub budget: String,
     pub codex: CodexDraft,
+    pub qwen: QwenDraft,
     pub approval_timeout: String,
     pub background_timeout: String,
     pub updates: UpdateCheck,
@@ -308,6 +423,7 @@ impl Default for Draft {
             permission_mode: PermissionMode::Default,
             budget: String::new(),
             codex: CodexDraft::default(),
+            qwen: QwenDraft::default(),
             approval_timeout: DEFAULT_APPROVAL_TIMEOUT.as_secs().to_string(),
             background_timeout: DEFAULT_BACKGROUND_TIMEOUT.as_secs().to_string(),
             updates: UpdateCheck::Enabled,
@@ -328,6 +444,7 @@ impl fmt::Debug for Draft {
             permission_mode,
             budget,
             codex,
+            qwen,
             approval_timeout,
             background_timeout,
             updates,
@@ -343,6 +460,7 @@ impl fmt::Debug for Draft {
             .field("permission_mode", permission_mode)
             .field("budget", budget)
             .field("codex", codex)
+            .field("qwen", qwen)
             .field("approval_timeout", approval_timeout)
             .field("background_timeout", background_timeout)
             .field("updates", updates)
@@ -370,6 +488,13 @@ impl Draft {
             Field::Codex(CodexField::ApiKey),
             parse_api_key(&self.codex.api_key),
         );
+        let qwen_cli =
+            check(&mut errors, Field::Qwen(QwenField::Cli), parse_cli(&self.qwen.cli, home));
+        let qwen_model =
+            check(&mut errors, Field::Qwen(QwenField::Model), parse_model(&self.qwen.model));
+        let endpoint = parse_endpoint(&self.qwen.base_url, &self.qwen.api_key)
+            .map_err(|error| errors.push(error))
+            .ok();
         let approval =
             check(&mut errors, Field::ApprovalTimeout, parse_seconds(&self.approval_timeout));
         let background =
@@ -385,6 +510,9 @@ impl Draft {
             Some(codex_cli),
             Some(codex_model),
             Some(api_key),
+            Some(qwen_cli),
+            Some(qwen_model),
+            Some(endpoint),
             Some(approval),
             Some(background),
         ) = (
@@ -398,6 +526,9 @@ impl Draft {
             codex_cli,
             codex_model,
             api_key,
+            qwen_cli,
+            qwen_model,
+            endpoint,
             approval,
             background,
         )
@@ -415,6 +546,12 @@ impl Draft {
                 sandbox: self.codex.sandbox,
                 approval: self.codex.approval,
                 api_key,
+            },
+            qwen: QwenSettings {
+                cli: qwen_cli,
+                model: qwen_model,
+                approval: self.qwen.approval,
+                endpoint,
             },
             timeouts: Timeouts { approval, background },
             updates: self.updates,
@@ -463,6 +600,28 @@ impl Draft {
                     .api_key
                     .as_ref()
                     .map(|key| key.expose().to_owned())
+                    .unwrap_or_default(),
+            },
+            qwen: QwenDraft {
+                cli: settings
+                    .qwen
+                    .cli
+                    .as_ref()
+                    .map(|cli| cli.display().to_string())
+                    .unwrap_or_default(),
+                model: settings.qwen.model.clone().unwrap_or_default(),
+                approval: settings.qwen.approval,
+                base_url: settings
+                    .qwen
+                    .endpoint
+                    .as_ref()
+                    .map(|endpoint| endpoint.base_url().to_owned())
+                    .unwrap_or_default(),
+                api_key: settings
+                    .qwen
+                    .endpoint
+                    .as_ref()
+                    .map(|endpoint| endpoint.key().expose().to_owned())
                     .unwrap_or_default(),
             },
             approval_timeout: settings.timeouts.approval.as_secs().to_string(),
@@ -545,6 +704,40 @@ fn parse_api_key(raw: &str) -> Result<Option<ApiKey>, String> {
     ApiKey::parse(raw).map(Some).ok_or_else(|| "Ключ не должен содержать пробелов".to_owned())
 }
 
+const BASE_URL_SHAPE: &str = "Ожидается адрес http:// или https://, например https://dashscope-intl.aliyuncs.com/compatible-mode/v1";
+
+/// Empty means Qwen's own setup; anything else is an `http(s)://` address without spaces.
+fn parse_base_url(raw: &str) -> Result<Option<String>, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let rest = trimmed.strip_prefix("https://").or_else(|| trimmed.strip_prefix("http://"));
+    match rest {
+        Some(rest) if !rest.is_empty() && !trimmed.chars().any(char::is_whitespace) => {
+            Ok(Some(trimmed.to_owned()))
+        }
+        Some(_) | None => Err(BASE_URL_SHAPE.to_owned()),
+    }
+}
+
+fn parse_endpoint(base_url: &str, key: &str) -> Result<Option<ApiEndpoint>, FieldError> {
+    let error = |field, message: String| FieldError { field: Field::Qwen(field), message };
+    let base_url =
+        parse_base_url(base_url).map_err(|message| error(QwenField::BaseUrl, message))?;
+    let key = parse_api_key(key).map_err(|message| error(QwenField::ApiKey, message))?;
+    match (base_url, key) {
+        (Some(base_url), Some(key)) => Ok(Some(ApiEndpoint { base_url, key })),
+        (None, None) => Ok(None),
+        (Some(_), None) => {
+            Err(error(QwenField::ApiKey, "Укажите API-ключ для этого адреса".to_owned()))
+        }
+        (None, Some(_)) => {
+            Err(error(QwenField::BaseUrl, "Укажите base URL для этого ключа".to_owned()))
+        }
+    }
+}
+
 fn parse_budget(raw: &str) -> Result<Option<Budget>, String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
@@ -578,6 +771,8 @@ pub struct SettingsFile {
     pub claude: ClaudeFile,
     #[serde(default)]
     pub codex: CodexFile,
+    #[serde(default)]
+    pub qwen: QwenFile,
     #[serde(default)]
     pub timeouts: TimeoutsFile,
     #[serde(default)]
@@ -622,10 +817,21 @@ pub struct CodexFile {
     pub approval: Option<String>,
 }
 
+/// The API key is kept in the OS keyring, not here.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct QwenFile {
+    pub cli: Option<String>,
+    pub model: Option<String>,
+    pub approval: Option<String>,
+    pub base_url: Option<String>,
+}
+
 /// Secrets the file does not hold, read from the keyring by the caller.
 pub struct Keys {
     pub token: String,
     pub api_key: String,
+    pub qwen_key: String,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -663,6 +869,16 @@ impl SettingsFile {
                 sandbox: Some(settings.codex.sandbox.wire().to_owned()),
                 approval: Some(settings.codex.approval.wire().to_owned()),
             },
+            qwen: QwenFile {
+                cli: settings.qwen.cli.as_ref().map(|cli| cli.display().to_string()),
+                model: settings.qwen.model.clone(),
+                approval: Some(settings.qwen.approval.wire().to_owned()),
+                base_url: settings
+                    .qwen
+                    .endpoint
+                    .as_ref()
+                    .map(|endpoint| endpoint.base_url().to_owned()),
+            },
             timeouts: TimeoutsFile {
                 approval_seconds: Some(settings.timeouts.approval.as_secs()),
                 background_seconds: Some(settings.timeouts.background.as_secs()),
@@ -678,7 +894,7 @@ impl SettingsFile {
 
     /// The file as a form draft, so file and form share one parser.
     pub fn to_draft(&self, keys: Keys) -> Result<Draft, FieldError> {
-        let Keys { token, api_key } = keys;
+        let Keys { token, api_key, qwen_key } = keys;
         let permission_mode = choice(
             self.claude.permission_mode.as_deref(),
             PermissionMode::Default,
@@ -707,6 +923,13 @@ impl SettingsFile {
             Field::Codex(CodexField::Approval),
             "Неизвестный режим одобрений",
         )?;
+        let qwen_approval = choice(
+            self.qwen.approval.as_deref(),
+            QwenApproval::Default,
+            QwenApproval::parse,
+            Field::Qwen(QwenField::Approval),
+            "Неизвестный режим одобрений",
+        )?;
         let defaults = Draft::default();
         Ok(Draft {
             token,
@@ -724,6 +947,13 @@ impl SettingsFile {
                 sandbox,
                 approval,
                 api_key,
+            },
+            qwen: QwenDraft {
+                cli: self.qwen.cli.clone().unwrap_or_default(),
+                model: self.qwen.model.clone().unwrap_or_default(),
+                approval: qwen_approval,
+                base_url: self.qwen.base_url.clone().unwrap_or_default(),
+                api_key: qwen_key,
             },
             approval_timeout: self
                 .timeouts
@@ -800,6 +1030,10 @@ mod tests {
         assert_eq!(settings.codex.sandbox, Sandbox::WorkspaceWrite);
         assert_eq!(settings.codex.approval, Approval::OnRequest);
         assert_eq!(settings.codex.api_key, None);
+        assert_eq!(settings.qwen.cli, None);
+        assert_eq!(settings.qwen.model, None);
+        assert_eq!(settings.qwen.approval, QwenApproval::Default);
+        assert_eq!(settings.qwen.endpoint, None);
     }
 
     #[test]
@@ -872,8 +1106,11 @@ mod tests {
     fn file_round_trips_through_draft() {
         let settings = draft().parse(&home()).unwrap();
         let file = SettingsFile::from_settings(&settings);
-        let keys =
-            Keys { token: settings.telegram.token.expose().to_owned(), api_key: String::new() };
+        let keys = Keys {
+            token: settings.telegram.token.expose().to_owned(),
+            api_key: String::new(),
+            qwen_key: String::new(),
+        };
         let restored = file.to_draft(keys).unwrap();
         assert_eq!(restored.parse(&home()).unwrap(), settings);
     }
@@ -882,7 +1119,7 @@ mod tests {
     fn file_with_unknown_permission_mode_is_rejected() {
         let mut file = SettingsFile::from_settings(&draft().parse(&home()).unwrap());
         file.claude.permission_mode = Some("yolo".to_owned());
-        let keys = Keys { token: String::new(), api_key: String::new() };
+        let keys = Keys { token: String::new(), api_key: String::new(), qwen_key: String::new() };
         assert_eq!(file.to_draft(keys).unwrap_err().field, Field::PermissionMode);
     }
 
@@ -946,6 +1183,7 @@ mod tests {
         let keys = Keys {
             token: settings.telegram.token.expose().to_owned(),
             api_key: "sk-test".to_owned(),
+            qwen_key: String::new(),
         };
         assert_eq!(file.to_draft(keys).unwrap().parse(&home()).unwrap(), settings);
         assert!(!toml::to_string(&file).unwrap().contains("sk-test"));
@@ -963,10 +1201,12 @@ root = \"~/w\"
 ",
         )
         .unwrap();
-        let keys = Keys { token: "1:a".to_owned(), api_key: String::new() };
+        let keys =
+            Keys { token: "1:a".to_owned(), api_key: String::new(), qwen_key: String::new() };
         let draft = file.to_draft(keys).unwrap();
         assert_eq!(draft.default_backend, BackendKind::Claude);
         assert_eq!(draft.codex, CodexDraft::default());
+        assert_eq!(draft.qwen, QwenDraft::default());
     }
 
     #[rstest]
@@ -988,6 +1228,12 @@ approval = \"always\"
 ",
         Field::Codex(CodexField::Approval)
     )]
+    #[case(
+        "[qwen]
+approval = \"auto\"
+",
+        Field::Qwen(QwenField::Approval)
+    )]
     fn file_with_unknown_choice_is_rejected(#[case] extra: &str, #[case] field: Field) {
         let text = format!(
             "[telegram]
@@ -1000,8 +1246,107 @@ root = \"~/w\"
 {extra}"
         );
         let file: SettingsFile = toml::from_str(&text).unwrap();
-        let keys = Keys { token: String::new(), api_key: String::new() };
+        let keys = Keys { token: String::new(), api_key: String::new(), qwen_key: String::new() };
         assert_eq!(file.to_draft(keys).unwrap_err().field, field);
+    }
+
+    fn qwen_draft() -> Draft {
+        Draft {
+            default_backend: BackendKind::Qwen,
+            qwen: QwenDraft {
+                cli: "~/bin/qwen".to_owned(),
+                model: " qwen3-coder-plus ".to_owned(),
+                approval: QwenApproval::AutoEdit,
+                base_url: " https://dashscope-intl.aliyuncs.com/compatible-mode/v1 ".to_owned(),
+                api_key: " sk-qwen ".to_owned(),
+            },
+            ..draft()
+        }
+    }
+
+    #[test]
+    fn qwen_values_are_parsed() {
+        let settings = qwen_draft().parse(&home()).unwrap();
+        assert_eq!(
+            (
+                settings.default_backend,
+                settings.qwen.cli,
+                settings.qwen.model.as_deref(),
+                settings.qwen.approval,
+                settings
+                    .qwen
+                    .endpoint
+                    .as_ref()
+                    .map(|e| (e.base_url().to_owned(), e.key().expose().to_owned())),
+            ),
+            (
+                BackendKind::Qwen,
+                Some(home().join("bin/qwen")),
+                Some("qwen3-coder-plus"),
+                QwenApproval::AutoEdit,
+                Some((
+                    "https://dashscope-intl.aliyuncs.com/compatible-mode/v1".to_owned(),
+                    "sk-qwen".to_owned()
+                )),
+            )
+        );
+    }
+
+    #[rstest]
+    #[case::relative_cli(QwenDraft { cli: "qwen".to_owned(), ..QwenDraft::default() }, QwenField::Cli)]
+    #[case::spaced_model(QwenDraft { model: "a b".to_owned(), ..QwenDraft::default() }, QwenField::Model)]
+    #[case::not_http(QwenDraft { base_url: "ftp://x".to_owned(), api_key: "k".to_owned(), ..QwenDraft::default() }, QwenField::BaseUrl)]
+    #[case::bare_scheme(QwenDraft { base_url: "https://".to_owned(), api_key: "k".to_owned(), ..QwenDraft::default() }, QwenField::BaseUrl)]
+    #[case::spaced_key(QwenDraft { base_url: "https://x/v1".to_owned(), api_key: "sk a".to_owned(), ..QwenDraft::default() }, QwenField::ApiKey)]
+    #[case::url_without_key(QwenDraft { base_url: "https://x/v1".to_owned(), ..QwenDraft::default() }, QwenField::ApiKey)]
+    #[case::key_without_url(QwenDraft { api_key: "sk-q".to_owned(), ..QwenDraft::default() }, QwenField::BaseUrl)]
+    fn invalid_qwen_values_are_reported(#[case] qwen: QwenDraft, #[case] field: QwenField) {
+        let errors = Draft { qwen, ..draft() }.parse(&home()).unwrap_err();
+        assert_eq!(
+            errors.iter().map(|error| error.field).collect::<Vec<_>>(),
+            [Field::Qwen(field)]
+        );
+    }
+
+    #[test]
+    fn qwen_file_round_trips_through_draft_without_the_key() {
+        let settings = qwen_draft().parse(&home()).unwrap();
+        let file = SettingsFile::from_settings(&settings);
+        let keys = Keys {
+            token: settings.telegram.token.expose().to_owned(),
+            api_key: String::new(),
+            qwen_key: "sk-qwen".to_owned(),
+        };
+        assert_eq!(file.to_draft(keys).unwrap().parse(&home()).unwrap(), settings);
+        let text = toml::to_string(&file).unwrap();
+        assert!(!text.contains("sk-qwen") && text.contains("[qwen]"));
+    }
+
+    #[test]
+    fn debug_output_hides_qwen_key() {
+        let settings = qwen_draft().parse(&home()).unwrap();
+        assert!(!format!("{settings:?}").contains("sk-qwen"));
+        assert!(!format!("{:?}", qwen_draft()).contains("sk-qwen"));
+    }
+
+    #[test]
+    fn qwen_approvals_have_wire_names() {
+        let names: Vec<_> = QwenApproval::ALL.into_iter().map(QwenApproval::wire).collect();
+        assert_eq!(names, ["plan", "default", "auto-edit", "yolo"]);
+        assert_eq!(QwenApproval::parse("auto"), None);
+    }
+
+    #[rstest]
+    #[case("https://api.example.com/v1", false)]
+    #[case("http://localhost:11434/v1", false)]
+    #[case("http://127.0.0.1/v1", false)]
+    #[case("http://[::1]:8000", false)]
+    #[case("http://192.168.1.5:8000/v1", true)]
+    #[case("http://localhost.example.com/v1", true)]
+    fn cleartext_to_another_machine_is_detected(#[case] base_url: &str, #[case] expected: bool) {
+        let endpoint =
+            ApiEndpoint { base_url: base_url.to_owned(), key: ApiKey::parse("k").unwrap() };
+        assert_eq!(endpoint.is_cleartext_remote(), expected);
     }
 
     #[test]

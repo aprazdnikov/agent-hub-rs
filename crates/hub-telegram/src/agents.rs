@@ -55,6 +55,10 @@ impl Agents for HubAgents {
                         Err(error) => refuse(&conversation, error.to_string(), inbox).await,
                     }
                 }
+                BackendKind::Qwen => {
+                    // Replaced by the Qwen backend once `hub-qwen` exists.
+                    refuse(&conversation, "Qwen пока не подключён".to_owned(), inbox).await
+                }
             }
         })
     }

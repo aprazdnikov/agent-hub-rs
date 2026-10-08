@@ -41,16 +41,18 @@ impl SessionId {
 pub enum BackendKind {
     Claude,
     Codex,
+    Qwen,
 }
 
 impl BackendKind {
-    pub const ALL: [Self; 2] = [Self::Claude, Self::Codex];
+    pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Qwen];
 
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Qwen => "qwen",
         }
     }
 
@@ -256,11 +258,12 @@ impl Prompt {
     }
 }
 
-/// What the agent reports about a finished turn: Claude counts turns and cost, Codex tokens.
+/// What the agent reports about a finished turn: Claude counts turns and cost, Codex and Qwen tokens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Usage {
     Claude { turns: u32, cost: Option<Decimal> },
     Codex { tokens: Option<u64> },
+    Qwen { tokens: Option<u64> },
 }
 
 /// One agent turn ended; `background` tasks keep running and report in later turns.
@@ -306,6 +309,8 @@ mod tests {
     #[case("Claude", Some(BackendKind::Claude))]
     #[case("codex", Some(BackendKind::Codex))]
     #[case("CODEX", Some(BackendKind::Codex))]
+    #[case("qwen", Some(BackendKind::Qwen))]
+    #[case("Qwen", Some(BackendKind::Qwen))]
     #[case("gpt", None)]
     fn backend_kind_parses_case_insensitively(
         #[case] raw: &str,

@@ -43,8 +43,8 @@ pub fn help(root: &Path) -> String {
     format!(
         "Каждая тема этой группы — отдельная сессия агента.\n\n\
          Просто пишите задачу в теме. Команды:\n\
-         /new [backend] [путь] — новая сессия в этой теме (сброс контекста)\n\
-         /backend [claude|codex] — сменить агента в этой теме (сброс контекста)\n\
+         /new [claude|codex|qwen] [путь] — новая сессия в этой теме (сброс контекста)\n\
+         /backend [claude|codex|qwen] — сменить агента в этой теме (сброс контекста)\n\
          /cwd <путь> — сменить рабочую директорию (сброс контекста)\n\
          /reset — начать разговор заново в той же директории\n\
          /stop — прервать текущую задачу\n\
@@ -137,7 +137,10 @@ mod tests {
 
     #[test]
     fn unknown_backend_lists_the_known_ones() {
-        assert_eq!(unknown_backend("gpt"), "⚠️ Неизвестный бэкенд gpt. Доступны: claude, codex");
+        assert_eq!(
+            unknown_backend("gpt"),
+            "⚠️ Неизвестный бэкенд gpt. Доступны: claude, codex, qwen"
+        );
     }
 
     #[test]
@@ -147,10 +150,13 @@ mod tests {
         assert!(text.starts_with("Каждая тема этой группы — отдельная сессия агента."));
         assert!(text.contains(".agent-hub/uploads"));
         assert!(text.contains(&root.as_path().display().to_string()));
-        assert!(text.ends_with("Бэкенды: claude, codex"));
-        assert!(
-            text.contains("/backend [claude|codex] — сменить агента в этой теме (сброс контекста)")
-        );
+        assert!(text.ends_with("Бэкенды: claude, codex, qwen"));
+        assert!(text.contains(
+            "/new [claude|codex|qwen] [путь] — новая сессия в этой теме (сброс контекста)"
+        ));
+        assert!(text.contains(
+            "/backend [claude|codex|qwen] — сменить агента в этой теме (сброс контекста)"
+        ));
     }
 
     #[test]

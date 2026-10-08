@@ -894,7 +894,9 @@ mod tests {
         .await;
         world.send(text(Some(7), 3, "/backend gpt")).await;
         eventually("unknown", || {
-            world.texts().contains(&"⚠️ Неизвестный бэкенд gpt. Доступны: claude, codex".to_owned())
+            world
+                .texts()
+                .contains(&"⚠️ Неизвестный бэкенд gpt. Доступны: claude, codex, qwen".to_owned())
         })
         .await;
         world.send(text(Some(7), 4, "/backend codex")).await;

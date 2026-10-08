@@ -54,9 +54,10 @@ pub fn truncate(text: &str, limit: usize) -> String {
 pub fn format_finished(finished: &Finished) -> String {
     let usage = match &finished.usage {
         Usage::Claude { turns, cost } => format!(" · ходов: {turns}{}", cost_text(*cost)),
-        Usage::Codex { tokens } => tokens.map_or_else(String::new, |tokens| {
-            format!(" · токенов в сессии: {}", group_thousands(tokens))
-        }),
+        Usage::Codex { tokens } | Usage::Qwen { tokens } => tokens
+            .map_or_else(String::new, |tokens| {
+                format!(" · токенов в сессии: {}", group_thousands(tokens))
+            }),
     };
     let pending = if finished.background == 0 {
         String::new()
@@ -186,6 +187,18 @@ mod tests {
             format_finished(&claude(3, None, 2)),
             "✅ Готово · ходов: 3 · ⏳ в фоне задач: 2, пришлю результат"
         );
+    }
+
+    #[rstest]
+    #[case(None, "✅ Готово")]
+    #[case(Some(12_345), "✅ Готово · токенов в сессии: 12 345")]
+    fn qwen_finished_line(#[case] tokens: Option<u64>, #[case] expected: &str) {
+        let finished = Finished {
+            session: SessionId::parse("q").unwrap(),
+            usage: Usage::Qwen { tokens },
+            background: 0,
+        };
+        assert_eq!(format_finished(&finished), expected);
     }
 
     #[rstest]

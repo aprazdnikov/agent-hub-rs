@@ -119,6 +119,8 @@ mod tests {
     #[case(&["claude"], BackendKind::Claude, None)]
     #[case(&["Claude", "shop/backend"], BackendKind::Claude, Some("shop/backend"))]
     #[case(&["codex", "shop"], BackendKind::Codex, Some("shop"))]
+    #[case(&["qwen"], BackendKind::Qwen, None)]
+    #[case(&["QWEN", "shop"], BackendKind::Qwen, Some("shop"))]
     #[case(&["shop/backend"], BackendKind::Codex, Some("shop/backend"))]
     #[case(&["my", "dir"], BackendKind::Codex, Some("my dir"))]
     fn new_args_fall_back_to_the_default_backend(
@@ -154,6 +156,12 @@ mod tests {
     fn other_backend_keeps_the_directory_and_drops_the_session() {
         let switched = TopicSession::fresh(BackendKind::Codex, current().cwd);
         assert_eq!(decide_backend(&["codex"], &current()), BackendDecision::Switch(switched));
+    }
+
+    #[test]
+    fn qwen_is_a_backend_to_switch_to() {
+        let switched = TopicSession::fresh(BackendKind::Qwen, current().cwd);
+        assert_eq!(decide_backend(&["qwen"], &current()), BackendDecision::Switch(switched));
     }
 
     #[rstest]

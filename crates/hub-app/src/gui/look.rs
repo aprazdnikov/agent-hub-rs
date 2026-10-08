@@ -60,6 +60,7 @@ pub const fn agent_title(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::Claude => "Claude Code",
         BackendKind::Codex => "Codex",
+        BackendKind::Qwen => "Qwen Code",
     }
 }
 
@@ -283,5 +284,6 @@ mod tests {
     fn agents_have_titles() {
         assert_eq!(agent_title(BackendKind::Claude), "Claude Code");
         assert_eq!(agent_title(BackendKind::Codex), "Codex");
+        assert_eq!(agent_title(BackendKind::Qwen), "Qwen Code");
     }
 }

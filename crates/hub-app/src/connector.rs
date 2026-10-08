@@ -61,6 +61,8 @@ async fn check_agent(kind: BackendKind, settings: &Settings) -> Result<AgentStat
             }
             Ok(AgentState::Ready { version: version.to_string(), auth: Some(auth) })
         }
+        // Replaced by the real check once `hub-qwen` exists.
+        BackendKind::Qwen => Ok(AgentState::Unavailable("Qwen пока не подключён".to_owned())),
     }
 }
 
