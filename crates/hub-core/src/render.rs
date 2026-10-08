@@ -54,7 +54,7 @@ pub fn truncate(text: &str, limit: usize) -> String {
 pub fn format_finished(finished: &Finished) -> String {
     let usage = match &finished.usage {
         Usage::Claude { turns, cost } => format!(" · ходов: {turns}{}", cost_text(*cost)),
-        Usage::Codex { tokens } | Usage::Qwen { tokens } => tokens
+        Usage::Codex { tokens } | Usage::Qwen { tokens } | Usage::Hermes { tokens } => tokens
             .map_or_else(String::new, |tokens| {
                 format!(" · токенов в сессии: {}", group_thousands(tokens))
             }),
@@ -197,6 +197,24 @@ mod tests {
             session: SessionId::parse("q").unwrap(),
             usage: Usage::Qwen { tokens },
             background: 0,
+        };
+        assert_eq!(format_finished(&finished), expected);
+    }
+
+    #[rstest]
+    #[case(None, 0, "✅ Готово")]
+    #[case(Some(0), 0, "✅ Готово · токенов в сессии: 0")]
+    #[case(Some(12_345), 0, "✅ Готово · токенов в сессии: 12 345")]
+    #[case(None, 2, "✅ Готово · ⏳ в фоне задач: 2, пришлю результат")]
+    fn hermes_finished_line(
+        #[case] tokens: Option<u64>,
+        #[case] background: usize,
+        #[case] expected: &str,
+    ) {
+        let finished = Finished {
+            session: SessionId::parse("h").unwrap(),
+            usage: Usage::Hermes { tokens },
+            background,
         };
         assert_eq!(format_finished(&finished), expected);
     }

@@ -124,6 +124,27 @@ mod tests {
     }
 
     #[test]
+    fn hermes_settings_round_trip_without_new_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut form = draft(dir.path());
+        form.default_backend = hub_core::domain::BackendKind::Hermes;
+        form.hermes = hub_core::settings::HermesDraft {
+            cli: dir.path().join("hermes").display().to_string(),
+            profile: "engineering".to_owned(),
+            model: "openai/gpt-test".to_owned(),
+        };
+        let settings = form.parse(dir.path()).unwrap();
+        let store = store(dir.path());
+        store.save(&settings).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("settings.toml")).unwrap();
+        assert!(text.contains("[hermes]") && text.contains("engineering"));
+        match store.load(dir.path()).unwrap() {
+            Loaded::Ready(loaded) => assert_eq!(loaded, settings),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn missing_token_leaves_the_form_incomplete() {
         let dir = tempfile::tempdir().unwrap();
         let settings = draft(dir.path()).parse(dir.path()).unwrap();

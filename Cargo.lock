@@ -1769,6 +1769,7 @@ dependencies = [
  "hub-claude",
  "hub-codex",
  "hub-core",
+ "hub-hermes",
  "hub-qwen",
  "hub-telegram",
  "keyring",
@@ -1842,6 +1843,23 @@ dependencies = [
 ]
 
 [[package]]
+name = "hub-hermes"
+version = "0.3.0"
+dependencies = [
+ "base64 0.23.1",
+ "futures",
+ "hub-agent",
+ "hub-core",
+ "rstest",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "hub-qwen"
 version = "0.3.0"
 dependencies = [
@@ -1868,6 +1886,7 @@ dependencies = [
  "hub-claude",
  "hub-codex",
  "hub-core",
+ "hub-hermes",
  "hub-qwen",
  "rstest",
  "serde_json",

@@ -32,6 +32,8 @@ pub enum AgentError {
     Login(#[from] ProbeError),
     #[error(transparent)]
     Qwen(#[from] hub_qwen::version::CliError),
+    #[error(transparent)]
+    Hermes(#[from] hub_hermes::version::CliError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -66,6 +68,12 @@ async fn check_agent(kind: BackendKind, settings: &Settings) -> Result<AgentStat
                 version: version.to_string(),
                 auth: Some(AgentAuth::Codex(auth)),
             })
+        }
+        BackendKind::Hermes => {
+            let cli = hub_hermes::version::locate(settings.hermes.cli.as_deref())?;
+            let version = hub_hermes::version::check(&cli).await?;
+            // No trial session: Hermes owns its profiles, credentials and session database.
+            Ok(AgentState::Ready { version: version.to_string(), auth: Some(AgentAuth::Hermes) })
         }
         BackendKind::Qwen => {
             let cli = hub_qwen::version::locate(settings.qwen.cli.as_deref())?;
@@ -228,6 +236,38 @@ mod tests {
 
     fn ready(version: &str) -> AgentState {
         AgentState::Ready { version: version.to_owned(), auth: None }
+    }
+
+    #[tokio::test]
+    async fn configured_missing_hermes_is_reported_without_telegram() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut form = Draft {
+            token: "1:a".to_owned(),
+            chat: "-100".to_owned(),
+            users: "1".to_owned(),
+            workspace_root: dir.path().display().to_string(),
+            ..Draft::default()
+        };
+        form.hermes.cli = dir.path().join("missing-hermes").display().to_string();
+        let settings = form.parse(dir.path()).unwrap();
+        let error = check_agent(BackendKind::Hermes, &settings).await.unwrap_err();
+        assert!(matches!(error, AgentError::Hermes(_)));
+        assert!(matches!(
+            statuses(BackendKind::Hermes, vec![(BackendKind::Hermes, Err(error))]),
+            Err(AgentError::Hermes(_))
+        ));
+    }
+
+    #[test]
+    fn optional_missing_hermes_does_not_block_the_default() {
+        let missing = AgentError::Hermes(hub_hermes::version::CliError::Missing);
+        let statuses = statuses(
+            BackendKind::Claude,
+            vec![(BackendKind::Claude, Ok(ready("2.1.287"))), (BackendKind::Hermes, Err(missing))],
+        )
+        .unwrap();
+        assert!(statuses.iter().any(|status| status.kind == BackendKind::Hermes
+            && matches!(status.state, AgentState::Unavailable(_))));
     }
 
     #[test]

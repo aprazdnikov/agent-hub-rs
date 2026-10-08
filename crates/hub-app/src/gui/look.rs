@@ -62,6 +62,7 @@ pub const fn agent_title(kind: BackendKind) -> &'static str {
         BackendKind::Claude => "Claude Code",
         BackendKind::Codex => "Codex",
         BackendKind::Qwen => "Qwen Code",
+        BackendKind::Hermes => "Hermes",
     }
 }
 
@@ -86,6 +87,7 @@ const fn auth_text(auth: AgentAuth) -> &'static str {
         AgentAuth::Codex(CodexAuth::Missing) => "вход: не выполнен — `codex login` или API-ключ",
         AgentAuth::Qwen(QwenAuth::HubKey) => "ключ из настроек хаба",
         AgentAuth::Qwen(QwenAuth::OwnSetup) => "собственная настройка qwen",
+        AgentAuth::Hermes => "собственная настройка Hermes (вход не проверен)",
     }
 }
 
@@ -282,6 +284,7 @@ mod tests {
     #[case(Some(AgentState::Ready { version: "0.25.0".to_owned(), auth: Some(AgentAuth::Qwen(QwenAuth::HubKey)) }), "0.25.0 · ключ из настроек хаба")]
     #[case(Some(AgentState::Ready { version: "0.25.0".to_owned(), auth: Some(AgentAuth::Qwen(QwenAuth::OwnSetup)) }), "0.25.0 · собственная настройка qwen")]
     #[case(Some(AgentState::Unavailable("Codex не найден".to_owned())), "недоступен: Codex не найден")]
+    #[case(Some(AgentState::Ready { version: "0.21.5".to_owned(), auth: Some(AgentAuth::Hermes) }), "0.21.5 · собственная настройка Hermes (вход не проверен)")]
     fn agent_lines(#[case] state: Option<AgentState>, #[case] expected: &str) {
         assert_eq!(agent_line(state.as_ref()), expected);
     }
@@ -291,5 +294,6 @@ mod tests {
         assert_eq!(agent_title(BackendKind::Claude), "Claude Code");
         assert_eq!(agent_title(BackendKind::Codex), "Codex");
         assert_eq!(agent_title(BackendKind::Qwen), "Qwen Code");
+        assert_eq!(agent_title(BackendKind::Hermes), "Hermes");
     }
 }

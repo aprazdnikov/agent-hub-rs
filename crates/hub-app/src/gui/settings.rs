@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 use hub_core::domain::BackendKind;
 use hub_core::settings::{
-    ApiEndpoint, Approval, CodexField, Draft, Field, FieldError, PermissionMode, QwenApproval,
-    QwenField, Sandbox, Settings, UpdateCheck,
+    ApiEndpoint, Approval, CodexField, Draft, Field, FieldError, HermesField, PermissionMode,
+    QwenApproval, QwenField, Sandbox, Settings, UpdateCheck,
 };
 
 use crate::gui::log::LogAction;
@@ -127,6 +127,8 @@ impl SettingsForm {
             self.codex(ui, &errors);
             ui.separator();
             self.qwen(ui, &errors, endpoint);
+            ui.separator();
+            self.hermes(ui, &errors);
             ui.separator();
             self.timeouts(ui, &errors);
         });
@@ -369,6 +371,37 @@ impl SettingsForm {
         );
     }
 
+    fn hermes(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
+        ui.heading("Hermes");
+        ui.horizontal(|ui| {
+            ui.label("Путь к hermes");
+            ui.add(egui::TextEdit::singleline(&mut self.draft.hermes.cli).hint_text("из PATH"));
+            if ui.button("Выбрать…").clicked()
+                && let Some(path) = pick_file(&self.draft.hermes.cli)
+            {
+                self.draft.hermes.cli = path;
+            }
+        });
+        messages(ui, errors, Field::Hermes(HermesField::Cli));
+        ui.horizontal(|ui| {
+            ui.label("Профиль");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.draft.hermes.profile)
+                    .hint_text("активный профиль Hermes"),
+            );
+        });
+        messages(ui, errors, Field::Hermes(HermesField::Profile));
+        ui.horizontal(|ui| {
+            ui.label("Модель");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.draft.hermes.model)
+                    .hint_text("из настроек Hermes"),
+            );
+        });
+        messages(ui, errors, Field::Hermes(HermesField::Model));
+        ui.label("Вход и провайдер настраиваются в Hermes (`hermes setup`). Хаб запускает `hermes acp`, не меняя профиль и его секреты. Новые сообщения во время работы ждут следующего хода.");
+    }
+
     fn timeouts(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
         ui.heading("Таймауты и обновления");
         ui.horizontal(|ui| {
@@ -420,6 +453,33 @@ pub fn home_or_root() -> PathBuf {
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    #[test]
+    fn hermes_settings_are_visible() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 4000.0));
+        let mut form = SettingsForm::default();
+        let mut output =
+            ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    form.show(ui, Path::new("/"), 0, &mut |_| {});
+                });
+            });
+        output.textures_delta.clear();
+        let labels: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|clipped| {
+                if let egui::Shape::Text(text) = &clipped.shape {
+                    Some(text.galley.text().to_owned())
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert!(labels.iter().any(|label| label == "Hermes"), "Hermes section missing");
+        assert!(labels.iter().any(|label| label == "Профиль"), "Hermes profile missing");
+    }
 
     #[test]
     fn visible_save_dispatches_edited_settings() {
