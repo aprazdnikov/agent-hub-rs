@@ -10,12 +10,15 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use futures::future::BoxFuture;
+use hub_core::render::truncate;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_util::codec::{FramedRead, LinesCodec};
 use tokio_util::sync::CancellationToken;
+
+use crate::tools::TOOL_SUMMARY_LIMIT;
 
 // A whole turn item (a diff, a command's output) arrives as one line.
 const MAX_LINE: usize = 64 * 1024 * 1024;
@@ -278,6 +281,7 @@ impl Link {
                     reply,
                     self.outbox.clone(),
                     self.envelope,
+                    self.peer,
                 ));
             }
             (None, Some(method)) => {
@@ -323,15 +327,18 @@ async fn answer(
     reply: BoxFuture<'static, Result<Value, RequestError>>,
     outbox: mpsc::Sender<String>,
     envelope: Envelope,
+    peer: &'static str,
 ) {
     let message = match reply.await {
         Ok(result) => json!({"id": id, "result": result}),
         Err(error @ RequestError::Unsupported(_)) => {
-            tracing::debug!(%method, "unsupported server request");
+            tracing::debug!(peer, %method, "unsupported server request");
             json!({"id": id, "error": {"code": METHOD_NOT_FOUND, "message": error.to_string()}})
         }
         Err(error @ RequestError::Malformed(_)) => {
-            tracing::warn!(%method, %error, "malformed server request");
+            // The text may quote the agent's whole params (shell commands); the log gets a bounded part.
+            let logged = truncate(&error.to_string(), TOOL_SUMMARY_LIMIT);
+            tracing::warn!(peer, %method, error = %logged, "malformed server request");
             json!({"id": id, "error": {"code": INVALID_PARAMS, "message": error.to_string()}})
         }
     };

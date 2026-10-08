@@ -366,6 +366,12 @@ mod tests {
         HubTools { url: "http://127.0.0.1:4321/mcp", token: "t0k3n" }
     }
 
+    #[test]
+    fn debug_output_hides_the_token() {
+        let shown = format!("{:?}", tools());
+        assert!(!shown.contains("t0k3n") && shown.contains("***"));
+    }
+
     fn text(text: &str) -> Prompt {
         Prompt::new(text.to_owned(), Vec::new()).unwrap()
     }
