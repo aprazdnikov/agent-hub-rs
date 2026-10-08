@@ -5,19 +5,27 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 use hub_core::domain::BackendKind;
 use hub_core::settings::{
-    Approval, CodexField, Draft, Field, FieldError, PermissionMode, Sandbox, UpdateCheck,
+    ApiEndpoint, Approval, CodexField, Draft, Field, FieldError, PermissionMode, QwenApproval,
+    QwenField, Sandbox, Settings, UpdateCheck,
 };
 
 use crate::gui::log::LogAction;
 use crate::gui::look::{add_user, telegram_changed, use_chat};
 use crate::supervisor::Command;
 
+/// Which secret fields are shown in clear text.
+#[derive(Default)]
+struct Revealed {
+    token: bool,
+    codex_key: bool,
+    qwen_key: bool,
+}
+
 #[derive(Default)]
 pub struct SettingsForm {
     draft: Draft,
     synced: Option<Draft>,
-    reveal: bool,
-    reveal_key: bool,
+    revealed: Revealed,
     confirming: bool,
 }
 
@@ -67,14 +75,18 @@ impl SettingsForm {
         }
     }
 
-    fn errors(&self, home: &Path) -> Vec<FieldError> {
+    /// Parses the draft once: the field errors and, when it parses, the settings.
+    fn check(&self, home: &Path) -> (Vec<FieldError>, Option<Settings>) {
         match self.draft.parse(home) {
-            Ok(settings) if settings.workspace_root.is_dir() => Vec::new(),
-            Ok(_) => vec![FieldError {
-                field: Field::WorkspaceRoot,
-                message: "Такого каталога нет".to_owned(),
-            }],
-            Err(errors) => errors,
+            Ok(settings) if settings.workspace_root.is_dir() => (Vec::new(), Some(settings)),
+            Ok(settings) => (
+                vec![FieldError {
+                    field: Field::WorkspaceRoot,
+                    message: "Такого каталога нет".to_owned(),
+                }],
+                Some(settings),
+            ),
+            Err(errors) => (errors, None),
         }
     }
 
@@ -85,7 +97,8 @@ impl SettingsForm {
         sessions: usize,
         send: &mut impl FnMut(Command),
     ) {
-        let errors = self.errors(home);
+        let (errors, parsed) = self.check(home);
+        let endpoint = parsed.as_ref().and_then(|settings| settings.qwen.endpoint.as_ref());
         egui::ScrollArea::vertical().show(ui, |ui| {
             self.telegram(ui, &errors);
             ui.separator();
@@ -94,6 +107,8 @@ impl SettingsForm {
             self.agent(ui, &errors);
             ui.separator();
             self.codex(ui, &errors);
+            ui.separator();
+            self.qwen(ui, &errors, endpoint);
             ui.separator();
             self.timeouts(ui, &errors);
         });
@@ -121,8 +136,10 @@ impl SettingsForm {
         ui.label("Изменение этих полей перезапускает бота и прерывает работающие сессии.");
         ui.horizontal(|ui| {
             ui.label("Токен бота");
-            ui.add(egui::TextEdit::singleline(&mut self.draft.token).password(!self.reveal));
-            ui.checkbox(&mut self.reveal, "показать");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.draft.token).password(!self.revealed.token),
+            );
+            ui.checkbox(&mut self.revealed.token, "показать");
         });
         messages(ui, errors, Field::Token);
         ui.horizontal(|ui| {
@@ -267,15 +284,86 @@ impl SettingsForm {
             ui.label("API-ключ OpenAI");
             ui.add(
                 egui::TextEdit::singleline(&mut self.draft.codex.api_key)
-                    .password(!self.reveal_key)
+                    .password(!self.revealed.codex_key)
                     .hint_text("вход через codex login"),
             );
-            ui.checkbox(&mut self.reveal_key, "показать");
+            ui.checkbox(&mut self.revealed.codex_key, "показать");
         });
         messages(ui, errors, Field::Codex(CodexField::ApiKey));
         ui.label(
             "Без ключа используется вход `codex login`. Ключ хранится в системном хранилище \
                  ключей и не заменяет вход по подписке ChatGPT.",
+        );
+    }
+
+    fn qwen(&mut self, ui: &mut egui::Ui, errors: &[FieldError], endpoint: Option<&ApiEndpoint>) {
+        ui.heading("Qwen");
+        ui.horizontal(|ui| {
+            ui.label("Путь к qwen");
+            ui.add(egui::TextEdit::singleline(&mut self.draft.qwen.cli).hint_text("из PATH"));
+            if ui.button("Выбрать…").clicked()
+                && let Some(path) = pick_file(&self.draft.qwen.cli)
+            {
+                self.draft.qwen.cli = path;
+            }
+        });
+        messages(ui, errors, Field::Qwen(QwenField::Cli));
+        ui.horizontal(|ui| {
+            ui.label("Модель");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.draft.qwen.model)
+                    .hint_text("из настроек Qwen"),
+            );
+        });
+        messages(ui, errors, Field::Qwen(QwenField::Model));
+        ui.horizontal(|ui| {
+            ui.label("Одобрения");
+            egui::ComboBox::from_id_salt("qwen_approval")
+                .selected_text(self.draft.qwen.approval.wire())
+                .show_ui(ui, |ui| {
+                    for approval in QwenApproval::ALL {
+                        ui.selectable_value(
+                            &mut self.draft.qwen.approval,
+                            approval,
+                            approval.wire(),
+                        );
+                    }
+                });
+        });
+        if self.draft.qwen.approval == QwenApproval::Yolo {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "yolo: Qwen выполняет любые инструменты без подтверждения.",
+            );
+        }
+        ui.horizontal(|ui| {
+            ui.label("Base URL");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.draft.qwen.base_url)
+                    .hint_text("собственная настройка qwen"),
+            );
+        });
+        messages(ui, errors, Field::Qwen(QwenField::BaseUrl));
+        ui.horizontal(|ui| {
+            ui.label("API-ключ");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.draft.qwen.api_key)
+                    .password(!self.revealed.qwen_key)
+                    .hint_text("собственная настройка qwen"),
+            );
+            ui.checkbox(&mut self.revealed.qwen_key, "показать");
+        });
+        messages(ui, errors, Field::Qwen(QwenField::ApiKey));
+        if endpoint.is_some_and(ApiEndpoint::is_cleartext_remote) {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "http:// к другому компьютеру: ключ уходит в сеть открытым текстом.",
+            );
+        }
+        ui.label(
+            "Без адреса и ключа Qwen использует собственную настройку (`qwen` → /auth, \
+             ~/.qwen/settings.json). Адрес OpenAI-совместимый; ключ хранится в системном \
+             хранилище ключей и передаётся только процессу qwen.",
         );
     }
 
