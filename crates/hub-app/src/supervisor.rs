@@ -3,6 +3,7 @@
 
 use hub_codex::protocol::CodexAuth;
 use hub_core::domain::BackendKind;
+use hub_qwen::backend::QwenAuth;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,9 +43,16 @@ pub enum BotStatus {
     Failed(String),
 }
 
+/// How an agent signs in to its model, where the hub knows it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AgentAuth {
+    Codex(CodexAuth),
+    Qwen(QwenAuth),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentState {
-    Ready { version: String, auth: Option<CodexAuth> },
+    Ready { version: String, auth: Option<AgentAuth> },
     Unavailable(String),
 }
 

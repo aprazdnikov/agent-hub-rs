@@ -3,9 +3,10 @@
 use hub_codex::protocol::CodexAuth;
 use hub_core::domain::BackendKind;
 use hub_core::settings::Draft;
+use hub_qwen::backend::QwenAuth;
 use hub_telegram::hub::TopicState;
 
-use crate::supervisor::{AgentState, BotStatus, Snapshot};
+use crate::supervisor::{AgentAuth, AgentState, BotStatus, Snapshot};
 use crate::updater::UpdateState;
 
 const SHORT_SESSION: usize = 8;
@@ -70,19 +71,21 @@ pub fn agent_line(state: Option<&AgentState>) -> String {
         None => "—".to_owned(),
         Some(AgentState::Ready { version, auth: None }) => version.clone(),
         Some(AgentState::Ready { version, auth: Some(auth) }) => {
-            format!("{version} · вход: {}", auth_text(*auth))
+            format!("{version} · {}", auth_text(*auth))
         }
         Some(AgentState::Unavailable(reason)) => format!("недоступен: {reason}"),
     }
 }
 
-const fn auth_text(auth: CodexAuth) -> &'static str {
+const fn auth_text(auth: AgentAuth) -> &'static str {
     match auth {
-        CodexAuth::ApiKey => "API-ключ",
-        CodexAuth::ChatGpt => "ChatGPT",
-        CodexAuth::Other => "другой способ",
-        CodexAuth::NotRequired => "не требуется",
-        CodexAuth::Missing => "не выполнен — `codex login` или API-ключ",
+        AgentAuth::Codex(CodexAuth::ApiKey) => "вход: API-ключ",
+        AgentAuth::Codex(CodexAuth::ChatGpt) => "вход: ChatGPT",
+        AgentAuth::Codex(CodexAuth::Other) => "вход: другой способ",
+        AgentAuth::Codex(CodexAuth::NotRequired) => "вход: не требуется",
+        AgentAuth::Codex(CodexAuth::Missing) => "вход: не выполнен — `codex login` или API-ключ",
+        AgentAuth::Qwen(QwenAuth::HubKey) => "ключ из настроек хаба",
+        AgentAuth::Qwen(QwenAuth::OwnSetup) => "собственная настройка qwen",
     }
 }
 
@@ -167,11 +170,12 @@ pub fn update_item(state: &UpdateState) -> (String, bool) {
 mod tests {
     use hub_codex::protocol::CodexAuth;
     use hub_core::domain::{AbsolutePath, BackendKind, ChatId, ThreadId, TopicKey, TopicSession};
+    use hub_qwen::backend::QwenAuth;
     use hub_telegram::hub::TopicView;
     use rstest::rstest;
 
     use super::*;
-    use crate::supervisor::AgentState;
+    use crate::supervisor::{AgentAuth, AgentState};
 
     fn view(thread: i32, state: TopicState) -> TopicView {
         let root = if cfg!(windows) { r"C:\p" } else { "/p" };
@@ -272,9 +276,11 @@ mod tests {
     #[rstest]
     #[case(None, "—")]
     #[case(Some(AgentState::Ready { version: "2.1.287".to_owned(), auth: None }), "2.1.287")]
-    #[case(Some(AgentState::Ready { version: "0.160.0".to_owned(), auth: Some(CodexAuth::ChatGpt) }), "0.160.0 · вход: ChatGPT")]
-    #[case(Some(AgentState::Ready { version: "0.160.0".to_owned(), auth: Some(CodexAuth::ApiKey) }), "0.160.0 · вход: API-ключ")]
-    #[case(Some(AgentState::Ready { version: "0.160.0".to_owned(), auth: Some(CodexAuth::Missing) }), "0.160.0 · вход: не выполнен — `codex login` или API-ключ")]
+    #[case(Some(AgentState::Ready { version: "0.160.0".to_owned(), auth: Some(AgentAuth::Codex(CodexAuth::ChatGpt)) }), "0.160.0 · вход: ChatGPT")]
+    #[case(Some(AgentState::Ready { version: "0.160.0".to_owned(), auth: Some(AgentAuth::Codex(CodexAuth::ApiKey)) }), "0.160.0 · вход: API-ключ")]
+    #[case(Some(AgentState::Ready { version: "0.160.0".to_owned(), auth: Some(AgentAuth::Codex(CodexAuth::Missing)) }), "0.160.0 · вход: не выполнен — `codex login` или API-ключ")]
+    #[case(Some(AgentState::Ready { version: "0.25.0".to_owned(), auth: Some(AgentAuth::Qwen(QwenAuth::HubKey)) }), "0.25.0 · ключ из настроек хаба")]
+    #[case(Some(AgentState::Ready { version: "0.25.0".to_owned(), auth: Some(AgentAuth::Qwen(QwenAuth::OwnSetup)) }), "0.25.0 · собственная настройка qwen")]
     #[case(Some(AgentState::Unavailable("Codex не найден".to_owned())), "недоступен: Codex не найден")]
     fn agent_lines(#[case] state: Option<AgentState>, #[case] expected: &str) {
         assert_eq!(agent_line(state.as_ref()), expected);

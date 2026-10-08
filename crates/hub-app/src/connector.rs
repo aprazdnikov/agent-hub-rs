@@ -10,6 +10,7 @@ use std::sync::Arc;
 
 use futures::future::BoxFuture;
 use hub_core::settings::Settings;
+use hub_qwen::backend::QwenAuth;
 use hub_telegram::agents::HubAgents;
 use hub_telegram::hub::{self, HubHandle, HubMessage, HubSetup};
 use hub_telegram::paths::{CwdError, workspace_root};
@@ -18,7 +19,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::error::StoreError;
-use crate::supervisor::{AgentState, AgentStatus, Connector, Started};
+use crate::supervisor::{AgentAuth, AgentState, AgentStatus, Connector, Started};
 use crate::topics::{FileTopics, load_topics};
 
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +30,8 @@ pub enum AgentError {
     Codex(#[from] hub_codex::version::CliError),
     #[error(transparent)]
     Login(#[from] ProbeError),
+    #[error(transparent)]
+    Qwen(#[from] hub_qwen::version::CliError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -59,10 +62,19 @@ async fn check_agent(kind: BackendKind, settings: &Settings) -> Result<AgentStat
                     "codex is not logged in: run `codex login` or set an OpenAI API key"
                 );
             }
+            Ok(AgentState::Ready {
+                version: version.to_string(),
+                auth: Some(AgentAuth::Codex(auth)),
+            })
+        }
+        BackendKind::Qwen => {
+            let cli = hub_qwen::version::locate(settings.qwen.cli.as_deref())?;
+            let version = hub_qwen::version::check(&cli).await?;
+            // Sign-in is not probed: qwen reports it only on session/new, and a trial session
+            // would leave a file in ~/.qwen.
+            let auth = AgentAuth::Qwen(QwenAuth::of(&settings.qwen));
             Ok(AgentState::Ready { version: version.to_string(), auth: Some(auth) })
         }
-        // Replaced by the real check once `hub-qwen` exists.
-        BackendKind::Qwen => Ok(AgentState::Unavailable("Qwen пока не подключён".to_owned())),
     }
 }
 
@@ -161,7 +173,7 @@ async fn shutdown(hub: mpsc::Sender<HubMessage>, listener: Listener, task: JoinH
 #[cfg(test)]
 mod tests {
     use hub_core::domain::BackendKind;
-    use hub_core::settings::Draft;
+    use hub_core::settings::{Draft, QwenDraft};
 
     use crate::supervisor::{AgentState, AgentStatus};
 
@@ -269,5 +281,52 @@ mod tests {
         let error = connector.connect(receiver).await.err().unwrap();
         assert!(matches!(error, StartError::Agent(AgentError::Claude(_))));
         assert!(!TelegramConnector::transient(&error));
+    }
+
+    #[test]
+    fn qwen_that_is_not_the_default_may_be_missing() {
+        let checked = vec![
+            (BackendKind::Claude, Ok(ready("2.1.287"))),
+            (BackendKind::Qwen, Err(AgentError::Qwen(hub_qwen::version::CliError::Missing))),
+        ];
+        assert_eq!(
+            statuses(BackendKind::Claude, checked).unwrap(),
+            [
+                AgentStatus { kind: BackendKind::Claude, state: ready("2.1.287") },
+                AgentStatus {
+                    kind: BackendKind::Qwen,
+                    state: AgentState::Unavailable(
+                        "Qwen Code не найден: укажите путь в настройках или установите `qwen` в PATH"
+                            .to_owned()
+                    ),
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_default_qwen_stops_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let connector = TelegramConnector {
+            home: dir.path().to_path_buf(),
+            topics: dir.path().join("topics.json"),
+        };
+        let settings = Draft {
+            token: "1:a".to_owned(),
+            chat: "-100".to_owned(),
+            users: "1".to_owned(),
+            workspace_root: dir.path().display().to_string(),
+            default_backend: BackendKind::Qwen,
+            qwen: QwenDraft {
+                cli: dir.path().join("нет-qwen").display().to_string(),
+                ..QwenDraft::default()
+            },
+            ..Draft::default()
+        }
+        .parse(dir.path())
+        .unwrap();
+        let receiver = watch::Sender::new(Arc::new(settings)).subscribe();
+        let error = connector.connect(receiver).await.err().unwrap();
+        assert!(matches!(error, StartError::Agent(AgentError::Qwen(_))));
     }
 }
