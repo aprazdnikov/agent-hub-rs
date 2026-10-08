@@ -1,0 +1,8 @@
+---
+source: crates/hub-qwen/src/protocol.rs
+expression: rendered(call(name))
+---
+session/cancel
+{
+  "sessionId": "s-1"
+}

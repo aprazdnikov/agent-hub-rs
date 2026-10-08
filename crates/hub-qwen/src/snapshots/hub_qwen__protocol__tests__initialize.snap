@@ -1,0 +1,20 @@
+---
+source: crates/hub-qwen/src/protocol.rs
+expression: rendered(call(name))
+---
+initialize
+{
+  "clientCapabilities": {
+    "fs": {
+      "readTextFile": false,
+      "writeTextFile": false
+    },
+    "terminal": false
+  },
+  "clientInfo": {
+    "name": "agent-hub",
+    "title": "agent-hub",
+    "version": "test"
+  },
+  "protocolVersion": 1
+}

@@ -1,0 +1,22 @@
+---
+source: crates/hub-qwen/src/protocol.rs
+expression: rendered(call(name))
+---
+session/load
+{
+  "cwd": "[cwd]",
+  "mcpServers": [
+    {
+      "headers": [
+        {
+          "name": "Authorization",
+          "value": "Bearer t0k3n"
+        }
+      ],
+      "name": "agent-hub",
+      "type": "http",
+      "url": "http://127.0.0.1:4321/mcp"
+    }
+  ],
+  "sessionId": "s-1"
+}

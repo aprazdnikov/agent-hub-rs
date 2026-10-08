@@ -1,0 +1,19 @@
+---
+source: crates/hub-qwen/src/protocol.rs
+expression: rendered(call(name))
+---
+session/prompt
+{
+  "prompt": [
+    {
+      "data": "AQID",
+      "mimeType": "image/png",
+      "type": "image"
+    },
+    {
+      "text": "что на фото?",
+      "type": "text"
+    }
+  ],
+  "sessionId": "s-1"
+}
