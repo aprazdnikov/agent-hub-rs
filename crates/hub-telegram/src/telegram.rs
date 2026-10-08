@@ -28,6 +28,7 @@ use tokio::task::JoinHandle;
 
 use crate::hub::HubMessage;
 use crate::inbound::{Attachment, Content, FileRef, Inbound, Press};
+pub use crate::menu::{MenuError, synchronize_commands};
 use crate::messenger::{Format, Messenger, Outgoing, SendError, Target};
 
 // Uploads and downloads of large files take far longer than ordinary requests.

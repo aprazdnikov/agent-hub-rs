@@ -14,16 +14,50 @@ pub enum Command {
 }
 
 impl Command {
+    pub const ALL: [Self; 7] =
+        [Self::New, Self::Backend, Self::Cwd, Self::Reset, Self::Stop, Self::Status, Self::Help];
+
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Help => "help",
+            Self::New => "new",
+            Self::Cwd => "cwd",
+            Self::Reset => "reset",
+            Self::Stop => "stop",
+            Self::Status => "status",
+            Self::Backend => "backend",
+        }
+    }
+
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::Help => "эта справка",
+            Self::New => "новая сессия в этой теме (сброс контекста)",
+            Self::Cwd => "сменить рабочую директорию (сброс контекста)",
+            Self::Reset => "начать разговор заново в той же директории",
+            Self::Stop => "прервать текущую задачу",
+            Self::Status => "состояние сессии",
+            Self::Backend => "сменить агента в этой теме (сброс контекста)",
+        }
+    }
+
+    #[must_use]
+    pub const fn arguments(self) -> &'static str {
+        match self {
+            Self::New => " [агент] [путь]",
+            Self::Backend => " [агент]",
+            Self::Cwd => " <путь>",
+            Self::Help | Self::Reset | Self::Stop | Self::Status => "",
+        }
+    }
+
     fn parse(name: &str) -> Option<Self> {
-        match name.to_lowercase().as_str() {
-            "start" | "help" => Some(Self::Help),
-            "new" => Some(Self::New),
-            "cwd" => Some(Self::Cwd),
-            "reset" => Some(Self::Reset),
-            "stop" => Some(Self::Stop),
-            "status" => Some(Self::Status),
-            "backend" => Some(Self::Backend),
-            _ => None,
+        if name.eq_ignore_ascii_case("start") {
+            Some(Self::Help)
+        } else {
+            Self::ALL.into_iter().find(|command| name.eq_ignore_ascii_case(command.name()))
         }
     }
 }
@@ -113,6 +147,20 @@ mod tests {
 
     use super::*;
     use crate::domain::{AbsolutePath, SessionId, TopicSession};
+
+    #[test]
+    fn menu_registry_is_unique_valid_and_parsed() {
+        let mut names = std::collections::HashSet::new();
+        for command in Command::ALL {
+            let name = command.name();
+            assert!(names.insert(name));
+            assert!((1..=32).contains(&name.len()));
+            assert!(name.bytes().all(|byte| byte.is_ascii_lowercase() || byte == b'_'));
+            assert!((1..=256).contains(&command.description().chars().count()));
+            assert_eq!(Command::parse(name), Some(command));
+        }
+        assert_eq!(names.len(), 7);
+    }
 
     #[rstest]
     #[case(&[], BackendKind::Codex, None)]
