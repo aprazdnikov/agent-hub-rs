@@ -59,11 +59,11 @@ mod tests {
         Reply { status, head: head.to_owned(), body: body.to_owned() }
     }
 
-    fn request(method: &str, path: &str, token: Option<&str>, body: &str) -> String {
+    fn request(address: &str, method: &str, path: &str, token: Option<&str>, body: &str) -> String {
         let auth =
             token.map(|token| format!("Authorization: Bearer {token}\r\n")).unwrap_or_default();
         format!(
-            "{method} {path} HTTP/1.1\r\nHost: 127.0.0.1\r\n{auth}Content-Type: application/json\r\n\
+            "{method} {path} HTTP/1.1\r\nHost: {address}\r\n{auth}Content-Type: application/json\r\n\
              Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
             body.len()
         )
@@ -86,8 +86,13 @@ mod tests {
     async fn requests_without_the_session_token_are_refused() {
         let (channel, server) = start().await;
         let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_file","arguments":{"path":"a.txt"}}}"#;
-        let missing = send(&address(&server), request("POST", "/mcp", None, call)).await;
-        let wrong = send(&address(&server), request("POST", "/mcp", Some("guess"), call)).await;
+        let missing =
+            send(&address(&server), request(&address(&server), "POST", "/mcp", None, call)).await;
+        let wrong = send(
+            &address(&server),
+            request(&address(&server), "POST", "/mcp", Some("guess"), call),
+        )
+        .await;
         assert_eq!((missing.status, wrong.status), (401, 401));
         assert!(channel.sent.lock().unwrap().is_empty());
     }
@@ -99,9 +104,13 @@ mod tests {
         let init = r#"{"jsonrpc":"2.0","id":0,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{}}}"#;
         let initialized = r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#;
         let list = r#"{"jsonrpc":"2.0","id":1,"method":"tools/list"}"#;
-        let init = send(&address(&server), request("POST", "/mcp", token, init)).await;
-        let notified = send(&address(&server), request("POST", "/mcp", token, initialized)).await;
-        let listed = send(&address(&server), request("POST", "/mcp", token, list)).await;
+        let init =
+            send(&address(&server), request(&address(&server), "POST", "/mcp", token, init)).await;
+        let notified =
+            send(&address(&server), request(&address(&server), "POST", "/mcp", token, initialized))
+                .await;
+        let listed =
+            send(&address(&server), request(&address(&server), "POST", "/mcp", token, list)).await;
         let init_body: Value = serde_json::from_str(&init.body).unwrap();
         let listed_body: Value = serde_json::from_str(&listed.body).unwrap();
         assert_eq!(
@@ -121,8 +130,11 @@ mod tests {
     async fn send_file_reaches_the_user() {
         let (channel, server) = start().await;
         let call = r#"{"jsonrpc":"2.0","id":7,"method":"tools/call","params":{"name":"send_file","arguments":{"path":"out/a.txt","caption":"отчёт"}}}"#;
-        let reply =
-            send(&address(&server), request("POST", "/mcp", Some(server.token()), call)).await;
+        let reply = send(
+            &address(&server),
+            request(&address(&server), "POST", "/mcp", Some(server.token()), call),
+        )
+        .await;
         let body: Value = serde_json::from_str(&reply.body).unwrap();
         assert_eq!(
             body,
@@ -138,18 +150,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_and_foreign_host_requests_are_forbidden() {
+        let (channel, server) = start().await;
+        let call = r#"{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"send_file","arguments":{"path":"a.txt"}}}"#;
+        let address = address(&server);
+        let with_origin = request(&address, "POST", "/mcp", Some(server.token()), call)
+            .replace("Content-Type", "Origin: http://evil.example\r\nContent-Type");
+        let rebound = request("evil.example", "POST", "/mcp", Some(server.token()), call);
+        let origin = send(&address, with_origin).await;
+        let host = send(&address, rebound).await;
+        assert_eq!((origin.status, origin.body.as_str()), (403, ""));
+        assert_eq!((host.status, host.body.as_str()), (403, ""));
+        assert!(channel.sent.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn wrong_method_path_and_size_are_rejected() {
         let (_channel, server) = start().await;
         let token = Some(server.token());
-        let get = send(&address(&server), request("GET", "/mcp", token, "")).await;
-        let other = send(&address(&server), request("POST", "/other", token, "{}")).await;
+        let get =
+            send(&address(&server), request(&address(&server), "GET", "/mcp", token, "")).await;
+        let other =
+            send(&address(&server), request(&address(&server), "POST", "/other", token, "{}"))
+                .await;
         let huge = format!(
-            "POST /mcp HTTP/1.1\r\nHost: 127.0.0.1\r\nAuthorization: Bearer {}\r\n\
+            "POST /mcp HTTP/1.1\r\nHost: {}\r\nAuthorization: Bearer {}\r\n\
              Content-Type: application/json\r\nContent-Length: 2097152\r\nConnection: close\r\n\r\n",
+            address(&server),
             server.token()
         );
         let huge = send(&address(&server), huge).await;
-        let garbage = send(&address(&server), request("POST", "/mcp", token, "не json")).await;
+        let garbage =
+            send(&address(&server), request(&address(&server), "POST", "/mcp", token, "не json"))
+                .await;
         assert_eq!((get.status, other.status, huge.status, garbage.status), (405, 404, 413, 400));
         assert!(get.head.to_ascii_lowercase().contains("allow: post"));
         assert_eq!(

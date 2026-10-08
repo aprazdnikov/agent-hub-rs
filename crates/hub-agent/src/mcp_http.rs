@@ -1,7 +1,8 @@
 //! The hub's own MCP server for one agent session, over HTTP on the loopback interface.
 //!
-//! It offers only `send_file`. Every request must carry the session's bearer token, so other
-//! local processes and web pages cannot reach the user's chat; dropping the server stops it.
+//! It offers only `send_file`. Every request must carry the session's bearer token and the
+//! server's own `Host`, and none may carry an `Origin`, so other local processes and web pages
+//! (DNS rebinding included) cannot reach the user's chat; dropping the server stops it.
 
 use std::convert::Infallible;
 use std::fmt;
@@ -12,7 +13,9 @@ use std::time::Duration;
 
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::{Bytes, Incoming};
-use hyper::header::{ALLOW, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HeaderValue};
+use hyper::header::{
+    ALLOW, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderValue, ORIGIN,
+};
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -60,7 +63,8 @@ impl McpHttpServer {
         let port = listener.local_addr()?.port();
         let token = new_token();
         let stop = CancellationToken::new();
-        let state = Arc::new(State { token: token.clone(), channel });
+        let state =
+            Arc::new(State { token: token.clone(), host: format!("127.0.0.1:{port}"), channel });
         tokio::spawn(accept(listener, state, stop.clone()));
         Ok(Self {
             url: format!("http://127.0.0.1:{port}{MCP_PATH}"),
@@ -87,6 +91,8 @@ fn new_token() -> String {
 
 struct State {
     token: String,
+    /// The only `Host` the server answers to: its own loopback address.
+    host: String,
     channel: Arc<dyn UserChannel>,
 }
 
@@ -130,21 +136,46 @@ async fn serve_connection(stream: TcpStream, state: Arc<State>) {
 enum Admission {
     Mcp,
     Unauthorized,
+    Forbidden,
     NotFound,
     MethodNotAllowed,
 }
 
-/// The token is checked before anything else, so an unauthenticated caller learns nothing.
-fn admit(
-    method: &Method,
-    path: &str,
-    authorization: Option<&HeaderValue>,
-    token: &str,
-) -> Admission {
-    let expected = format!("Bearer {token}");
-    let presented = authorization.map_or(b"".as_slice(), HeaderValue::as_bytes);
-    if !bool::from(presented.ct_eq(expected.as_bytes())) {
+struct Headers {
+    authorization: Option<HeaderValue>,
+    host: Option<HeaderValue>,
+    origin: Option<HeaderValue>,
+}
+
+impl Headers {
+    fn of(request: &Request<Incoming>) -> Self {
+        let headers = request.headers();
+        Self {
+            authorization: headers.get(AUTHORIZATION).cloned(),
+            host: headers.get(HOST).cloned(),
+            origin: headers.get(ORIGIN).cloned(),
+        }
+    }
+}
+
+struct Expected<'a> {
+    token: &'a str,
+    host: &'a str,
+}
+
+/// The token is checked first, so an unauthenticated caller learns nothing, not even the rules
+/// below. Then the DNS-rebinding guard the MCP transport requires: a browser always sends
+/// `Origin` (qwen's Node client sends none), and a rebound page carries a foreign `Host`; a
+/// missing `Host` is refused because HTTP/1.1 requires one.
+fn admit(method: &Method, path: &str, headers: &Headers, expected: &Expected<'_>) -> Admission {
+    let wanted = format!("Bearer {}", expected.token);
+    let presented = headers.authorization.as_ref().map_or(b"".as_slice(), HeaderValue::as_bytes);
+    if !bool::from(presented.ct_eq(wanted.as_bytes())) {
         return Admission::Unauthorized;
+    }
+    let host_matches = headers.host.as_ref().is_some_and(|host| host == expected.host);
+    if headers.origin.is_some() || !host_matches {
+        return Admission::Forbidden;
     }
     if path != MCP_PATH {
         return Admission::NotFound;
@@ -217,11 +248,12 @@ async fn respond(request: Request<Incoming>, state: &State) -> Response<Full<Byt
     let admission = admit(
         request.method(),
         request.uri().path(),
-        request.headers().get(AUTHORIZATION),
-        &state.token,
+        &Headers::of(&request),
+        &Expected { token: &state.token, host: &state.host },
     );
     match admission {
         Admission::Unauthorized => return empty(StatusCode::UNAUTHORIZED),
+        Admission::Forbidden => return empty(StatusCode::FORBIDDEN),
         Admission::NotFound => return empty(StatusCode::NOT_FOUND),
         Admission::MethodNotAllowed => {
             let mut response = empty(StatusCode::METHOD_NOT_ALLOWED);
@@ -305,21 +337,124 @@ mod tests {
 
     const TOKEN: &str = "t0k3n";
 
+    const HOST: &str = "127.0.0.1:4321";
+
     #[rstest]
-    #[case::no_token(Method::POST, "/mcp", None, Admission::Unauthorized)]
-    #[case::wrong_token(Method::POST, "/mcp", Some("Bearer nope"), Admission::Unauthorized)]
-    #[case::token_without_scheme(Method::POST, "/mcp", Some("t0k3n"), Admission::Unauthorized)]
-    #[case::unknown_path(Method::POST, "/other", Some("Bearer t0k3n"), Admission::NotFound)]
-    #[case::get(Method::GET, "/mcp", Some("Bearer t0k3n"), Admission::MethodNotAllowed)]
-    #[case::post(Method::POST, "/mcp", Some("Bearer t0k3n"), Admission::Mcp)]
+    #[case::no_token(Method::POST, "/mcp", None, Some(HOST), None, Admission::Unauthorized)]
+    #[case::wrong_token(
+        Method::POST,
+        "/mcp",
+        Some("Bearer nope"),
+        Some(HOST),
+        None,
+        Admission::Unauthorized
+    )]
+    #[case::token_without_scheme(
+        Method::POST,
+        "/mcp",
+        Some("t0k3n"),
+        Some(HOST),
+        None,
+        Admission::Unauthorized
+    )]
+    #[case::unknown_path(
+        Method::POST,
+        "/other",
+        Some("Bearer t0k3n"),
+        Some(HOST),
+        None,
+        Admission::NotFound
+    )]
+    #[case::get(
+        Method::GET,
+        "/mcp",
+        Some("Bearer t0k3n"),
+        Some(HOST),
+        None,
+        Admission::MethodNotAllowed
+    )]
+    #[case::post(Method::POST, "/mcp", Some("Bearer t0k3n"), Some(HOST), None, Admission::Mcp)]
+    #[case::origin_present(
+        Method::POST,
+        "/mcp",
+        Some("Bearer t0k3n"),
+        Some(HOST),
+        Some("http://evil.example"),
+        Admission::Forbidden
+    )]
+    #[case::origin_null(
+        Method::POST,
+        "/mcp",
+        Some("Bearer t0k3n"),
+        Some(HOST),
+        Some("null"),
+        Admission::Forbidden
+    )]
+    #[case::foreign_host(
+        Method::POST,
+        "/mcp",
+        Some("Bearer t0k3n"),
+        Some("evil.example"),
+        None,
+        Admission::Forbidden
+    )]
+    #[case::wrong_port(
+        Method::POST,
+        "/mcp",
+        Some("Bearer t0k3n"),
+        Some("127.0.0.1:9999"),
+        None,
+        Admission::Forbidden
+    )]
+    #[case::host_without_port(
+        Method::POST,
+        "/mcp",
+        Some("Bearer t0k3n"),
+        Some("127.0.0.1"),
+        None,
+        Admission::Forbidden
+    )]
+    #[case::localhost_name(
+        Method::POST,
+        "/mcp",
+        Some("Bearer t0k3n"),
+        Some("localhost:4321"),
+        None,
+        Admission::Forbidden
+    )]
+    #[case::missing_host(
+        Method::POST,
+        "/mcp",
+        Some("Bearer t0k3n"),
+        None,
+        None,
+        Admission::Forbidden
+    )]
+    #[case::unauthenticated_origin_learns_nothing(
+        Method::POST,
+        "/mcp",
+        None,
+        Some("evil.example"),
+        Some("http://evil.example"),
+        Admission::Unauthorized
+    )]
     fn requests_are_admitted(
         #[case] method: Method,
         #[case] path: &str,
         #[case] authorization: Option<&'static str>,
+        #[case] host: Option<&'static str>,
+        #[case] origin: Option<&'static str>,
         #[case] expected: Admission,
     ) {
-        let header = authorization.map(HeaderValue::from_static);
-        assert_eq!(admit(&method, path, header.as_ref(), TOKEN), expected);
+        let headers = Headers {
+            authorization: authorization.map(HeaderValue::from_static),
+            host: host.map(HeaderValue::from_static),
+            origin: origin.map(HeaderValue::from_static),
+        };
+        assert_eq!(
+            admit(&method, path, &headers, &Expected { token: TOKEN, host: HOST }),
+            expected
+        );
     }
 
     #[rstest]
