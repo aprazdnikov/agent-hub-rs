@@ -412,6 +412,7 @@ mod tests {
         let (drain, _requests) = drain_channel();
         let started = tokio::time::Instant::now();
         assert!(drain.take().await.is_empty());
+        assert!(started.elapsed() >= DRAIN_DEADLINE);
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 
@@ -428,11 +429,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stop_wins_over_a_prompt_that_arrived_at_the_same_moment() {
+    async fn stop_and_a_finished_turn_at_the_same_moment_send_no_second_prompt() {
         for _ in 0..20 {
             let harness = start();
             eventually("started", || harness.agent.calls().len() == 1).await;
             harness.inbox.send(prompt("одновременно")).await.unwrap();
+            // No await between the two: the loop wakes with both the reply and the stop ready.
+            harness.ends.send(Ok(StopReason::EndTurn)).unwrap();
             harness.cancel.cancel();
             let (mut inbox, outcome) = harness.done.await.unwrap();
             assert_eq!(outcome, Ok(()));
@@ -442,6 +445,28 @@ mod tests {
                 Some("одновременно".to_owned())
             );
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_prompt_handed_to_a_drain_that_gave_up_starts_the_next_turn_first() {
+        let harness = start();
+        eventually("started", || harness.agent.calls().len() == 1).await;
+        harness.inbox.send(prompt("опоздавший")).await.unwrap();
+        // A handler that timed out: its receiving end is gone before the loop answers.
+        let (reply, handed) = oneshot::channel();
+        drop(handed);
+        harness.drain.requests.send(reply).await.unwrap();
+        harness.inbox.send(prompt("следующий")).await.unwrap();
+        eventually("late drain taken", || harness.inbox.capacity() == harness.inbox.max_capacity())
+            .await;
+        for turns in 2..=3 {
+            harness.ends.send(Ok(StopReason::EndTurn)).unwrap();
+            eventually("next turn", || harness.agent.calls().len() == turns).await;
+        }
+        harness.ends.send(Ok(StopReason::EndTurn)).unwrap();
+        let (_inbox, outcome) = harness.done.await.unwrap();
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(harness.agent.calls(), ["prompt:hi", "prompt:опоздавший", "prompt:следующий"]);
     }
 
     #[tokio::test]
