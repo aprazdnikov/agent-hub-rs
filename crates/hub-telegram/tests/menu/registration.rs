@@ -61,10 +61,8 @@ fn menu_key(scope: &Value, language: &str) -> String {
 async fn api(policy: Policy) -> Api {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
-    let client = teloxide::net::default_reqwest_settings()
-        .timeout(Duration::from_secs(120))
-        .build()
-        .unwrap();
+    let client =
+        teloxide::net::default_reqwest_settings().timeout(Duration::from_mins(2)).build().unwrap();
     let bot = Bot::with_client("1:test", client)
         .set_api_url(format!("http://{address}/").parse().unwrap());
     let state = Arc::new(Mutex::new(State::default()));
