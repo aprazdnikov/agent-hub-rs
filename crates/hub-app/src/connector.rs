@@ -142,6 +142,9 @@ impl Connector for TelegramConnector {
             }
             let Connection { bot, messenger, username } =
                 telegram::connect(&current.telegram.token, current.telegram.chat).await?;
+            if let Err(error) = telegram::synchronize_commands(&bot, &current.telegram).await {
+                tracing::warn!(%error, "command menu not synchronized; bot will keep running");
+            }
             let HubHandle { mailbox, views, registries: _registries, task } =
                 hub::spawn(HubSetup {
                     agents: Arc::new(HubAgents::new(settings.clone())),

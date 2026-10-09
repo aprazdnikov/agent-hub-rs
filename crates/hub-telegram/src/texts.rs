@@ -5,6 +5,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use hub_core::attachments::UPLOADS_DIR;
+use hub_core::commands::Command;
 use hub_core::domain::{AbsolutePath, BackendKind, Decision, ToolRequest, ToolUse, TopicSession};
 use hub_core::escape::escape;
 use hub_core::render::truncate;
@@ -40,16 +41,20 @@ const FAILURE_TEXT_LIMIT: usize = 3500;
 pub fn help(root: &Path) -> String {
     let uploads = UPLOADS_DIR.join("/");
     let backends = backend_names();
+    let backend_choices =
+        BackendKind::ALL.iter().map(|kind| kind.name()).collect::<Vec<_>>().join("|");
+    let commands = Command::ALL
+        .into_iter()
+        .map(|command| {
+            let arguments = command.arguments().replace("агент", &backend_choices);
+            format!("/{}{arguments} — {}", command.name(), command.description())
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
     format!(
         "Каждая тема этой группы — отдельная сессия агента.\n\n\
          Просто пишите задачу в теме. Команды:\n\
-         /new [claude|codex|qwen|hermes] [путь] — новая сессия в этой теме (сброс контекста)\n\
-         /backend [claude|codex|qwen|hermes] — сменить агента в этой теме (сброс контекста)\n\
-         /cwd <путь> — сменить рабочую директорию (сброс контекста)\n\
-         /reset — начать разговор заново в той же директории\n\
-         /stop — прервать текущую задачу\n\
-         /status — состояние сессии\n\
-         /help — эта справка\n\n\
+         {commands}\n\n\
          Можно прикладывать фото (агент их видит) и файлы (сохраняются в {uploads} в\n\
          рабочей директории). Голосовые сообщения не поддерживаются.\n\n\
          Пути абсолютные или относительно корня: {}\n\
@@ -157,6 +162,10 @@ mod tests {
         assert!(text.contains(
             "/backend [claude|codex|qwen|hermes] — сменить агента в этой теме (сброс контекста)"
         ));
+        for command in Command::ALL {
+            assert!(text.contains(&format!("/{}", command.name())));
+            assert!(text.contains(command.description()));
+        }
     }
 
     #[test]
