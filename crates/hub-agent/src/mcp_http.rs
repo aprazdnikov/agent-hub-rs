@@ -1,6 +1,6 @@
 //! The hub's own MCP server for one agent session, over HTTP on the loopback interface.
 //!
-//! It offers only `send_file`. Every request must carry the session's bearer token and the
+//! It offers `send_file`, with opt-in `ask_user`. Every request carries a bearer token and the
 //! server's own `Host`, and none may carry an `Origin`, so other local processes and web pages
 //! (DNS rebinding included) cannot reach the user's chat; dropping the server stops it.
 
@@ -12,6 +12,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
+use hub_core::domain::QuestionsOutcome;
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{
     ALLOW, AUTHORIZATION, CONTENT_LENGTH, CONTENT_TYPE, HOST, HeaderValue, ORIGIN,
@@ -29,7 +30,10 @@ use uuid::Uuid;
 
 use crate::channel::UserChannel;
 use crate::rpc::{INVALID_PARAMS, METHOD_NOT_FOUND};
-use crate::tools::{SEND_FILE, SEND_FILE_DESCRIPTION, ToolResult, deliver_file, send_file_schema};
+use crate::tools::{
+    ASK_USER, ASK_USER_DESCRIPTION, ASK_USER_SHAPE, SEND_FILE, SEND_FILE_DESCRIPTION, ToolResult,
+    ask_user_schema, deliver_file, parse_questions, send_file_schema,
+};
 
 pub const SERVER_NAME: &str = "agent-hub";
 pub const MCP_PATH: &str = "/mcp";
@@ -58,13 +62,26 @@ impl fmt::Debug for McpHttpServer {
 }
 
 impl McpHttpServer {
+    /// Adds the hub's question tool for agents without native user-question transport.
+    pub async fn start_with_questions(channel: Arc<dyn UserChannel>) -> io::Result<Self> {
+        Self::start_tools(channel, Tools::FilesAndQuestions).await
+    }
+
     pub async fn start(channel: Arc<dyn UserChannel>) -> io::Result<Self> {
+        Self::start_tools(channel, Tools::Files).await
+    }
+
+    async fn start_tools(channel: Arc<dyn UserChannel>, tools: Tools) -> io::Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let port = listener.local_addr()?.port();
         let token = new_token();
         let stop = CancellationToken::new();
-        let state =
-            Arc::new(State { token: token.clone(), host: format!("127.0.0.1:{port}"), channel });
+        let state = Arc::new(State {
+            token: token.clone(),
+            host: format!("127.0.0.1:{port}"),
+            channel,
+            tools,
+        });
         tokio::spawn(accept(listener, state, stop.clone()));
         Ok(Self {
             url: format!("http://127.0.0.1:{port}{MCP_PATH}"),
@@ -89,11 +106,18 @@ fn new_token() -> String {
     format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
+#[derive(Clone, Copy)]
+enum Tools {
+    Files,
+    FilesAndQuestions,
+}
+
 struct State {
     token: String,
     /// The only `Host` the server answers to: its own loopback address.
     host: String,
     channel: Arc<dyn UserChannel>,
+    tools: Tools,
 }
 
 async fn accept(listener: TcpListener, state: Arc<State>, stop: CancellationToken) {
@@ -192,9 +216,10 @@ enum Step {
     Accepted,
     Invalid(Value),
     SendFile { id: Value, arguments: Value },
+    AskUser { id: Value, arguments: Value },
 }
 
-fn dispatch(message: &Value) -> Step {
+fn dispatch(message: &Value, tools: Tools) -> Step {
     let Some(object) = message.as_object() else {
         return Step::Invalid(rpc_error(&Value::Null, INVALID_REQUEST, "Invalid request"));
     };
@@ -220,16 +245,13 @@ fn dispatch(message: &Value) -> Step {
             ))
         }
         "ping" => Step::Reply(rpc_result(&id, &json!({}))),
-        "tools/list" => Step::Reply(rpc_result(
-            &id,
-            &json!({"tools": [{
-                "name": SEND_FILE,
-                "description": SEND_FILE_DESCRIPTION,
-                "inputSchema": send_file_schema(),
-            }]}),
-        )),
+        "tools/list" => Step::Reply(rpc_result(&id, &json!({"tools": tool_schemas(tools)}))),
         "tools/call" => match message.pointer("/params/name").and_then(Value::as_str) {
             Some(SEND_FILE) => Step::SendFile {
+                id,
+                arguments: message.pointer("/params/arguments").cloned().unwrap_or(Value::Null),
+            },
+            Some(ASK_USER) if matches!(tools, Tools::FilesAndQuestions) => Step::AskUser {
                 id,
                 arguments: message.pointer("/params/arguments").cloned().unwrap_or(Value::Null),
             },
@@ -288,7 +310,7 @@ async fn respond(request: Request<Incoming>, state: &State) -> Response<Full<Byt
             &rpc_error(&Value::Null, PARSE_ERROR, "Parse error"),
         );
     };
-    match dispatch(&message) {
+    match dispatch(&message, state.tools) {
         Step::Reply(reply) => json_response(StatusCode::OK, &reply),
         Step::Accepted => empty(StatusCode::ACCEPTED),
         Step::Invalid(reply) => json_response(StatusCode::BAD_REQUEST, &reply),
@@ -296,6 +318,41 @@ async fn respond(request: Request<Incoming>, state: &State) -> Response<Full<Byt
             let result = deliver_file(&arguments, state.channel.as_ref()).await;
             json_response(StatusCode::OK, &rpc_result(&id, &tool_result(result)))
         }
+        Step::AskUser { id, arguments } => {
+            let result = ask_user(&arguments, state.channel.as_ref()).await;
+            json_response(StatusCode::OK, &rpc_result(&id, &tool_result(result)))
+        }
+    }
+}
+
+fn tool_schemas(tools: Tools) -> Vec<Value> {
+    let file = json!({"name": SEND_FILE, "description": SEND_FILE_DESCRIPTION, "inputSchema": send_file_schema()});
+    match tools {
+        Tools::Files => vec![file],
+        Tools::FilesAndQuestions => vec![
+            file,
+            json!({
+                "name": ASK_USER, "description": ASK_USER_DESCRIPTION, "inputSchema": ask_user_schema(),
+            }),
+        ],
+    }
+}
+
+async fn ask_user(arguments: &Value, channel: &dyn UserChannel) -> ToolResult {
+    let Some(questions) = parse_questions(arguments) else {
+        return ToolResult::Error(ASK_USER_SHAPE.to_owned());
+    };
+    if questions.len() > 5 || questions.iter().any(|question| question.options().len() > 4) {
+        return ToolResult::Error("At most five questions with four options each".to_owned());
+    }
+    match channel.ask(questions).await {
+        QuestionsOutcome::Answered(answers) => ToolResult::Success(
+            json!({"answers": answers.into_iter().map(|answer| {
+            json!({"question": answer.question, "answer": answer.answer})
+        }).collect::<Vec<_>>()})
+            .to_string(),
+        ),
+        QuestionsOutcome::Denied(denied) => ToolResult::Error(denied.reason),
     }
 }
 
@@ -466,14 +523,16 @@ mod tests {
     #[case::send_file(json!({"jsonrpc": "2.0", "id": 5, "method": "tools/call", "params": {"name": "send_file", "arguments": {"path": "a.txt"}}}), Step::SendFile { id: json!(5), arguments: json!({"path": "a.txt"}) })]
     #[case::not_an_object(json!([1]), Step::Invalid(json!({"jsonrpc": "2.0", "id": null, "error": {"code": -32600, "message": "Invalid request"}})))]
     fn messages_are_dispatched(#[case] message: Value, #[case] expected: Step) {
-        assert_eq!(dispatch(&message), expected);
+        assert_eq!(dispatch(&message, Tools::Files), expected);
     }
 
     #[test]
     fn initialize_echoes_the_protocol_and_names_the_server() {
         let message = json!({"jsonrpc": "2.0", "id": 0, "method": "initialize",
                              "params": {"protocolVersion": "2025-03-26", "capabilities": {}}});
-        let Step::Reply(reply) = dispatch(&message) else { panic!("expected a reply") };
+        let Step::Reply(reply) = dispatch(&message, Tools::Files) else {
+            panic!("expected a reply")
+        };
         assert_eq!(
             (
                 reply.pointer("/result/protocolVersion"),
@@ -487,7 +546,7 @@ mod tests {
     #[test]
     fn tools_list_offers_only_send_file() {
         let Step::Reply(reply) =
-            dispatch(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}))
+            dispatch(&json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}), Tools::Files)
         else {
             panic!("expected a reply")
         };

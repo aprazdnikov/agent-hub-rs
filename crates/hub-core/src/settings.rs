@@ -263,6 +263,14 @@ pub struct QwenSettings {
     pub endpoint: Option<ApiEndpoint>,
 }
 
+/// Overrides only; authentication and provider setup remain with the Hermes operator.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HermesSettings {
+    pub cli: Option<PathBuf>,
+    pub profile: Option<String>,
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
     pub approval: Duration,
@@ -278,6 +286,7 @@ pub struct Settings {
     pub claude: ClaudeSettings,
     pub codex: CodexSettings,
     pub qwen: QwenSettings,
+    pub hermes: HermesSettings,
     pub timeouts: Timeouts,
     pub updates: UpdateCheck,
 }
@@ -297,6 +306,14 @@ pub enum Field {
     DefaultBackend,
     Codex(CodexField),
     Qwen(QwenField),
+    Hermes(HermesField),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HermesField {
+    Cli,
+    Profile,
+    Model,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -392,6 +409,24 @@ impl fmt::Debug for QwenDraft {
 }
 
 /// The settings form as typed by the user.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct HermesDraft {
+    pub cli: String,
+    pub profile: String,
+    pub model: String,
+}
+
+impl HermesDraft {
+    fn parse(&self, home: &Path, errors: &mut Vec<FieldError>) -> Option<HermesSettings> {
+        let Self { cli, profile, model } = self;
+        let cli = check(errors, Field::Hermes(HermesField::Cli), parse_cli(cli, home));
+        let profile = check(errors, Field::Hermes(HermesField::Profile), parse_profile(profile));
+        let model = check(errors, Field::Hermes(HermesField::Model), parse_model(model));
+        Some(HermesSettings { cli: cli?, profile: profile?, model: model? })
+    }
+}
+
+/// The settings form as typed by the user.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Draft {
     pub token: String,
@@ -405,6 +440,7 @@ pub struct Draft {
     pub budget: String,
     pub codex: CodexDraft,
     pub qwen: QwenDraft,
+    pub hermes: HermesDraft,
     pub approval_timeout: String,
     pub background_timeout: String,
     pub updates: UpdateCheck,
@@ -424,6 +460,7 @@ impl Default for Draft {
             budget: String::new(),
             codex: CodexDraft::default(),
             qwen: QwenDraft::default(),
+            hermes: HermesDraft::default(),
             approval_timeout: DEFAULT_APPROVAL_TIMEOUT.as_secs().to_string(),
             background_timeout: DEFAULT_BACKGROUND_TIMEOUT.as_secs().to_string(),
             updates: UpdateCheck::Enabled,
@@ -445,6 +482,7 @@ impl fmt::Debug for Draft {
             budget,
             codex,
             qwen,
+            hermes,
             approval_timeout,
             background_timeout,
             updates,
@@ -461,6 +499,7 @@ impl fmt::Debug for Draft {
             .field("budget", budget)
             .field("codex", codex)
             .field("qwen", qwen)
+            .field("hermes", hermes)
             .field("approval_timeout", approval_timeout)
             .field("background_timeout", background_timeout)
             .field("updates", updates)
@@ -495,6 +534,7 @@ impl Draft {
         let endpoint = parse_endpoint(&self.qwen.base_url, &self.qwen.api_key)
             .map_err(|error| errors.push(error))
             .ok();
+        let hermes = self.hermes.parse(home, &mut errors);
         let approval =
             check(&mut errors, Field::ApprovalTimeout, parse_seconds(&self.approval_timeout));
         let background =
@@ -513,6 +553,7 @@ impl Draft {
             Some(qwen_cli),
             Some(qwen_model),
             Some(endpoint),
+            Some(hermes),
             Some(approval),
             Some(background),
         ) = (
@@ -529,6 +570,7 @@ impl Draft {
             qwen_cli,
             qwen_model,
             endpoint,
+            hermes,
             approval,
             background,
         )
@@ -553,6 +595,7 @@ impl Draft {
                 approval: self.qwen.approval,
                 endpoint,
             },
+            hermes,
             timeouts: Timeouts { approval, background },
             updates: self.updates,
         })
@@ -624,6 +667,16 @@ impl Draft {
                     .map(|endpoint| endpoint.key().expose().to_owned())
                     .unwrap_or_default(),
             },
+            hermes: HermesDraft {
+                cli: settings
+                    .hermes
+                    .cli
+                    .as_ref()
+                    .map(|cli| cli.display().to_string())
+                    .unwrap_or_default(),
+                profile: settings.hermes.profile.clone().unwrap_or_default(),
+                model: settings.hermes.model.clone().unwrap_or_default(),
+            },
             approval_timeout: settings.timeouts.approval.as_secs().to_string(),
             background_timeout: settings.timeouts.background.as_secs().to_string(),
             updates: settings.updates,
@@ -692,6 +745,15 @@ fn parse_model(raw: &str) -> Result<Option<String>, String> {
     let trimmed = raw.trim();
     if trimmed.chars().any(char::is_whitespace) {
         return Err("Имя модели не должно содержать пробелов".to_owned());
+    }
+    Ok((!trimmed.is_empty()).then(|| trimmed.to_owned()))
+}
+
+/// Empty means the operator's default Hermes profile.
+fn parse_profile(raw: &str) -> Result<Option<String>, String> {
+    let trimmed = raw.trim();
+    if trimmed.chars().any(char::is_whitespace) {
+        return Err("Имя профиля не должно содержать пробелов".to_owned());
     }
     Ok((!trimmed.is_empty()).then(|| trimmed.to_owned()))
 }
@@ -774,6 +836,8 @@ pub struct SettingsFile {
     #[serde(default)]
     pub qwen: QwenFile,
     #[serde(default)]
+    pub hermes: HermesFile,
+    #[serde(default)]
     pub timeouts: TimeoutsFile,
     #[serde(default)]
     pub updates: UpdatesFile,
@@ -827,6 +891,15 @@ pub struct QwenFile {
     pub base_url: Option<String>,
 }
 
+/// Hermes overrides; credentials remain in the operator's own Hermes setup.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HermesFile {
+    pub cli: Option<String>,
+    pub profile: Option<String>,
+    pub model: Option<String>,
+}
+
 /// Secrets the file does not hold, read from the keyring by the caller.
 pub struct Keys {
     pub token: String,
@@ -878,6 +951,11 @@ impl SettingsFile {
                     .endpoint
                     .as_ref()
                     .map(|endpoint| endpoint.base_url().to_owned()),
+            },
+            hermes: HermesFile {
+                cli: settings.hermes.cli.as_ref().map(|cli| cli.display().to_string()),
+                profile: settings.hermes.profile.clone(),
+                model: settings.hermes.model.clone(),
             },
             timeouts: TimeoutsFile {
                 approval_seconds: Some(settings.timeouts.approval.as_secs()),
@@ -954,6 +1032,11 @@ impl SettingsFile {
                 approval: qwen_approval,
                 base_url: self.qwen.base_url.clone().unwrap_or_default(),
                 api_key: qwen_key,
+            },
+            hermes: HermesDraft {
+                cli: self.hermes.cli.clone().unwrap_or_default(),
+                profile: self.hermes.profile.clone().unwrap_or_default(),
+                model: self.hermes.model.clone().unwrap_or_default(),
             },
             approval_timeout: self
                 .timeouts
@@ -1124,6 +1207,125 @@ mod tests {
     }
 
     #[test]
+    fn hermes_file_section_and_default_are_supported() {
+        let text = "[telegram]\nchat = -100\nusers = [1]\n\
+                    [workspace]\nroot = \"~/w\"\n\
+                    [agents]\ndefault = \"hermes\"\n\
+                    [hermes]\ncli = \"~/bin/hermes\"\nprofile = \"work\"\nmodel = \"test-model\"\n";
+        let file: SettingsFile = toml::from_str(text).unwrap();
+        let keys =
+            Keys { token: "1:a".to_owned(), api_key: String::new(), qwen_key: String::new() };
+        let settings = file.to_draft(keys).unwrap().parse(&home()).unwrap();
+        assert_eq!(
+            (settings.default_backend.name(), settings.hermes),
+            (
+                "hermes",
+                HermesSettings {
+                    cli: Some(home().join("bin/hermes")),
+                    profile: Some("work".to_owned()),
+                    model: Some("test-model".to_owned()),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn hermes_file_rejects_a_spaced_profile() {
+        let text = "[telegram]\nchat = -100\nusers = [1]\n\
+                    [workspace]\nroot = \"~/w\"\n\
+                    [hermes]\nprofile = \"bad profile\"\n";
+        let file: SettingsFile = toml::from_str(text).unwrap();
+        let keys =
+            Keys { token: "1:a".to_owned(), api_key: String::new(), qwen_key: String::new() };
+        assert_eq!(
+            file.to_draft(keys).unwrap().parse(&home()).unwrap_err(),
+            [FieldError {
+                field: Field::Hermes(HermesField::Profile),
+                message: "Имя профиля не должно содержать пробелов".to_owned(),
+            }]
+        );
+    }
+
+    #[test]
+    fn hermes_defaults_preserve_the_operators_setup() {
+        assert_eq!(
+            draft().parse(&home()).unwrap().hermes,
+            HermesSettings { cli: None, profile: None, model: None }
+        );
+    }
+
+    #[test]
+    fn hermes_draft_and_file_round_trip() {
+        let input = Draft {
+            default_backend: BackendKind::Hermes,
+            hermes: HermesDraft {
+                cli: " ~/bin/hermes ".to_owned(),
+                profile: " work ".to_owned(),
+                model: " test-model ".to_owned(),
+            },
+            ..draft()
+        };
+        let settings = input.parse(&home()).unwrap();
+        let text = toml::to_string(&SettingsFile::from_settings(&settings)).unwrap();
+        let file: SettingsFile = toml::from_str(&text).unwrap();
+        let keys = Keys { token: input.token, api_key: String::new(), qwen_key: String::new() };
+        assert_eq!(
+            (
+                Draft::from_settings(&settings).parse(&home()).unwrap(),
+                file.to_draft(keys).unwrap().parse(&home()).unwrap(),
+            ),
+            (settings.clone(), settings)
+        );
+    }
+
+    #[rstest]
+    #[case::relative_cli(HermesDraft { cli: "hermes".to_owned(), profile: String::new(), model: String::new() }, HermesField::Cli)]
+    #[case::spaced_profile(HermesDraft { cli: String::new(), profile: "bad profile".to_owned(), model: String::new() }, HermesField::Profile)]
+    #[case::spaced_model(HermesDraft { cli: String::new(), profile: String::new(), model: "bad model".to_owned() }, HermesField::Model)]
+    fn hermes_invalid_values_report_their_field(
+        #[case] hermes: HermesDraft,
+        #[case] field: HermesField,
+    ) {
+        let errors = Draft { hermes, ..draft() }.parse(&home()).unwrap_err();
+        assert_eq!(
+            errors.iter().map(|error| error.field).collect::<Vec<_>>(),
+            [Field::Hermes(field)]
+        );
+    }
+
+    #[test]
+    fn hermes_errors_are_aggregated_in_form_order() {
+        let errors = Draft {
+            hermes: HermesDraft {
+                cli: "relative".to_owned(),
+                profile: "bad profile".to_owned(),
+                model: "bad model".to_owned(),
+            },
+            ..draft()
+        }
+        .parse(&home())
+        .unwrap_err();
+        assert_eq!(
+            errors.iter().map(|error| error.field).collect::<Vec<_>>(),
+            [
+                Field::Hermes(HermesField::Cli),
+                Field::Hermes(HermesField::Profile),
+                Field::Hermes(HermesField::Model)
+            ]
+        );
+    }
+
+    #[rstest]
+    #[case("api_key")]
+    #[case("provider")]
+    fn hermes_file_rejects_unsupported_fields(#[case] name: &str) {
+        let text = format!(
+            "[telegram]\nchat = -100\nusers = [1]\n[workspace]\nroot = \"~/w\"\n[hermes]\n{name} = \"x\"\n"
+        );
+        assert!(toml::from_str::<SettingsFile>(&text).is_err());
+    }
+
+    #[test]
     fn debug_output_hides_token() {
         let settings = draft().parse(&home()).unwrap();
         assert!(!format!("{settings:?}").contains("123:abc"));
@@ -1207,6 +1409,7 @@ root = \"~/w\"
         assert_eq!(draft.default_backend, BackendKind::Claude);
         assert_eq!(draft.codex, CodexDraft::default());
         assert_eq!(draft.qwen, QwenDraft::default());
+        assert_eq!(draft.hermes, HermesDraft::default());
     }
 
     #[rstest]

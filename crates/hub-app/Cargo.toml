@@ -18,6 +18,7 @@ futures.workspace = true
 hub-claude.workspace = true
 hub-codex.workspace = true
 hub-qwen.workspace = true
+hub-hermes.workspace = true
 hub-core.workspace = true
 hub-telegram.workspace = true
 keyring.workspace = true

@@ -42,10 +42,11 @@ pub enum BackendKind {
     Claude,
     Codex,
     Qwen,
+    Hermes,
 }
 
 impl BackendKind {
-    pub const ALL: [Self; 3] = [Self::Claude, Self::Codex, Self::Qwen];
+    pub const ALL: [Self; 4] = [Self::Claude, Self::Codex, Self::Qwen, Self::Hermes];
 
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -53,6 +54,7 @@ impl BackendKind {
             Self::Claude => "claude",
             Self::Codex => "codex",
             Self::Qwen => "qwen",
+            Self::Hermes => "hermes",
         }
     }
 
@@ -258,12 +260,13 @@ impl Prompt {
     }
 }
 
-/// What the agent reports about a finished turn: Claude counts turns and cost, Codex and Qwen tokens.
+/// What the agent reports about a finished turn: Claude counts turns and cost, other agents tokens.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Usage {
     Claude { turns: u32, cost: Option<Decimal> },
     Codex { tokens: Option<u64> },
     Qwen { tokens: Option<u64> },
+    Hermes { tokens: Option<u64> },
 }
 
 /// One agent turn ended; `background` tasks keep running and report in later turns.
@@ -317,6 +320,22 @@ mod tests {
         #[case] expected: Option<BackendKind>,
     ) {
         assert_eq!(BackendKind::parse(raw), expected);
+    }
+
+    #[rstest]
+    #[case("hermes")]
+    #[case("HERMES")]
+    #[case("Hermes")]
+    fn hermes_backend_has_a_canonical_name(#[case] raw: &str) {
+        assert_eq!(BackendKind::parse(raw).map(BackendKind::name), Some("hermes"));
+    }
+
+    #[test]
+    fn backend_list_includes_hermes_once() {
+        assert_eq!(
+            BackendKind::ALL.into_iter().map(BackendKind::name).collect::<Vec<_>>(),
+            ["claude", "codex", "qwen", "hermes"]
+        );
     }
 
     #[test]

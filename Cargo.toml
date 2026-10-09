@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/hub-core", "crates/hub-agent", "crates/hub-claude", "crates/hub-codex", "crates/hub-qwen", "crates/hub-telegram", "crates/hub-app"]
+members = ["crates/hub-core", "crates/hub-agent", "crates/hub-claude", "crates/hub-codex", "crates/hub-qwen", "crates/hub-hermes", "crates/hub-telegram", "crates/hub-app"]
 
 [workspace.package]
 version = "0.3.1"
@@ -16,6 +16,7 @@ hub-agent = { path = "crates/hub-agent" }
 hub-claude = { path = "crates/hub-claude" }
 hub-codex = { path = "crates/hub-codex" }
 hub-qwen = { path = "crates/hub-qwen" }
+hub-hermes = { path = "crates/hub-hermes" }
 hub-telegram = { path = "crates/hub-telegram" }
 anyhow = "1.0"
 directories = "6.0"

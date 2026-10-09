@@ -48,6 +48,8 @@ pub enum BotStatus {
 pub enum AgentAuth {
     Codex(CodexAuth),
     Qwen(QwenAuth),
+    /// Hermes owns its provider credentials; starting ACP does not prove model sign-in.
+    Hermes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

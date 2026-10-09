@@ -8,6 +8,7 @@ use hub_claude::backend::ClaudeBackend;
 use hub_codex::backend::CodexBackend;
 use hub_core::domain::{AgentEvent, BackendKind, Prompt, TopicSession};
 use hub_core::settings::Settings;
+use hub_hermes::backend::HermesBackend;
 use hub_qwen::backend::QwenBackend;
 use tokio::sync::{mpsc, watch};
 
@@ -50,6 +51,16 @@ impl Agents for HubAgents {
                     match hub_codex::version::locate(settings.codex.cli.as_deref()) {
                         Ok(cli) => {
                             CodexBackend::new(cli, settings.codex.clone())
+                                .run(session, prompt, inbox, conversation)
+                                .await
+                        }
+                        Err(error) => refuse(&conversation, error.to_string(), inbox).await,
+                    }
+                }
+                BackendKind::Hermes => {
+                    match hub_hermes::version::locate(settings.hermes.cli.as_deref()) {
+                        Ok(cli) => {
+                            HermesBackend::new(cli, settings.hermes.clone())
                                 .run(session, prompt, inbox, conversation)
                                 .await
                         }
@@ -176,5 +187,37 @@ mod tests {
             received.recv().await,
             Some(AgentEvent::Failed(hub_qwen::backend::QWEN_FAILED.to_owned()))
         );
+    }
+
+    #[tokio::test]
+    async fn hermes_topics_run_the_configured_hermes_and_preserve_inbox() {
+        let root = std::env::temp_dir();
+        let mut form = Draft {
+            token: "1:a".to_owned(),
+            chat: "-100".to_owned(),
+            users: "1".to_owned(),
+            workspace_root: root.display().to_string(),
+            ..Draft::default()
+        };
+        form.hermes.cli = root.join("definitely-not-hermes-binary").display().to_string();
+        let agents =
+            HubAgents::new(watch::Sender::new(Arc::new(form.parse(&root).unwrap())).subscribe());
+        let session = TopicSession::fresh(BackendKind::Hermes, AbsolutePath::new(root).unwrap());
+        let (events, mut received) = mpsc::channel(4);
+        let conversation = Conversation {
+            channel: Arc::new(Allowing),
+            events,
+            cancel: CancellationToken::new(),
+            limits: Limits::new(Duration::from_secs(1)),
+        };
+        let (queued, inbox) = mpsc::channel(1);
+        queued.send(Prompt::new("later".to_owned(), Vec::new()).unwrap()).await.unwrap();
+        let mut inbox = agents
+            .run(&session, Prompt::new("hi".to_owned(), Vec::new()).unwrap(), inbox, conversation)
+            .await;
+        assert!(
+            matches!(received.recv().await, Some(AgentEvent::Failed(reason)) if reason.contains("Hermes"))
+        );
+        assert_eq!(inbox.try_recv().unwrap().text(), "later");
     }
 }

@@ -19,14 +19,25 @@ mod tests {
     #[derive(Default)]
     struct Recording {
         sent: Mutex<Vec<OutgoingFile>>,
+        asked: Mutex<Vec<Question>>,
+        denial: Option<String>,
     }
 
     impl UserChannel for Recording {
         fn request(&self, _tool: ToolRequest) -> BoxFuture<'_, Decision> {
             Box::pin(async { Decision::Allowed })
         }
-        fn ask(&self, _questions: Vec<Question>) -> BoxFuture<'_, QuestionsOutcome> {
-            Box::pin(async { QuestionsOutcome::Answered(Vec::new()) })
+        fn ask(&self, questions: Vec<Question>) -> BoxFuture<'_, QuestionsOutcome> {
+            self.asked.lock().unwrap().extend(questions);
+            Box::pin(async {
+                if let Some(reason) = &self.denial {
+                    return QuestionsOutcome::Denied(hub_core::domain::Denied::new(reason.clone()));
+                }
+                QuestionsOutcome::Answered(vec![hub_core::domain::QuestionAnswer {
+                    question: "Формат?".to_owned(),
+                    answer: "CSV".to_owned(),
+                }])
+            })
         }
         fn send_file(&self, file: OutgoingFile) -> BoxFuture<'_, FileDelivery> {
             self.sent.lock().unwrap().push(file);
@@ -74,6 +85,116 @@ mod tests {
         let server =
             McpHttpServer::start(Arc::clone(&channel) as Arc<dyn UserChannel>).await.unwrap();
         (channel, server)
+    }
+
+    #[tokio::test]
+    async fn opted_in_questions_reach_the_user() {
+        let channel = Arc::new(Recording::default());
+        let server =
+            McpHttpServer::start_with_questions(Arc::clone(&channel) as Arc<dyn UserChannel>)
+                .await
+                .unwrap();
+        let call = json!({"jsonrpc": "2.0", "id": 9, "method": "tools/call", "params": {
+            "name": "ask_user", "arguments": {"questions": [{"question": "Формат?"}]}
+        }});
+        let reply = send(
+            &address(&server),
+            request(&address(&server), "POST", "/mcp", Some(server.token()), &call.to_string()),
+        )
+        .await;
+        let body: Value = serde_json::from_str(&reply.body).unwrap();
+        assert_eq!(body.pointer("/result/isError"), Some(&json!(false)));
+        assert!(
+            body.pointer("/result/content/0/text")
+                .and_then(Value::as_str)
+                .is_some_and(|text| text.contains("CSV"))
+        );
+        assert_eq!(channel.asked.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn questions_are_opt_in_and_authenticated() {
+        let (channel, files) = start().await;
+        let server =
+            McpHttpServer::start_with_questions(Arc::clone(&channel) as Arc<dyn UserChannel>)
+                .await
+                .unwrap();
+        let call = json!({"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {
+            "name": "ask_user", "arguments": {"questions": [{"question": "Формат?"}]}
+        }})
+        .to_string();
+        let disabled = send(
+            &address(&files),
+            request(&address(&files), "POST", "/mcp", Some(files.token()), &call),
+        )
+        .await;
+        let unauthenticated =
+            send(&address(&server), request(&address(&server), "POST", "/mcp", None, &call)).await;
+        let disabled_body: Value = serde_json::from_str(&disabled.body).unwrap();
+        assert_eq!(disabled_body.pointer("/error/code"), Some(&json!(-32602)));
+        assert_eq!(unauthenticated.status, 401);
+        assert!(channel.asked.lock().unwrap().is_empty());
+        let listed = send(
+            &address(&server),
+            request(
+                &address(&server),
+                "POST",
+                "/mcp",
+                Some(server.token()),
+                r#"{"jsonrpc":"2.0","id":2,"method":"tools/list"}"#,
+            ),
+        )
+        .await;
+        let listed_body: Value = serde_json::from_str(&listed.body).unwrap();
+        assert_eq!(listed_body.pointer("/result/tools/1/name"), Some(&json!("ask_user")));
+        assert_eq!(listed_body.pointer("/result/tools/2"), None);
+    }
+
+    #[tokio::test]
+    async fn malformed_or_excessive_questions_never_reach_the_user() {
+        let channel = Arc::new(Recording::default());
+        let server =
+            McpHttpServer::start_with_questions(Arc::clone(&channel) as Arc<dyn UserChannel>)
+                .await
+                .unwrap();
+        for arguments in [
+            json!({}),
+            json!({"questions": []}),
+            json!({"questions": vec![json!({"question":"q"}); 6]}),
+            json!({"questions": [{"question":"q", "options": vec![json!({"label":"a"}); 5]}]}),
+        ] {
+            let call = json!({"jsonrpc":"2.0", "id":3, "method":"tools/call", "params":{"name":"ask_user", "arguments":arguments}});
+            let reply = send(
+                &address(&server),
+                request(&address(&server), "POST", "/mcp", Some(server.token()), &call.to_string()),
+            )
+            .await;
+            let body: Value = serde_json::from_str(&reply.body).unwrap();
+            assert_eq!(body.pointer("/result/isError"), Some(&json!(true)));
+        }
+        assert!(channel.asked.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn denied_questions_return_a_tool_error() {
+        let channel = Arc::new(Recording {
+            denial: Some("Отклонено".to_owned()),
+            ..Recording::default()
+        });
+        let server = McpHttpServer::start_with_questions(channel).await.unwrap();
+        let call = json!({"jsonrpc":"2.0", "id":4, "method":"tools/call", "params":{
+            "name":"ask_user", "arguments":{"questions":[{"question":"Формат?"}]}
+        }});
+        let reply = send(
+            &address(&server),
+            request(&address(&server), "POST", "/mcp", Some(server.token()), &call.to_string()),
+        )
+        .await;
+        let body: Value = serde_json::from_str(&reply.body).unwrap();
+        assert_eq!(
+            body.get("result"),
+            Some(&json!({"content":[{"type":"text","text":"Отклонено"}],"isError":true}))
+        );
     }
 
     #[tokio::test]

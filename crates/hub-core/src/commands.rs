@@ -165,6 +165,44 @@ mod tests {
     }
 
     #[rstest]
+    #[case(&["hermes"], None)]
+    #[case(&["HERMES", "my", "dir"], Some("my dir"))]
+    fn hermes_new_args_select_backend(#[case] args: &[&str], #[case] cwd: Option<&str>) {
+        let parsed = parse_new_args(args, BackendKind::Claude);
+        assert_eq!((parsed.backend.name(), parsed.cwd.as_deref()), ("hermes", cwd));
+    }
+
+    #[test]
+    fn hermes_backend_switch_resets_context() {
+        let decision = decide_backend(&["Hermes"], &current());
+        assert!(matches!(
+            decision,
+            BackendDecision::Switch(session)
+                if session.backend.name() == "hermes"
+                    && session.cwd == current().cwd
+                    && session.session.is_none()
+        ));
+    }
+
+    #[test]
+    fn hermes_backend_already_selected_keeps_session() {
+        let session = TopicSession::fresh(BackendKind::Hermes, current().cwd)
+            .with_session(SessionId::parse("h-1"));
+        assert_eq!(
+            decide_backend(&["HERMES"], &session),
+            BackendDecision::AlreadySelected(session)
+        );
+    }
+
+    #[test]
+    fn hermes_default_is_used_for_a_new_path() {
+        assert_eq!(
+            parse_new_args(&["shop"], BackendKind::Hermes),
+            NewSessionArgs { backend: BackendKind::Hermes, cwd: Some("shop".to_owned()) }
+        );
+    }
+
+    #[rstest]
     #[case(&["gpt"], "gpt")]
     #[case(&["codex", "now"], "codex now")]
     fn unknown_backend_names_what_was_typed(#[case] args: &[&str], #[case] name: &str) {
