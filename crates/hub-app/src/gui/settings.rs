@@ -99,6 +99,24 @@ impl SettingsForm {
     ) {
         let (errors, parsed) = self.check(home);
         let endpoint = parsed.as_ref().and_then(|settings| settings.qwen.endpoint.as_ref());
+        let changed = self.synced.as_ref().is_none_or(|synced| *synced != self.draft);
+        egui::Panel::bottom("settings_actions").show(ui, |ui| {
+            ui.horizontal(|ui| {
+                let save =
+                    ui.add_enabled(errors.is_empty() && changed, egui::Button::new("Сохранить"));
+                if save.clicked() {
+                    if telegram_changed(self.synced.as_ref(), &self.draft) && sessions > 0 {
+                        self.confirming = true;
+                    } else {
+                        send(Command::Save(Box::new(self.draft.clone())));
+                    }
+                }
+                if ui.add_enabled(changed, egui::Button::new("Отменить изменения")).clicked()
+                {
+                    self.draft = self.synced.clone().unwrap_or_default();
+                }
+            });
+        });
         egui::ScrollArea::vertical().show(ui, |ui| {
             self.telegram(ui, &errors);
             ui.separator();
@@ -111,22 +129,6 @@ impl SettingsForm {
             self.qwen(ui, &errors, endpoint);
             ui.separator();
             self.timeouts(ui, &errors);
-        });
-        ui.separator();
-        let changed = self.synced.as_ref().is_none_or(|synced| *synced != self.draft);
-        ui.horizontal(|ui| {
-            let save = ui.add_enabled(errors.is_empty() && changed, egui::Button::new("Сохранить"));
-            if save.clicked() {
-                if telegram_changed(self.synced.as_ref(), &self.draft) && sessions > 0 {
-                    self.confirming = true;
-                } else {
-                    send(Command::Save(Box::new(self.draft.clone())));
-                }
-            }
-            if ui.add_enabled(changed, egui::Button::new("Отменить изменения")).clicked()
-            {
-                self.draft = self.synced.clone().unwrap_or_default();
-            }
         });
         self.confirm(ui.ctx(), sessions, send);
     }
@@ -412,4 +414,102 @@ impl SettingsForm {
 #[must_use]
 pub fn home_or_root() -> PathBuf {
     directories::BaseDirs::new().map(|dirs| dirs.home_dir().to_path_buf()).unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rstest::rstest;
+
+    #[test]
+    fn visible_save_dispatches_edited_settings() {
+        let home = home_or_root();
+        let draft = Draft {
+            token: "123:test-token".to_owned(),
+            chat: "0".to_owned(),
+            users: "1".to_owned(),
+            workspace_root: home.display().to_string(),
+            ..Draft::default()
+        };
+        let mut form = SettingsForm::default();
+        form.sync(Some(&draft));
+        form.apply(LogAction::UseChat(-100));
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 360.0));
+        let mut commands = Vec::new();
+        let mut frame = |events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput { screen_rect: Some(screen), events, ..Default::default() },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        form.show(ui, &home, 0, &mut |command| commands.push(command));
+                    });
+                },
+            );
+            output.textures_delta.clear();
+            output
+        };
+        let output = frame(Vec::new());
+        let save = output
+            .shapes
+            .iter()
+            .find_map(|clipped| {
+                if let egui::Shape::Text(text) = &clipped.shape
+                    && text.galley.text() == "Сохранить"
+                {
+                    Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                } else {
+                    None
+                }
+            })
+            .expect("save button is painted");
+        assert!(screen.contains(save));
+        for pressed in [true, false] {
+            frame(vec![
+                egui::Event::PointerMoved(save),
+                egui::Event::PointerButton {
+                    pos: save,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+        }
+        assert!(matches!(commands.as_slice(), [Command::Save(saved)] if saved.chat == "-100"));
+    }
+
+    #[rstest]
+    #[case(egui::vec2(960.0, 640.0))]
+    #[case(egui::vec2(640.0, 360.0))]
+    fn settings_actions_remain_visible(#[case] size: egui::Vec2) {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
+        let mut form = SettingsForm::default();
+        for _ in 0..2 {
+            let mut output = ctx.run_ui(
+                egui::RawInput { screen_rect: Some(screen), ..Default::default() },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| {
+                        form.show(ui, Path::new("/"), 0, &mut |_| {});
+                    });
+                },
+            );
+            output.textures_delta.clear();
+            for label in ["Сохранить", "Отменить изменения"] {
+                assert!(
+                    output.shapes.iter().any(|clipped| {
+                        if let egui::Shape::Text(text) = &clipped.shape {
+                            let rect = text.galley.rect.translate(text.pos.to_vec2());
+                            text.galley.text() == label
+                                && screen.contains_rect(rect)
+                                && clipped.clip_rect.contains_rect(rect)
+                        } else {
+                            false
+                        }
+                    }),
+                    "{label} is clipped at {size:?}"
+                );
+            }
+        }
+    }
 }
