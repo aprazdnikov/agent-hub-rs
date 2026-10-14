@@ -4,7 +4,7 @@
 
 **Goal:** команды `/save [имя]`, `/saves`, `/restore <имя> [каталог]` сохраняют данные хаба и историю агента темы в каталог снимков и разворачивают снимок в другой теме для Claude, Codex, Qwen и Hermes; релиз 0.5.0.
 
-**Architecture:** `hub-core::snapshot` — чистые типы (`SnapshotName`, `RelPath`, `BackendData`, `Manifest`, `default_name`) и разбор команд. `hub-agent::archive` — трейт `SessionArchive` (блокирующий, вызывается из `spawn_blocking`), `ArchiveError` и помощники копирования по белому списку (только обычные файлы, без символьных ссылок, `0700`/`0600`, без перезаписи, откат при сбое). Каждый бэкенд-крейт получает модуль `archive` со своей функцией корня хранилища; Hermes переносит строки `state.db` встроенным Python-скриптом через собственный запуск Hermes. `hub-telegram::snapshots::SnapshotStore` пишет снимок через приватный staging-каталог и одно `rename`; `hub-telegram::transfer` выполняет файловую работу `/save`/`/restore` вне задачи хаба и возвращает результат сообщением `HubMessage::Snapshot`; хаб только затем меняет привязки тем (одна операция над `Topics` и один `put`). `hub-core::settings` получает `[snapshots] dir`, `hub-app` — поле в GUI.
+**Architecture:** `hub-core::snapshot` — чистые типы (`SnapshotName`, `RelPath`, `BackendData`, `Manifest`, `default_name`) и разбор команд. `hub-agent::archive` — трейт `SessionArchive` (блокирующий, вызывается из `spawn_blocking`), `ArchiveError` и помощники копирования по белому списку: каждая часть пути от доверенного корня проверяется `symlink_metadata` (ссылка где угодно — отказ), каталоги назначения создаются по одной части, файлы — `create_new`, `0700`/`0600`, откат при сбое. Каждый бэкенд-крейт получает модуль `archive` со своей функцией корня хранилища; Hermes переносит строки `state.db` встроенным Python-скриптом через собственный запуск Hermes. `hub-telegram::snapshots::SnapshotStore` пишет снимок через приватный staging-каталог и одно `rename`; `hub-telegram::transfer` выполняет файловую работу `/save`/`/restore` вне задачи хаба и возвращает результат сообщением `HubMessage::Snapshot`; хаб резервирует сессию агента на время файловой работы (второй `/save`/`/restore` той же сессии и ходы привязанных к ней тем ждут) и меняет привязки транзакционно: новые `Topics` сначала записываются `TopicStore::save`, и только после успеха заменяют текущие. `hub-core::settings` получает `[snapshots] dir`, `hub-app` — поле в GUI.
 
 **Tech stack:** Rust 2024 (1.96), tokio (`spawn_blocking`), serde/serde_json, thiserror, uuid v4, chrono 0.4.45 (`clock`, уже в `Cargo.lock`), tempfile (уже в `Cargo.lock`); тесты — rstest, tempfile, `#[ignore]` живые тесты; Python ≥ 3.11 внутри Hermes.
 
@@ -20,7 +20,7 @@
 - Код в плане написан против текущих API, но не компилировался. Если `clippy::pedantic` просит `#[must_use]`, ссылку вместо значения, `# Errors`, бэктики в документации (`doc_markdown`) и т. п. — исправить код по линту, не подавляя его, сохраняя имена и сигнатуры из блоков **Interfaces**.
 - Коммит после каждой задачи; сообщения по-русски в стиле истории репозитория; **никаких строк атрибуции ИИ** (`Co-Authored-By`, «Generated with …», упоминаний Claude как автора) — пользователь их запрещает. Ветку план не предписывает. `git push` и push тега — только в задаче 14 после отдельного подтверждения пользователя.
 
-**Non-goals:** удаление снимков командой; архив одним файлом и передача через Telegram; создание темы ботом; ответвление сессии; перенос файлов проекта и `file-history` Claude; субагенты Codex и цепочки `history_base`; `advanced.runtimeOutputDir` Qwen; относительные `QWEN_RUNTIME_DIR`/`QWEN_HOME`; ожидание файловой работы снимков при остановке бота (результат, пришедший после `Shutdown`, отбрасывается — повторный `/restore` идемпотентен).
+**Non-goals:** удаление снимков командой; архив одним файлом и передача через Telegram; создание темы ботом; ответвление сессии; перенос файлов проекта и `file-history` Claude; субагенты Codex и цепочки `history_base`; `advanced.runtimeOutputDir` Qwen; относительные `QWEN_RUNTIME_DIR`/`QWEN_HOME`; ожидание файловой работы снимков при остановке бота (результат, пришедший после `Shutdown`, отбрасывается — повторный `/restore` идемпотентен); кнопки GUI «запечатать бекапы» (архив снимков), «Открыть папку» и список снимков в окне — отдельная веха; перенос старых снимков при смене каталога снимков (старые остаются на месте, README говорит об этом).
 
 ---
 
@@ -41,11 +41,14 @@
 11. **`SnapshotName` строже:** кроме `[a-z0-9._-]{1,64}` и запрета ведущей точки — запрет завершающей точки и имён устройств Windows по основе до первой точки (`con`, `prn`, `aux`, `nul`, `com1`…`com9`, `lpt1`…`lpt9`): такие каталоги на Windows не создаются или совпадают с другими.
 12. **Название темы.** Хаб знает название только из `forum_topic_created`, увиденного в этом запуске (`crates/hub-telegram/src/hub.rs:238-239`, `titles` не сохраняются). Нет названия — имя по умолчанию строится из имени бэкенда (`claude-20261009-1530`), `manifest.title = null`, `/saves` показывает «—». Пример спецификации `fix-tests-…` — перевод; транслитерация «Починить тесты» даёт `pochinit-testy-…`.
 13. **Время.** Суффикс имени — местное время (`chrono::Local`), `created_at` — UTC `YYYY-MM-DDTHH:MM:SSZ`. `chrono 0.4.45` уже в `Cargo.lock` с `iana-time-zone`/`windows-link` (возможность `clock`); новых пакетов нет.
-14. **Новые тексты и защита на время файловой работы.** Пока `/save` или `/restore` темы не завершились, в этой теме не стартует ход и отказывают `/new`, `/cwd`, `/reset`, `/backend` (новый текст `SNAPSHOT_BUSY`): иначе ход начался бы со старой сессией или агент дописывал бы копируемую историю. Новые тексты: занятое и неверное имя, подсказка `/restore`, `SNAPSHOT_BUSY`, `SESSION_BUSY_ELSEWHERE`, «снимок не найден» (задача 2).
+14. **Новые тексты и защита на время файловой работы.** Пока `/save` или `/restore` темы не завершились, в этой теме не стартует ход и отказывают `/new`, `/cwd`, `/reset`, `/backend` (новый текст `SNAPSHOT_BUSY`): иначе ход начался бы со старой сессией или агент дописывал бы копируемую историю. Новые тексты: занятое и неверное имя, подсказка `/restore`, `SNAPSHOT_BUSY`, `SESSION_BUSY_ELSEWHERE`, `SESSION_RESERVED`, `RESTORE_NOT_PERSISTED`, «снимок не найден», «В Qwen уже есть сессия <id> для каталога <cwd>» (задачи 2, 3).
 15. **Сессия занята в другой теме.** Если к концу `/restore` тема-владелец сессии выполняет ход, привязки не меняются (`SESSION_BUSY_ELSEWHERE`); уже возвращённые агенту файлы остаются — повтор `/restore` увидит их через `present` и только перепривяжет.
 16. **Профиль Hermes при возврате** — текущий из настроек (в нём тема и будет работать), а не записанный в манифесте; `backend_data.profile` информационный, расхождение пишется в лог.
 17. **Манифест:** `backend` выводится из `backend_data.kind`, разбор отвергает несовпадение; `title` может быть `null`; `files` — не больше 10 000. `ArchiveError::Archived(String)` несёт id для текста `codex unarchive <id>`.
 18. **Проверенная версия Hermes.** `MIN_VERSION = 0.21.5` (`crates/hub-hermes/src/version.rs:91`) проверен для ACP; путь снимков (`--run-module`, `SessionDB`, схема 31) — только по исходникам `7085fbf7`. Подтверждается живым тестом задачи 12; при несовпадении — `Unsupported`, а не порча данных.
+19. **Одна сессия — одна файловая операция** (ревью PR #5, замечания 4–5). Спецификация запрещает `/save`/`/restore` только во время хода темы. План дополнительно резервирует сессию агента в хабе: пока её выгружают или возвращают, второй `/save`/`/restore` той же сессии из любой темы и ход любой темы, привязанной к ней, отказывают (`SESSION_RESERVED`); `/restore` получает резерв до `present`/`import`.
+20. **Привязки после `/restore` — только при успешной записи** (замечание 6): если `topics.json` не записался, темы не меняются и пользователь получает `RESTORE_NOT_PERSISTED`; уже возвращённые агенту файлы остаются (повтор увидит их через `present`).
+21. **`present` Qwen сверяет записанный `cwd`** (замечание 2): `san` неоднозначен (`/work/a-b` и `/work/a_b`), поэтому сессия «есть» только при совпадении `sessionId` и `cwd` первой записи; чат этого id для другого каталога — отказ «В Qwen уже есть сессия <id> для каталога <cwd>», а не тихая перепривязка. `todos/<id>.json` вне каталога проекта при возврате в другой каталог не перезаписывается (замечание 1).
 
 ## Хранилища агентов: проверено
 
@@ -76,8 +79,9 @@
 1. **Белый список и символьные ссылки** (задачи 3–7): ни одна функция экспорта не перечисляет каталоги целиком, кроме каталогов сессии (`projects/<P>/<id>/`, `subagents/<id>/`); ссылки пропускаются, не разыменовываются.
 2. **Пути из манифеста** (задачи 1, 4–7, 9): `RelPath` без `..`, абсолютных, `\`, `:`, NUL; имя снимка — без разделителей; импорт проверяет форму каждого пути для своего бэкенда.
 3. **Атомарность** (задача 9): снимок виден целиком или не виден; ошибка на любом шаге не оставляет `.tmp-*`.
-4. **Порядок восстановления** (задача 11): `load` → проверка каталога → `present` → `import` (с откатом созданных файлов) → только затем одна операция над `Topics` и один `put`.
-5. **Ход и снимок не пересекаются** (задача 11): отказ во время хода; во время файловой работы ход и команды смены сессии в этой теме не стартуют.
+4. **Порядок восстановления** (задача 11): `load` → проверка каталога → резерв сессии в хабе → `present` → `import` (с откатом созданных файлов) → новые `Topics` записываются `TopicStore::save`, и только после успеха заменяют текущие.
+5. **Ход и снимок не пересекаются** (задача 11): отказ во время хода; во время файловой работы ход и команды смены сессии в этой теме не стартуют; сессия агента зарезервирована — второй `/save`/`/restore` её и ходы всех привязанных к ней тем ждут.
+7. **Ссылки в родительских частях пути** (задачи 3–7, 9): каждая часть от доверенного корня — `symlink_metadata`, каталоги назначения — по одной части.
 6. **Hermes** (задача 7): без оболочки, тайм-аут, результат только файлом, схема 31, без перезаписи существующих id.
 
 ## Порядок задач
@@ -111,13 +115,13 @@
 
 **Interfaces:**
 - Produces (`hub_core::snapshot`):
-  - `MANIFEST_VERSION: u32 = 1`, `NAME_LIMIT: usize = 64`, `FILES_LIMIT: usize = 10_000`.
+  - `MANIFEST_VERSION: u32 = 1`, `NAME_LIMIT: usize = 64`, `FILES_LIMIT: usize = 10_000`, `MANIFEST_LIMIT: usize = 1024 * 1024` (байт JSON; одинаково для записи и чтения — ревью PR #5, замечание 3).
   - `SnapshotName` (`parse(&str) -> Result<Self, NameError>`, `as_str`, `Display`), `NameError { Empty, TooLong, Dot, Reserved, Character(char) }`.
   - `Minute { year: i32, month: u32, day: u32, hour: u32, minute: u32 }`; `default_name(title: Option<&str>, fallback: &str, at: Minute) -> SnapshotName`.
   - `RelPath` (`parse`, `from_parts(&[&str])`, `as_str`, `parts() -> Split<'_, char>`, `under(&Path) -> PathBuf`, `Display`), `PathError { Shape(String), Character(String) }`.
   - `BackendData { Claude { project: RelPath }, Codex, Qwen, Hermes { profile: Option<String> } }`, `BackendData::backend() -> BackendKind`.
   - `Manifest { name, created_at: String, title: Option<String>, cwd: AbsolutePath, session: SessionId, agent_version: String, data: BackendData, files: Vec<RelPath> }`, `Manifest::parse(&str) -> Result<Self, ManifestError>`, `Manifest::dump(&self) -> Result<String, ManifestError>`.
-  - `ManifestError { Json(serde_json::Error), Version(u32), Field { field: &'static str, reason: String }, NonUtf8Path(PathBuf) }`.
+  - `ManifestError { Json(serde_json::Error), Version(u32), Field { field: &'static str, reason: String }, NonUtf8Path(PathBuf), TooLarge(usize) }` — `dump` отказывает при `files.len() > FILES_LIMIT` и тексте длиннее `MANIFEST_LIMIT`, `parse` — при тексте длиннее `MANIFEST_LIMIT`, так что опубликованный снимок всегда читается.
 
 - [ ] **Step 1: Тесты (RED)**
 
@@ -322,6 +326,33 @@ mod tests {
         ));
     }
 
+    /// A manifest whose JSON is exactly `len` bytes, padded through the title.
+    fn manifest_of_len(len: usize) -> Manifest {
+        let base = Manifest { title: Some(String::new()), ..manifest(BackendData::Codex) };
+        let padding = len - base.dump().unwrap().len();
+        Manifest { title: Some("a".repeat(padding)), ..base }
+    }
+
+    #[test]
+    fn dump_and_parse_share_the_size_limit() {
+        let at_limit = manifest_of_len(MANIFEST_LIMIT);
+        let text = at_limit.dump().unwrap();
+        assert_eq!(text.len(), MANIFEST_LIMIT);
+        assert_eq!(Manifest::parse(&text).unwrap(), at_limit);
+        let over = Manifest { title: at_limit.title.map(|title| format!("{title}a")), ..at_limit };
+        assert!(matches!(over.dump(), Err(ManifestError::TooLarge(len)) if len == MANIFEST_LIMIT + 1));
+        assert!(matches!(Manifest::parse(&format!("{text} ")), Err(ManifestError::TooLarge(_))));
+    }
+
+    #[test]
+    fn dump_refuses_more_files_than_parse_accepts() {
+        let file = RelPath::parse("f").unwrap();
+        let at_limit = Manifest { files: vec![file.clone(); FILES_LIMIT], ..manifest(BackendData::Codex) };
+        assert_eq!(Manifest::parse(&at_limit.dump().unwrap()).unwrap().files.len(), FILES_LIMIT);
+        let over = Manifest { files: vec![file; FILES_LIMIT + 1], ..manifest(BackendData::Codex) };
+        assert!(matches!(over.dump(), Err(ManifestError::Field { field: "files", .. })));
+    }
+
     #[test]
     fn too_many_files_are_refused() {
         let files: Vec<String> = (0..=FILES_LIMIT).map(|i| format!("f{i}")).collect();
@@ -358,6 +389,8 @@ use crate::domain::{AbsolutePath, BackendKind, SessionId};
 pub const MANIFEST_VERSION: u32 = 1;
 pub const NAME_LIMIT: usize = 64;
 pub const FILES_LIMIT: usize = 10_000;
+/// The largest `manifest.json`, in bytes; `dump` refuses what `parse` would refuse.
+pub const MANIFEST_LIMIT: usize = 1024 * 1024;
 /// Device names Windows reserves for any extension: such directories cannot be created there.
 const RESERVED: [&str; 22] = [
     "con", "prn", "aux", "nul", "com1", "com2", "com3", "com4", "com5", "com6", "com7", "com8",
@@ -589,6 +622,8 @@ pub enum ManifestError {
     Field { field: &'static str, reason: String },
     #[error("путь {} не в UTF-8", .0.display())]
     NonUtf8Path(PathBuf),
+    #[error("manifest.json занимает {0} байт, больше {MANIFEST_LIMIT}")]
+    TooLarge(usize),
 }
 
 #[derive(Deserialize)]
@@ -626,6 +661,9 @@ fn bad(field: &'static str, reason: impl Into<String>) -> ManifestError {
 impl Manifest {
     /// The version is checked first, so a newer format is reported as such, not as garbage.
     pub fn parse(raw: &str) -> Result<Self, ManifestError> {
+        if raw.len() > MANIFEST_LIMIT {
+            return Err(ManifestError::TooLarge(raw.len()));
+        }
         let Versioned { version } = serde_json::from_str(raw)?;
         if version != MANIFEST_VERSION {
             return Err(ManifestError::Version(version));
@@ -673,8 +711,12 @@ impl Manifest {
         Ok(Self { name, created_at, title, cwd, session, agent_version, data, files })
     }
 
+    /// The same limits as `parse`, so a snapshot that is published can always be read back.
     pub fn dump(&self) -> Result<String, ManifestError> {
         let Self { name, created_at, title, cwd, session, agent_version, data, files } = self;
+        if files.len() > FILES_LIMIT {
+            return Err(bad("files", format!("больше {FILES_LIMIT} файлов")));
+        }
         let path = cwd.as_path();
         let file = ManifestFile {
             version: MANIFEST_VERSION,
@@ -698,7 +740,11 @@ impl Manifest {
             },
             files: files.iter().map(|file| file.as_str().to_owned()).collect(),
         };
-        Ok(serde_json::to_string_pretty(&file)?)
+        let text = serde_json::to_string_pretty(&file)?;
+        if text.len() > MANIFEST_LIMIT {
+            return Err(ManifestError::TooLarge(text.len()));
+        }
+        Ok(text)
     }
 }
 ```
@@ -733,7 +779,7 @@ git commit -m "hub-core: имена снимков, относительные �
 
 **Interfaces:**
 - Produces (`hub_core::commands`): `Command::{Save, Saves, Restore}`; `Command::ALL: [Self; 10]` = `[New, Backend, Cwd, Reset, Stop, Status, Save, Saves, Restore, Help]`; `SaveArgs { Default, Named(SnapshotName) }`, `parse_save_args(&[&str]) -> Result<SaveArgs, NameError>`; `RestoreArgs { name: SnapshotName, cwd: Option<String> }`, `parse_restore_args(&[&str]) -> Result<Option<RestoreArgs>, NameError>`.
-- Produces (`hub_telegram::texts`): `NOTHING_TO_SAVE`, `NO_SNAPSHOTS`, `SESSION_MOVED`, `FINISH_TURN_FIRST`, `RESTORE_USAGE`, `SNAPSHOT_BUSY`, `SESSION_BUSY_ELSEWHERE`, `SNAPSHOTS_PENDING` (временная, удаляется в задаче 11); `saved(&Manifest) -> String`, `restored(&SnapshotName, &TopicSession) -> String`, `snapshot_list(&[Manifest]) -> String`.
+- Produces (`hub_telegram::texts`): `NOTHING_TO_SAVE`, `NO_SNAPSHOTS`, `SESSION_MOVED`, `FINISH_TURN_FIRST`, `RESTORE_USAGE`, `SNAPSHOT_BUSY`, `SESSION_BUSY_ELSEWHERE`, `SESSION_RESERVED`, `RESTORE_NOT_PERSISTED` (ревью PR #5, замечания 4–6), `SNAPSHOTS_PENDING` (временная, удаляется в задаче 11); `saved(&Manifest) -> String`, `restored(&SnapshotName, &TopicSession) -> String`, `snapshot_list(&[Manifest]) -> String`.
 - Consumes: `hub_core::snapshot::{SnapshotName, NameError, Manifest}` (задача 1).
 
 - [ ] **Step 1: Тесты (RED)**
@@ -944,6 +990,10 @@ pub const SNAPSHOT_BUSY: &str =
     "⏳ Снимок этой темы ещё сохраняется или восстанавливается — подождите.";
 pub const SESSION_BUSY_ELSEWHERE: &str = "⚠️ Сессия сейчас выполняет ход в другой теме — \
                                           дождитесь его конца или /stop там и повторите /restore";
+pub const SESSION_RESERVED: &str =
+    "⏳ С этой сессией сейчас работает /save или /restore в другой теме — подождите.";
+pub const RESTORE_NOT_PERSISTED: &str =
+    "⚠️ Восстановление не сохранено: привязки тем не записались на диск, темы не изменены";
 /// Until the hub handles snapshots (removed in the task that wires them).
 pub const SNAPSHOTS_PENDING: &str = "Снимки сессий ещё не подключены";
 const SNAPSHOT_LIST_LIMIT: usize = 30;
@@ -1026,7 +1076,7 @@ git commit -m "Команды /save, /saves, /restore в реестре и их 
 
 ### Task 3: `SessionArchive` и копирование по белому списку (`hub-agent`)
 
-Общий контракт бэкендов и помощники, на которых держатся гарантии безопасности: только перечисленные обычные файлы, ссылки не разыменовываются, файлы снимка приватные, файлы агента не перезаписываются, неудачный возврат откатывается.
+Общий контракт бэкендов и помощники, на которых держатся гарантии безопасности: только перечисленные обычные файлы; **каждая часть пути от доверенного корня** (корень хранилища агента, `agent/` снимка) проверяется `symlink_metadata` — ссылка в любой части отвергается, а не разыменовывается; каталоги назначения создаются по одной части с той же проверкой; файлы создаются `create_new` (не перезаписываются, конечная ссылка не открывается); файлы снимка приватные; неудачный возврат откатывается. Ревью PR #5, замечание 7.
 
 **Files:**
 - Create: `crates/hub-agent/src/archive.rs`
@@ -1038,10 +1088,16 @@ git commit -m "Команды /save, /saves, /restore в реестре и их 
 **Interfaces:**
 - Produces (`hub_agent::archive`):
   - `pub struct Exported { pub files: Vec<RelPath>, pub data: BackendData, pub agent_version: String }`.
-  - `pub enum ArchiveError { NotFound, Ambiguous, Archived(String), Unsupported(String), Io(io::Error), Malformed(String) }` (`thiserror`, `Io` — `#[from]`), `impl From<PathError> for ArchiveError` (→ `Malformed`).
+  - `pub enum ArchiveError { NotFound, Ambiguous, Archived(String), Occupied { id: String, cwd: String }, Link(String), Unsupported(String), Io(io::Error), Malformed(String) }` (`thiserror`, `Io` — `#[from]`), `impl From<PathError> for ArchiveError` (→ `Malformed`). `Occupied` — «В Qwen уже есть сессия <id> для каталога <cwd>» (задача 6); `Link` — путь идёт через символьную ссылку.
   - `pub trait SessionArchive: Send + Sync` с `export(&self, session: &SessionId, cwd: &AbsolutePath, dest: &Path) -> Result<Exported, ArchiveError>`, `present(&self, session: &SessionId, cwd: &AbsolutePath, data: &BackendData) -> Result<bool, ArchiveError>`, `import(&self, session: &SessionId, data: &BackendData, files: &[RelPath], src: &Path, cwd: &AbsolutePath) -> Result<(), ArchiveError>`. Все три — блокирующие.
-  - `file_stem(&SessionId) -> Result<&str, ArchiveError>`; `private_dirs(&Path) -> io::Result<()>`; `private_file(&Path) -> io::Result<File>`; `restrict_dir(&Path) -> io::Result<()>`; `is_regular_file(&Path) -> io::Result<bool>`; `is_real_dir(&Path) -> io::Result<bool>`; `collect_tree(root: &Path, dir: &RelPath) -> Result<Vec<RelPath>, ArchiveError>`; `export_files(root: &Path, files: &[RelPath], dest: &Path) -> Result<(), ArchiveError>`; `place_all(pairs: &[(PathBuf, PathBuf)], write: impl FnMut(&Path, &mut File) -> io::Result<()>) -> Result<(), ArchiveError>`; `copy_plain(from: &Path, out: &mut File) -> io::Result<()>`.
-- Consumes: `hub_core::snapshot::{BackendData, RelPath}` (задача 1).
+  - `pub enum Entry { Missing, File, Dir, Link, Other }`; `entry_under(root: &Path, rel: &RelPath) -> Result<Entry, ArchiveError>` — ссылка или не-каталог в **родительской** части → `Err(Link)`, сама последняя часть-ссылка → `Entry::Link`.
+  - `open_under(root: &Path, rel: &RelPath) -> Result<File, ArchiveError>` (только `Entry::File`, иначе `Link`/`Malformed`); `create_under(root: &Path, rel: &RelPath) -> Result<File, ArchiveError>` (родители по одной части, `0700`, ссылка → `Link`; файл `create_new`, `0600`).
+  - `file_stem(&SessionId) -> Result<&str, ArchiveError>`; `private_dirs(&Path) -> io::Result<()>` и `private_file(&Path) -> io::Result<File>` — только для каталогов, которые создаёт сам хаб (корень снимков, staging, рабочий каталог Hermes); `restrict_dir(&Path) -> io::Result<()>`.
+  - `collect_tree(root: &Path, dir: &RelPath) -> Result<Vec<RelPath>, ArchiveError>`; `export_files(root: &Path, files: &[RelPath], dest: &Path) -> Result<(), ArchiveError>`.
+  - `place_all(src: &Path, dest: &Path, pairs: &[(RelPath, RelPath)], write: impl FnMut(&RelPath, File, &mut File) -> io::Result<()>) -> Result<(), ArchiveError>` — пара `(путь в src, путь в dest)`; писатель получает уже открытый проверенный источник; `copy_plain(rel: &RelPath, from: File, out: &mut File) -> io::Result<()>`.
+- Consumes: `hub_core::snapshot::{BackendData, PathError, RelPath}` (задача 1).
+
+Остаточный риск (раздел «Покрытие…»): подмена части пути на ссылку между проверкой и `open`/`remove_file` (TOCTOU) возможна только процессу того же пользователя, пишущему в каталоги `0700`; `O_NOFOLLOW` без `libc`/`unsafe` недоступен, поэтому конечный файл назначения защищает `create_new`, источник — проверка непосредственно перед `open`.
 
 - [ ] **Step 1: Тесты (RED)**
 
@@ -1060,11 +1116,13 @@ mod copy;
 `crates/hub-agent/tests/archive/copy.rs`:
 
 ```rust
-use std::fs;
-use std::io::{self, Write};
+use std::fs::{self, File};
+use std::io::{self, Read, Write};
 use std::path::Path;
 
-use hub_agent::archive::{ArchiveError, collect_tree, copy_plain, export_files, place_all};
+use hub_agent::archive::{
+    ArchiveError, Entry, collect_tree, copy_plain, entry_under, export_files, place_all,
+};
 use hub_core::snapshot::RelPath;
 
 fn rel(raw: &str) -> RelPath {
@@ -1074,6 +1132,10 @@ fn rel(raw: &str) -> RelPath {
 fn write(path: &Path, text: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, text).unwrap();
+}
+
+fn pair(from: &str, to: &str) -> (RelPath, RelPath) {
+    (rel(from), rel(to))
 }
 
 #[test]
@@ -1101,7 +1163,7 @@ fn exported_files_and_directories_are_private() {
 
 #[cfg(unix)]
 #[test]
-fn a_linked_source_is_refused_not_followed() {
+fn a_linked_source_file_is_refused_not_followed() {
     let (root, dest, outside) =
         (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     write(&outside.path().join("key"), "secret");
@@ -1111,8 +1173,33 @@ fn a_linked_source_is_refused_not_followed() {
 
     let result = export_files(root.path(), &[rel("projects/p/id.jsonl")], dest.path());
 
-    assert!(matches!(result, Err(ArchiveError::Malformed(_))));
+    assert!(matches!(result, Err(ArchiveError::Link(_))));
     assert!(!rel("projects/p/id.jsonl").under(dest.path()).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_parent_on_the_source_side_is_refused() {
+    let (root, dest, outside) =
+        (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write(&rel("p/id.jsonl").under(outside.path()), "secret");
+    std::os::unix::fs::symlink(outside.path(), root.path().join("projects")).unwrap();
+
+    assert!(matches!(entry_under(root.path(), &rel("projects/p/id.jsonl")), Err(ArchiveError::Link(_))));
+    let result = export_files(root.path(), &[rel("projects/p/id.jsonl")], dest.path());
+
+    assert!(matches!(result, Err(ArchiveError::Link(_))));
+    assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn entries_are_classified_without_following_anything() {
+    let root = tempfile::tempdir().unwrap();
+    write(&rel("a/b.txt").under(root.path()), "b");
+    assert_eq!(entry_under(root.path(), &rel("a/b.txt")).unwrap(), Entry::File);
+    assert_eq!(entry_under(root.path(), &rel("a")).unwrap(), Entry::Dir);
+    assert_eq!(entry_under(root.path(), &rel("a/missing/c")).unwrap(), Entry::Missing);
+    assert!(matches!(entry_under(root.path(), &rel("a/b.txt/c")), Err(ArchiveError::Link(_))));
 }
 
 #[test]
@@ -1126,9 +1213,10 @@ fn trees_list_regular_files_sorted_and_missing_trees_are_empty() {
 
 #[cfg(unix)]
 #[test]
-fn trees_skip_links_to_files_and_directories() {
+fn trees_skip_links_inside_and_refuse_links_above() {
     let (root, outside) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     write(&outside.path().join("secret"), "x");
+    write(&rel("id/x.txt").under(outside.path()), "x");
     write(&rel("s/id/a.txt").under(root.path()), "a");
     std::os::unix::fs::symlink(outside.path().join("secret"), rel("s/id/file-link").under(root.path()))
         .unwrap();
@@ -1137,6 +1225,7 @@ fn trees_skip_links_to_files_and_directories() {
 
     assert_eq!(collect_tree(root.path(), &rel("s/id")).unwrap(), [rel("s/id/a.txt")]);
     assert_eq!(collect_tree(root.path(), &rel("linked")).unwrap(), Vec::<RelPath>::new());
+    assert!(matches!(collect_tree(root.path(), &rel("linked/id")), Err(ArchiveError::Link(_))));
 }
 
 #[test]
@@ -1145,12 +1234,8 @@ fn placing_never_overwrites_and_rolls_back() {
     write(&src.path().join("a"), "new a");
     write(&src.path().join("b"), "new b");
     write(&rel("x/b").under(dest.path()), "old b");
-    let pairs = [
-        (src.path().join("a"), rel("x/a").under(dest.path())),
-        (src.path().join("b"), rel("x/b").under(dest.path())),
-    ];
 
-    let result = place_all(&pairs, copy_plain);
+    let result = place_all(src.path(), dest.path(), &[pair("a", "x/a"), pair("b", "x/b")], copy_plain);
 
     assert!(matches!(result, Err(ArchiveError::Io(ref error)) if error.kind() == io::ErrorKind::AlreadyExists));
     assert!(!rel("x/a").under(dest.path()).exists());
@@ -1162,13 +1247,9 @@ fn a_failed_write_leaves_nothing_behind() {
     let (src, dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     write(&src.path().join("a"), "a");
     write(&src.path().join("b"), "b");
-    let pairs = [
-        (src.path().join("a"), rel("x/a").under(dest.path())),
-        (src.path().join("b"), rel("x/b").under(dest.path())),
-    ];
 
-    let result = place_all(&pairs, |from, out| {
-        if from.ends_with("b") { Err(io::Error::other("boom")) } else { copy_plain(from, out) }
+    let result = place_all(src.path(), dest.path(), &[pair("a", "x/a"), pair("b", "x/b")], |file, from, out| {
+        if file.as_str() == "b" { Err(io::Error::other("boom")) } else { copy_plain(file, from, out) }
     });
 
     assert!(matches!(result, Err(ArchiveError::Io(_))));
@@ -1179,17 +1260,48 @@ fn a_failed_write_leaves_nothing_behind() {
 fn placed_files_carry_what_the_writer_wrote() {
     let (src, dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     write(&src.path().join("a"), "abc");
-    let pairs = [(src.path().join("a"), rel("y/a").under(dest.path()))];
-    place_all(&pairs, |from, out| out.write_all(fs::read_to_string(from)?.to_uppercase().as_bytes()))
-        .unwrap();
+    place_all(src.path(), dest.path(), &[pair("a", "y/a")], |_file, mut from: File, out| {
+        let mut text = String::new();
+        from.read_to_string(&mut text)?;
+        out.write_all(text.to_uppercase().as_bytes())
+    })
+    .unwrap();
     assert_eq!(fs::read_to_string(rel("y/a").under(dest.path())).unwrap(), "ABC");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_parent_on_the_destination_side_is_refused() {
+    let (src, dest, outside) =
+        (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write(&src.path().join("a"), "a");
+    std::os::unix::fs::symlink(outside.path(), dest.path().join("x")).unwrap();
+
+    let result = place_all(src.path(), dest.path(), &[pair("a", "x/sub/a")], copy_plain);
+
+    assert!(matches!(result, Err(ArchiveError::Link(_))));
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0, "nothing written outside the root");
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_parent_on_the_snapshot_side_is_refused() {
+    let (src, dest, outside) =
+        (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write(&rel("p/id.jsonl").under(outside.path()), "planted");
+    std::os::unix::fs::symlink(outside.path(), src.path().join("projects")).unwrap();
+
+    let result = place_all(src.path(), dest.path(), &[pair("projects/p/id.jsonl", "projects/p/id.jsonl")], copy_plain);
+
+    assert!(matches!(result, Err(ArchiveError::Link(_))));
+    assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
 }
 ```
 
 - [ ] **Step 2: Проверить RED**
 
 Run: `cargo test -p hub-agent --test archive`
-Expected: FAIL — `unresolved import hub_agent::archive` (модуль пуст/нет символов).
+Expected: FAIL — `unresolved import hub_agent::archive`.
 
 - [ ] **Step 3: Реализация**
 
@@ -1199,8 +1311,10 @@ Expected: FAIL — `unresolved import hub_agent::archive` (модуль пуст
 //! Moving one agent session's own history into a snapshot and back.
 //!
 //! Archives block (plain `std::fs`, child processes): call them from `spawn_blocking`.
-//! Only what a backend lists is copied, links are never followed, snapshot files are private,
-//! and nothing already in the agent's storage is overwritten.
+//! Only what a backend lists is copied. Every component below a trusted root is checked
+//! with `symlink_metadata`: a link anywhere on the way is refused, never followed.
+//! Destination directories are made one component at a time, files with `create_new`, so
+//! nothing in the agent's storage is overwritten; snapshot files are private.
 
 use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io;
@@ -1229,6 +1343,10 @@ pub enum ArchiveError {
     Ambiguous,
     #[error("Сессия в архиве Codex: выполните `codex unarchive {0}`")]
     Archived(String),
+    #[error("В Qwen уже есть сессия {id} для каталога {cwd}")]
+    Occupied { id: String, cwd: String },
+    #[error("«{0}»: путь идёт через символьную ссылку — снимки по ссылкам не ходят")]
+    Link(String),
     #[error("{0}")]
     Unsupported(String),
     #[error("Файлы агента недоступны: {0}")]
@@ -1273,6 +1391,17 @@ pub trait SessionArchive: Send + Sync {
     ) -> Result<(), ArchiveError>;
 }
 
+/// What a path below a trusted root is, found without following any link.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Entry {
+    Missing,
+    File,
+    Dir,
+    /// The last component itself is a link (or a Windows junction); callers skip or refuse it.
+    Link,
+    Other,
+}
+
 /// The id as a file-name stem; agents mint UUID-like ids, anything else could leave a directory.
 pub fn file_stem(session: &SessionId) -> Result<&str, ArchiveError> {
     let id = session.as_str();
@@ -1285,10 +1414,21 @@ pub fn file_stem(session: &SessionId) -> Result<&str, ArchiveError> {
     }
 }
 
-/// Creates `path` and its missing parents; new directories are `0700` on Unix.
+/// Creates `path` and its missing parents; new directories are `0700` on Unix. Only for
+/// directories the hub owns (the snapshot root, staging, its own temporary directories).
 pub fn private_dirs(path: &Path) -> io::Result<()> {
     let mut builder = DirBuilder::new();
     builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
+}
+
+fn new_dir(path: &Path) -> io::Result<()> {
+    let mut builder = DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -1322,16 +1462,6 @@ pub fn restrict_dir(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-/// Whether `path` itself is a regular file (a link to one is not).
-pub fn is_regular_file(path: &Path) -> io::Result<bool> {
-    kind(path).map(|kind| kind.is_some_and(|kind| kind.is_file()))
-}
-
-/// Whether `path` itself is a directory (a link or junction to one is not).
-pub fn is_real_dir(path: &Path) -> io::Result<bool> {
-    kind(path).map(|kind| kind.is_some_and(|kind| kind.is_dir()))
-}
-
 fn kind(path: &Path) -> io::Result<Option<fs::FileType>> {
     match fs::symlink_metadata(path) {
         Ok(metadata) => Ok(Some(metadata.file_type())),
@@ -1340,11 +1470,84 @@ fn kind(path: &Path) -> io::Result<Option<fs::FileType>> {
     }
 }
 
+fn classify(kind: Option<fs::FileType>) -> Entry {
+    match kind {
+        None => Entry::Missing,
+        Some(kind) if kind.is_symlink() => Entry::Link,
+        Some(kind) if kind.is_file() => Entry::File,
+        Some(kind) if kind.is_dir() => Entry::Dir,
+        // Windows junctions and other reparse points are neither file nor dir here.
+        Some(_) => Entry::Other,
+    }
+}
+
+/// Walks `rel` from `root` component by component. A parent that is a link or not a directory
+/// is refused (`Link`); a missing parent means the whole path is `Missing`.
+pub fn entry_under(root: &Path, rel: &RelPath) -> Result<Entry, ArchiveError> {
+    let parts: Vec<&str> = rel.parts().collect();
+    let Some((last, parents)) = parts.split_last() else {
+        return Ok(Entry::Missing);
+    };
+    let mut path = root.to_path_buf();
+    for part in parents {
+        path.push(part);
+        match classify(kind(&path)?) {
+            Entry::Missing => return Ok(Entry::Missing),
+            Entry::Dir => {}
+            Entry::File | Entry::Link | Entry::Other => return Err(ArchiveError::Link(rel.to_string())),
+        }
+    }
+    path.push(last);
+    Ok(classify(kind(&path)?))
+}
+
+/// Opens `root/rel` for reading, right after checking every component.
+pub fn open_under(root: &Path, rel: &RelPath) -> Result<File, ArchiveError> {
+    match entry_under(root, rel)? {
+        Entry::File => Ok(File::open(rel.under(root))?),
+        Entry::Link => Err(ArchiveError::Link(rel.to_string())),
+        Entry::Missing | Entry::Dir | Entry::Other => {
+            Err(ArchiveError::Malformed(format!("{rel}: не обычный файл")))
+        }
+    }
+}
+
+/// Creates the parents of `root/rel` one component at a time (an existing component must be a
+/// real directory), then the file with `create_new`, so neither a planted link nor an existing
+/// file is followed or overwritten.
+pub fn create_under(root: &Path, rel: &RelPath) -> Result<File, ArchiveError> {
+    let parts: Vec<&str> = rel.parts().collect();
+    let Some((last, parents)) = parts.split_last() else {
+        return Err(ArchiveError::Malformed("пустой путь".to_owned()));
+    };
+    let mut path = root.to_path_buf();
+    for part in parents {
+        path.push(part);
+        match new_dir(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+        match classify(kind(&path)?) {
+            Entry::Dir => {}
+            Entry::Missing | Entry::File | Entry::Link | Entry::Other => {
+                return Err(ArchiveError::Link(rel.to_string()));
+            }
+        }
+    }
+    path.push(last);
+    Ok(private_file(&path)?)
+}
+
 /// Every regular file under `root/dir` as paths relative to `root`, sorted. Links, special
-/// files and names that are not valid `RelPath`s are skipped; a missing directory is empty.
+/// files and names that are not valid `RelPath`s inside the tree are skipped; a missing or
+/// linked `dir` is empty; a link *above* `dir` is refused.
 pub fn collect_tree(root: &Path, dir: &RelPath) -> Result<Vec<RelPath>, ArchiveError> {
     let mut found = Vec::new();
-    walk(root, dir, 0, &mut found)?;
+    match entry_under(root, dir)? {
+        Entry::Dir => walk(root, dir, 0, &mut found)?,
+        Entry::Missing | Entry::File | Entry::Link | Entry::Other => {}
+    }
     found.sort();
     Ok(found)
 }
@@ -1355,14 +1558,10 @@ fn walk(
     depth: usize,
     found: &mut Vec<RelPath>,
 ) -> Result<(), ArchiveError> {
-    let path = dir.under(root);
-    if !is_real_dir(&path)? {
-        return Ok(());
-    }
     if depth > TREE_DEPTH {
         return Err(ArchiveError::Malformed(format!("{dir}: вложенность больше {TREE_DEPTH}")));
     }
-    for entry in fs::read_dir(&path)? {
+    for entry in fs::read_dir(dir.under(root))? {
         let entry = entry?;
         let child = entry
             .file_name()
@@ -1386,36 +1585,31 @@ fn walk(
     Ok(())
 }
 
-/// Copies `files` from `root` into `dest` under the same relative paths, into private
-/// directories and files; a source that is not a regular file is refused, never followed.
+/// Copies `files` from `root` into `dest` under the same relative paths, private and checked
+/// component by component on both sides.
 pub fn export_files(root: &Path, files: &[RelPath], dest: &Path) -> Result<(), ArchiveError> {
     files.iter().try_for_each(|file| {
-        let from = file.under(root);
-        if !is_regular_file(&from)? {
-            return Err(ArchiveError::Malformed(format!("{file}: не обычный файл")));
-        }
-        let to = file.under(dest);
-        if let Some(parent) = to.parent() {
-            private_dirs(parent)?;
-        }
-        let mut out = private_file(&to)?;
-        io::copy(&mut File::open(&from)?, &mut out)?;
+        let mut from = open_under(root, file)?;
+        let mut out = create_under(dest, file)?;
+        io::copy(&mut from, &mut out)?;
         out.sync_all()?;
         Ok(())
     })
 }
 
-/// Writes every `(from, to)` pair through `write`, creating each `to` anew (an existing file is
-/// an error, not overwritten). On the first failure every file created so far is removed, so a
-/// failed import leaves the agent's storage as it was. Missing parent directories are created
-/// and may stay behind empty.
+/// Writes every `(from, to)` pair — `from` under `src`, `to` under `dest` — through `write`,
+/// which gets the opened, checked source. Each `to` is created anew; on the first failure every
+/// file created so far is removed, so a failed import leaves the agent's storage as it was.
+/// Missing parent directories are created and may stay behind empty.
 pub fn place_all(
-    pairs: &[(PathBuf, PathBuf)],
-    mut write: impl FnMut(&Path, &mut File) -> io::Result<()>,
+    src: &Path,
+    dest: &Path,
+    pairs: &[(RelPath, RelPath)],
+    mut write: impl FnMut(&RelPath, File, &mut File) -> io::Result<()>,
 ) -> Result<(), ArchiveError> {
-    let mut created: Vec<&Path> = Vec::new();
+    let mut created: Vec<PathBuf> = Vec::new();
     for (from, to) in pairs {
-        if let Err(error) = place(from, to, &mut write) {
+        if let Err(error) = place(src, from, dest, to, &mut write) {
             for path in created.iter().rev() {
                 if let Err(cleanup) = fs::remove_file(path) {
                     tracing::warn!(path = %path.display(), error = %cleanup, "restored file left behind");
@@ -1423,28 +1617,26 @@ pub fn place_all(
             }
             return Err(error);
         }
-        created.push(to);
+        created.push(to.under(dest));
     }
     Ok(())
 }
 
 fn place(
-    from: &Path,
-    to: &Path,
-    write: &mut impl FnMut(&Path, &mut File) -> io::Result<()>,
+    src: &Path,
+    from: &RelPath,
+    dest: &Path,
+    to: &RelPath,
+    write: &mut impl FnMut(&RelPath, File, &mut File) -> io::Result<()>,
 ) -> Result<(), ArchiveError> {
-    if !is_regular_file(from)? {
-        return Err(ArchiveError::Malformed(format!("{}: не обычный файл", from.display())));
-    }
-    if let Some(parent) = to.parent() {
-        private_dirs(parent)?;
-    }
-    let mut out = private_file(to)?;
-    let written = write(from, &mut out).and_then(|()| out.sync_all());
+    let source = open_under(src, from)?;
+    let mut out = create_under(dest, to)?;
+    let written = write(from, source, &mut out).and_then(|()| out.sync_all());
     drop(out);
     if let Err(error) = written {
-        if let Err(cleanup) = fs::remove_file(to) {
-            tracing::warn!(path = %to.display(), error = %cleanup, "half-written file left behind");
+        let path = to.under(dest);
+        if let Err(cleanup) = fs::remove_file(&path) {
+            tracing::warn!(path = %path.display(), error = %cleanup, "half-written file left behind");
         }
         return Err(error.into());
     }
@@ -1452,8 +1644,8 @@ fn place(
 }
 
 /// The plain writer for [`place_all`]: the bytes as they are.
-pub fn copy_plain(from: &Path, out: &mut File) -> io::Result<()> {
-    io::copy(&mut File::open(from)?, out).map(drop)
+pub fn copy_plain(_file: &RelPath, mut from: File, out: &mut File) -> io::Result<()> {
+    io::copy(&mut from, out).map(drop)
 }
 
 #[cfg(test)]
@@ -1475,6 +1667,8 @@ mod tests {
     }
 }
 ```
+
+`copy_plain` принимает `&RelPath` ради общей сигнатуры писателя (Qwen решает по пути, переписывать ли строки); `clippy::needless_pass_by_value` для `from: File` не срабатывает — файл потребляется `io::copy`. Если срабатывает — поправить по линту, сохраняя сигнатуру `FnMut(&RelPath, File, &mut File)`.
 
 - [ ] **Step 4: Проверить GREEN**
 
@@ -1681,6 +1875,26 @@ fn a_linked_transcript_is_skipped() {
         Err(ArchiveError::NotFound)
     ));
 }
+
+#[cfg(unix)]
+#[test]
+fn a_linked_projects_directory_is_refused_on_export_and_import() {
+    let outside = claude_home();
+    let root = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path().join("projects"), root.path().join("projects")).unwrap();
+    let dest = tempfile::tempdir().unwrap();
+    assert!(matches!(archive(root.path()).export(&id(), &cwd(), dest.path()), Err(ArchiveError::Link(_))));
+    assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
+
+    let snapshot = tempfile::tempdir().unwrap();
+    let exported = archive(outside.path()).export(&id(), &cwd(), snapshot.path()).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(elsewhere.path(), target.path().join("projects")).unwrap();
+    let result = archive(target.path()).import(&id(), &exported.data, &exported.files, snapshot.path(), &cwd());
+    assert!(matches!(result, Err(ArchiveError::Link(_))));
+    assert_eq!(fs::read_dir(elsewhere.path()).unwrap().count(), 0, "nothing written outside the root");
+}
 ```
 
 - [ ] **Step 2: Проверить RED**
@@ -1704,8 +1918,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use hub_agent::archive::{
-    ArchiveError, Exported, SessionArchive, collect_tree, copy_plain, export_files, file_stem,
-    is_real_dir, is_regular_file, place_all,
+    ArchiveError, Entry, Exported, SessionArchive, collect_tree, copy_plain, entry_under,
+    export_files, file_stem, place_all,
 };
 use hub_core::domain::{AbsolutePath, SessionId};
 use hub_core::snapshot::{BackendData, RelPath};
@@ -1732,19 +1946,25 @@ impl ClaudeArchive {
         Self { root, version }
     }
 
-    /// Project directories holding `<stem>.jsonl` as a regular file, sorted.
+    /// Project directories holding `<stem>.jsonl` as a regular file, sorted; a linked
+    /// `projects/` is refused, linked project directories and transcripts are skipped.
     fn projects_with(&self, stem: &str) -> Result<Vec<String>, ArchiveError> {
-        let projects = self.root.join(PROJECTS);
-        if !is_real_dir(&projects)? {
-            return Ok(Vec::new());
+        let projects = RelPath::parse(PROJECTS)?;
+        match entry_under(&self.root, &projects)? {
+            Entry::Dir => {}
+            Entry::Missing => return Ok(Vec::new()),
+            Entry::File | Entry::Link | Entry::Other => {
+                return Err(ArchiveError::Link(projects.to_string()));
+            }
         }
         let mut found = Vec::new();
-        for entry in fs::read_dir(&projects)? {
+        for entry in fs::read_dir(projects.under(&self.root))? {
             let entry = entry?;
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
-            if entry.file_type()?.is_dir()
-                && is_regular_file(&entry.path().join(format!("{stem}.jsonl")))?
-            {
+            let Ok(transcript) = RelPath::from_parts(&[PROJECTS, &name, &format!("{stem}.jsonl")]) else {
+                continue;
+            };
+            if entry.file_type()?.is_dir() && entry_under(&self.root, &transcript)? == Entry::File {
                 found.push(name);
             }
         }
@@ -1817,7 +2037,7 @@ impl SessionArchive for ClaudeArchive {
                     _ => false,
                 };
                 if ours {
-                    Ok((file.under(src), file.under(&self.root)))
+                    Ok((file.clone(), file.clone()))
                 } else {
                     Err(ArchiveError::Malformed(format!("{file}: не файл этой сессии Claude")))
                 }
@@ -1826,7 +2046,7 @@ impl SessionArchive for ClaudeArchive {
         if !files.iter().any(|file| file.parts().last() == Some(transcript.as_str())) {
             return Err(ArchiveError::Malformed("в снимке нет транскрипта Claude".to_owned()));
         }
-        place_all(&pairs, copy_plain)
+        place_all(src, &self.root, &pairs, copy_plain)
     }
 }
 
@@ -2137,12 +2357,12 @@ impl SessionArchive for CodexArchive {
                     _ => None,
                 };
                 match target {
-                    Some(target) => Ok((file.under(src), target?.under(&self.root))),
+                    Some(target) => Ok((file.clone(), target?)),
                     None => Err(ArchiveError::Malformed(format!("{file}: не файл этой сессии Codex"))),
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        place_all(&pairs, copy_plain)
+        place_all(src, &self.root, &pairs, copy_plain)
     }
 }
 
@@ -2210,12 +2430,16 @@ git commit -m "hub-codex: выгрузка и возврат rollout-файло�
 - Modify: `crates/hub-qwen/src/lib.rs:1` (`pub mod archive;`)
 - Modify: `crates/hub-qwen/Cargo.toml` (`[dev-dependencies]`: `tempfile.workspace = true`), `Cargo.lock`
 - Create: `crates/hub-qwen/tests/archive.rs`, `crates/hub-qwen/tests/archive/qwen.rs`
-- Test: `crates/hub-qwen/src/archive.rs` (чистые `storage_root`, `sanitize`, `rewrite_cwd`), `crates/hub-qwen/tests/archive/qwen.rs`
+- Test: `crates/hub-qwen/src/archive.rs` (чистые `storage_root`, `sanitize`, `rewrite_cwd`, `same_dir`), `crates/hub-qwen/tests/archive/qwen.rs`
 
 **Interfaces:**
 - Produces (`hub_qwen::archive`): `storage_root(runtime: Option<&OsStr>, qwen_home: Option<&OsStr>, home: &Path) -> Result<PathBuf, ArchiveError>`; `sanitize(cwd: &str, windows: bool) -> String`; `QwenArchive::new(root: PathBuf, version: String) -> Self`; `impl SessionArchive for QwenArchive`.
+- Consumes: `hub_agent::archive::{ArchiveError::{Occupied, Link}, Entry, entry_under, open_under, collect_tree, export_files, place_all, copy_plain, file_stem}` (задача 3).
 
-Поведение (раздел «Хранилища агентов», Qwen): выгружаются `projects/<san(cwd)>/chats/<id>.jsonl` и спутники `<id>.*` кроме `.runtime.json`/`.worktree.json`, `projects/<san(cwd)>/subagents/<id>/**`, `todos/<id>.json`. `present` — есть ли `projects/<san(cwd назначения)>/chats/<id>.jsonl`. `import` переносит файлы под `san(cwd назначения)`; если каталог проекта другой — во всех `*.jsonl` строковое поле `cwd` верхнего уровня записи заменяется новым `cwd` (прочие поля и нераспознанные строки — как есть).
+Поведение (раздел «Хранилища агентов», Qwen):
+- `export` — `projects/<san(cwd)>/chats/<id>.jsonl` и спутники `<id>.*` кроме `.runtime.json`/`.worktree.json`, `projects/<san(cwd)>/subagents/<id>/**`, `todos/<id>.json`.
+- `present(cwd)` (ревью PR #5, замечание 2) — `true`, только если чат `projects/<san(cwd)>/chats/<id>.jsonl` есть **и** его первая запись несёт `sessionId == id` (без учёта регистра, как Qwen) **и** `cwd == cwd назначения` (на Windows без учёта регистра); чат с этим id, но другим `cwd` (например, `/work/a-b` и `/work/a_b` дают один каталог проекта) → `ArchiveError::Occupied` «В Qwen уже есть сессия <id> для каталога <cwd>»; нет чата — `false`.
+- `import` переносит файлы под `san(cwd назначения)`. Решение переписывать `cwd` принимается по полю `cwd` первой записи чата **в снимке**, сравнённому с `cwd` назначения, а не по именам каталогов проекта. `todos/<id>.json` лежит вне каталога проекта и ключуется только id (замечание 1): если он уже есть у Qwen обычным файлом — остаётся нетронутым и пропускается; ссылка или не-файл — `Link`.
 
 - [ ] **Step 1: Тесты (RED)**
 
@@ -2231,7 +2455,7 @@ mod qwen;
 
 ```rust
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use hub_agent::archive::{ArchiveError, SessionArchive};
 use hub_core::domain::{AbsolutePath, SessionId};
@@ -2272,20 +2496,34 @@ fn record(cwd: &AbsolutePath) -> String {
         .to_string()
 }
 
-/// A `~/.qwen` with the session in project `shop`, its extras, another session and secrets.
-fn qwen_home() -> tempfile::TempDir {
+fn chat(root: &Path, cwd: &AbsolutePath) -> std::path::PathBuf {
+    rel(&format!("projects/{}/chats/{ID}.jsonl", san(cwd))).under(root)
+}
+
+fn first_cwd(path: &Path) -> String {
+    let text = fs::read_to_string(path).unwrap();
+    let first: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    first["cwd"].as_str().unwrap().to_owned()
+}
+
+/// A `~/.qwen` with the session in directory `name`, its extras, another session and secrets.
+fn qwen_home_for(name: &str) -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
-    let project = format!("projects/{}", san(&cwd("shop")));
-    write(root.path(), &format!("{project}/chats/{ID}.jsonl"), &format!("{}\nnot json\n", record(&cwd("shop"))));
+    let project = format!("projects/{}", san(&cwd(name)));
+    write(root.path(), &format!("{project}/chats/{ID}.jsonl"), &format!("{}\nnot json\n", record(&cwd(name))));
     write(root.path(), &format!("{project}/chats/{ID}.pr.json"), "{}");
     write(root.path(), &format!("{project}/chats/{ID}.runtime.json"), "{\"workDir\":\"old\"}");
     write(root.path(), &format!("{project}/chats/{ID}.worktree.json"), "{}");
     write(root.path(), &format!("{project}/chats/other.jsonl"), "{}\n");
-    write(root.path(), &format!("{project}/subagents/{ID}/agent-1.jsonl"), &format!("{}\n", record(&cwd("shop"))));
+    write(root.path(), &format!("{project}/subagents/{ID}/agent-1.jsonl"), &format!("{}\n", record(&cwd(name))));
     write(root.path(), &format!("todos/{ID}.json"), "{\"todos\":[]}");
     write(root.path(), "settings.json", "{\"apiKey\":\"secret\"}");
     write(root.path(), "oauth_creds.json", "secret");
     root
+}
+
+fn qwen_home() -> tempfile::TempDir {
+    qwen_home_for("shop")
 }
 
 fn exported_files(project: &str) -> Vec<RelPath> {
@@ -2295,6 +2533,13 @@ fn exported_files(project: &str) -> Vec<RelPath> {
         rel(&format!("projects/{project}/subagents/{ID}/agent-1.jsonl")),
         rel(&format!("todos/{ID}.json")),
     ]
+}
+
+/// Exports the session of `root` from directory `name` into a fresh snapshot.
+fn export_from(root: &Path, name: &str) -> (tempfile::TempDir, Vec<RelPath>) {
+    let snapshot = tempfile::tempdir().unwrap();
+    let files = archive(root).export(&id(), &cwd(name), snapshot.path()).unwrap().files;
+    (snapshot, files)
 }
 
 #[test]
@@ -2320,16 +2565,10 @@ fn a_session_of_another_project_is_not_found() {
     assert!(!archive(root.path()).present(&id(), &cwd("other"), &BackendData::Qwen).unwrap());
 }
 
-fn exported() -> (tempfile::TempDir, Vec<RelPath>) {
-    let root = qwen_home();
-    let snapshot = tempfile::tempdir().unwrap();
-    let files = archive(root.path()).export(&id(), &cwd("shop"), snapshot.path()).unwrap().files;
-    (snapshot, files)
-}
-
 #[test]
 fn the_same_directory_gets_the_files_unchanged() {
-    let (snapshot, files) = exported();
+    let root = qwen_home();
+    let (snapshot, files) = export_from(root.path(), "shop");
     let fresh = tempfile::tempdir().unwrap();
 
     archive(fresh.path()).import(&id(), &BackendData::Qwen, &files, snapshot.path(), &cwd("shop")).unwrap();
@@ -2341,15 +2580,15 @@ fn the_same_directory_gets_the_files_unchanged() {
 
 #[test]
 fn a_new_directory_gets_the_files_under_its_project_with_cwd_rewritten() {
-    let (snapshot, files) = exported();
+    let root = qwen_home();
+    let (snapshot, files) = export_from(root.path(), "shop");
     let fresh = tempfile::tempdir().unwrap();
     let target = cwd("moved");
 
     archive(fresh.path()).import(&id(), &BackendData::Qwen, &files, snapshot.path(), &target).unwrap();
 
     assert!(archive(fresh.path()).present(&id(), &target, &BackendData::Qwen).unwrap());
-    let chat: PathBuf = rel(&format!("projects/{}/chats/{ID}.jsonl", san(&target))).under(fresh.path());
-    let text = fs::read_to_string(chat).unwrap();
+    let text = fs::read_to_string(chat(fresh.path(), &target)).unwrap();
     let mut lines = text.lines();
     let first: Value = serde_json::from_str(lines.next().unwrap()).unwrap();
     assert_eq!(first["cwd"], Value::from(target.as_path().to_str().unwrap()));
@@ -2361,8 +2600,49 @@ fn a_new_directory_gets_the_files_under_its_project_with_cwd_rewritten() {
 }
 
 #[test]
+fn restoring_into_another_directory_keeps_the_existing_todos() {
+    let root = qwen_home();
+    let (snapshot, files) = export_from(root.path(), "shop");
+    let todos = rel(&format!("todos/{ID}.json")).under(root.path());
+    fs::write(&todos, "{\"todos\":[\"still mine\"]}").unwrap();
+    let target = cwd("moved");
+
+    archive(root.path()).import(&id(), &BackendData::Qwen, &files, snapshot.path(), &target).unwrap();
+
+    assert_eq!(fs::read_to_string(&todos).unwrap(), "{\"todos\":[\"still mine\"]}");
+    assert!(archive(root.path()).present(&id(), &target, &BackendData::Qwen).unwrap());
+    assert_eq!(first_cwd(&chat(root.path(), &cwd("shop"))), cwd("shop").as_path().to_str().unwrap());
+}
+
+#[test]
+fn directories_that_sanitize_alike_are_told_apart_by_the_recorded_cwd() {
+    let (dash, under) = (cwd("a-b"), cwd("a_b"));
+    assert_eq!(san(&dash), san(&under));
+    let root = qwen_home_for("a-b");
+    let (snapshot, files) = export_from(root.path(), "a-b");
+
+    let occupied = archive(root.path()).present(&id(), &under, &BackendData::Qwen);
+    assert!(matches!(occupied, Err(ArchiveError::Occupied { ref cwd, .. }) if cwd == dash.as_path().to_str().unwrap()));
+    assert_eq!(
+        occupied.unwrap_err().to_string(),
+        format!("В Qwen уже есть сессия {ID} для каталога {}", dash.as_path().display())
+    );
+
+    for file in &files {
+        fs::remove_file(file.under(root.path())).unwrap();
+    }
+    assert!(!archive(root.path()).present(&id(), &under, &BackendData::Qwen).unwrap());
+    archive(root.path()).import(&id(), &BackendData::Qwen, &files, snapshot.path(), &under).unwrap();
+
+    assert_eq!(first_cwd(&chat(root.path(), &under)), under.as_path().to_str().unwrap());
+    assert!(archive(root.path()).present(&id(), &under, &BackendData::Qwen).unwrap());
+    assert!(matches!(archive(root.path()).present(&id(), &dash, &BackendData::Qwen), Err(ArchiveError::Occupied { .. })));
+}
+
+#[test]
 fn import_refuses_files_that_are_not_this_session() {
-    let (snapshot, mut files) = exported();
+    let root = qwen_home();
+    let (snapshot, mut files) = export_from(root.path(), "shop");
     write(snapshot.path(), "settings.json", "planted");
     files.push(rel("settings.json"));
     let fresh = tempfile::tempdir().unwrap();
@@ -2375,6 +2655,19 @@ fn import_refuses_files_that_are_not_this_session() {
     let result = archive(fresh.path()).import(&id(), &BackendData::Qwen, &mixed, snapshot.path(), &cwd("shop"));
     assert!(matches!(result, Err(ArchiveError::Malformed(_))));
     assert_eq!(fs::read_dir(fresh.path()).unwrap().count(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn linked_todos_or_projects_are_refused() {
+    let root = qwen_home();
+    let (snapshot, files) = export_from(root.path(), "shop");
+    let fresh = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), fresh.path().join("projects")).unwrap();
+    let result = archive(fresh.path()).import(&id(), &BackendData::Qwen, &files, snapshot.path(), &cwd("moved"));
+    assert!(matches!(result, Err(ArchiveError::Link(_))));
+    assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0, "nothing written outside the root");
 }
 ```
 
@@ -2389,17 +2682,17 @@ Expected: FAIL — `unresolved import hub_qwen::archive`.
 
 ```rust
 //! Qwen keeps a session under `projects/<sanitized cwd>/` and loads it only when the first
-//! record's `cwd` hashes to the project, so a session moved to another directory has its
-//! records' `cwd` rewritten.
+//! record's `cwd` hashes to the project. Sanitizing is lossy (`/a-b` and `/a_b` share a
+//! directory), so the recorded `cwd`, not the directory name, decides what a chat belongs to.
 
 use std::ffi::OsStr;
 use std::fs::{self, File};
-use std::io::{self, BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 
 use hub_agent::archive::{
-    ArchiveError, Exported, SessionArchive, collect_tree, copy_plain, export_files, file_stem,
-    is_real_dir, is_regular_file, place_all,
+    ArchiveError, Entry, Exported, SessionArchive, collect_tree, copy_plain, entry_under,
+    export_files, file_stem, open_under, place_all,
 };
 use hub_core::domain::{AbsolutePath, SessionId};
 use hub_core::snapshot::{BackendData, RelPath};
@@ -2411,6 +2704,8 @@ const SUBAGENTS: &str = "subagents";
 const TODOS: &str = "todos";
 /// Sidecars that hold the old directory and would point the session back at it.
 const STALE: [&str; 2] = [".runtime.json", ".worktree.json"];
+/// The first record is read only up to this many bytes.
+const FIRST_RECORD_LIMIT: u64 = 1024 * 1024;
 
 /// `$QWEN_RUNTIME_DIR`, else `$QWEN_HOME`, else `~/.qwen`; `~` expands as in Qwen, a relative
 /// value (Qwen resolves it against its own cwd) is refused.
@@ -2447,6 +2742,11 @@ pub fn sanitize(cwd: &str, windows: bool) -> String {
         .collect()
 }
 
+/// Qwen compares project roots by `sha256(cwd)`, lowercased on Windows.
+fn same_dir(recorded: &str, cwd: &str, windows: bool) -> bool {
+    if windows { recorded.to_lowercase() == cwd.to_lowercase() } else { recorded == cwd }
+}
+
 /// The record with its top-level string `cwd` replaced; anything else is left as written.
 fn rewrite_cwd(line: &str, cwd: &str) -> String {
     match serde_json::from_str::<Value>(line) {
@@ -2458,11 +2758,26 @@ fn rewrite_cwd(line: &str, cwd: &str) -> String {
     }
 }
 
-fn rewrite_lines(from: &Path, out: &mut File, cwd: &str) -> io::Result<()> {
-    for line in BufReader::new(File::open(from)?).lines() {
+fn rewrite_lines(from: File, out: &mut File, cwd: &str) -> io::Result<()> {
+    for line in BufReader::new(from).lines() {
         writeln!(out, "{}", rewrite_cwd(&line?, cwd))?;
     }
     Ok(())
+}
+
+/// `sessionId` and `cwd` of the chat's first record.
+fn first_record(root: &Path, chat: &RelPath) -> Result<(String, String), ArchiveError> {
+    let mut line = String::new();
+    BufReader::new(open_under(root, chat)?.take(FIRST_RECORD_LIMIT)).read_line(&mut line)?;
+    let record: Value = serde_json::from_str(&line)
+        .map_err(|_| ArchiveError::Malformed(format!("{chat}: первая запись не JSON")))?;
+    let field = |name: &str| record.get(name).and_then(Value::as_str).map(str::to_owned);
+    match (field("sessionId"), field("cwd")) {
+        (Some(id), Some(cwd)) => Ok((id, cwd)),
+        (None, _) | (_, None) => {
+            Err(ArchiveError::Malformed(format!("{chat}: в первой записи нет sessionId или cwd")))
+        }
+    }
 }
 
 fn cwd_text(cwd: &AbsolutePath) -> Result<&str, ArchiveError> {
@@ -2471,8 +2786,8 @@ fn cwd_text(cwd: &AbsolutePath) -> Result<&str, ArchiveError> {
         .ok_or_else(|| ArchiveError::Unsupported("рабочий каталог не в UTF-8".to_owned()))
 }
 
-fn project_of(cwd: &AbsolutePath) -> Result<String, ArchiveError> {
-    Ok(sanitize(cwd_text(cwd)?, cfg!(windows)))
+fn chat_of(project: &str, stem: &str) -> Result<RelPath, ArchiveError> {
+    Ok(RelPath::from_parts(&[PROJECTS, project, CHATS, &format!("{stem}.jsonl")])?)
 }
 
 pub struct QwenArchive {
@@ -2489,13 +2804,13 @@ impl QwenArchive {
     /// The chat and its sidecars `<stem>.*`, minus the stale ones; regular files only.
     fn chat_files(&self, project: &str, stem: &str) -> Result<Vec<RelPath>, ArchiveError> {
         let chats = RelPath::from_parts(&[PROJECTS, project, CHATS])?;
-        let dir = chats.under(&self.root);
-        if !is_real_dir(&dir)? {
-            return Ok(Vec::new());
+        match entry_under(&self.root, &chats)? {
+            Entry::Dir => {}
+            Entry::Missing | Entry::File | Entry::Link | Entry::Other => return Ok(Vec::new()),
         }
         let prefix = format!("{stem}.");
         let mut found = Vec::new();
-        for entry in fs::read_dir(&dir)? {
+        for entry in fs::read_dir(chats.under(&self.root))? {
             let entry = entry?;
             let Some(name) = entry.file_name().to_str().map(str::to_owned) else { continue };
             let wanted = name.starts_with(&prefix) && !STALE.iter().any(|stale| name.ends_with(stale));
@@ -2516,13 +2831,12 @@ impl SessionArchive for QwenArchive {
         dest: &Path,
     ) -> Result<Exported, ArchiveError> {
         let stem = file_stem(session)?;
-        let project = project_of(cwd)?;
-        let main = RelPath::from_parts(&[PROJECTS, &project, CHATS, &format!("{stem}.jsonl")])?;
-        if !is_regular_file(&main.under(&self.root))? {
+        let project = sanitize(cwd_text(cwd)?, cfg!(windows));
+        if entry_under(&self.root, &chat_of(&project, stem)?)? != Entry::File {
             return Err(ArchiveError::NotFound);
         }
         let todo = RelPath::from_parts(&[TODOS, &format!("{stem}.json")])?;
-        let todos = if is_regular_file(&todo.under(&self.root))? { vec![todo] } else { Vec::new() };
+        let todos = if entry_under(&self.root, &todo)? == Entry::File { vec![todo] } else { Vec::new() };
         let subagents = RelPath::from_parts(&[PROJECTS, &project, SUBAGENTS, stem])?;
         let files: Vec<RelPath> = self
             .chat_files(&project, stem)?
@@ -2534,6 +2848,7 @@ impl SessionArchive for QwenArchive {
         Ok(Exported { files, data: BackendData::Qwen, agent_version: self.version.clone() })
     }
 
+    /// Resumable here only if the chat's first record names this session and this very cwd.
     fn present(
         &self,
         session: &SessionId,
@@ -2541,8 +2856,20 @@ impl SessionArchive for QwenArchive {
         _data: &BackendData,
     ) -> Result<bool, ArchiveError> {
         let stem = file_stem(session)?;
-        let chat = RelPath::from_parts(&[PROJECTS, &project_of(cwd)?, CHATS, &format!("{stem}.jsonl")])?;
-        Ok(is_regular_file(&chat.under(&self.root))?)
+        let target = cwd_text(cwd)?;
+        let chat = chat_of(&sanitize(target, cfg!(windows)), stem)?;
+        match entry_under(&self.root, &chat)? {
+            Entry::Missing => Ok(false),
+            Entry::File => {
+                let (recorded_id, recorded_cwd) = first_record(&self.root, &chat)?;
+                if recorded_id.eq_ignore_ascii_case(stem) && same_dir(&recorded_cwd, target, cfg!(windows)) {
+                    Ok(true)
+                } else {
+                    Err(ArchiveError::Occupied { id: stem.to_owned(), cwd: recorded_cwd })
+                }
+            }
+            Entry::Dir | Entry::Link | Entry::Other => Err(ArchiveError::Link(chat.to_string())),
+        }
     }
 
     fn import(
@@ -2560,16 +2887,26 @@ impl SessionArchive for QwenArchive {
             }
         }
         let stem = file_stem(session)?;
-        let new = project_of(cwd)?;
-        let (chat, todo) = (format!("{stem}.jsonl"), format!("{stem}.json"));
-        let prefix = format!("{stem}.");
+        let target = cwd_text(cwd)?;
+        let new = sanitize(target, cfg!(windows));
+        let (todo, prefix) = (format!("{stem}.json"), format!("{stem}."));
         let foreign = |file: &RelPath| ArchiveError::Malformed(format!("{file}: не файл этой сессии Qwen"));
         let mut old: Option<String> = None;
         let mut pairs = Vec::new();
         for file in files {
             let parts: Vec<&str> = file.parts().collect();
-            let (project, target) = match parts.as_slice() {
-                [TODOS, name] if *name == todo => (None, file.clone()),
+            let (project, target_path) = match parts.as_slice() {
+                [TODOS, name] if *name == todo => {
+                    // Keyed by the id alone, outside any project: an existing one is the same
+                    // session's and stays as it is.
+                    match entry_under(&self.root, file)? {
+                        Entry::Missing => (None, file.clone()),
+                        Entry::File => continue,
+                        Entry::Dir | Entry::Link | Entry::Other => {
+                            return Err(ArchiveError::Link(file.to_string()));
+                        }
+                    }
+                }
                 [PROJECTS, project, CHATS, name]
                     if name.starts_with(&prefix) && !STALE.iter().any(|stale| name.ends_with(stale)) =>
                 {
@@ -2588,18 +2925,22 @@ impl SessionArchive for QwenArchive {
                     Some(_) => return Err(foreign(file)),
                 }
             }
-            pairs.push((file.under(src), target.under(&self.root)));
+            pairs.push((file.clone(), target_path));
         }
-        if !files.iter().any(|file| file.parts().nth(3) == Some(chat.as_str())) {
+        let chat = chat_of(old.as_deref().unwrap_or_default(), stem)?;
+        if !files.contains(&chat) {
             return Err(ArchiveError::Malformed("в снимке нет чата Qwen".to_owned()));
         }
-        let rewrite = old.as_deref() != Some(new.as_str());
-        let cwd = cwd_text(cwd)?;
-        place_all(&pairs, |from, out| {
-            if rewrite && from.extension().is_some_and(|ext| ext == "jsonl") {
-                rewrite_lines(from, out, cwd)
+        let (recorded_id, recorded_cwd) = first_record(src, &chat)?;
+        if !recorded_id.eq_ignore_ascii_case(stem) {
+            return Err(ArchiveError::Malformed("чат снимка принадлежит другой сессии".to_owned()));
+        }
+        let rewrite = !same_dir(&recorded_cwd, target, cfg!(windows));
+        place_all(src, &self.root, &pairs, |file, from, out| {
+            if rewrite && file.as_str().ends_with(".jsonl") {
+                rewrite_lines(from, out, target)
             } else {
-                copy_plain(from, out)
+                copy_plain(file, from, out)
             }
         })
     }
@@ -2616,8 +2957,23 @@ mod tests {
     #[case::windows(r"C:\Work\Shop", true, "c--work-shop")]
     #[case::cyrillic("/tmp/проект", false, "-tmp-------")]
     #[case::astral("/a😀", false, "-a--")]
+    #[case::dash_and_underscore_collide("/work/a_b", false, "-work-a-b")]
     fn cwd_is_sanitized_like_qwen(#[case] cwd: &str, #[case] windows: bool, #[case] expected: &str) {
         assert_eq!(sanitize(cwd, windows), expected);
+    }
+
+    #[rstest]
+    #[case::same("/work/a-b", "/work/a-b", false, true)]
+    #[case::collision("/work/a-b", "/work/a_b", false, false)]
+    #[case::case_on_unix("/Work", "/work", false, false)]
+    #[case::case_on_windows(r"C:\Work", r"c:\work", true, true)]
+    fn directories_are_compared_like_qwen(
+        #[case] recorded: &str,
+        #[case] cwd: &str,
+        #[case] windows: bool,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(same_dir(recorded, cwd, windows), expected);
     }
 
     #[rstest]
@@ -2643,7 +2999,7 @@ mod tests {
 }
 ```
 
-Проверка в `rewritten`: ключи `serde_json::Map` упорядочены (`BTreeMap`, без `preserve_order`), поэтому `{"cwd","uuid"}` выводится в том же порядке; если в `Cargo.lock` у `serde_json` включён `preserve_order` (через `indexmap`), порядок тоже сохранится. Qwen порядок ключей не важен.
+Замечания: порядок ключей в `rewritten` — `serde_json::Map` без `preserve_order` сортирует ключи (`cwd` < `uuid`), с `preserve_order` сохраняет порядок вставки; Qwen порядок ключей не важен. Цикл `for file in files` в `import` — накопление с ранним выходом, `continue` для существующего `todos` и проверкой общего каталога проекта; свёртка с тремя исходами читалась бы хуже. Если `clippy` попросит `Path::extension` вместо `ends_with(".jsonl")` (`case_sensitive_file_extension_comparisons`), — поправить по линту.
 
 - [ ] **Step 4: Проверить GREEN**
 
@@ -2653,7 +3009,7 @@ Expected: PASS.
 - [ ] **Step 5: Гейты**
 
 Run: `cargo fmt --all --check && cargo clippy --workspace --all-targets --locked -- -D warnings && cargo test --workspace --locked`
-Expected: PASS. Цикл `for file in files` в `import` — накопление с ранним выходом и проверкой общего каталога; если `clippy` не возражает, оставить (свёртка `try_fold` с двумя аккумуляторами читается хуже).
+Expected: PASS.
 
 - [ ] **Step 6: Commit**
 
@@ -3290,7 +3646,7 @@ use std::process::{Child, Command, ExitStatus, Stdio};
 use std::time::{Duration, Instant};
 
 use hub_agent::archive::{
-    ArchiveError, Exported, SessionArchive, file_stem, is_regular_file, private_file,
+    ArchiveError, Entry, Exported, SessionArchive, entry_under, file_stem, private_file,
 };
 use hub_agent::cli::hide_std_window;
 use hub_core::domain::{AbsolutePath, SessionId};
@@ -3499,11 +3855,12 @@ impl SessionArchive for HermesArchive {
         if value.get("found").and_then(Value::as_bool) != Some(true) {
             return Err(ArchiveError::NotFound);
         }
-        if !is_regular_file(&out)? {
+        let file = RelPath::parse(SESSION_FILE)?;
+        if entry_under(dest, &file)? != Entry::File {
             return Err(ArchiveError::Malformed("Hermes не записал выгрузку".to_owned()));
         }
         Ok(Exported {
-            files: vec![RelPath::parse(SESSION_FILE)?],
+            files: vec![file],
             data: BackendData::Hermes { profile: self.profile.clone() },
             agent_version: self.version.clone(),
         })
@@ -3539,9 +3896,17 @@ impl SessionArchive for HermesArchive {
                 return Err(ArchiveError::Malformed("снимок другого бэкенда".to_owned()));
             }
         }
-        match files {
-            [file] if file.as_str() == SESSION_FILE => {}
+        let file = match files {
+            [file] if file.as_str() == SESSION_FILE => file,
             _ => return Err(ArchiveError::Malformed(format!("ожидался один файл {SESSION_FILE}"))),
+        };
+        // The script opens the path itself: every component under the snapshot is checked first.
+        match entry_under(src, file)? {
+            Entry::File => {}
+            Entry::Link => return Err(ArchiveError::Link(file.to_string())),
+            Entry::Missing | Entry::Dir | Entry::Other => {
+                return Err(ArchiveError::Malformed(format!("{file}: не обычный файл")));
+            }
         }
         let cwd = cwd
             .as_path()
@@ -3753,8 +4118,9 @@ git commit -m "Настройка каталога снимков и поле в
   - `save(&self, name: &SnapshotName, fill: impl FnOnce(&Path) -> Result<Manifest, ArchiveError>) -> Result<Manifest, SnapshotError>` — создаёт `snapshots/.tmp-<uuid>/agent/` (`0700`), вызывает `fill(agent)`, пишет `manifest.json` (`0600`, `sync_all`), переименовывает в `snapshots/<name>/`; любая ошибка удаляет staging; staging старше суток (после сбоя питания) убирается при следующем `save`.
   - `list(&self) -> Result<Vec<Manifest>, SnapshotError>` — новые сверху (по `created_at`, затем по имени); повреждённые и служебные каталоги пропускаются с `warn`; нет каталога — пустой список.
   - `load(&self, name: &SnapshotName) -> Result<Loaded, SnapshotError>`; `pub struct Loaded { pub manifest: Manifest, pub agent: PathBuf }` — проверены: каталог не ссылка, имя в манифесте совпадает, каждый файл из `files` — обычный файл в `agent/`.
-  - `pub enum SnapshotError { Exists(SnapshotName), Missing(SnapshotName), Corrupt { name: SnapshotName, reason: String }, Io(io::Error), Archive(ArchiveError) }`; тексты: «Снимок <имя> уже существует», «Снимок <имя> не найден», «Снимок <имя> повреждён: …», «Каталог снимков недоступен: …», `Archive` — прозрачно.
-- Consumes: `hub_agent::archive::{ArchiveError, private_dirs, private_file, restrict_dir, is_real_dir, is_regular_file}`, `hub_core::snapshot::{Manifest, SnapshotName}`.
+  - `pub enum SnapshotError { Exists(SnapshotName), Missing(SnapshotName), Corrupt { name: SnapshotName, reason: String }, Manifest(ManifestError), Io(io::Error), Archive(ArchiveError) }`; тексты: «Снимок <имя> уже существует», «Снимок <имя> не найден», «Снимок <имя> повреждён: …», «Манифест снимка не записан: …» (`dump` отказал до публикации — замечание 3), «Каталог снимков недоступен: …», `Archive` — прозрачно.
+  - Проверки путей — `entry_under` от доверенного корня `snapshots/` (ревью PR #5, замечание 7): каталог снимка, `agent/` и каждая часть каждого файла из `files` — не ссылки; `manifest.json` читается не больше `MANIFEST_LIMIT + 1` байт, лишний байт — `Corrupt`.
+- Consumes: `hub_agent::archive::{ArchiveError, Entry, entry_under, private_dirs, private_file, restrict_dir}`, `hub_core::snapshot::{Manifest, ManifestError, MANIFEST_LIMIT, FILES_LIMIT, RelPath, SnapshotName}`.
 
 - [ ] **Step 1: Тесты (RED)**
 
@@ -3775,7 +4141,9 @@ use std::path::Path;
 
 use hub_agent::archive::{ArchiveError, private_dirs, private_file};
 use hub_core::domain::{AbsolutePath, SessionId};
-use hub_core::snapshot::{BackendData, Manifest, RelPath, SnapshotName};
+use hub_core::snapshot::{
+    BackendData, FILES_LIMIT, MANIFEST_LIMIT, Manifest, ManifestError, RelPath, SnapshotName,
+};
 use hub_telegram::snapshots::{SnapshotError, SnapshotStore};
 
 fn name(raw: &str) -> SnapshotName {
@@ -3885,6 +4253,67 @@ fn loading_checks_name_presence_and_files() {
     assert!(matches!(store.load(&name("snap")), Err(SnapshotError::Corrupt { .. })));
 }
 
+/// `fill` for a manifest of `files` existing files, optionally padded to an exact JSON size.
+fn fill_many(raw: &str, count: usize, size: Option<usize>) -> impl FnOnce(&Path) -> Result<Manifest, ArchiveError> {
+    let files: Vec<RelPath> = (0..count).map(|i| RelPath::parse(&format!("fake/f{i}")).unwrap()).collect();
+    let base = Manifest { files, title: Some(String::new()), ..manifest(raw, "2026-10-09T15:30:12Z") };
+    let manifest = match size {
+        Some(size) => {
+            let padding = size - base.dump().unwrap().len();
+            Manifest { title: Some("a".repeat(padding)), ..base }
+        }
+        None => base,
+    };
+    move |agent: &Path| {
+        private_dirs(&agent.join("fake"))?;
+        for file in manifest.files.iter().take(FILES_LIMIT) {
+            private_file(&file.under(agent))?;
+        }
+        Ok(manifest)
+    }
+}
+
+#[test]
+fn the_size_limit_holds_on_save_and_load_alike() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SnapshotStore::new(dir.path());
+    store.save(&name("big"), fill_many("big", 1, Some(MANIFEST_LIMIT))).unwrap();
+    assert_eq!(fs::metadata(dir.path().join("snapshots").join("big").join("manifest.json")).unwrap().len(), u64::try_from(MANIFEST_LIMIT).unwrap());
+    assert_eq!(store.load(&name("big")).unwrap().manifest.files.len(), 1);
+
+    let over = store.save(&name("bigger"), fill_many("bigger", 1, Some(MANIFEST_LIMIT + 1)));
+    assert!(matches!(over, Err(SnapshotError::Manifest(ManifestError::TooLarge(_)))));
+    assert_eq!(entries(&dir.path().join("snapshots")), ["big"]);
+}
+
+#[test]
+fn the_files_limit_holds_on_save_and_load_alike() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = SnapshotStore::new(dir.path());
+    store.save(&name("many"), fill_many("many", FILES_LIMIT, None)).unwrap();
+    assert_eq!(store.load(&name("many")).unwrap().manifest.files.len(), FILES_LIMIT);
+
+    let over = store.save(&name("more"), fill_many("more", FILES_LIMIT + 1, None));
+    assert!(matches!(over, Err(SnapshotError::Manifest(ManifestError::Field { field: "files", .. }))));
+    assert_eq!(entries(&dir.path().join("snapshots")), ["many"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn a_linked_parent_inside_a_snapshot_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let store = SnapshotStore::new(dir.path());
+    store.save(&name("snap"), fill("snap", "2026-10-09T15:30:12Z")).unwrap();
+    let agent = dir.path().join("snapshots").join("snap").join("agent");
+    fs::create_dir_all(outside.path().join("fake")).unwrap();
+    fs::write(outside.path().join("fake").join("s-1.txt"), "planted").unwrap();
+    fs::remove_dir_all(agent.join("fake")).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("fake"), agent.join("fake")).unwrap();
+
+    assert!(matches!(store.load(&name("snap")), Err(SnapshotError::Corrupt { .. })));
+}
+
 #[cfg(unix)]
 #[test]
 fn snapshots_are_private() {
@@ -3943,16 +4372,13 @@ use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use hub_agent::archive::{
-    ArchiveError, is_real_dir, is_regular_file, private_dirs, private_file, restrict_dir,
-};
-use hub_core::snapshot::{Manifest, ManifestError, SnapshotName};
+use hub_agent::archive::{ArchiveError, Entry, entry_under, private_dirs, private_file, restrict_dir};
+use hub_core::snapshot::{MANIFEST_LIMIT, Manifest, ManifestError, RelPath, SnapshotName};
 
 const SNAPSHOTS: &str = "snapshots";
 const MANIFEST: &str = "manifest.json";
 const AGENT: &str = "agent";
 const STAGING_PREFIX: &str = ".tmp-";
-const MANIFEST_LIMIT: u64 = 1024 * 1024;
 /// Staging older than this was left by a crash; a live save finishes in minutes.
 const STALE_STAGING: Duration = Duration::from_hours(24);
 
@@ -3964,6 +4390,8 @@ pub enum SnapshotError {
     Missing(SnapshotName),
     #[error("Снимок {name} повреждён: {reason}")]
     Corrupt { name: SnapshotName, reason: String },
+    #[error("Манифест снимка не записан: {0}")]
+    Manifest(#[from] ManifestError),
     #[error("Каталог снимков недоступен: {0}")]
     Io(#[from] io::Error),
     #[error(transparent)]
@@ -4037,7 +4465,8 @@ impl SnapshotStore {
         if manifest.name != *name {
             return Err(SnapshotError::Corrupt { name: name.clone(), reason: "имя в манифесте другое".to_owned() });
         }
-        let text = manifest.dump().map_err(|error| corrupt(name, &error))?;
+        // Fails before anything is published if the manifest would not read back.
+        let text = manifest.dump()?;
         let mut file = private_file(&staging.path.join(MANIFEST))?;
         file.write_all(text.as_bytes())?;
         file.sync_all()?;
@@ -4076,13 +4505,22 @@ impl SnapshotStore {
 
     pub fn load(&self, name: &SnapshotName) -> Result<Loaded, SnapshotError> {
         let manifest = self.read(name)?;
-        let agent = self.root.join(name.as_str()).join(AGENT);
-        if let Some(missing) = manifest
-            .files
-            .iter()
-            .find(|file| !is_regular_file(&file.under(&agent)).unwrap_or(false))
-        {
-            return Err(SnapshotError::Corrupt { name: name.clone(), reason: format!("нет файла {missing}") });
+        let snapshot = self.root.join(name.as_str());
+        let broken = |reason: String| SnapshotError::Corrupt { name: name.clone(), reason };
+        match entry_under(&snapshot, &RelPath::parse(AGENT).map_err(|error| broken(error.to_string()))?) {
+            Ok(Entry::Dir) => {}
+            Ok(Entry::Missing | Entry::File | Entry::Link | Entry::Other) | Err(_) => {
+                return Err(broken("agent/ не каталог".to_owned()));
+            }
+        }
+        let agent = snapshot.join(AGENT);
+        for file in &manifest.files {
+            match entry_under(&agent, file) {
+                Ok(Entry::File) => {}
+                Ok(Entry::Missing | Entry::Dir | Entry::Link | Entry::Other) | Err(_) => {
+                    return Err(broken(format!("нет обычного файла {file}")));
+                }
+            }
         }
         Ok(Loaded { manifest, agent })
     }
@@ -4094,17 +4532,19 @@ impl SnapshotStore {
                 return Err(SnapshotError::Missing(name.clone()));
             }
             Err(error) => return Err(error.into()),
-            Ok(_) if !is_real_dir(&dir)? => {
+            Ok(metadata) if !metadata.file_type().is_dir() => {
                 return Err(SnapshotError::Corrupt { name: name.clone(), reason: "не каталог".to_owned() });
             }
             Ok(_) => {}
         }
-        let path = dir.join(MANIFEST);
-        if !is_regular_file(&path)? {
+        let manifest_path = RelPath::parse(MANIFEST).map_err(|error| corrupt_text(name, error.to_string()))?;
+        if !matches!(entry_under(&dir, &manifest_path), Ok(Entry::File)) {
             return Err(SnapshotError::Corrupt { name: name.clone(), reason: "нет manifest.json".to_owned() });
         }
         let mut raw = String::new();
-        File::open(&path)?.take(MANIFEST_LIMIT).read_to_string(&mut raw)?;
+        // One byte over the limit is enough to tell "too large" from "truncated".
+        let limit = u64::try_from(MANIFEST_LIMIT).unwrap_or(u64::MAX).saturating_add(1);
+        File::open(dir.join(MANIFEST))?.take(limit).read_to_string(&mut raw)?;
         let manifest = Manifest::parse(&raw).map_err(|error| corrupt(name, &error))?;
         if manifest.name != *name {
             return Err(SnapshotError::Corrupt {
@@ -4134,7 +4574,11 @@ impl SnapshotStore {
 }
 
 fn corrupt(name: &SnapshotName, error: &ManifestError) -> SnapshotError {
-    SnapshotError::Corrupt { name: name.clone(), reason: error.to_string() }
+    corrupt_text(name, error.to_string())
+}
+
+fn corrupt_text(name: &SnapshotName, reason: String) -> SnapshotError {
+    SnapshotError::Corrupt { name: name.clone(), reason }
 }
 
 /// Makes the rename durable on Unix; elsewhere the filesystem gives no handle for it.
@@ -4148,7 +4592,7 @@ fn sync_dir(dir: &Path) {
 }
 ```
 
-Замечания: `is_regular_file(..).unwrap_or(false)` в `load` — ошибка доступа к файлу считается «файла нет» и даёт `Corrupt` (снимок не используется), а не тихую подстановку; `sweep` — лучшее усилие (сбой — только место на диске, пишется `warn`). Если `clippy` отвергает `let _unused = dir;`, разделить `sync_dir` на две `#[cfg]`-функции, как `restrict_dir`.
+Замечания: в `load` ошибка проверки пути (в том числе ссылка в родительской части, `Err(Link)`) даёт `Corrupt` — снимок не используется, а не подставляется молча; `u64::try_from(..).unwrap_or(u64::MAX)` не может сработать на поддерживаемых платформах (`usize` ≤ 64 бит) и лишь избегает `as`; `sweep` — лучшее усилие (сбой — только место на диске, пишется `warn`). Если `clippy` отвергает `let _unused = dir;`, разделить `sync_dir` на две `#[cfg]`-функции, как `restrict_dir`.
 
 - [ ] **Step 4: Проверить GREEN**
 
@@ -4352,21 +4796,26 @@ git commit -m "Хаб получает архив сессий бэкенда п
 
 ### Task 11: `Hub` — `/save`, `/saves`, `/restore` и перенос из прежней темы
 
-Хаб остаётся актором без ожиданий: проверки и выбор имени — в задаче хаба, файловая работа — в `transfer` (`spawn_blocking`), результат возвращается сообщением `HubMessage::Snapshot`, и только тогда меняются привязки. Порядок `/restore`: `load` → каталог (явный — до запуска задачи, из манифеста — в задаче, оба через `resolve_cwd` внутри `workspace_root`) → `present` → `import` (с откатом) → проверка, что ни тема, ни владелец сессии не выполняют ход → одна правка `Topics` (сброс владельцев и привязка темы) и один `put` → тексты.
+Хаб остаётся актором без ожиданий: проверки и выбор имени — в задаче хаба, файловая работа — в `transfer` (`spawn_blocking`), результаты возвращаются сообщениями `HubMessage::Snapshot`. Хаб — единственный владелец двух инвариантов (ревью PR #5, замечания 4–6):
+
+- **Резерв сессии.** `reserved: HashMap<Reservation, TopicKey>`, где `Reservation = (BackendKind, SessionId)`. `/save` берёт резерв до запуска выгрузки; `/restore` — в два этапа: задача читает снимок и проверяет каталог, затем спрашивает хаб (`Done::Loaded` с `oneshot`), и только получив резерв, вызывает `present`/`import`. Резерв снимается, когда хаб обработал результат. Пока сессия зарезервирована, второй `/save` или `/restore` этой сессии из любой темы и ход в любой теме, привязанной к ней, отказывают (`SESSION_RESERVED`).
+- **Транзакционная перепривязка.** `rebind` строит новые `Topics` (владельцы сброшены, тема привязана), вызывает `TopicStore::save` и проверяет результат; только при успехе заменяет `self.topics` и шлёт «♻️ Восстановлено …» и «Сессия перенесена в другую тему». При ошибке привязки прежние, пользователь получает `RESTORE_NOT_PERSISTED`. Перепривязка отказывает, если тема или владелец выполняют ход или заняты своим снимком.
+
+Порядок `/restore`: каталог (явный — до запуска задачи) → `load` и каталог из манифеста (в задаче, через `resolve_cwd` внутри `workspace_root`) → резерв в хабе (отказ, если сессия зарезервирована или выполняет ход в какой-либо теме) → `present` → `import` (с откатом) → снятие резерва → `rebind`.
 
 **Files:**
 - Modify: `Cargo.toml:16-54` (`[workspace.dependencies]`: `chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }`), `crates/hub-telegram/Cargo.toml:9-24` (`chrono.workspace = true`), `Cargo.lock`
 - Create: `crates/hub-telegram/src/transfer.rs`
 - Modify: `crates/hub-telegram/src/lib.rs` (`mod transfer;` после `mod session;`)
-- Modify: `crates/hub-telegram/src/hub.rs` — импорты `:4-33`, `HubMessage` `:69-91`, `Hub` `:117-133`, `spawn` `:136-160`, `handle` `:183-226`, `command` `:299-380`, `launch` `:465-509`, `refuse_if_running` `:561-567`, новые методы после `bind` `:527-532`; тесты `:593-1044`
+- Modify: `crates/hub-telegram/src/hub.rs` — импорты `:4-33`, `HubMessage` `:69-91`, `Hub` `:117-133`, `spawn` `:136-160`, `handle` `:183-226`, `command` `:299-380`, `launch` `:465-509`, `refuse_if_running` `:561-567`, новые методы после `bind` `:527-532`; тесты `:593-1044` (в т. ч. `MemoryStore` `:664-678`)
 - Modify: `crates/hub-telegram/src/texts.rs` (удалить `SNAPSHOTS_PENDING` из задачи 2)
 - Modify: `crates/hub-app/src/supervisor.rs:483-489` (`| HubMessage::Snapshot(_)` в исчерпывающем `match`)
 - Test: `crates/hub-telegram/src/hub.rs` (`#[cfg(test)]`), `crates/hub-telegram/src/transfer.rs` (`holders`)
 
 **Interfaces:**
 - Produces (`hub_telegram::hub`): `HubMessage::Snapshot(SnapshotDone)`; `pub struct SnapshotDone(pub(crate) Done)` (содержимое закрыто).
-- Produces (`crate::transfer`, приватный модуль): `enum Done { Saved { key, name, outcome: Result<Manifest, String> }, Restored { key, outcome: Result<Restoration, String> } }`; `struct Restoration { name: SnapshotName, session: TopicSession, imported: bool }`; `SaveJob<A>`, `RestoreJob<A>` с `async fn run(self)`; `holders(&Topics, TopicKey, &TopicSession) -> Vec<TopicKey>`; `local_minute() -> Minute`; `utc_now() -> String`.
-- Consumes: задачи 1, 2, 9, 10.
+- Produces (`crate::transfer`, приватный модуль): `type Reservation = (BackendKind, SessionId)`; `enum Done { Saved { key, name, reservation: Reservation, outcome: Result<Manifest, String> }, Loaded { key, reservation: Reservation, reply: oneshot::Sender<bool> }, Restored { key, reservation: Option<Reservation>, outcome: Result<Restoration, String> } }`; `struct Restoration { name: SnapshotName, session: TopicSession, imported: bool }`; `SaveJob<A>`, `RestoreJob<A>` с `async fn run(self)`; `holders(&Topics, TopicKey, &TopicSession) -> Vec<TopicKey>`; `local_minute() -> Minute`; `utc_now() -> String`.
+- Consumes: задачи 1, 2 (`SESSION_RESERVED`, `RESTORE_NOT_PERSISTED`), 9, 10; `TopicStore::save(&mut self, &Topics) -> Result<(), String>` (`hub.rs:51-53`).
 
 - [ ] **Step 1: Тесты (RED)**
 
@@ -4380,16 +4829,49 @@ git commit -m "Хаб получает архив сессий бэкенда п
     use hub_core::snapshot::{BackendData, RelPath};
 ```
 
+`MemoryStore` (`:664-678`) — хранит удачные записи и умеет отказывать:
+
+```rust
+    #[derive(Default, Clone)]
+    struct MemoryStore {
+        saved: Arc<StdMutex<Vec<Topics>>>,
+        fail: Arc<AtomicBool>,
+    }
+
+    impl MemoryStore {
+        /// What a restart would load: the last bindings that reached the "disk".
+        fn last(&self) -> Option<Topics> {
+            self.saved.lock().unwrap().last().cloned()
+        }
+    }
+
+    impl TopicStore for MemoryStore {
+        fn save(&mut self, topics: &Topics) -> Result<(), String> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err("диск полон".to_owned());
+            }
+            self.saved.lock().unwrap().push(topics.clone());
+            Ok(())
+        }
+    }
+```
+
 подделка архива (заменяет временную `archive` из задачи 10):
 
 ```rust
-    /// Remembers which sessions the "agent" has; `hold` blocks the next export until released.
+    type Gate = StdMutex<Option<std::sync::mpsc::Receiver<()>>>;
+
+    /// Remembers which sessions the "agent" has; `hold_*` pause the next export or import
+    /// until released, `exporting`/`importing` tell the test it got there.
     #[derive(Default)]
     struct FakeArchive {
         known: StdMutex<HashSet<String>>,
         imports: StdMutex<Vec<String>>,
         fail_import: AtomicBool,
-        hold: StdMutex<Option<std::sync::mpsc::Receiver<()>>>,
+        hold_export: Gate,
+        hold_import: Gate,
+        exporting: AtomicBool,
+        importing: AtomicBool,
     }
 
     impl FakeArchive {
@@ -4402,6 +4884,14 @@ git commit -m "Хаб получает архив сессий бэкенда п
         }
     }
 
+    fn pause(gate: &Gate, reached: &AtomicBool) {
+        reached.store(true, Ordering::SeqCst);
+        let held = gate.lock().unwrap().take();
+        if let Some(release) = held {
+            release.recv().unwrap();
+        }
+    }
+
     impl SessionArchive for FakeArchive {
         fn export(
             &self,
@@ -4409,10 +4899,7 @@ git commit -m "Хаб получает архив сессий бэкенда п
             _cwd: &AbsolutePath,
             dest: &Path,
         ) -> Result<Exported, ArchiveError> {
-            let held = self.hold.lock().unwrap().take();
-            if let Some(release) = held {
-                release.recv().unwrap();
-            }
+            pause(&self.hold_export, &self.exporting);
             let file = RelPath::parse(&format!("fake/{}.txt", session.as_str())).unwrap();
             std::fs::create_dir_all(dest.join("fake"))?;
             std::fs::write(file.under(dest), "history")?;
@@ -4441,10 +4928,11 @@ git commit -m "Хаб получает архив сессий бэкенда п
             _src: &Path,
             _cwd: &AbsolutePath,
         ) -> Result<(), ArchiveError> {
+            pause(&self.hold_import, &self.importing);
+            self.imports.lock().unwrap().push(session.as_str().to_owned());
             if self.fail_import.load(Ordering::SeqCst) {
                 return Err(ArchiveError::Malformed("сбой".to_owned()));
             }
-            self.imports.lock().unwrap().push(session.as_str().to_owned());
             self.known.lock().unwrap().insert(session.as_str().to_owned());
             Ok(())
         }
@@ -4470,6 +4958,7 @@ git commit -m "Хаб получает архив сессий бэкенда п
 
 ```rust
     const OTHER: TopicKey = TopicKey { chat: ChatId(-100), thread: ThreadId(8) };
+    const THIRD: TopicKey = TopicKey { chat: ChatId(-100), thread: ThreadId(9) };
 
     async fn bound(world: &World, key: TopicKey, id: &str) {
         world.send(HubMessage::Bind { key, session: SessionId::parse(id).unwrap() }).await;
@@ -4485,6 +4974,10 @@ git commit -m "Хаб получает архив сессий бэкенда п
 
     fn said(world: &World, prefix: &str) -> bool {
         world.texts().iter().any(|text| text.starts_with(prefix))
+    }
+
+    fn count(world: &World, text: &str) -> usize {
+        world.texts().iter().filter(|said| *said == text).count()
     }
 
     async fn saved_snap(world: &World) {
@@ -4539,6 +5032,71 @@ git commit -m "Хаб получает архив сессий бэкенда п
     }
 
     #[tokio::test]
+    async fn an_unpersisted_restore_keeps_the_old_bindings() {
+        let world = world(FakeAgents::default());
+        saved_snap(&world).await;
+        world.store.fail.store(true, Ordering::SeqCst);
+
+        world.send(text(Some(8), 2, "/restore snap")).await;
+
+        eventually("not persisted", || world.texts().contains(&texts::RESTORE_NOT_PERSISTED.to_owned())).await;
+        assert!(!said(&world, "♻️") && !world.texts().contains(&texts::SESSION_MOVED.to_owned()));
+        world.store.fail.store(false, Ordering::SeqCst);
+        let persisted = world.store.last().unwrap();
+        assert_eq!(persisted.get(&KEY).and_then(|s| s.session.clone()), SessionId::parse("s-1"));
+        assert!(persisted.get(&OTHER).is_none());
+        world.send(text(Some(8), 3, "/status")).await;
+        eventually("still unbound in memory", || world.texts().contains(&texts::NO_SESSION.to_owned())).await;
+    }
+
+    #[tokio::test]
+    async fn a_second_restore_of_the_same_session_waits_for_the_first() {
+        let world = world(FakeAgents::default());
+        saved_snap(&world).await;
+        world.agents.archive.forget();
+        let (release, held) = std::sync::mpsc::channel();
+        *world.agents.archive.hold_import.lock().unwrap() = Some(held);
+
+        world.send(text(Some(8), 2, "/restore snap")).await;
+        eventually("first import paused", || world.agents.archive.importing.load(Ordering::SeqCst)).await;
+        world.send(text(Some(9), 3, "/restore snap")).await;
+        eventually("second refused", || count(&world, texts::SESSION_RESERVED) == 1).await;
+
+        release.send(()).unwrap();
+        eventually("first restored", || said(&world, "♻️ Восстановлено: snap")).await;
+        // The second restore never reached `present`/`import`, so the first one's files were
+        // never shared with it and no rollback could touch them.
+        assert_eq!(world.agents.archive.imports(), ["s-1"]);
+        assert_eq!(world.texts().iter().filter(|t| t.starts_with("♻️")).count(), 1);
+        let topics = world.store.last().unwrap();
+        assert_eq!(topics.get(&OTHER).and_then(|s| s.session.clone()), SessionId::parse("s-1"));
+        assert!(topics.get(&THIRD).is_none());
+    }
+
+    #[tokio::test]
+    async fn a_session_being_saved_is_neither_restored_nor_run_elsewhere() {
+        let world = world(FakeAgents::default());
+        saved_snap(&world).await;
+        bound(&world, OTHER, "s-1").await;
+        let (release, held) = std::sync::mpsc::channel();
+        *world.agents.archive.hold_export.lock().unwrap() = Some(held);
+        world.agents.archive.exporting.store(false, Ordering::SeqCst);
+
+        world.send(text(Some(7), 4, "/save second")).await;
+        eventually("export paused", || world.agents.archive.exporting.load(Ordering::SeqCst)).await;
+        world.send(text(Some(8), 5, "/restore snap")).await;
+        eventually("restore refused", || count(&world, texts::SESSION_RESERVED) == 1).await;
+        world.send(text(Some(8), 6, "привет")).await;
+
+        eventually("turn refused", || count(&world, texts::SESSION_RESERVED) == 2).await;
+        assert!(world.agents.prompts().is_empty());
+        release.send(()).unwrap();
+        eventually("saved", || said(&world, "💾 Сохранено: second")).await;
+        world.send(text(Some(8), 7, "теперь можно")).await;
+        eventually("ran", || world.agents.prompts() == ["теперь можно"]).await;
+    }
+
+    #[tokio::test]
     async fn save_and_restore_wait_for_the_turn() {
         let world = world(FakeAgents::scripted(vec![Script::UntilStopped]));
         world.send(text(Some(7), 1, "долго")).await;
@@ -4547,10 +5105,7 @@ git commit -m "Хаб получает архив сессий бэкенда п
         world.send(text(Some(7), 2, "/save snap")).await;
         world.send(text(Some(7), 3, "/restore snap")).await;
 
-        eventually("refused twice", || {
-            world.texts().iter().filter(|t| *t == texts::FINISH_TURN_FIRST).count() == 2
-        })
-        .await;
+        eventually("refused twice", || count(&world, texts::FINISH_TURN_FIRST) == 2).await;
         world.send(HubMessage::Stop(KEY)).await;
     }
 
@@ -4559,16 +5114,13 @@ git commit -m "Хаб получает архив сессий бэкенда п
         let world = world(FakeAgents::default());
         bound(&world, KEY, "s-1").await;
         let (release, held) = std::sync::mpsc::channel();
-        *world.agents.archive.hold.lock().unwrap() = Some(held);
+        *world.agents.archive.hold_export.lock().unwrap() = Some(held);
 
         world.send(text(Some(7), 1, "/save snap")).await;
         world.send(text(Some(7), 2, "привет")).await;
         world.send(text(Some(7), 3, "/reset")).await;
 
-        eventually("busy twice", || {
-            world.texts().iter().filter(|t| *t == texts::SNAPSHOT_BUSY).count() == 2
-        })
-        .await;
+        eventually("busy twice", || count(&world, texts::SNAPSHOT_BUSY) == 2).await;
         assert!(world.agents.prompts().is_empty());
         release.send(()).unwrap();
         eventually("saved", || said(&world, "💾 Сохранено: snap")).await;
@@ -4650,7 +5202,7 @@ mod tests {
 - [ ] **Step 2: Проверить RED**
 
 Run: `cargo test -p hub-telegram --lib -- hub::tests transfer`
-Expected: FAIL — нет `HubMessage::Snapshot`, модуля `transfer`; тесты снимков получают `SNAPSHOTS_PENDING`.
+Expected: FAIL — нет `HubMessage::Snapshot`, модуля `transfer`, `MemoryStore` без `fail`; тесты снимков получают `SNAPSHOTS_PENDING`.
 
 - [ ] **Step 3: Реализация**
 
@@ -4662,17 +5214,18 @@ Expected: FAIL — нет `HubMessage::Snapshot`, модуля `transfer`; те�
 
 ```rust
 //! The file work of `/save` and `/restore`, off the hub task: the agent CLI is checked, files
-//! copied and Hermes run in blocking threads; the hub then applies the result in one step.
+//! copied and Hermes run in blocking threads. The hub owns the decisions: it reserves the
+//! agent session before any agent file is touched and applies the result in one step.
 
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{Datelike, Timelike};
-use hub_agent::archive::{ArchiveError, Exported};
-use hub_core::domain::{AbsolutePath, SessionId, TopicKey, TopicSession};
-use hub_core::snapshot::{Manifest, Minute, SnapshotName};
+use hub_agent::archive::{ArchiveError, Exported, SessionArchive};
+use hub_core::domain::{AbsolutePath, BackendKind, SessionId, TopicKey, TopicSession};
+use hub_core::snapshot::{BackendData, Manifest, Minute, RelPath, SnapshotName};
 use hub_core::topics::Topics;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinError;
 
 use crate::hub::{Agents, HubMessage, SnapshotDone};
@@ -4680,9 +5233,25 @@ use crate::paths::resolve_cwd;
 use crate::snapshots::{Loaded, SnapshotStore};
 use crate::texts;
 
+/// One agent session; at most one snapshot job works on it at a time.
+pub type Reservation = (BackendKind, SessionId);
+
 pub enum Done {
-    Saved { key: TopicKey, name: SnapshotName, outcome: Result<Manifest, String> },
-    Restored { key: TopicKey, outcome: Result<Restoration, String> },
+    Saved {
+        key: TopicKey,
+        name: SnapshotName,
+        reservation: Reservation,
+        outcome: Result<Manifest, String>,
+    },
+    /// `/restore` loaded its snapshot; the hub grants the session (`true`) or refuses and
+    /// tells the topic itself (`false`).
+    Loaded { key: TopicKey, reservation: Reservation, reply: oneshot::Sender<bool> },
+    Restored {
+        key: TopicKey,
+        /// `None` when the job failed before the hub granted the session.
+        reservation: Option<Reservation>,
+        outcome: Result<Restoration, String>,
+    },
 }
 
 pub struct Restoration {
@@ -4740,13 +5309,15 @@ pub struct SaveJob<A> {
 }
 
 impl<A: Agents> SaveJob<A> {
+    /// The hub has already reserved `(session.backend, id)` for this job.
     pub async fn run(self) {
         let (key, name, mailbox) = (self.key, self.name.clone(), self.mailbox.clone());
+        let reservation = (self.session.backend, self.id.clone());
         let outcome = self.save().await;
         if let Err(reason) = &outcome {
             tracing::warn!(chat = key.chat.0, thread = key.thread.0, snapshot = name.as_str(), %reason, "snapshot not saved");
         }
-        report(&mailbox, Done::Saved { key, name, outcome }).await;
+        report(&mailbox, Done::Saved { key, name, reservation, outcome }).await;
     }
 
     async fn save(self) -> Result<Manifest, String> {
@@ -4789,71 +5360,116 @@ pub struct RestoreJob<A> {
     pub mailbox: mpsc::Sender<HubMessage>,
 }
 
+/// What phase one found: everything `present`/`import` need.
+struct Plan {
+    session: SessionId,
+    data: BackendData,
+    files: Vec<RelPath>,
+    agent: PathBuf,
+    cwd: AbsolutePath,
+}
+
 impl<A: Agents> RestoreJob<A> {
     pub async fn run(self) {
-        let (key, name, mailbox) = (self.key, self.name.clone(), self.mailbox.clone());
-        let outcome = self.restore().await;
-        match &outcome {
-            Ok(restoration) => tracing::info!(snapshot = name.as_str(), imported = restoration.imported, "snapshot restored"),
-            Err(reason) => tracing::warn!(chat = key.chat.0, thread = key.thread.0, snapshot = name.as_str(), %reason, "snapshot not restored"),
-        }
-        report(&mailbox, Done::Restored { key, outcome }).await;
-    }
-
-    async fn restore(self) -> Result<Restoration, String> {
-        let Self { key: _key, name, cwd, root, store, home, agents, mailbox: _mailbox } = self;
-        let wanted = name.clone();
-        let Loaded { manifest, agent } = tokio::task::spawn_blocking(move || store.load(&wanted))
-            .await
-            .map_err(internal)?
-            .map_err(|error| error.to_string())?;
-        let Manifest {
-            name: _name,
-            created_at: _created_at,
-            title: _title,
-            cwd: saved,
-            session,
-            agent_version: _agent_version,
-            data,
-            files,
-        } = manifest;
-        let cwd = match cwd {
-            Some(cwd) => cwd,
-            None => resolve_cwd(&root, &home, Some(&saved.as_path().display().to_string()))
-                .map_err(|error| error.to_string())?,
+        let Self { key, name, cwd, root, store, home, agents, mailbox } = self;
+        let plan = match load(&name, cwd, &root, store, &home).await {
+            Ok(plan) => plan,
+            Err(reason) => return finish(&mailbox, key, &name, None, Err(reason)).await,
         };
-        let backend = data.backend();
-        let archive = agents.archive(backend, &home).await?;
-        let (id, target) = (session.clone(), cwd.clone());
-        let imported = tokio::task::spawn_blocking(move || -> Result<bool, ArchiveError> {
-            if archive.present(&id, &target, &data)? {
-                return Ok(false);
-            }
-            archive.import(&id, &data, &files, &agent, &target)?;
-            Ok(true)
-        })
+        let reservation = (plan.data.backend(), plan.session.clone());
+        let (reply, granted) = oneshot::channel();
+        report(&mailbox, Done::Loaded { key, reservation: reservation.clone(), reply }).await;
+        // `false` or a hub gone away: the hub already told the topic, nothing was touched.
+        if !matches!(granted.await, Ok(true)) {
+            return;
+        }
+        let outcome = apply(name.clone(), plan, &*agents, &home).await;
+        finish(&mailbox, key, &name, Some(reservation), outcome).await;
+    }
+}
+
+async fn finish(
+    mailbox: &mpsc::Sender<HubMessage>,
+    key: TopicKey,
+    name: &SnapshotName,
+    reservation: Option<Reservation>,
+    outcome: Result<Restoration, String>,
+) {
+    match &outcome {
+        Ok(restoration) => tracing::info!(snapshot = name.as_str(), imported = restoration.imported, "snapshot restored"),
+        Err(reason) => tracing::warn!(chat = key.chat.0, thread = key.thread.0, snapshot = name.as_str(), %reason, "snapshot not restored"),
+    }
+    report(mailbox, Done::Restored { key, reservation, outcome }).await;
+}
+
+async fn load(
+    name: &SnapshotName,
+    cwd: Option<AbsolutePath>,
+    root: &AbsolutePath,
+    store: SnapshotStore,
+    home: &std::path::Path,
+) -> Result<Plan, String> {
+    let wanted = name.clone();
+    let Loaded { manifest, agent } = tokio::task::spawn_blocking(move || store.load(&wanted))
         .await
         .map_err(internal)?
         .map_err(|error| error.to_string())?;
-        Ok(Restoration { name, session: TopicSession { backend, cwd, session: Some(session) }, imported })
-    }
+    let Manifest {
+        name: _name,
+        created_at: _created_at,
+        title: _title,
+        cwd: saved,
+        session,
+        agent_version: _agent_version,
+        data,
+        files,
+    } = manifest;
+    let cwd = match cwd {
+        Some(cwd) => cwd,
+        None => resolve_cwd(root, home, Some(&saved.as_path().display().to_string()))
+            .map_err(|error| error.to_string())?,
+    };
+    Ok(Plan { session, data, files, agent, cwd })
+}
+
+async fn apply<A: Agents>(
+    name: SnapshotName,
+    plan: Plan,
+    agents: &A,
+    home: &std::path::Path,
+) -> Result<Restoration, String> {
+    let Plan { session, data, files, agent, cwd } = plan;
+    let backend = data.backend();
+    let archive: Arc<dyn SessionArchive> = agents.archive(backend, home).await?;
+    let (id, target) = (session.clone(), cwd.clone());
+    let imported = tokio::task::spawn_blocking(move || -> Result<bool, ArchiveError> {
+        if archive.present(&id, &target, &data)? {
+            return Ok(false);
+        }
+        archive.import(&id, &data, &files, &agent, &target)?;
+        Ok(true)
+    })
+    .await
+    .map_err(internal)?
+    .map_err(|error| error.to_string())?;
+    Ok(Restoration { name, session: TopicSession { backend, cwd, session: Some(session) }, imported })
 }
 ```
 
 `crates/hub-telegram/src/hub.rs`:
 
-- импорты: `use std::collections::{HashMap, HashSet};`, `use hub_core::commands::{…, RestoreArgs, SaveArgs, parse_restore_args, parse_save_args};`, `use hub_core::snapshot::{SnapshotName, default_name};`, `use crate::snapshots::{SnapshotError, SnapshotStore};`, `use crate::transfer::{Done, Restoration, RestoreJob, SaveJob, holders, local_minute, utc_now};`.
+- импорты: `use std::collections::{HashMap, HashSet};`, `use hub_core::commands::{…, RestoreArgs, SaveArgs, parse_restore_args, parse_save_args};`, `use hub_core::snapshot::{SnapshotName, default_name};`, `use crate::snapshots::{SnapshotError, SnapshotStore};`, `use crate::transfer::{Done, Reservation, Restoration, RestoreJob, SaveJob, holders, local_minute, utc_now};`.
 - `HubMessage` — после `Reset(TopicKey),`:
 
 ```rust
-    /// A `/save` or `/restore` finished its file work.
+    /// A `/save` or `/restore` reached a decision point or finished its file work.
     Snapshot(SnapshotDone),
 ```
 
 и рядом с `HubMessage`:
 
 ```rust
-/// The outcome of a snapshot job; only the hub reads it.
+/// A message of a snapshot job; only the hub reads it.
 pub struct SnapshotDone(pub(crate) Done);
 ```
 
@@ -4864,9 +5480,12 @@ pub struct SnapshotDone(pub(crate) Done);
     snapshotting: HashSet<TopicKey>,
     /// Names being written now, so two topics cannot race for one name.
     naming: HashSet<SnapshotName>,
+    /// Agent sessions a snapshot job works on, and the topic that asked: no second job and
+    /// no turn of any topic bound to them until the hub has processed the result.
+    reserved: HashMap<Reservation, TopicKey>,
 ```
 
-и в `spawn` — `snapshotting: HashSet::new(), naming: HashSet::new(),`.
+и в `spawn` — `snapshotting: HashSet::new(), naming: HashSet::new(), reserved: HashMap::new(),`.
 - `handle`: `HubMessage::Snapshot(SnapshotDone(done)) => self.snapshot_done(done),`.
 - `command`: ветку из задачи 2 заменить на
 
@@ -4881,6 +5500,10 @@ pub struct SnapshotDone(pub(crate) Done);
 ```rust
         if self.snapshotting.contains(&key) {
             self.say(Target::Topic(key), texts::SNAPSHOT_BUSY.to_owned());
+            return;
+        }
+        if self.topics.get(&key).is_some_and(|session| self.is_reserved(session)) {
+            self.say(Target::Topic(key), texts::SESSION_RESERVED.to_owned());
             return;
         }
 ```
@@ -4904,6 +5527,10 @@ pub struct SnapshotDone(pub(crate) Done);
 - новые методы после `bind`:
 
 ```rust
+    fn is_reserved(&self, session: &TopicSession) -> bool {
+        session.session.as_ref().is_some_and(|id| self.reserved.contains_key(&(session.backend, id.clone())))
+    }
+
     /// `/save` and `/restore` refuse during a turn and while another snapshot job runs here.
     fn refuse_snapshot(&self, key: TopicKey) -> bool {
         let text = if self.running.contains_key(&key) {
@@ -4934,6 +5561,11 @@ pub struct SnapshotDone(pub(crate) Done);
             self.say(Target::Topic(key), texts::NOTHING_TO_SAVE.to_owned());
             return;
         };
+        let reservation: Reservation = (session.backend, id.clone());
+        if self.reserved.contains_key(&reservation) {
+            self.say(Target::Topic(key), texts::SESSION_RESERVED.to_owned());
+            return;
+        }
         let title = self.titles.get(&key).cloned();
         let name = match requested {
             SaveArgs::Named(name) => name,
@@ -4944,6 +5576,7 @@ pub struct SnapshotDone(pub(crate) Done);
             return;
         }
         self.snapshotting.insert(key);
+        self.reserved.insert(reservation, key);
         let job = SaveJob {
             key,
             name,
@@ -5014,17 +5647,22 @@ pub struct SnapshotDone(pub(crate) Done);
 
     fn snapshot_done(&mut self, done: Done) {
         match done {
-            Done::Saved { key, name, outcome } => {
+            Done::Saved { key, name, reservation, outcome } => {
                 self.snapshotting.remove(&key);
                 self.naming.remove(&name);
+                self.reserved.remove(&reservation);
                 let text = match outcome {
                     Ok(manifest) => texts::saved(&manifest),
                     Err(reason) => texts::warning(&reason),
                 };
                 self.say(Target::Topic(key), text);
             }
-            Done::Restored { key, outcome } => {
+            Done::Loaded { key, reservation, reply } => self.grant(key, reservation, reply),
+            Done::Restored { key, reservation, outcome } => {
                 self.snapshotting.remove(&key);
+                if let Some(reservation) = reservation {
+                    self.reserved.remove(&reservation);
+                }
                 match outcome {
                     Ok(restoration) => self.rebind(key, restoration),
                     Err(reason) => self.say(Target::Topic(key), texts::warning(&reason)),
@@ -5033,20 +5671,63 @@ pub struct SnapshotDone(pub(crate) Done);
         }
     }
 
-    /// One session, one topic: every other holder is reset, then `key` is bound, in one save.
+    /// Phase two of `/restore` may touch the agent's files only with the session reserved and
+    /// no topic bound to it running a turn.
+    fn grant(&mut self, key: TopicKey, reservation: Reservation, reply: oneshot::Sender<bool>) {
+        let (backend, id) = &reservation;
+        let running = self.topics.iter().any(|(other, session)| {
+            session.backend == *backend
+                && session.session.as_ref() == Some(id)
+                && self.running.contains_key(other)
+        });
+        let refusal = if self.reserved.contains_key(&reservation) {
+            Some(texts::SESSION_RESERVED)
+        } else if running {
+            Some(texts::SESSION_BUSY_ELSEWHERE)
+        } else {
+            None
+        };
+        if let Some(text) = refusal {
+            self.snapshotting.remove(&key);
+            self.say(Target::Topic(key), text.to_owned());
+            // The job only waits for this answer; if it is gone there is nothing to stop.
+            let _ = reply.send(false);
+            return;
+        }
+        self.reserved.insert(reservation.clone(), key);
+        if reply.send(true).is_err() {
+            // The job vanished (runtime shutting down): it will not report back.
+            self.reserved.remove(&reservation);
+            self.snapshotting.remove(&key);
+        }
+    }
+
+    /// One session, one topic: every other holder is reset and `key` bound, persisted as one
+    /// save; only a successful save changes the hub's bindings and tells the topics.
     fn rebind(&mut self, key: TopicKey, restoration: Restoration) {
         let Restoration { name, session, imported: _imported } = restoration;
         let holders = holders(&self.topics, key, &session);
-        if self.running.contains_key(&key) || holders.iter().any(|holder| self.running.contains_key(holder)) {
+        let busy = |topic: &TopicKey| self.running.contains_key(topic) || self.snapshotting.contains(topic);
+        if busy(&key) || holders.iter().any(busy) {
             self.say(Target::Topic(key), texts::SESSION_BUSY_ELSEWHERE.to_owned());
             return;
         }
-        for holder in &holders {
-            if let Some(old) = self.topics.get(holder).cloned() {
-                self.topics.insert(*holder, old.with_session(None));
+        let next = {
+            let mut next = self.topics.clone();
+            for holder in &holders {
+                if let Some(old) = next.get(holder).cloned() {
+                    next.insert(*holder, old.with_session(None));
+                }
             }
+            next.insert(key, session.clone());
+            next
+        };
+        if let Err(error) = self.store.save(&next) {
+            tracing::error!(%error, snapshot = name.as_str(), "restored bindings could not be saved");
+            self.say(Target::Topic(key), texts::RESTORE_NOT_PERSISTED.to_owned());
+            return;
         }
-        self.put(key, session.clone());
+        self.topics = next;
         self.say(Target::Topic(key), texts::restored(&name, &session));
         for holder in holders {
             self.say(Target::Topic(holder), texts::SESSION_MOVED.to_owned());
@@ -5054,7 +5735,7 @@ pub struct SnapshotDone(pub(crate) Done);
     }
 ```
 
-`put` вставляет и сохраняет все `Topics` одним вызовом `store.save` — сброс владельцев и новая привязка уходят на диск вместе (`hub.rs:546-551`). Уведомление прежней теме — через `say`, без гарантии доставки (как в спецификации). Результат, пришедший во время остановки, обрабатывается, если хаб ещё жив; иначе отбрасывается (non-goal).
+`rebind` больше не вызывает `put` (тот только пишет ошибку в лог, `hub.rs:546-551`): привязки меняются в памяти лишь после удачного `TopicStore::save`, и сброс владельцев уходит на диск в той же записи. Файлы, уже возвращённые агенту при неудачной записи привязок, остаются — повторный `/restore` увидит их через `present`. Уведомление прежней теме — через `say`, без гарантии доставки (как в спецификации). `use tokio::sync::{mpsc, oneshot, watch};` в `hub.rs` уже есть (`:20`).
 
 `crates/hub-telegram/src/texts.rs`: удалить `SNAPSHOTS_PENDING` и её комментарий.
 
@@ -5063,7 +5744,7 @@ pub struct SnapshotDone(pub(crate) Done);
 - [ ] **Step 4: Проверить GREEN**
 
 Run: `cargo test -p hub-telegram --lib -- hub::tests transfer && cargo test -p hub-app --lib -- supervisor`
-Expected: PASS, включая прежние тесты хаба.
+Expected: PASS, включая прежние тесты хаба (они используют `world.store.last()` — смысл не изменился).
 
 - [ ] **Step 5: Гейты**
 
@@ -5380,7 +6061,7 @@ Expected: PASS — новые тесты `ignored`.
 
 `/restore <имя> [каталог]` в новой теме продолжает ту же сессию: одна сессия — одна тема, прежняя тема сбрасывается и получает уведомление. Каталог — из снимка или указанный (внутри корня рабочих каталогов, должен существовать). Если у агента сессия уже есть, файлы не трогаются — тема только перепривязывается; иначе история возвращается агенту без перезаписи его файлов. Во время хода `/save` и `/restore` отказывают.
 
-Снимки лежат в `<каталог снимков>/snapshots/<имя>/` (`manifest.json` и `agent/`); каталог по умолчанию — `~/.agent-hub`, меняется в «Настройках». Удалить снимок — удалить его каталог.
+Снимки лежат в `<каталог снимков>/snapshots/<имя>/` (`manifest.json` и `agent/`); каталог по умолчанию — `~/.agent-hub`, меняется в «Настройках». При смене каталога старые снимки остаются на прежнем месте и в `/saves` не видны — перенесите их вручную. Удалить снимок — удалить его каталог.
 
 Что переносится по бэкендам: Claude — `projects/<проект>/<id>.jsonl` и каталог сессии; Codex — файлы `rollout-…-<id>` из `sessions/` (архивную сессию сначала верните: `codex unarchive <id>`); Qwen — чат, его спутники, субагенты и задачи, при новом каталоге поле `cwd` в истории переписывается; Hermes — строки сессии (с цепочкой сжатия) из `state.db` профиля из настроек, через собственный Python Hermes.
 ```
@@ -5435,6 +6116,10 @@ Expected: 4 PASS. Падение Hermes на `sessions delete` — сверит�
 8. Codex: `codex` в терминале → архивировать сессию → `/save` → «Сессия в архиве Codex: выполните `codex unarchive <id>`».
 9. Сбой посреди сохранения: `chmod 000 ~/.claude/projects/<P>/<id>` → `/save x` → предупреждение; в `~/.agent-hub/snapshots/` нет `.tmp-*`; вернуть права.
 10. Логи: `rg -n "бирюза|\"content\"" ~/.local/share/agent-hub/logs` — пусто (в лог не попадает история).
+11. Резерв: в теме A начать `/save big` для длинной сессии и сразу в теме B `/restore` снимка этой же сессии → «⏳ С этой сессией сейчас работает /save или /restore в другой теме — подождите.»; после «💾 Сохранено» повтор в B проходит.
+12. Qwen: каталоги `~/work/a-b` и `~/work/a_b` внутри корня; сессия в `a-b`, `/save q`, `/restore q ~/work/a_b` без удаления исходной → «⚠️ В Qwen уже есть сессия <id> для каталога …/a-b»; `todos/<id>.json` не изменился (`stat`).
+13. Запись привязок: `chmod 500` каталога данных agent-hub (`~/.local/share/agent-hub`), `/restore` → «⚠️ Восстановление не сохранено: …»; `/status` в обеих темах — как до команды; вернуть права.
+14. Ссылки: `mv ~/.claude/projects ~/claude-projects && ln -s ~/claude-projects ~/.claude/projects`, `/save` → «⚠️ «projects»: путь идёт через символьную ссылку …»; вернуть как было.
 
 - [ ] **Step 3: Windows**
 
@@ -5483,28 +6168,45 @@ Expected: `release.yml` собирает Windows, macOS и Linux. Без под�
 | Выход за каталог через имя снимка | Задача 1: `SnapshotName` — `[a-z0-9._-]`, без ведущей/завершающей точки и имён устройств Windows; тесты `../x`, `a/b`, `con` |
 | Выход за каталог через `manifest.json` | Задача 1: `RelPath` без `..`, `.`, пустых частей, `\`, `:`, управляющих символов; `project` Claude — одна часть; задачи 4–7: импорт принимает только форму путей своей сессии (`Malformed` иначе), тесты с `.credentials.json`, `../`, чужим проектом/датой |
 | Id сессии как часть имени файла | Задача 3: `file_stem` — `[A-Za-z0-9_-]{1,128}` |
-| Символьные ссылки | Задача 3: `symlink_metadata`/`DirEntry::file_type` — ссылки пропускаются в обходе, источник-ссылка отвергается; задача 9: каталог снимка-ссылка — `Corrupt`; тесты `#[cfg(unix)]` |
+| Символьные ссылки, в том числе в родительских частях пути | Задача 3: `entry_under`/`open_under`/`create_under` проверяют `symlink_metadata` каждую часть от доверенного корня (корень хранилища агента, `agent/` снимка), ссылка — `ArchiveError::Link`; каталоги назначения создаются по одной части, конечный файл — `create_new`; в обходе дерева ссылки пропускаются (`DirEntry::file_type`); задачи 4, 6: `projects/` или `todos/` ссылкой — отказ; задача 9: каталог снимка, `agent/` и родители файлов — не ссылки, иначе `Corrupt`. Тесты: `a_linked_parent_on_the_source_side_is_refused`, `a_linked_parent_on_the_destination_side_is_refused`, `a_linked_parent_on_the_snapshot_side_is_refused`, `a_linked_projects_directory_is_refused_on_export_and_import`, `linked_todos_or_projects_are_refused`, `a_linked_parent_inside_a_snapshot_is_refused` |
 | Права файлов снимка | Задачи 3, 9: каталоги `0700` (`DirBuilder::mode`, `restrict_dir` для существующего корня), файлы `0600` (`create_new` + `mode`); тесты прав |
-| Перезапись данных агента | Задача 3: `place_all` создаёт файлы `create_new`, при ошибке удаляет созданные; задачи 4–7: `present` до `import`; Hermes `import_sessions` пропускает существующие id |
+| Перезапись данных агента | Задача 3: `place_all` создаёт файлы `create_new`, при ошибке удаляет созданные; задачи 4–7: `present` до `import`; задача 6: существующий `todos/<id>.json` не трогается, `present` Qwen сверяет `sessionId` и `cwd` первой записи (`Occupied` при чужом каталоге); Hermes `import_sessions` пропускает существующие id |
+| Две операции над одной сессией | Задача 11: резерв `(BackendKind, SessionId)` в акторе хаба — берётся до выгрузки (`/save`) и до `present`/`import` (`/restore`, этап `Done::Loaded`), снимается при обработке результата; второй `/save`/`/restore` и ходы привязанных тем — `SESSION_RESERVED`; откат одного `/restore` не может удалить файлы другого, потому что второй до `import` не доходит. Тесты: `a_second_restore_of_the_same_session_waits_for_the_first`, `a_session_being_saved_is_neither_restored_nor_run_elsewhere` |
+| Привязки тем не записались | Задача 11: `rebind` пишет новые `Topics` через `TopicStore::save` и заменяет текущие только при `Ok`; иначе `RESTORE_NOT_PERSISTED`, прежние привязки и в памяти, и на диске. Тест `an_unpersisted_restore_keeps_the_old_bindings` |
 | Неполный снимок | Задача 9: staging `.tmp-<uuid>` → `manifest.json` с `sync_all` → `rename` → `fsync` каталога; любая ошибка — `Drop` удаляет staging; брошенные после сбоя — уборка старше суток |
 | Гонка двух `/save` с одним именем | Задача 11: множество `naming` в акторе хаба + проверка перед `rename` (остаточное окно — только при внешней записи в каталог снимков) |
-| Ход во время снимка, перепривязка при сбое импорта | Задача 11: `/save`/`/restore` отказывают во время хода; `snapshotting` блокирует `launch` и `/new`/`/cwd`/`/reset`/`/backend`; привязки меняются только после успешных `present`/`import` и только если ни тема, ни владелец не выполняют ход; одна правка `Topics` и один `put`; тест `a_failed_import_leaves_the_topics_unchanged` |
+| Ход во время снимка, перепривязка при сбое импорта | Задача 11: `/save`/`/restore` отказывают во время хода; `snapshotting` блокирует `launch` и `/new`/`/cwd`/`/reset`/`/backend`; привязки меняются только после успешных `present`/`import` и только если ни тема, ни владелец не выполняют ход и не заняты своим снимком; тест `a_failed_import_leaves_the_topics_unchanged` |
 | Запуск Hermes | Задача 7: `std::process::Command` со списком аргументов, без оболочки; скрипт и данные — в `tempfile` `0700`; результат — только файлом, ограничен 1 МиБ; тайм-аут 120 с с `kill`; схема 31 сверяется в коде и в базе; `stdin`/`stdout` закрыты, `stderr` в файл, в лог — только `debug` |
 | Подмена интерпретатора Hermes | Задача 7: интерпретатор — из файла `hermes`, который пользователь указал или нашёл `which` (тот же, что уже запускается для ACP); `#!/usr/bin/env` и неизвестные формы — отказ |
 | Утечка истории в логи | Задачи 9–11: в `info`/`warn` — имя снимка, бэкенд, число файлов, вид отказа Hermes; задача 13, шаг 2.10 |
 | Блокировка актора хаба | Задача 11: файловая работа и процессы — в `spawn_blocking`, хаб получает `HubMessage::Snapshot`; список снимков — тоже в отдельной задаче |
-| Рост хранилища | Снимки удаляет пользователь (решение спецификации, README); staging убирается; список ограничен 30 строками, манифест — 1 МиБ, `files` — 10 000, обход — 100 000 файлов и глубина 16 |
+| Рост хранилища, нечитаемый снимок | Снимки удаляет пользователь (решение спецификации, README); staging убирается; список ограничен 30 строками; манифест — `MANIFEST_LIMIT` (1 МиБ) и `FILES_LIMIT` (10 000) одинаково при `dump` и `parse`, так что `save` отказывает до публикации снимка, который `load` не прочёл бы (задачи 1, 9; тесты `dump_and_parse_share_the_size_limit`, `dump_refuses_more_files_than_parse_accepts`, `the_size_limit_holds_on_save_and_load_alike`, `the_files_limit_holds_on_save_and_load_alike`); обход — 100 000 файлов и глубина 16 |
 | Совместимость `settings.toml` | Задача 8: `#[serde(default)] snapshots`, тест старого файла без секции |
 | Формат снимка во времени | Задача 1: `manifest.version = 1`, неизвестная версия сообщается до разбора формы |
 
-Остаточные риски: TOCTOU между `symlink_metadata` и `open` в каталогах агента (возможен только процессу того же пользователя, у которого и так есть доступ к истории); при остановке бота результат незавершённого `/restore` теряется (повтор идемпотентен); Hermes и Codex проверены по исходникам конкретных коммитов — несовпадение версий ловят `MIN_VERSION`, схема 31 и живые тесты.
+Остаточные риски (приняты): гонка «проверка части пути → `open`/`create`/`remove_file`» (TOCTOU) — подменить часть пути на ссылку во время копирования может только процесс того же пользователя, пишущий в каталоги `0700` хаба или агента, и у такого процесса уже есть доступ к истории; `O_NOFOLLOW` без `libc`/`unsafe` недоступен, поэтому конечный файл назначения защищён `create_new`, источник — проверкой непосредственно перед `open`; при остановке бота результат незавершённого `/restore` теряется (повтор идемпотентен); файлы, возвращённые агенту при неудачной записи `topics.json`, остаются (их увидит `present` при повторе); при остановке бота результат незавершённого `/restore` теряется (повтор идемпотентен); Hermes и Codex проверены по исходникам конкретных коммитов — несовпадение версий ловят `MIN_VERSION`, схема 31 и живые тесты.
 
 ## Самопроверка плана
 
-- Имена сквозь задачи: `SnapshotName`, `NameError`, `Minute`, `default_name`, `RelPath`, `PathError`, `BackendData`, `Manifest`, `ManifestError` (1) → `SaveArgs`/`RestoreArgs`, `texts::{saved, restored, snapshot_list}` (2) → `Exported`, `ArchiveError` (+`From<PathError>`), `SessionArchive`, помощники (3) → `ClaudeArchive`/`CodexArchive`/`QwenArchive`/`HermesArchive` и `storage_root` с сигнатурами `(Option<&OsStr>, &Path)`, `(Option<&OsStr>, Option<&OsStr>, &Path) -> Result`, `HermesArchive::new(&Path, Option<String>, String) -> Result` (4–7) → `Agents::archive` в `HubAgents` (10) → `SaveJob`/`RestoreJob` (11) и живые тесты (12).
-- `Settings.snapshots_dir`/`Draft.snapshots_dir` (8) используются в `Hub::save/saves/restore` и в `world_from` тестов (11); `SnapshotStore::{new, save, list, load}`, `Loaded`, `SnapshotError` (9) — в `transfer` и `Hub` (11).
+- Имена сквозь задачи: `SnapshotName`, `NameError`, `Minute`, `default_name`, `RelPath`, `PathError`, `BackendData`, `Manifest`, `ManifestError` (+`TooLarge`), `MANIFEST_LIMIT`, `FILES_LIMIT` (1) → `SaveArgs`/`RestoreArgs`, `texts::{saved, restored, snapshot_list}`, `SESSION_RESERVED`, `RESTORE_NOT_PERSISTED` (2) → `Exported`, `ArchiveError` (+`Occupied`, `Link`, `From<PathError>`), `SessionArchive`, `Entry`, `entry_under`, `open_under`, `create_under`, `collect_tree`, `export_files`, `place_all(src, dest, &[(RelPath, RelPath)], FnMut(&RelPath, File, &mut File))`, `copy_plain` (3) — все вызовы в задачах 4–7 и 9 переписаны на эти сигнатуры, `is_regular_file`/`is_real_dir` больше нигде не используются → `ClaudeArchive`/`CodexArchive`/`QwenArchive`/`HermesArchive` и `storage_root` с сигнатурами `(Option<&OsStr>, &Path)`, `(Option<&OsStr>, Option<&OsStr>, &Path) -> Result`, `HermesArchive::new(&Path, Option<String>, String) -> Result` (4–7) → `Agents::archive` в `HubAgents` (10) → `SaveJob`/`RestoreJob` (11) и живые тесты (12).
+- `Settings.snapshots_dir`/`Draft.snapshots_dir` (8) используются в `Hub::save/saves/restore` и в `world_from` тестов (11); `SnapshotStore::{new, save, list, load}`, `Loaded`, `SnapshotError` (+`Manifest`) (9) — в `transfer` и `Hub` (11).
+- Резерв: `Reservation` и `Done::{Saved, Loaded, Restored}` (11) — резерв берут `Hub::save` и `Hub::grant`, снимает `snapshot_done` во всех ветках (`Saved`, `Restored` с `Some`), отказ в `grant` снимает `snapshotting` сам; `launch` проверяет и `snapshotting`, и резерв.
+- `MemoryStore` в тестах хаба стал структурой с `saved`/`fail`; прежние тесты используют только `store.last()`, смысл которого («последняя удачная запись») не изменился.
 - Тексты: дословные из спецификации — `NOTHING_TO_SAVE`, `NO_SNAPSHOTS`, `SESSION_MOVED`, `FINISH_TURN_FIRST`, «💾 Сохранено: …», «♻️ Восстановлено: …», «Сессия в архиве Codex: выполните `codex unarchive <id>`», «Hermes <версия> не поддерживается для переноса»; новые — перечислены в расхождении 14. Ожидания тестов хаба (`⚠️ Данные снимка повреждены: сбой`, `⚠️ Снимок nope не найден`, `⚠️ Снимок snap уже существует`) совпадают с `Display` `ArchiveError::Malformed`/`SnapshotError` и `texts::warning`.
 - Временные ветки: `SNAPSHOTS_PENDING` (2) и заглушка `FakeAgents::archive` (10) заменяются в задаче 11.
 - Форма `manifest.json` в тесте задачи 1 совпадает с примером спецификации (плюс `title: null` и `backend_data.kind`); протокол скрипта Hermes в задаче 7 одинаков в `archive.py`, `HermesArchive::run`, поддельном Python и заглушках.
 - `Cargo.lock`: новые рёбра только к пакетам, уже бывшим в lock (`tempfile`, `chrono`); после задач 3–7 и 11 — `git diff --stat Cargo.lock`.
 - Коммиты — по-русски, без строк атрибуции; push — только в задаче 14 после подтверждения пользователя.
+
+## Ревью PR #5
+
+| # | Замечание | Где исправлено |
+|---|---|---|
+| 1 | P1: `todos/<id>.json` вне каталога проекта ломал возврат в другой каталог при живой исходной сессии | Задача 6, шаг 3 (`import`: существующий обычный `todos` пропускается, ссылка — `Link`); тест `restoring_into_another_directory_keeps_the_existing_todos` |
+| 2 | P1: коллизия `san` (`/work/a-b` и `/work/a_b`) | Задача 3 (`ArchiveError::Occupied`); задача 6, шаг 3 (`present` и решение о переписывании — по `sessionId`/`cwd` первой записи, `same_dir`); тесты `directories_that_sanitize_alike_are_told_apart_by_the_recorded_cwd`, `directories_are_compared_like_qwen`, `cwd_is_sanitized_like_qwen::dash_and_underscore_collide`; расхождение 21 |
+| 3 | P2: `dump` без лимитов чтения | Задача 1 (`MANIFEST_LIMIT`, `ManifestError::TooLarge`, проверки в `dump` и `parse`; тесты `dump_and_parse_share_the_size_limit`, `dump_refuses_more_files_than_parse_accepts`); задача 9 (`SnapshotError::Manifest`, чтение `MANIFEST_LIMIT + 1`; тесты `the_size_limit_holds_on_save_and_load_alike`, `the_files_limit_holds_on_save_and_load_alike`) |
+| 4 | P1: два `/restore` одной сессии одновременно | Задача 11 (`reserved`, этап `Done::Loaded` → `grant`); тест `a_second_restore_of_the_same_session_waits_for_the_first`; расхождение 19 |
+| 5 | P1: `/save` и `/restore`/ход по одной сессии одновременно | Задача 11 (резерв в `Hub::save`, проверка в `launch`, `rebind` отказывает при снимке у владельца); тест `a_session_being_saved_is_neither_restored_nor_run_elsewhere`; тексты `SESSION_RESERVED` (задача 2) |
+| 6 | P2: перепривязка без проверки записи | Задача 11 (`rebind` через `TopicStore::save` и `Result`); `RESTORE_NOT_PERSISTED` (задача 2); тест `an_unpersisted_restore_keeps_the_old_bindings`; расхождение 20 |
+| 7 | P1: ссылки в родительских частях пути | Задача 3 (переписана: `Entry`, `entry_under`, `open_under`, `create_under`, новая сигнатура `place_all`); задачи 4–7 и 9 переведены на них; тесты в задачах 3, 4, 6, 9 (см. «Покрытие…»); остаточный TOCTOU — в «Покрытии…» |
+| — | Вне объёма: кнопки GUI «запечатать бекапы», «Открыть папку», список снимков в окне; старые снимки при смене каталога | **Non-goals**; README (задача 12, шаг 5) |
