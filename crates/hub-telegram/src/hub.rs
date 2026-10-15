@@ -1,7 +1,7 @@
 //! The hub actor: one task owns every topic's state and handles messages one at a time
 //! without waiting on the network; sessions run in their own tasks and report back.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -10,13 +10,14 @@ use futures::future::BoxFuture;
 use hub_agent::archive::SessionArchive;
 use hub_agent::conversation::Conversation;
 use hub_core::commands::{
-    BackendDecision, Command, Input, NewSessionArgs, decide_backend, join_path_args, parse_input,
-    parse_new_args,
+    BackendDecision, Command, Input, NewSessionArgs, RestoreArgs, SaveArgs, decide_backend,
+    join_path_args, parse_input, parse_new_args, parse_restore_args, parse_save_args,
 };
 use hub_core::domain::{
     AbsolutePath, BackendKind, ChatId, MessageId, Prompt, SessionId, TopicKey, TopicSession,
 };
 use hub_core::settings::Settings;
+use hub_core::snapshot::{SnapshotName, default_name};
 use hub_core::topics::Topics;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
@@ -31,7 +32,11 @@ use crate::paths::{CwdError, resolve_cwd, workspace_root};
 use crate::press;
 use crate::sender::Sender;
 use crate::session::{First, Run};
+use crate::snapshots::{SnapshotError, SnapshotStore};
 use crate::texts;
+use crate::transfer::{
+    Done, Reservation, Restoration, RestoreJob, SaveJob, holders, local_minute, supervise, utc_now,
+};
 
 pub(crate) const INBOX: usize = 32;
 const MAILBOX: usize = 256;
@@ -96,8 +101,13 @@ pub enum HubMessage {
     },
     Stop(TopicKey),
     Reset(TopicKey),
+    /// A `/save` or `/restore` reached a decision point or finished its file work.
+    Snapshot(SnapshotDone),
     Shutdown(oneshot::Sender<()>),
 }
+
+/// A message of a snapshot job; only the hub reads it.
+pub struct SnapshotDone(pub(crate) Done);
 
 pub struct HubSetup<A> {
     pub agents: Arc<A>,
@@ -139,6 +149,13 @@ struct Hub<A> {
     mailbox: mpsc::Sender<HubMessage>,
     views: watch::Sender<Vec<TopicView>>,
     shutdown: Option<(oneshot::Sender<()>, Instant)>,
+    /// Topics with a `/save` or `/restore` in flight: no turn or session change starts there.
+    snapshotting: HashSet<TopicKey>,
+    /// Names being written now, so two topics cannot race for one name.
+    naming: HashSet<SnapshotName>,
+    /// Agent sessions a snapshot job works on, and the topic that asked: no second job and
+    /// no turn of any topic bound to them until the hub has processed the result.
+    reserved: HashMap<Reservation, TopicKey>,
 }
 
 #[must_use]
@@ -163,6 +180,9 @@ pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
         mailbox: mailbox.clone(),
         views,
         shutdown: None,
+        snapshotting: HashSet::new(),
+        naming: HashSet::new(),
+        reserved: HashMap::new(),
     };
     let task = tokio::spawn(hub.run(inbox));
     HubHandle { mailbox, views: watched, registries, task }
@@ -218,12 +238,15 @@ impl<A: Agents> Hub<A> {
                 }
             }
             HubMessage::Reset(key) => {
+                // Like `/reset`: not during a turn or a snapshot of this topic.
                 if !self.running.contains_key(&key)
+                    && !self.snapshotting.contains(&key)
                     && let Some(session) = self.topics.get(&key).cloned()
                 {
                     self.put(key, session.with_session(None));
                 }
             }
+            HubMessage::Snapshot(SnapshotDone(done)) => self.snapshot_done(done),
             HubMessage::Shutdown(done) => {
                 for live in self.running.values() {
                     live.cancel.cancel();
@@ -385,9 +408,9 @@ impl<A: Agents> Hub<A> {
                     self.say(Target::Topic(key), texts::describe(state, session));
                 }
             },
-            Command::Save | Command::Saves | Command::Restore => {
-                self.say(Target::Topic(key), texts::SNAPSHOTS_PENDING.to_owned());
-            }
+            Command::Save => self.save(key, args),
+            Command::Saves => self.saves(key),
+            Command::Restore => self.restore(key, args),
         }
     }
 
@@ -489,6 +512,14 @@ impl<A: Agents> Hub<A> {
             );
             return;
         }
+        if self.snapshotting.contains(&key) {
+            self.say(Target::Topic(key), texts::SNAPSHOT_BUSY.to_owned());
+            return;
+        }
+        if self.topics.get(&key).is_some_and(|session| self.is_reserved(session)) {
+            self.say(Target::Topic(key), texts::SESSION_RESERVED.to_owned());
+            return;
+        }
         let session = match self.session(key) {
             Ok(session) => session,
             Err(error) => {
@@ -543,6 +574,260 @@ impl<A: Agents> Hub<A> {
         }
     }
 
+    fn is_reserved(&self, session: &TopicSession) -> bool {
+        session
+            .session
+            .as_ref()
+            .is_some_and(|id| self.reserved.contains_key(&(session.backend, id.clone())))
+    }
+
+    /// Why a snapshot job may not take the agent session now: another job holds it, or a
+    /// topic bound to it runs a turn and its history is being written.
+    fn session_refusal(&self, reservation: &Reservation) -> Option<&'static str> {
+        let (backend, id) = reservation;
+        let running = self.topics.iter().any(|(topic, session)| {
+            session.backend == *backend
+                && session.session.as_ref() == Some(id)
+                && self.running.contains_key(topic)
+        });
+        if self.reserved.contains_key(reservation) {
+            Some(texts::SESSION_RESERVED)
+        } else if running {
+            Some(texts::SESSION_BUSY_ELSEWHERE)
+        } else {
+            None
+        }
+    }
+
+    /// `/save` and `/restore` refuse during a turn and while another snapshot job runs here.
+    fn refuse_snapshot(&self, key: TopicKey) -> bool {
+        let text = if self.running.contains_key(&key) {
+            texts::FINISH_TURN_FIRST
+        } else if self.snapshotting.contains(&key) {
+            texts::SNAPSHOT_BUSY
+        } else {
+            return false;
+        };
+        self.say(Target::Topic(key), text.to_owned());
+        true
+    }
+
+    fn save(&mut self, key: TopicKey, args: &[&str]) {
+        if self.refuse_snapshot(key) {
+            return;
+        }
+        let requested = match parse_save_args(args) {
+            Ok(requested) => requested,
+            Err(error) => {
+                self.say(Target::Topic(key), texts::warning(&error));
+                return;
+            }
+        };
+        let Some((session, id)) = self
+            .topics
+            .get(&key)
+            .and_then(|session| Some((session.clone(), session.session.clone()?)))
+        else {
+            self.say(Target::Topic(key), texts::NOTHING_TO_SAVE.to_owned());
+            return;
+        };
+        let reservation: Reservation = (session.backend, id.clone());
+        if let Some(text) = self.session_refusal(&reservation) {
+            self.say(Target::Topic(key), text.to_owned());
+            return;
+        }
+        let title = self.titles.get(&key).cloned();
+        let name = match requested {
+            SaveArgs::Named(name) => name,
+            SaveArgs::Default => {
+                default_name(title.as_deref(), session.backend.name(), local_minute())
+            }
+        };
+        if !self.naming.insert(name.clone()) {
+            self.say(Target::Topic(key), texts::warning(&SnapshotError::Exists(name)));
+            return;
+        }
+        self.snapshotting.insert(key);
+        self.reserved.insert(reservation.clone(), key);
+        let crashed = Done::Saved {
+            key,
+            name: name.clone(),
+            reservation,
+            outcome: Err(texts::INTERNAL_ERROR.to_owned()),
+        };
+        let job = SaveJob {
+            key,
+            name,
+            title,
+            session,
+            id,
+            created_at: utc_now(),
+            store: SnapshotStore::new(&self.settings.borrow().snapshots_dir),
+            home: self.home.clone(),
+            agents: Arc::clone(&self.agents),
+            mailbox: self.mailbox.clone(),
+        };
+        supervise(job.run(), self.mailbox.clone(), crashed);
+    }
+
+    fn saves(&self, key: TopicKey) {
+        let store = SnapshotStore::new(&self.settings.borrow().snapshots_dir);
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            let text = match tokio::task::spawn_blocking(move || store.list()).await {
+                Ok(Ok(manifests)) => texts::snapshot_list(&manifests),
+                Ok(Err(error)) => texts::warning(&error),
+                Err(error) => {
+                    tracing::error!(panic = error.is_panic(), "snapshot list crashed");
+                    texts::INTERNAL_ERROR.to_owned()
+                }
+            };
+            sender.text(Target::Topic(key), &text).await;
+        });
+    }
+
+    fn restore(&mut self, key: TopicKey, args: &[&str]) {
+        if self.refuse_snapshot(key) {
+            return;
+        }
+        let RestoreArgs { name, cwd } = match parse_restore_args(args) {
+            Ok(Some(args)) => args,
+            Ok(None) => {
+                self.say(Target::Topic(key), texts::RESTORE_USAGE.to_owned());
+                return;
+            }
+            Err(error) => {
+                self.say(Target::Topic(key), texts::warning(&error));
+                return;
+            }
+        };
+        let resolved = self.root().and_then(|root| {
+            let cwd =
+                cwd.as_deref().map(|raw| resolve_cwd(&root, &self.home, Some(raw))).transpose()?;
+            Ok((root, cwd))
+        });
+        let (root, cwd) = match resolved {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                self.say(Target::Topic(key), texts::warning(&error));
+                return;
+            }
+        };
+        self.snapshotting.insert(key);
+        let crashed = Done::Restored {
+            key,
+            reservation: None,
+            outcome: Err(texts::INTERNAL_ERROR.to_owned()),
+        };
+        let job = RestoreJob {
+            key,
+            name,
+            cwd,
+            root,
+            store: SnapshotStore::new(&self.settings.borrow().snapshots_dir),
+            home: self.home.clone(),
+            agents: Arc::clone(&self.agents),
+            mailbox: self.mailbox.clone(),
+        };
+        supervise(job.run(), self.mailbox.clone(), crashed);
+    }
+
+    fn snapshot_done(&mut self, done: Done) {
+        match done {
+            Done::Saved { key, name, reservation, outcome } => {
+                self.snapshotting.remove(&key);
+                self.naming.remove(&name);
+                self.reserved.remove(&reservation);
+                let text = match outcome {
+                    Ok(manifest) => texts::saved(&manifest),
+                    Err(text) => text,
+                };
+                self.say(Target::Topic(key), text);
+            }
+            Done::Loaded { key, reservation, reply } => self.grant(key, reservation, reply),
+            Done::Restored { key, reservation, outcome } => {
+                self.snapshotting.remove(&key);
+                match reservation {
+                    Some(reservation) => {
+                        self.reserved.remove(&reservation);
+                    }
+                    // Failed before the grant (nothing held) or crashed after it: one topic
+                    // runs one job at a time, so whatever it holds belongs to this one.
+                    None => self.reserved.retain(|_, holder| *holder != key),
+                }
+                match outcome {
+                    Ok(restoration) => self.rebind(key, restoration),
+                    Err(text) => self.say(Target::Topic(key), text),
+                }
+            }
+        }
+    }
+
+    /// Phase two of `/restore` may touch the agent's files only with the session reserved and
+    /// no topic bound to it running a turn.
+    fn grant(&mut self, key: TopicKey, reservation: Reservation, reply: oneshot::Sender<bool>) {
+        if self.shutdown.is_some() {
+            // No agent files are touched while the bot stops; `/restore` is simply repeated.
+            tracing::info!(
+                chat = key.chat.0,
+                thread = key.thread.0,
+                "restore dropped: shutting down"
+            );
+            self.snapshotting.remove(&key);
+            let _ = reply.send(false);
+            return;
+        }
+        if let Some(text) = self.session_refusal(&reservation) {
+            self.snapshotting.remove(&key);
+            self.say(Target::Topic(key), text.to_owned());
+            // The job only waits for this answer; if it is gone there is nothing to stop.
+            let _ = reply.send(false);
+            return;
+        }
+        // The hub handles one message at a time: nothing else sees the session in between.
+        if reply.send(true).is_ok() {
+            self.reserved.insert(reservation, key);
+        } else {
+            // The job vanished (runtime shutting down): it will not report back.
+            self.snapshotting.remove(&key);
+        }
+    }
+
+    /// One session, one topic: every other holder is reset and `key` bound, persisted as one
+    /// save; only a successful save changes the hub's bindings and tells the topics.
+    fn rebind(&mut self, key: TopicKey, restoration: Restoration) {
+        let Restoration { name, session, imported: _imported } = restoration;
+        let holders = holders(&self.topics, key, &session);
+        let busy = |topic: &TopicKey| {
+            self.running.contains_key(topic) || self.snapshotting.contains(topic)
+        };
+        if busy(&key) || holders.iter().any(busy) {
+            self.say(Target::Topic(key), texts::SESSION_BUSY_ELSEWHERE.to_owned());
+            return;
+        }
+        let next = {
+            let mut next = self.topics.clone();
+            for holder in &holders {
+                if let Some(old) = next.get(holder).cloned() {
+                    next.insert(*holder, old.with_session(None));
+                }
+            }
+            next.insert(key, session.clone());
+            next
+        };
+        // The store's error can name the topics file path: it is not logged.
+        if self.store.save(&next).is_err() {
+            tracing::error!(snapshot = name.as_str(), "restored bindings could not be saved");
+            self.say(Target::Topic(key), texts::RESTORE_NOT_PERSISTED.to_owned());
+            return;
+        }
+        self.topics = next;
+        self.say(Target::Topic(key), texts::restored(&name, &session));
+        for holder in holders {
+            self.say(Target::Topic(holder), texts::SESSION_MOVED.to_owned());
+        }
+    }
+
     /// The topic's session, binding a fresh one at the root on first use.
     fn session(&mut self, key: TopicKey) -> Result<TopicSession, CwdError> {
         if let Some(session) = self.topics.get(&key) {
@@ -571,6 +856,10 @@ impl<A: Agents> Hub<A> {
     }
 
     fn refuse_if_running(&self, key: TopicKey) -> bool {
+        if self.snapshotting.contains(&key) {
+            self.say(Target::Topic(key), texts::SNAPSHOT_BUSY.to_owned());
+            return true;
+        }
         let running = self.running.contains_key(&key);
         if running {
             self.say(Target::Topic(key), texts::ALREADY_RUNNING.to_owned());
@@ -604,15 +893,18 @@ impl<A: Agents> Hub<A> {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
+    use std::collections::{HashSet, VecDeque};
     use std::sync::Mutex as StdMutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
+    use hub_agent::archive::{ArchiveError, Exported};
     use hub_core::domain::{
         AgentEvent, BackendKind, ChatId, Finished, Question, Selection, ThreadId, Usage, UserId,
     };
     use hub_core::questions::{Answer, QuestionId};
     use hub_core::settings::Draft;
+    use hub_core::snapshot::{BackendData, RelPath};
 
     use super::*;
     use crate::inbound::{Attachment, FileRef};
@@ -630,6 +922,9 @@ mod tests {
     struct FakeAgents {
         scripts: StdMutex<VecDeque<Script>>,
         prompts: StdMutex<Vec<String>>,
+        archive: Arc<FakeArchive>,
+        /// The next `archive` lookup panics, as a bug in a backend would.
+        crash_archive: AtomicBool,
     }
 
     impl FakeAgents {
@@ -648,8 +943,12 @@ mod tests {
             _backend: BackendKind,
             _home: &'a Path,
         ) -> BoxFuture<'a, Result<Arc<dyn SessionArchive>, String>> {
-            Box::pin(async {
-                Err("архивы в этих тестах не нужны".to_owned())
+            let archive: Arc<dyn SessionArchive> =
+                Arc::clone(&self.archive) as Arc<dyn SessionArchive>;
+            let crash = self.crash_archive.swap(false, Ordering::SeqCst);
+            Box::pin(async move {
+                assert!(!crash, "архив упал");
+                Ok(archive)
             })
         }
 
@@ -684,17 +983,103 @@ mod tests {
     }
 
     #[derive(Default, Clone)]
-    struct MemoryStore(Arc<StdMutex<Vec<Topics>>>);
+    struct MemoryStore {
+        saved: Arc<StdMutex<Vec<Topics>>>,
+        fail: Arc<AtomicBool>,
+    }
 
     impl MemoryStore {
+        /// What a restart would load: the last bindings that reached the "disk".
         fn last(&self) -> Option<Topics> {
-            self.0.lock().unwrap().last().cloned()
+            self.saved.lock().unwrap().last().cloned()
         }
     }
 
     impl TopicStore for MemoryStore {
         fn save(&mut self, topics: &Topics) -> Result<(), String> {
-            self.0.lock().unwrap().push(topics.clone());
+            if self.fail.load(Ordering::SeqCst) {
+                return Err("диск полон".to_owned());
+            }
+            self.saved.lock().unwrap().push(topics.clone());
+            Ok(())
+        }
+    }
+
+    type Gate = StdMutex<Option<std::sync::mpsc::Receiver<()>>>;
+
+    /// Remembers which sessions the "agent" has; `hold_*` pause the next export or import
+    /// until released, `exporting`/`importing` tell the test it got there.
+    #[derive(Default)]
+    struct FakeArchive {
+        known: StdMutex<HashSet<String>>,
+        imports: StdMutex<Vec<String>>,
+        fail_import: AtomicBool,
+        hold_export: Gate,
+        hold_import: Gate,
+        exporting: AtomicBool,
+        importing: AtomicBool,
+    }
+
+    impl FakeArchive {
+        fn forget(&self) {
+            self.known.lock().unwrap().clear();
+        }
+
+        fn imports(&self) -> Vec<String> {
+            self.imports.lock().unwrap().clone()
+        }
+    }
+
+    fn pause(gate: &Gate, reached: &AtomicBool) {
+        reached.store(true, Ordering::SeqCst);
+        let held = gate.lock().unwrap().take();
+        if let Some(release) = held {
+            release.recv().unwrap();
+        }
+    }
+
+    impl SessionArchive for FakeArchive {
+        fn export(
+            &self,
+            session: &SessionId,
+            _cwd: &AbsolutePath,
+            dest: &Path,
+        ) -> Result<Exported, ArchiveError> {
+            pause(&self.hold_export, &self.exporting);
+            let file = RelPath::parse(&format!("fake/{}.txt", session.as_str())).unwrap();
+            std::fs::create_dir_all(dest.join("fake"))?;
+            std::fs::write(file.under(dest), "history")?;
+            self.known.lock().unwrap().insert(session.as_str().to_owned());
+            Ok(Exported {
+                files: vec![file],
+                data: BackendData::Claude { project: RelPath::parse("p").unwrap() },
+                agent_version: "1.0.0".to_owned(),
+            })
+        }
+
+        fn present(
+            &self,
+            session: &SessionId,
+            _cwd: &AbsolutePath,
+            _data: &BackendData,
+        ) -> Result<bool, ArchiveError> {
+            Ok(self.known.lock().unwrap().contains(session.as_str()))
+        }
+
+        fn import(
+            &self,
+            session: &SessionId,
+            _data: &BackendData,
+            _files: &[RelPath],
+            _src: &Path,
+            _cwd: &AbsolutePath,
+        ) -> Result<(), ArchiveError> {
+            pause(&self.hold_import, &self.importing);
+            self.imports.lock().unwrap().push(session.as_str().to_owned());
+            if self.fail_import.load(Ordering::SeqCst) {
+                return Err(ArchiveError::Malformed("сбой".to_owned()));
+            }
+            self.known.lock().unwrap().insert(session.as_str().to_owned());
             Ok(())
         }
     }
@@ -742,6 +1127,7 @@ mod tests {
             chat: "-100".to_owned(),
             users: "1".to_owned(),
             workspace_root: root.path().display().to_string(),
+            snapshots_dir: root.path().join("store").display().to_string(),
             approval_timeout: "5".to_owned(),
             default_backend,
             ..Draft::default()
@@ -1062,5 +1448,308 @@ mod tests {
         world.send(HubMessage::Deliver { key: late, prompt }).await;
         tokio::time::timeout(Duration::from_secs(5), stopped).await.unwrap().unwrap();
         assert_eq!(world.agents.prompts(), ["долго"]);
+    }
+
+    const OTHER: TopicKey = TopicKey { chat: ChatId(-100), thread: ThreadId(8) };
+    const THIRD: TopicKey = TopicKey { chat: ChatId(-100), thread: ThreadId(9) };
+
+    async fn bound(world: &World, key: TopicKey, id: &str) {
+        world.send(HubMessage::Bind { key, session: SessionId::parse(id).unwrap() }).await;
+        eventually("bound", || {
+            world
+                .store
+                .last()
+                .and_then(|topics| topics.get(&key).cloned())
+                .is_some_and(|session| session.session == SessionId::parse(id))
+        })
+        .await;
+    }
+
+    fn said(world: &World, prefix: &str) -> bool {
+        world.texts().iter().any(|text| text.starts_with(prefix))
+    }
+
+    fn count(world: &World, text: &str) -> usize {
+        world.texts().iter().filter(|said| *said == text).count()
+    }
+
+    async fn saved_snap(world: &World) {
+        bound(world, KEY, "s-1").await;
+        world.send(text(Some(7), 1, "/save snap")).await;
+        eventually("saved", || said(world, "💾 Сохранено: snap · claude · ")).await;
+    }
+
+    fn bound_to(world: &World, key: TopicKey) -> Option<SessionId> {
+        world.store.last().and_then(|topics| topics.get(&key).and_then(|s| s.session.clone()))
+    }
+
+    #[tokio::test]
+    async fn restore_moves_the_session_from_its_old_topic() {
+        let world = world(FakeAgents::default());
+        saved_snap(&world).await;
+
+        world.send(text(Some(8), 2, "/restore snap")).await;
+
+        eventually("restored", || said(&world, "♻️ Восстановлено: snap · claude · ")).await;
+        eventually("told", || world.texts().contains(&texts::SESSION_MOVED.to_owned())).await;
+        let topics = world.store.last().unwrap();
+        assert_eq!(topics.get(&OTHER).and_then(|s| s.session.clone()), SessionId::parse("s-1"));
+        assert_eq!(topics.get(&KEY).map(|s| s.session.is_none()), Some(true));
+        assert!(world.agents.archive.imports().is_empty(), "the agent still had it");
+    }
+
+    #[tokio::test]
+    async fn restore_imports_what_the_agent_lost_into_the_named_directory() {
+        let world = world(FakeAgents::default());
+        saved_snap(&world).await;
+        world.agents.archive.forget();
+
+        world.send(text(Some(8), 2, "/restore snap project")).await;
+
+        eventually("restored", || {
+            world
+                .texts()
+                .iter()
+                .any(|t| t.starts_with("♻️ Восстановлено: snap") && t.ends_with("project"))
+        })
+        .await;
+        assert_eq!(world.agents.archive.imports(), ["s-1"]);
+    }
+
+    #[tokio::test]
+    async fn a_failed_import_leaves_the_topics_unchanged() {
+        let world = world(FakeAgents::default());
+        saved_snap(&world).await;
+        world.agents.archive.forget();
+        world.agents.archive.fail_import.store(true, Ordering::SeqCst);
+
+        world.send(text(Some(8), 2, "/restore snap")).await;
+
+        eventually("failed", || {
+            world.texts().contains(&"⚠️ Данные снимка повреждены: сбой".to_owned())
+        })
+        .await;
+        let topics = world.store.last().unwrap();
+        assert_eq!(topics.get(&KEY).and_then(|s| s.session.clone()), SessionId::parse("s-1"));
+        assert!(!topics.contains_key(&OTHER));
+    }
+
+    #[tokio::test]
+    async fn an_unpersisted_restore_keeps_the_old_bindings() {
+        let world = world(FakeAgents::default());
+        saved_snap(&world).await;
+        world.store.fail.store(true, Ordering::SeqCst);
+
+        world.send(text(Some(8), 2, "/restore snap")).await;
+
+        eventually("not persisted", || {
+            world.texts().contains(&texts::RESTORE_NOT_PERSISTED.to_owned())
+        })
+        .await;
+        assert!(!said(&world, "♻️") && !world.texts().contains(&texts::SESSION_MOVED.to_owned()));
+        world.store.fail.store(false, Ordering::SeqCst);
+        let persisted = world.store.last().unwrap();
+        assert_eq!(persisted.get(&KEY).and_then(|s| s.session.clone()), SessionId::parse("s-1"));
+        assert!(!persisted.contains_key(&OTHER));
+        world.send(text(Some(8), 3, "/status")).await;
+        eventually("still unbound in memory", || {
+            world.texts().contains(&texts::NO_SESSION.to_owned())
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_second_restore_of_the_same_session_waits_for_the_first() {
+        let world = world(FakeAgents::default());
+        saved_snap(&world).await;
+        world.agents.archive.forget();
+        let (release, held) = std::sync::mpsc::channel();
+        *world.agents.archive.hold_import.lock().unwrap() = Some(held);
+
+        world.send(text(Some(8), 2, "/restore snap")).await;
+        eventually("first import paused", || world.agents.archive.importing.load(Ordering::SeqCst))
+            .await;
+        world.send(text(Some(9), 3, "/restore snap")).await;
+        eventually("second refused", || count(&world, texts::SESSION_RESERVED) == 1).await;
+
+        release.send(()).unwrap();
+        eventually("first restored", || said(&world, "♻️ Восстановлено: snap")).await;
+        // The second restore never reached `present`/`import`, so the first one's files were
+        // never shared with it and no rollback could touch them.
+        assert_eq!(world.agents.archive.imports(), ["s-1"]);
+        assert_eq!(world.texts().iter().filter(|t| t.starts_with("♻️")).count(), 1);
+        let topics = world.store.last().unwrap();
+        assert_eq!(topics.get(&OTHER).and_then(|s| s.session.clone()), SessionId::parse("s-1"));
+        assert!(!topics.contains_key(&THIRD));
+    }
+
+    #[tokio::test]
+    async fn a_session_being_saved_is_neither_restored_nor_run_elsewhere() {
+        let world = world(FakeAgents::default());
+        saved_snap(&world).await;
+        bound(&world, OTHER, "s-1").await;
+        let (release, held) = std::sync::mpsc::channel();
+        *world.agents.archive.hold_export.lock().unwrap() = Some(held);
+        world.agents.archive.exporting.store(false, Ordering::SeqCst);
+
+        world.send(text(Some(7), 4, "/save second")).await;
+        eventually("export paused", || world.agents.archive.exporting.load(Ordering::SeqCst)).await;
+        world.send(text(Some(8), 5, "/restore snap")).await;
+        eventually("restore refused", || count(&world, texts::SESSION_RESERVED) == 1).await;
+        world.send(text(Some(8), 6, "привет")).await;
+
+        eventually("turn refused", || count(&world, texts::SESSION_RESERVED) == 2).await;
+        assert!(world.agents.prompts().is_empty());
+        release.send(()).unwrap();
+        eventually("saved", || said(&world, "💾 Сохранено: second")).await;
+        world.send(text(Some(8), 7, "теперь можно")).await;
+        eventually("ran", || world.agents.prompts() == ["теперь можно"]).await;
+    }
+
+    #[tokio::test]
+    async fn save_and_restore_wait_for_the_turn() {
+        let world = world(FakeAgents::scripted(vec![Script::UntilStopped]));
+        world.send(text(Some(7), 1, "долго")).await;
+        eventually("running", || world.running()).await;
+
+        world.send(text(Some(7), 2, "/save snap")).await;
+        world.send(text(Some(7), 3, "/restore snap")).await;
+
+        eventually("refused twice", || count(&world, texts::FINISH_TURN_FIRST) == 2).await;
+        world.send(HubMessage::Stop(KEY)).await;
+    }
+
+    #[tokio::test]
+    async fn save_waits_for_a_turn_of_the_same_session_in_another_topic() {
+        let world = world(FakeAgents::scripted(vec![Script::UntilStopped]));
+        bound(&world, KEY, "s-1").await;
+        bound(&world, OTHER, "s-1").await;
+        world.send(text(Some(8), 1, "долго")).await;
+        eventually("running", || world.running()).await;
+
+        world.send(text(Some(7), 2, "/save snap")).await;
+
+        eventually("refused", || count(&world, texts::SESSION_BUSY_ELSEWHERE) == 1).await;
+        assert!(!world.agents.archive.exporting.load(Ordering::SeqCst), "history was copied");
+        world.send(HubMessage::Stop(OTHER)).await;
+        eventually("waiting", || !world.running()).await;
+        world.send(text(Some(7), 3, "/save snap")).await;
+        eventually("saved after the turn", || said(&world, "💾 Сохранено: snap")).await;
+    }
+
+    #[tokio::test]
+    async fn turns_wait_while_a_snapshot_is_being_written() {
+        let world = world(FakeAgents::default());
+        bound(&world, KEY, "s-1").await;
+        let (release, held) = std::sync::mpsc::channel();
+        *world.agents.archive.hold_export.lock().unwrap() = Some(held);
+
+        world.send(text(Some(7), 1, "/save snap")).await;
+        world.send(text(Some(7), 2, "привет")).await;
+        world.send(text(Some(7), 3, "/reset")).await;
+
+        eventually("busy twice", || count(&world, texts::SNAPSHOT_BUSY) == 2).await;
+        assert!(world.agents.prompts().is_empty());
+        release.send(()).unwrap();
+        eventually("saved", || said(&world, "💾 Сохранено: snap")).await;
+    }
+
+    #[tokio::test]
+    async fn the_gui_reset_waits_for_a_snapshot() {
+        let world = world(FakeAgents::default());
+        bound(&world, KEY, "s-1").await;
+        let (release, held) = std::sync::mpsc::channel();
+        *world.agents.archive.hold_export.lock().unwrap() = Some(held);
+        world.send(text(Some(7), 1, "/save snap")).await;
+        eventually("export paused", || world.agents.archive.exporting.load(Ordering::SeqCst)).await;
+
+        world.send(HubMessage::Reset(KEY)).await;
+        // The hub handles messages in order: once `/status` is answered, the reset was handled.
+        world.send(text(Some(7), 2, "/status")).await;
+        eventually("status", || said(&world, texts::WAITING)).await;
+
+        assert_eq!(bound_to(&world, KEY), SessionId::parse("s-1"));
+        assert!(world.texts().iter().any(|t| t.starts_with(texts::WAITING) && t.ends_with("s-1")));
+        release.send(()).unwrap();
+        eventually("saved", || said(&world, "💾 Сохранено: snap")).await;
+        world.send(HubMessage::Reset(KEY)).await;
+        eventually("reset after the save", || bound_to(&world, KEY).is_none()).await;
+    }
+
+    #[tokio::test]
+    async fn a_crashed_save_releases_the_session() {
+        let world = world(FakeAgents::default());
+        bound(&world, KEY, "s-1").await;
+        world.agents.crash_archive.store(true, Ordering::SeqCst);
+
+        world.send(text(Some(7), 1, "/save snap")).await;
+
+        eventually("reported", || count(&world, texts::INTERNAL_ERROR) == 1).await;
+        world.send(text(Some(7), 2, "/save snap")).await;
+        eventually("saved on retry", || said(&world, "💾 Сохранено: snap")).await;
+        world.send(text(Some(7), 3, "дальше")).await;
+        eventually("ran", || world.agents.prompts() == ["дальше"]).await;
+    }
+
+    #[tokio::test]
+    async fn a_crashed_restore_releases_the_session() {
+        let world = world(FakeAgents::default());
+        saved_snap(&world).await;
+        world.agents.crash_archive.store(true, Ordering::SeqCst);
+
+        world.send(text(Some(8), 2, "/restore snap")).await;
+
+        eventually("reported", || count(&world, texts::INTERNAL_ERROR) == 1).await;
+        assert_eq!(bound_to(&world, KEY), SessionId::parse("s-1"));
+        world.send(text(Some(7), 3, "дальше")).await;
+        eventually("ran", || world.agents.prompts() == ["дальше"]).await;
+        world.send(text(Some(8), 4, "/restore snap")).await;
+        eventually("restored on retry", || said(&world, "♻️ Восстановлено: snap")).await;
+    }
+
+    #[tokio::test]
+    async fn snapshot_commands_report_what_is_wrong() {
+        let world = world(FakeAgents::default());
+        world.send(text(Some(7), 1, "/save")).await;
+        eventually("nothing", || world.texts().contains(&texts::NOTHING_TO_SAVE.to_owned())).await;
+        world.send(text(Some(7), 2, "/save Bad")).await;
+        eventually("bad name", || said(&world, "⚠️ В имени снимка допустимы")).await;
+        world.send(text(Some(7), 3, "/restore")).await;
+        eventually("usage", || world.texts().contains(&texts::RESTORE_USAGE.to_owned())).await;
+        world.send(text(Some(7), 4, "/restore nope")).await;
+        eventually("unknown", || world.texts().contains(&"⚠️ Снимок nope не найден".to_owned()))
+            .await;
+        world.send(text(Some(7), 5, "/restore nope ../..")).await;
+        eventually("outside", || {
+            world.texts().iter().any(|t| t.starts_with("⚠️") && t.contains("вне корня"))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_taken_name_is_refused() {
+        let world = world(FakeAgents::default());
+        saved_snap(&world).await;
+        world.send(text(Some(7), 2, "/save snap")).await;
+        eventually("taken", || world.texts().contains(&"⚠️ Снимок snap уже существует".to_owned()))
+            .await;
+    }
+
+    #[tokio::test]
+    async fn saves_list_snapshots_and_default_names_follow_the_title() {
+        let world = world(FakeAgents::default());
+        world.send(text(Some(7), 1, "/saves")).await;
+        eventually("empty", || world.texts().contains(&texts::NO_SNAPSHOTS.to_owned())).await;
+
+        world
+            .send(inbound(Some(7), 2, Content::TopicCreated { name: "Починить тесты".to_owned() }))
+            .await;
+        bound(&world, KEY, "s-1").await;
+        world.send(text(Some(7), 3, "/save")).await;
+        eventually("saved", || said(&world, "💾 Сохранено: pochinit-testy-")).await;
+
+        world.send(text(Some(7), 4, "/saves")).await;
+        eventually("listed", || said(&world, "💾 Снимки, новые сверху:\npochinit-testy-")).await;
+        assert!(world.texts().iter().any(|t| t.ends_with(" · Починить тесты")));
     }
 }

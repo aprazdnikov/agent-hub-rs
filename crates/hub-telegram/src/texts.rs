@@ -42,13 +42,11 @@ pub const RESTORE_USAGE: &str = "Укажите снимок: /restore <имя> 
 pub const SNAPSHOT_BUSY: &str =
     "⏳ Снимок этой темы ещё сохраняется или восстанавливается — подождите.";
 pub const SESSION_BUSY_ELSEWHERE: &str = "⚠️ Сессия сейчас выполняет ход в другой теме — \
-                                          дождитесь его конца или /stop там и повторите /restore";
+                                          дождитесь его конца или /stop там и повторите команду";
 pub const SESSION_RESERVED: &str =
     "⏳ С этой сессией сейчас работает /save или /restore в другой теме — подождите.";
 pub const RESTORE_NOT_PERSISTED: &str =
     "⚠️ Восстановление не сохранено: привязки тем не записались на диск, темы не изменены";
-/// Until the hub handles snapshots (removed in the task that wires them).
-pub const SNAPSHOTS_PENDING: &str = "Снимки сессий ещё не подключены";
 const SNAPSHOT_LIST_LIMIT: usize = 30;
 const SNAPSHOT_LIST_TEXT_LIMIT: usize = 3500;
 const APPROVAL_TEXT_LIMIT: usize = 3500;

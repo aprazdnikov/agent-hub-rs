@@ -31,6 +31,7 @@ dunce = "1.0"
 tempfile = "3.27"
 teloxide = { version = "0.17", default-features = false, features = ["rustls"] }
 base64 = "0.23"
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 http-body-util = "0.1"
 hyper = { version = "1.11", default-features = false, features = ["http1", "server"] }
 hyper-util = { version = "0.1.21", default-features = false, features = ["tokio"] }
