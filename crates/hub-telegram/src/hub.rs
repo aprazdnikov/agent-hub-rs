@@ -2,18 +2,19 @@
 //! without waiting on the network; sessions run in their own tasks and report back.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
+use hub_agent::archive::SessionArchive;
 use hub_agent::conversation::Conversation;
 use hub_core::commands::{
     BackendDecision, Command, Input, NewSessionArgs, decide_backend, join_path_args, parse_input,
     parse_new_args,
 };
 use hub_core::domain::{
-    AbsolutePath, ChatId, MessageId, Prompt, SessionId, TopicKey, TopicSession,
+    AbsolutePath, BackendKind, ChatId, MessageId, Prompt, SessionId, TopicKey, TopicSession,
 };
 use hub_core::settings::Settings;
 use hub_core::topics::Topics;
@@ -46,6 +47,14 @@ pub trait Agents: Send + Sync + 'static {
         inbox: mpsc::Receiver<Prompt>,
         conversation: Conversation,
     ) -> BoxFuture<'a, mpsc::Receiver<Prompt>>;
+
+    /// The backend's session archive once its CLI is found and new enough; the error is the
+    /// text shown to the user.
+    fn archive<'a>(
+        &'a self,
+        backend: BackendKind,
+        home: &'a Path,
+    ) -> BoxFuture<'a, Result<Arc<dyn SessionArchive>, String>>;
 }
 
 pub trait TopicStore: Send + 'static {
@@ -634,6 +643,16 @@ mod tests {
     }
 
     impl Agents for FakeAgents {
+        fn archive<'a>(
+            &'a self,
+            _backend: BackendKind,
+            _home: &'a Path,
+        ) -> BoxFuture<'a, Result<Arc<dyn SessionArchive>, String>> {
+            Box::pin(async {
+                Err("архивы в этих тестах не нужны".to_owned())
+            })
+        }
+
         fn run<'a>(
             &'a self,
             _session: &'a TopicSession,

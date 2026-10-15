@@ -1,14 +1,21 @@
 //! The agent backends behind the hub; adding one is a new `BackendKind` variant and a match arm.
 
+use std::env;
+use std::path::Path;
 use std::sync::Arc;
 
 use futures::future::BoxFuture;
+use hub_agent::archive::SessionArchive;
 use hub_agent::conversation::Conversation;
+use hub_claude::archive::ClaudeArchive;
 use hub_claude::backend::ClaudeBackend;
+use hub_codex::archive::CodexArchive;
 use hub_codex::backend::CodexBackend;
 use hub_core::domain::{AgentEvent, BackendKind, Prompt, TopicSession};
 use hub_core::settings::Settings;
+use hub_hermes::archive::HermesArchive;
 use hub_hermes::backend::HermesBackend;
+use hub_qwen::archive::QwenArchive;
 use hub_qwen::backend::QwenBackend;
 use tokio::sync::{mpsc, watch};
 
@@ -80,6 +87,70 @@ impl Agents for HubAgents {
             }
         })
     }
+
+    fn archive<'a>(
+        &'a self,
+        backend: BackendKind,
+        home: &'a Path,
+    ) -> BoxFuture<'a, Result<Arc<dyn SessionArchive>, String>> {
+        let settings = Arc::clone(&self.settings.borrow());
+        Box::pin(async move { archive(backend, &settings, home).await })
+    }
+}
+
+/// The same CLI and environment the backend runs with: the storage root follows the variables
+/// the agent itself reads, and the checked version goes into the manifest.
+async fn archive(
+    backend: BackendKind,
+    settings: &Settings,
+    home: &Path,
+) -> Result<Arc<dyn SessionArchive>, String> {
+    let archive: Arc<dyn SessionArchive> = match backend {
+        BackendKind::Claude => {
+            let cli = hub_claude::version::locate(settings.claude.cli.as_deref())
+                .map_err(|error| error.to_string())?;
+            let version =
+                hub_claude::version::check(&cli).await.map_err(|error| error.to_string())?;
+            let root = hub_claude::archive::storage_root(
+                env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
+                home,
+            );
+            Arc::new(ClaudeArchive::new(root, version.to_string()))
+        }
+        BackendKind::Codex => {
+            let cli = hub_codex::version::locate(settings.codex.cli.as_deref())
+                .map_err(|error| error.to_string())?;
+            let version =
+                hub_codex::version::check(&cli).await.map_err(|error| error.to_string())?;
+            let root = hub_codex::archive::storage_root(env::var_os("CODEX_HOME").as_deref(), home);
+            Arc::new(CodexArchive::new(root, version.to_string()))
+        }
+        BackendKind::Qwen => {
+            let cli = hub_qwen::version::locate(settings.qwen.cli.as_deref())
+                .map_err(|error| error.to_string())?;
+            let version =
+                hub_qwen::version::check(&cli).await.map_err(|error| error.to_string())?;
+            let root = hub_qwen::archive::storage_root(
+                env::var_os("QWEN_RUNTIME_DIR").as_deref(),
+                env::var_os("QWEN_HOME").as_deref(),
+                home,
+            )
+            .map_err(|error| error.to_string())?;
+            Arc::new(QwenArchive::new(root, version.to_string()))
+        }
+        BackendKind::Hermes => {
+            let cli = hub_hermes::version::locate(settings.hermes.cli.as_deref())
+                .map_err(|error| error.to_string())?;
+            let version =
+                hub_hermes::version::check(&cli).await.map_err(|error| error.to_string())?;
+            // Reads the head of the launcher: short and blocking, after the async check.
+            let archive =
+                HermesArchive::new(&cli, settings.hermes.profile.clone(), version.to_string())
+                    .map_err(|error| error.to_string())?;
+            Arc::new(archive)
+        }
+    };
+    Ok(archive)
 }
 
 async fn refuse(
@@ -118,6 +189,35 @@ mod tests {
         }
         fn send_file(&self, _file: OutgoingFile) -> BoxFuture<'_, FileDelivery> {
             Box::pin(async { FileDelivery::Delivered })
+        }
+    }
+
+    #[tokio::test]
+    async fn archives_check_the_configured_cli_first() {
+        let root = std::env::temp_dir();
+        let missing = root.join("definitely-not-an-agent-binary");
+        let mut form = Draft {
+            token: "1:a".to_owned(),
+            chat: "-100".to_owned(),
+            users: "1".to_owned(),
+            workspace_root: root.display().to_string(),
+            ..Draft::default()
+        };
+        form.cli = missing.display().to_string();
+        form.codex.cli = missing.display().to_string();
+        form.qwen.cli = missing.display().to_string();
+        form.hermes.cli = missing.display().to_string();
+        let agents =
+            HubAgents::new(watch::Sender::new(Arc::new(form.parse(&root).unwrap())).subscribe());
+        for backend in BackendKind::ALL {
+            let Err(reason) = agents.archive(backend, &root).await else {
+                panic!("{} archive without its CLI", backend.name());
+            };
+            assert!(
+                reason.contains("definitely-not-an-agent-binary"),
+                "{}: {reason}",
+                backend.name()
+            );
         }
     }
 
