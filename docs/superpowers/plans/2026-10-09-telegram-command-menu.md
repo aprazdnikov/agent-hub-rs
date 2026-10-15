@@ -14,7 +14,7 @@
 2. `crates/hub-telegram/src/texts.rs`: справка из реестра, сохранить текущие аргументы и тексты; тест полноты.
 3. `crates/hub-telegram/src/menu.rs`, `src/lib.rs`, `src/telegram.rs`: операция полной замены/проверки с общим ограничением 30 с, безопасные структурные ошибки без токена/API URL. Мягкий вызов в `hub-app/src/connector.rs` до polling.
 4. Детерминированные loopback Bot API-тесты в `crates/hub-telegram/tests/`: старые/лишние команды исчезают, повторная регистрация идемпотентна, точные scopes/languages, mismatch, отказ записи и тайм-аут. RED на no-op регистрации, затем GREEN с настоящими HTTP-вызовами SDK.
-5. README и `docs/superpowers/spec/2026-10-09-telegram-command-menu-design.md`: область владения, замена с нуля, ошибки, ограничения локализации.
+5. README и `docs/superpowers/specs/2026-10-09-telegram-command-menu-design.md`: область владения, замена с нуля, ошибки, ограничения локализации.
 
 Gates: `cargo fmt --all --check`, `cargo test --workspace --locked`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo build -p hub-app --locked`, `git diff --check`.
 
