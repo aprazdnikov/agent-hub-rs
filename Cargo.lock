@@ -1740,7 +1740,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "hub-agent"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "futures",
  "http-body-util",
@@ -1761,7 +1761,7 @@ dependencies = [
 
 [[package]]
 name = "hub-app"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "directories",
@@ -1795,7 +1795,7 @@ dependencies = [
 
 [[package]]
 name = "hub-claude"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64 0.23.1",
  "futures",
@@ -1817,7 +1817,7 @@ dependencies = [
 
 [[package]]
 name = "hub-codex"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64 0.23.1",
  "futures",
@@ -1834,7 +1834,7 @@ dependencies = [
 
 [[package]]
 name = "hub-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "pulldown-cmark",
  "rstest",
@@ -1847,7 +1847,7 @@ dependencies = [
 
 [[package]]
 name = "hub-hermes"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64 0.23.1",
  "futures",
@@ -1864,7 +1864,7 @@ dependencies = [
 
 [[package]]
 name = "hub-qwen"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "base64 0.23.1",
  "futures",
@@ -1883,7 +1883,7 @@ dependencies = [
 
 [[package]]
 name = "hub-telegram"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "chrono",
  "dunce",
