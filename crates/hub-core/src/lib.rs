@@ -8,5 +8,6 @@ pub mod markdown;
 pub mod questions;
 pub mod render;
 pub mod settings;
+pub mod snapshot;
 pub mod topics;
 pub mod workspace;
