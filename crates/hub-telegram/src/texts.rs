@@ -9,6 +9,7 @@ use hub_core::commands::Command;
 use hub_core::domain::{AbsolutePath, BackendKind, Decision, ToolRequest, ToolUse, TopicSession};
 use hub_core::escape::escape;
 use hub_core::render::truncate;
+use hub_core::snapshot::{Manifest, SnapshotName};
 
 pub const CREATE_TOPIC: &str = "Создайте тему в группе — каждая тема это отдельная сессия.";
 pub const ALREADY_RUNNING: &str = "⏳ В этой теме уже выполняется задача. /stop — прервать.";
@@ -33,6 +34,23 @@ pub const QUESTION_UNSENT: &str = "Не удалось отправить воп
 pub const CURRENT_SESSION: &str = "ℹ️ Текущая сессия";
 pub const BACKEND_ALREADY: &str = "ℹ️ Бэкенд уже выбран";
 pub const BACKEND_SWITCHED: &str = "🔀 Бэкенд изменён";
+pub const NOTHING_TO_SAVE: &str = "Нечего сохранять: в теме ещё нет сессии";
+pub const NO_SNAPSHOTS: &str = "Снимков пока нет";
+pub const SESSION_MOVED: &str = "Сессия перенесена в другую тему";
+pub const FINISH_TURN_FIRST: &str = "Дождитесь конца хода или /stop";
+pub const RESTORE_USAGE: &str = "Укажите снимок: /restore <имя> [каталог]";
+pub const SNAPSHOT_BUSY: &str =
+    "⏳ Снимок этой темы ещё сохраняется или восстанавливается — подождите.";
+pub const SESSION_BUSY_ELSEWHERE: &str = "⚠️ Сессия сейчас выполняет ход в другой теме — \
+                                          дождитесь его конца или /stop там и повторите /restore";
+pub const SESSION_RESERVED: &str =
+    "⏳ С этой сессией сейчас работает /save или /restore в другой теме — подождите.";
+pub const RESTORE_NOT_PERSISTED: &str =
+    "⚠️ Восстановление не сохранено: привязки тем не записались на диск, темы не изменены";
+/// Until the hub handles snapshots (removed in the task that wires them).
+pub const SNAPSHOTS_PENDING: &str = "Снимки сессий ещё не подключены";
+const SNAPSHOT_LIST_LIMIT: usize = 30;
+const SNAPSHOT_LIST_TEXT_LIMIT: usize = 3500;
 const APPROVAL_TEXT_LIMIT: usize = 3500;
 const TOOL_CALL_TEXT_LIMIT: usize = 900;
 const FAILURE_TEXT_LIMIT: usize = 3500;
@@ -126,18 +144,109 @@ pub fn outside_root(cwd: &AbsolutePath, root: &AbsolutePath) -> String {
     )
 }
 
+#[must_use]
+pub fn saved(manifest: &Manifest) -> String {
+    format!(
+        "💾 Сохранено: {} · {} · {}",
+        manifest.name,
+        manifest.data.backend().name(),
+        manifest.cwd.as_path().display()
+    )
+}
+
+#[must_use]
+pub fn restored(name: &SnapshotName, session: &TopicSession) -> String {
+    format!(
+        "♻️ Восстановлено: {name} · {} · {}",
+        session.backend.name(),
+        session.cwd.as_path().display()
+    )
+}
+
+/// Newest first is the caller's order; at most 30 lines.
+#[must_use]
+pub fn snapshot_list(manifests: &[Manifest]) -> String {
+    if manifests.is_empty() {
+        return NO_SNAPSHOTS.to_owned();
+    }
+    let lines = manifests
+        .iter()
+        .take(SNAPSHOT_LIST_LIMIT)
+        .map(|manifest| {
+            format!(
+                "{} · {} · {} · {} · {}",
+                manifest.name,
+                manifest.data.backend().name(),
+                manifest.cwd.as_path().display(),
+                manifest.created_at,
+                manifest.title.as_deref().unwrap_or("—")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    truncate(&format!("💾 Снимки, новые сверху:\n{lines}"), SNAPSHOT_LIST_TEXT_LIMIT)
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
     use std::time::Duration;
 
     use hub_core::domain::{BackendKind, Denied, SessionId};
+    use hub_core::snapshot::{BackendData, Manifest, SnapshotName};
 
     use super::*;
 
     fn absolute(name: &str) -> AbsolutePath {
         let base = PathBuf::from(if cfg!(windows) { r"C:\work" } else { "/work" });
         AbsolutePath::new(base.join(name)).unwrap()
+    }
+
+    fn manifest(name: &str, created_at: &str, title: Option<&str>) -> Manifest {
+        Manifest {
+            name: SnapshotName::parse(name).unwrap(),
+            created_at: created_at.to_owned(),
+            title: title.map(str::to_owned),
+            cwd: absolute("shop"),
+            session: SessionId::parse("s-1").unwrap(),
+            agent_version: "2.1.292".to_owned(),
+            data: BackendData::Codex,
+            files: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn saved_and_restored_name_backend_and_directory() {
+        let shop = absolute("shop").as_path().display().to_string();
+        let snapshot = manifest("snap", "2026-10-09T15:30:12Z", None);
+        assert_eq!(saved(&snapshot), format!("💾 Сохранено: snap · codex · {shop}"));
+        let session = TopicSession::fresh(BackendKind::Codex, absolute("shop"));
+        assert_eq!(
+            restored(&snapshot.name, &session),
+            format!("♻️ Восстановлено: snap · codex · {shop}")
+        );
+    }
+
+    #[test]
+    fn snapshot_list_shows_up_to_thirty_with_titles() {
+        assert_eq!(snapshot_list(&[]), NO_SNAPSHOTS);
+        let shop = absolute("shop").as_path().display().to_string();
+        let titled = [manifest("a", "2026-10-09T15:30:12Z", Some("Починить тесты"))];
+        assert_eq!(
+            snapshot_list(&titled),
+            format!(
+                "💾 Снимки, новые сверху:\na · codex · {shop} · 2026-10-09T15:30:12Z · Починить тесты"
+            )
+        );
+        let many: Vec<_> =
+            (0..31).map(|i| manifest(&format!("s{i}"), "2026-10-09T15:30:12Z", None)).collect();
+        let text = snapshot_list(&many);
+        assert_eq!(text.lines().count(), 31);
+        assert!(
+            text.lines()
+                .last()
+                .is_some_and(|line| line.starts_with("s29 · ") && line.ends_with(" · —"))
+        );
     }
 
     #[test]
@@ -162,6 +271,11 @@ mod tests {
         assert!(text.contains(
             "/backend [claude|codex|qwen|hermes] — сменить агента в этой теме (сброс контекста)"
         ));
+        assert!(text.contains("/save [имя] — сохранить снимок сессии этой темы"));
+        assert!(text.contains("/saves — список снимков"));
+        assert!(
+            text.contains("/restore <имя> [каталог] — продолжить сессию из снимка в этой теме")
+        );
         for command in Command::ALL {
             assert!(text.contains(&format!("/{}", command.name())));
             assert!(text.contains(command.description()));

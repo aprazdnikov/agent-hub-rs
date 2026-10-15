@@ -1,6 +1,7 @@
 //! Pure parsing of bot commands and their arguments.
 
 use crate::domain::{BackendKind, TopicSession};
+use crate::snapshot::{NameError, SnapshotName};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
@@ -11,11 +12,24 @@ pub enum Command {
     Stop,
     Status,
     Backend,
+    Save,
+    Saves,
+    Restore,
 }
 
 impl Command {
-    pub const ALL: [Self; 7] =
-        [Self::New, Self::Backend, Self::Cwd, Self::Reset, Self::Stop, Self::Status, Self::Help];
+    pub const ALL: [Self; 10] = [
+        Self::New,
+        Self::Backend,
+        Self::Cwd,
+        Self::Reset,
+        Self::Stop,
+        Self::Status,
+        Self::Save,
+        Self::Saves,
+        Self::Restore,
+        Self::Help,
+    ];
 
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -27,6 +41,9 @@ impl Command {
             Self::Stop => "stop",
             Self::Status => "status",
             Self::Backend => "backend",
+            Self::Save => "save",
+            Self::Saves => "saves",
+            Self::Restore => "restore",
         }
     }
 
@@ -40,6 +57,9 @@ impl Command {
             Self::Stop => "прервать текущую задачу",
             Self::Status => "состояние сессии",
             Self::Backend => "сменить агента в этой теме (сброс контекста)",
+            Self::Save => "сохранить снимок сессии этой темы",
+            Self::Saves => "список снимков",
+            Self::Restore => "продолжить сессию из снимка в этой теме",
         }
     }
 
@@ -49,7 +69,9 @@ impl Command {
             Self::New => " [агент] [путь]",
             Self::Backend => " [агент]",
             Self::Cwd => " <путь>",
-            Self::Help | Self::Reset | Self::Stop | Self::Status => "",
+            Self::Save => " [имя]",
+            Self::Restore => " <имя> [каталог]",
+            Self::Help | Self::Reset | Self::Stop | Self::Status | Self::Saves => "",
         }
     }
 
@@ -141,12 +163,49 @@ pub fn join_path_args(args: &[&str]) -> Option<String> {
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SaveArgs {
+    Default,
+    Named(SnapshotName),
+}
+
+/// `/save [name]`; several words are one name with spaces, which the name check refuses.
+///
+/// # Errors
+/// [`NameError`] when the joined words are not a valid snapshot name.
+pub fn parse_save_args(args: &[&str]) -> Result<SaveArgs, NameError> {
+    match args {
+        [] => Ok(SaveArgs::Default),
+        [_, ..] => SnapshotName::parse(&args.join(" ")).map(SaveArgs::Named),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreArgs {
+    pub name: SnapshotName,
+    pub cwd: Option<String>,
+}
+
+/// `/restore <name> [path]`; `Ok(None)` when the name is missing.
+///
+/// # Errors
+/// [`NameError`] when the first word is not a valid snapshot name.
+pub fn parse_restore_args(args: &[&str]) -> Result<Option<RestoreArgs>, NameError> {
+    match args.split_first() {
+        None => Ok(None),
+        Some((name, rest)) => {
+            Ok(Some(RestoreArgs { name: SnapshotName::parse(name)?, cwd: join_path_args(rest) }))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rstest::rstest;
 
     use super::*;
     use crate::domain::{AbsolutePath, SessionId, TopicSession};
+    use crate::snapshot::{NameError, SnapshotName};
 
     #[test]
     fn menu_registry_is_unique_valid_and_parsed() {
@@ -159,7 +218,48 @@ mod tests {
             assert!((1..=256).contains(&command.description().chars().count()));
             assert_eq!(Command::parse(name), Some(command));
         }
-        assert_eq!(names.len(), 7);
+        assert_eq!(names.len(), 10);
+    }
+
+    #[test]
+    fn snapshot_commands_sit_before_help() {
+        let names: Vec<_> = Command::ALL.into_iter().map(Command::name).collect();
+        assert_eq!(
+            names,
+            [
+                "new", "backend", "cwd", "reset", "stop", "status", "save", "saves", "restore",
+                "help"
+            ]
+        );
+    }
+
+    #[rstest]
+    #[case::default(&[], Ok(SaveArgs::Default))]
+    #[case::named(&["snap-1"], Ok(SaveArgs::Named(SnapshotName::parse("snap-1").unwrap())))]
+    #[case::spaced(&["my", "snap"], Err(NameError::Character(' ')))]
+    #[case::upper(&["Snap"], Err(NameError::Character('S')))]
+    #[case::traversal(&["../x"], Err(NameError::Character('/')))]
+    fn save_args_are_one_valid_name(
+        #[case] args: &[&str],
+        #[case] expected: Result<SaveArgs, NameError>,
+    ) {
+        assert_eq!(parse_save_args(args), expected);
+    }
+
+    fn restore(name: &str, cwd: Option<&str>) -> RestoreArgs {
+        RestoreArgs { name: SnapshotName::parse(name).unwrap(), cwd: cwd.map(str::to_owned) }
+    }
+
+    #[rstest]
+    #[case::usage(&[], Ok(None))]
+    #[case::name_only(&["snap"], Ok(Some(restore("snap", None))))]
+    #[case::with_dir(&["snap", "my", "dir"], Ok(Some(restore("snap", Some("my dir")))))]
+    #[case::bad_name(&["Snap", "dir"], Err(NameError::Character('S')))]
+    fn restore_args_are_a_name_and_an_optional_path(
+        #[case] args: &[&str],
+        #[case] expected: Result<Option<RestoreArgs>, NameError>,
+    ) {
+        assert_eq!(parse_restore_args(args), expected);
     }
 
     #[rstest]
@@ -266,6 +366,9 @@ mod tests {
     #[rstest]
     #[case("/new shop backend", Input::Command { command: Command::New, args: vec!["shop", "backend"] })]
     #[case("/backend codex", Input::Command { command: Command::Backend, args: vec!["codex"] })]
+    #[case("/save snap", Input::Command { command: Command::Save, args: vec!["snap"] })]
+    #[case("/saves", Input::Command { command: Command::Saves, args: vec![] })]
+    #[case("/restore snap shop", Input::Command { command: Command::Restore, args: vec!["snap", "shop"] })]
     #[case("/start", Input::Command { command: Command::Help, args: vec![] })]
     #[case("/STOP", Input::Command { command: Command::Stop, args: vec![] })]
     #[case("/cwd@agent_hub_bot x", Input::Command { command: Command::Cwd, args: vec!["x"] })]

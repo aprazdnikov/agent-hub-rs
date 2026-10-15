@@ -376,6 +376,9 @@ impl<A: Agents> Hub<A> {
                     self.say(Target::Topic(key), texts::describe(state, session));
                 }
             },
+            Command::Save | Command::Saves | Command::Restore => {
+                self.say(Target::Topic(key), texts::SNAPSHOTS_PENDING.to_owned());
+            }
         }
     }
 
