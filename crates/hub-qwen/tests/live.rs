@@ -4,17 +4,21 @@
 
 #[cfg(test)]
 mod tests {
+    use std::path::PathBuf;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
 
     use futures::future::BoxFuture;
+    use hub_agent::archive::SessionArchive;
     use hub_agent::channel::UserChannel;
     use hub_agent::conversation::{Conversation, Limits};
     use hub_core::domain::{
         AbsolutePath, AgentEvent, BackendKind, Decision, Denied, FileDelivery, OutgoingFile,
-        Prompt, Question, QuestionAnswer, QuestionsOutcome, ToolRequest, TopicSession, Usage,
+        Prompt, Question, QuestionAnswer, QuestionsOutcome, SessionId, ToolRequest, TopicSession,
+        Usage,
     };
     use hub_core::settings::{Draft, QwenApproval, QwenDraft, QwenSettings};
+    use hub_qwen::archive::{QwenArchive, storage_root};
     use hub_qwen::backend::QwenBackend;
     use hub_qwen::version::{check, locate};
     use tokio::sync::mpsc;
@@ -127,5 +131,96 @@ mod tests {
                 .any(|r| r.summary.contains("README") || r.summary.contains("send_file")),
             "no approval was asked for send_file: {requests:?} {seen:?}"
         );
+    }
+
+    fn home() -> PathBuf {
+        std::env::var_os("HOME")
+            .or_else(|| std::env::var_os("USERPROFILE"))
+            .map(PathBuf::from)
+            .unwrap()
+    }
+
+    async fn turn(backend: &QwenBackend, session: &TopicSession, text: &str) -> Vec<AgentEvent> {
+        let (events_out, mut events) = mpsc::channel(256);
+        let (_inbox, inbox_in) = mpsc::channel(1);
+        let conversation = Conversation {
+            channel: Arc::new(Recording::default()),
+            events: events_out,
+            cancel: CancellationToken::new(),
+            limits: Limits::new(Duration::from_mins(1)),
+        };
+        let prompt = Prompt::new(text.to_owned(), Vec::new()).unwrap();
+        tokio::time::timeout(
+            Duration::from_mins(5),
+            backend.run(session, prompt, inbox_in, conversation),
+        )
+        .await
+        .unwrap();
+        std::iter::from_fn(|| events.try_recv().ok()).collect()
+    }
+
+    fn finished_session(seen: &[AgentEvent]) -> SessionId {
+        seen.iter()
+            .find_map(|event| {
+                if let AgentEvent::Finished(finished) = event {
+                    Some(finished.session.clone())
+                } else {
+                    None
+                }
+            })
+            .unwrap()
+    }
+
+    fn said(seen: &[AgentEvent]) -> String {
+        seen.iter()
+            .filter_map(|event| {
+                if let AgentEvent::AssistantText(text) = event { Some(text.as_str()) } else { None }
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a configured qwen and spends tokens"]
+    async fn qwen_snapshot_moves_to_another_directory_with_its_history() {
+        if std::env::var_os("AGENT_HUB_LIVE_QWEN").is_none() {
+            return;
+        }
+        let cli = locate(None).unwrap();
+        let version = check(&cli).await.unwrap();
+        let backend = QwenBackend::new(cli, settings(QwenApproval::Plan));
+        let base = std::env::temp_dir().join(format!("agent-hub-live-qwen-{}", std::process::id()));
+        let (old, new) = (base.join("old"), base.join("new"));
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::create_dir_all(&new).unwrap();
+        let (old, new) = (AbsolutePath::new(old).unwrap(), AbsolutePath::new(new).unwrap());
+        let first = turn(
+            &backend,
+            &TopicSession::fresh(BackendKind::Qwen, old.clone()),
+            "Запомни кодовое слово «бирюза». Ответь одним словом: ок",
+        )
+        .await;
+        let id = finished_session(&first);
+
+        let root = storage_root(
+            std::env::var_os("QWEN_RUNTIME_DIR").as_deref(),
+            std::env::var_os("QWEN_HOME").as_deref(),
+            &home(),
+        )
+        .unwrap();
+        let archive = QwenArchive::new(root.clone(), version.to_string());
+        let snapshot = tempfile::tempdir().unwrap();
+        let exported = archive.export(&id, &old, snapshot.path()).unwrap();
+        for file in &exported.files {
+            std::fs::remove_file(file.under(&root)).unwrap();
+        }
+        assert!(!archive.present(&id, &new, &exported.data).unwrap());
+        archive.import(&id, &exported.data, &exported.files, snapshot.path(), &new).unwrap();
+        assert!(archive.present(&id, &new, &exported.data).unwrap());
+
+        let moved = TopicSession::fresh(BackendKind::Qwen, new).with_session(Some(id));
+        let second =
+            turn(&backend, &moved, "Какое кодовое слово я просил запомнить? Ответь одним словом.")
+                .await;
+        assert!(said(&second).to_lowercase().contains("бирюз"), "{second:?}");
     }
 }

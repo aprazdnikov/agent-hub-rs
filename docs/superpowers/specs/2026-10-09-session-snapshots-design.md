@@ -87,17 +87,18 @@
 
 - `SnapshotName` — newtype, `parse` проверяет `[a-z0-9._-]{1,64}`, не начинается и не заканчивается точкой, основа до первой точки — не имя устройства Windows (`con`, `prn`, `aux`, `nul`, `com1`…`com9`, `lpt1`…`lpt9`).
 - `default_name(title, now) -> SnapshotName` — транслитерация кириллицы, обрезка, суффикс времени.
-- `Manifest { version, name, created_at, title, backend, cwd, session_id, agent_version, backend_data: BackendData, files: Vec<RelPath> }`; `RelPath` — newtype без `..` и абсолютных путей; `BackendData` — enum по бэкенду.
+- `Manifest { name, created_at: String (UTC), title: Option<String>, cwd: AbsolutePath, session: SessionId, agent_version, data: BackendData, files: Vec<RelPath> }`; версия (`MANIFEST_VERSION = 1`) и `backend` живут только в JSON: `backend` выводится из `data.backend()`. `Manifest::parse`/`dump` проверяют лимиты, `ManifestError`. `RelPath` — newtype без `..` и абсолютных путей; `BackendData` — enum `Claude { project }`, `Codex`, `Qwen`, `Hermes { profile }`.
 - `Command::{Save, Saves, Restore}`, разбор аргументов, тексты.
 
 ### `hub-agent`
 
 - Трейт `SessionArchive`:
-  - `export(&self, session: &SessionId, cwd: &AbsolutePath, dest: &Path) -> Result<Exported, ArchiveError>` — `Exported { files, backend_data, agent_version }`;
+  - `export(&self, session: &SessionId, cwd: &AbsolutePath, dest: &Path) -> Result<Exported, ArchiveError>` — `Exported { files: Vec<RelPath>, data: BackendData, agent_version: String }`;
   - `present(&self, session, cwd, data: &BackendData) -> Result<bool, ArchiveError>`;
-  - `import(&self, session, data, files, src: &Path, cwd) -> Result<(), ArchiveError>`.
-- `ArchiveError` (`thiserror`): `NotFound`, `Ambiguous`, `Archived`, `Unsupported(String)`, `Io(io::Error)`, `Malformed(String)`.
-- Помощник копирования по белому списку: только обычные файлы, без симлинков, с правами `0600`.
+  - `import(&self, session, data, files, src: &Path, cwd) -> Result<(), ArchiveError>` — всё или ничего, откат при сбое.
+  - Трейт блокирующий (`Send + Sync`), вызывается из `spawn_blocking`; `Agents::archive(backend, home)` отдаёт `Arc<dyn SessionArchive>` после проверки CLI.
+- `ArchiveError` (`thiserror`): `NotFound`, `Ambiguous`, `Archived(String)`, `Occupied { id, cwd }` (у Qwen уже есть другая сессия для этого каталога), `Link(String)` (путь идёт через символьную ссылку), `Unsupported(String)`, `Io(io::Error)`, `Malformed(String)`; `PathError` превращается в `Malformed`.
+- Помощники копирования по белому списку (`entry_under`, `open_under`, `create_under`, `collect_tree`, `export_files`, `place_all`): каждая часть пути от доверенного корня проверяется `symlink_metadata`, ссылка — `Link`; каталоги создаются по одной части, файлы — `create_new` с правами `0600` (каталоги `0700`); при сбое созданное удаляется.
 
 ### `hub-claude`, `hub-codex`, `hub-qwen`, `hub-hermes`
 
@@ -109,11 +110,14 @@
 
 ### `hub-telegram`
 
-- Модуль `snapshots`: `SnapshotStore { root }` — `save(name, fill)` (сам создаёт staging-каталог, отдаёт `agent/` замыканию, пишет `manifest.json`, переименовывает, убирает мусор при любой ошибке), `list() -> Vec<Manifest>` (повреждённые пропускаются с `warn`), `load(name)`. Живёт здесь, а не в `hub-app`: его вызывает `Hub`, а `hub-app` зависит от `hub-telegram`; корень читается из `Settings` на каждую операцию.
-- `Hub` обрабатывает три команды.
-- `/save`: отказ во время хода → `SessionArchive::export` во временный каталог хранилища → манифест → атомарное переименование.
-- `/restore`: отказ во время хода → чтение и проверка манифеста → проверка каталога → `present` → `import`, если сессии нет → **только затем** перепривязка тем (снятие с прежней темы и привязка к текущей — одна операция над `Topics`, затем `put()`) → уведомление прежней теме без гарантии доставки.
-- Ошибка импорта — темы не меняются.
+- Модуль `snapshots`: `SnapshotStore { root }` (`new(dir)` — корень `<dir>/snapshots`) — `save(name, fill) -> Manifest` (создаёт приватный staging-каталог `.tmp-<uuid>`, отдаёт `agent/` замыканию, проверяет, что манифест читается обратно, пишет `manifest.json`, одно `rename`; staging удаляется при любой ошибке и при `Drop`), `list() -> Vec<Manifest>` (повреждённые пропускаются с `warn`), `load(name) -> Loaded { manifest, agent }`. `SnapshotError`: `Exists`, `Missing`, `Corrupt`, `Manifest`, `Io`, `Archive`. Живёт здесь, а не в `hub-app`: его вызывает `Hub`, а `hub-app` зависит от `hub-telegram`; корень читается из `Settings` на каждую операцию.
+- Модуль `transfer`: `SaveJob` и `RestoreJob` выполняют файловую работу в своей задаче под `supervise` (паника задачи всё равно возвращает хабу `crashed`) и отчитываются сообщением `HubMessage::Snapshot(SnapshotDone(Done::…))`: `Saved`, `Loaded`, `Restored`.
+- `Hub` обрабатывает три команды и резервирует сессию агента (`Reservation = (бэкенд, id)`) на время файловой работы: второй `/save`/`/restore` той же сессии и ходы тем, привязанных к ней, отказывают или ждут.
+- `/save`: отказ во время хода → резерв сессии → `SessionArchive::export` в `agent/` staging-каталога → манифест → атомарное переименование → «💾 Сохранено».
+- `/restore`, фаза 1 (`load`): чтение и проверка манифеста, разрешение каталога внутри корня; файлы агента не тронуты. Задача сообщает `Done::Loaded`, хаб выдаёт сессию (`true`) или отказывает (`false`).
+- `/restore`, фаза 2 (`apply`, сессия зарезервирована): `present` → `import`, если сессии у агента нет. Результат — `Restoration { name, session, imported }`.
+- Перепривязка (`Hub::rebind`) транзакционна и заменяет прежний `put()`: пересчитываются `holders` — другие темы с той же сессией; если эта или любая из них занята ходом или файловой работой, привязки не меняются («сессия занята в другой теме»); иначе строится копия `Topics`, у прежних владельцев сессия сбрасывается, текущая тема привязывается, копия записывается `TopicStore::save`. Только после успеха копия заменяет `self.topics` и уходят сообщения (текущей теме — «♻️ Восстановлено», прежним — «Сессия перенесена в другую тему», без гарантии доставки). Ошибка записи — привязки прежние, пользователю «не сохранены привязки».
+- Ошибка импорта или загрузки — темы не меняются. Результат, пришедший после `Shutdown`, отбрасывается: повторный `/restore` идемпотентен.
 
 ## Безопасность
 
