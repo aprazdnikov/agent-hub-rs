@@ -170,6 +170,18 @@ impl SettingsForm {
             }
         });
         messages(ui, errors, Field::WorkspaceRoot);
+        ui.horizontal(|ui| {
+            ui.label("Каталог снимков");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.draft.snapshots_dir).hint_text("~/.agent-hub"),
+            );
+            if ui.button("Выбрать…").clicked()
+                && let Some(path) = pick_folder(&self.draft.snapshots_dir)
+            {
+                self.draft.snapshots_dir = path;
+            }
+        });
+        messages(ui, errors, Field::SnapshotsDir);
     }
 
     fn agent(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
@@ -453,6 +465,24 @@ pub fn home_or_root() -> PathBuf {
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    #[test]
+    fn snapshots_directory_is_visible() {
+        let ctx = egui::Context::default();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 4000.0));
+        let mut form = SettingsForm::default();
+        let mut output =
+            ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    form.show(ui, Path::new("/"), 0, &mut |_| {});
+                });
+            });
+        output.textures_delta.clear();
+        assert!(output.shapes.iter().any(|clipped| matches!(
+            &clipped.shape,
+            egui::Shape::Text(text) if text.galley.text() == "Каталог снимков"
+        )));
+    }
 
     #[test]
     fn hermes_settings_are_visible() {

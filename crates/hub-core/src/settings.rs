@@ -16,6 +16,8 @@ pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_mins(10);
 pub const DEFAULT_BACKGROUND_TIMEOUT: Duration = Duration::from_mins(30);
 // Keeps `Instant + timeout` far from overflow; longer waits are not meaningful for a chat.
 pub const MAX_TIMEOUT: Duration = Duration::from_hours(24);
+/// Snapshots directory relative to the home directory when none is configured.
+pub const DEFAULT_SNAPSHOTS_DIR: &str = ".agent-hub";
 
 #[derive(Clone, PartialEq, Eq)]
 pub struct Token(String);
@@ -282,6 +284,7 @@ pub struct Timeouts {
 pub struct Settings {
     pub telegram: TelegramSettings,
     pub workspace_root: PathBuf,
+    pub snapshots_dir: PathBuf,
     pub default_backend: BackendKind,
     pub claude: ClaudeSettings,
     pub codex: CodexSettings,
@@ -297,6 +300,7 @@ pub enum Field {
     Chat,
     Users,
     WorkspaceRoot,
+    SnapshotsDir,
     Cli,
     Model,
     PermissionMode,
@@ -433,6 +437,7 @@ pub struct Draft {
     pub chat: String,
     pub users: String,
     pub workspace_root: String,
+    pub snapshots_dir: String,
     pub default_backend: BackendKind,
     pub cli: String,
     pub model: String,
@@ -453,6 +458,7 @@ impl Default for Draft {
             chat: String::new(),
             users: String::new(),
             workspace_root: String::new(),
+            snapshots_dir: String::new(),
             default_backend: BackendKind::Claude,
             cli: String::new(),
             model: String::new(),
@@ -475,6 +481,7 @@ impl fmt::Debug for Draft {
             chat,
             users,
             workspace_root,
+            snapshots_dir,
             default_backend,
             cli,
             model,
@@ -492,6 +499,7 @@ impl fmt::Debug for Draft {
             .field("chat", chat)
             .field("users", users)
             .field("workspace_root", workspace_root)
+            .field("snapshots_dir", snapshots_dir)
             .field("default_backend", default_backend)
             .field("cli", cli)
             .field("model", model)
@@ -515,6 +523,8 @@ impl Draft {
         let chat = check(&mut errors, Field::Chat, parse_chat(&self.chat));
         let users = check(&mut errors, Field::Users, parse_users(&self.users));
         let root = check(&mut errors, Field::WorkspaceRoot, parse_root(&self.workspace_root, home));
+        let snapshots =
+            check(&mut errors, Field::SnapshotsDir, parse_snapshots_dir(&self.snapshots_dir, home));
         let cli = check(&mut errors, Field::Cli, parse_cli(&self.cli, home));
         let model = check(&mut errors, Field::Model, parse_model(&self.model));
         let budget = check(&mut errors, Field::Budget, parse_budget(&self.budget));
@@ -544,6 +554,7 @@ impl Draft {
             Some(chat),
             Some(users),
             Some(workspace_root),
+            Some(snapshots_dir),
             Some(cli),
             Some(model),
             Some(budget),
@@ -561,6 +572,7 @@ impl Draft {
             chat,
             users,
             root,
+            snapshots,
             cli,
             model,
             budget,
@@ -580,6 +592,7 @@ impl Draft {
         Ok(Settings {
             telegram: TelegramSettings { token, chat, users },
             workspace_root,
+            snapshots_dir,
             default_backend: self.default_backend,
             claude: ClaudeSettings { cli, model, permission_mode: self.permission_mode, budget },
             codex: CodexSettings {
@@ -614,6 +627,7 @@ impl Draft {
                 .collect::<Vec<_>>()
                 .join(", "),
             workspace_root: settings.workspace_root.display().to_string(),
+            snapshots_dir: settings.snapshots_dir.display().to_string(),
             default_backend: settings.default_backend,
             cli: settings
                 .claude
@@ -724,6 +738,12 @@ fn parse_root(raw: &str, home: &Path) -> Result<PathBuf, String> {
         return Err("Укажите корень рабочих директорий".to_owned());
     }
     absolute(trimmed, home)
+}
+
+/// Empty means `~/.agent-hub`; otherwise absolute or from `~`, like the workspace root.
+fn parse_snapshots_dir(raw: &str, home: &Path) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() { Ok(home.join(DEFAULT_SNAPSHOTS_DIR)) } else { absolute(trimmed, home) }
 }
 
 fn parse_cli(raw: &str, home: &Path) -> Result<Option<PathBuf>, String> {
@@ -838,6 +858,8 @@ pub struct SettingsFile {
     #[serde(default)]
     pub hermes: HermesFile,
     #[serde(default)]
+    pub snapshots: SnapshotsFile,
+    #[serde(default)]
     pub timeouts: TimeoutsFile,
     #[serde(default)]
     pub updates: UpdatesFile,
@@ -900,6 +922,13 @@ pub struct HermesFile {
     pub model: Option<String>,
 }
 
+/// Where `/save` writes snapshots; absent means `~/.agent-hub`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SnapshotsFile {
+    pub dir: Option<String>,
+}
+
 /// Secrets the file does not hold, read from the keyring by the caller.
 pub struct Keys {
     pub token: String,
@@ -957,6 +986,7 @@ impl SettingsFile {
                 profile: settings.hermes.profile.clone(),
                 model: settings.hermes.model.clone(),
             },
+            snapshots: SnapshotsFile { dir: Some(settings.snapshots_dir.display().to_string()) },
             timeouts: TimeoutsFile {
                 approval_seconds: Some(settings.timeouts.approval.as_secs()),
                 background_seconds: Some(settings.timeouts.background.as_secs()),
@@ -1014,6 +1044,7 @@ impl SettingsFile {
             chat: self.telegram.chat.to_string(),
             users: self.telegram.users.iter().map(u64::to_string).collect::<Vec<_>>().join(", "),
             workspace_root: self.workspace.root.clone(),
+            snapshots_dir: self.snapshots.dir.clone().unwrap_or_default(),
             default_backend,
             cli: self.claude.cli.clone().unwrap_or_default(),
             model: self.claude.model.clone().unwrap_or_default(),
@@ -1090,6 +1121,52 @@ mod tests {
             workspace_root: "~/Projects".to_owned(),
             ..Draft::default()
         }
+    }
+
+    #[test]
+    fn snapshots_live_in_agent_hub_under_home_by_default() {
+        assert_eq!(draft().parse(&home()).unwrap().snapshots_dir, home().join(".agent-hub"));
+    }
+
+    #[rstest]
+    #[case::tilde("~/snaps", Ok(()))]
+    #[case::relative("snaps", Err(Field::SnapshotsDir))]
+    fn snapshots_dir_is_absolute_or_from_home(
+        #[case] raw: &str,
+        #[case] expected: Result<(), Field>,
+    ) {
+        let parsed = Draft { snapshots_dir: raw.to_owned(), ..draft() }.parse(&home());
+        match expected {
+            Ok(()) => assert_eq!(parsed.unwrap().snapshots_dir, home().join("snaps")),
+            Err(field) => {
+                assert_eq!(
+                    parsed.unwrap_err().iter().map(|e| e.field).collect::<Vec<_>>(),
+                    [field]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_file_without_snapshots_section_still_loads() {
+        let file: SettingsFile = toml::from_str(
+            "[telegram]\nchat = -100\nusers = [1]\n[workspace]\nroot = \"~/Projects\"\n",
+        )
+        .unwrap();
+        let keys =
+            Keys { token: "1:a".to_owned(), api_key: String::new(), qwen_key: String::new() };
+        let settings = file.to_draft(keys).unwrap().parse(&home()).unwrap();
+        assert_eq!(settings.snapshots_dir, home().join(".agent-hub"));
+    }
+
+    #[test]
+    fn snapshots_dir_round_trips_through_the_file() {
+        let settings =
+            Draft { snapshots_dir: "~/snaps".to_owned(), ..draft() }.parse(&home()).unwrap();
+        let file = SettingsFile::from_settings(&settings);
+        let keys =
+            Keys { token: "123:abc".to_owned(), api_key: String::new(), qwen_key: String::new() };
+        assert_eq!(file.to_draft(keys).unwrap().parse(&home()).unwrap(), settings);
     }
 
     #[test]
