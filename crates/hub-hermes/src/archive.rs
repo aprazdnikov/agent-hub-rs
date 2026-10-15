@@ -80,7 +80,8 @@ fn classify(cli: &Path, head: &str) -> Result<Launch, ArchiveError> {
     }
     let python =
         program.file_name().and_then(OsStr::to_str).is_some_and(|name| name.starts_with("python"));
-    if python && program.is_absolute() {
+    // A POSIX shebang is absolute by POSIX rules, whatever host parses it.
+    if python && interpreter.starts_with('/') {
         Ok(Launch::Python(program.to_path_buf()))
     } else {
         Err(unknown())
