@@ -1,7 +1,9 @@
 use std::fs;
+use std::io::Write;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
-use hub_agent::archive::{ArchiveError, SessionArchive};
+use hub_agent::archive::{ArchiveError, SessionArchive, place_all};
 use hub_core::domain::{AbsolutePath, SessionId};
 use hub_core::snapshot::{BackendData, RelPath};
 use hub_qwen::archive::{Case, QwenArchive, sanitize};
@@ -398,4 +400,46 @@ fn rewriting_keeps_line_breaks_as_they_were() {
 
     let text = fs::read_to_string(chat(fresh.path(), &target)).unwrap();
     assert_eq!(text, format!("{}\r\n\r\nlast", record(&target)));
+}
+
+#[test]
+fn a_crashed_import_is_not_the_session_and_does_not_block_a_retry() {
+    let root = qwen_home();
+    let (snapshot, files) = export_from(root.path(), "shop");
+    let fresh = tempfile::tempdir().unwrap();
+    let chat_file = rel(&format!("projects/{}/chats/{ID}.jsonl", san(&cwd("shop"))));
+
+    let crashed = catch_unwind(AssertUnwindSafe(|| {
+        let pairs = [(chat_file.clone(), chat_file.clone())];
+        place_all(snapshot.path(), fresh.path(), &pairs, &chat_file, |_file, _from, out| {
+            out.write_all(b"{\"uuid\":")?;
+            panic!("the hub was killed mid-import");
+        })
+    }));
+
+    assert!(crashed.is_err());
+    let target = archive(fresh.path());
+    assert!(!target.present(&id(), &cwd("shop"), &BackendData::Qwen).unwrap());
+    target.import(&id(), &BackendData::Qwen, &files, snapshot.path(), &cwd("shop")).unwrap();
+    assert!(target.present(&id(), &cwd("shop"), &BackendData::Qwen).unwrap());
+}
+
+#[test]
+fn a_failed_extra_leaves_no_chat_behind() {
+    let root = qwen_home();
+    let (snapshot, files) = export_from(root.path(), "shop");
+    let fresh = tempfile::tempdir().unwrap();
+    let project = san(&cwd("shop"));
+    write(fresh.path(), &format!("projects/{project}/subagents/{ID}/agent-1.jsonl"), "here");
+
+    let result = archive(fresh.path()).import(
+        &id(),
+        &BackendData::Qwen,
+        &files,
+        snapshot.path(),
+        &cwd("shop"),
+    );
+
+    assert!(matches!(result, Err(ArchiveError::Io(_))));
+    assert!(!chat(fresh.path(), &cwd("shop")).exists());
 }

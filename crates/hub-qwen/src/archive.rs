@@ -374,7 +374,8 @@ impl SessionArchive for QwenArchive {
         } else {
             Records::MovedTo(target)
         };
-        place_all(src, &self.root, &pairs, |file, from, out| match records {
+        let presence = chat_of(&new, stem)?;
+        place_all(src, &self.root, &pairs, &presence, |file, from, out| match records {
             Records::MovedTo(cwd) if is_records(file) => rewrite_lines(from, out, cwd),
             Records::AsRecorded | Records::MovedTo(_) => copy_plain(file, from, out),
         })

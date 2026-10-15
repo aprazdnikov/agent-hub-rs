@@ -142,7 +142,7 @@ mod tests {
             turn(&backend, &fresh, "Запомни кодовое слово «бирюза». Ответь одним словом: ок").await;
         let id = finished_session(&first);
 
-        let root = storage_root(std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(), &home());
+        let root = storage_root(std::env::var_os("CLAUDE_CONFIG_DIR").as_deref(), &home()).unwrap();
         let archive = ClaudeArchive::new(root.clone(), version.to_string());
         let snapshot = tempfile::tempdir().unwrap();
         let exported = archive.export(&id, &cwd, snapshot.path()).unwrap();

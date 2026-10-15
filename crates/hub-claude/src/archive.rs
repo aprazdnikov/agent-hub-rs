@@ -15,12 +15,18 @@ use hub_core::snapshot::{BackendData, RelPath};
 
 const PROJECTS: &str = "projects";
 
-/// `$CLAUDE_CONFIG_DIR`, or `~/.claude` when it is unset or empty.
-#[must_use]
-pub fn storage_root(config_dir: Option<&OsStr>, home: &Path) -> PathBuf {
-    match config_dir.filter(|dir| !dir.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => home.join(".claude"),
+/// `$CLAUDE_CONFIG_DIR`, or `~/.claude` when it is unset or empty. A relative value (Claude
+/// resolves it against its own cwd, which differs per topic) is refused.
+///
+/// # Errors
+/// `Unsupported` for a relative value.
+pub fn storage_root(config_dir: Option<&OsStr>, home: &Path) -> Result<PathBuf, ArchiveError> {
+    match config_dir.filter(|dir| !dir.is_empty()).map(PathBuf::from) {
+        Some(dir) if dir.is_absolute() => Ok(dir),
+        Some(_) => {
+            Err(ArchiveError::Unsupported("CLAUDE_CONFIG_DIR: нужен абсолютный путь".to_owned()))
+        }
+        None => Ok(home.join(".claude")),
     }
 }
 
@@ -142,7 +148,7 @@ impl SessionArchive for ClaudeArchive {
         if self.projects_with(stem)?.iter().any(|other| other != project) {
             return Err(ArchiveError::Ambiguous);
         }
-        place_all(src, &self.root, &pairs, copy_plain)
+        place_all(src, &self.root, &pairs, &exact, copy_plain)
     }
 }
 
@@ -154,9 +160,19 @@ mod tests {
 
     #[test]
     fn config_dir_overrides_the_home_default() {
-        let home = Path::new("home");
-        assert_eq!(storage_root(Some(&OsString::from("custom")), home), PathBuf::from("custom"));
-        assert_eq!(storage_root(Some(&OsString::new()), home), home.join(".claude"));
-        assert_eq!(storage_root(None, home), home.join(".claude"));
+        let home = std::env::temp_dir();
+        let custom = home.join("custom");
+        assert_eq!(storage_root(Some(custom.as_os_str()), &home).unwrap(), custom);
+        assert_eq!(storage_root(Some(&OsString::new()), &home).unwrap(), home.join(".claude"));
+        assert_eq!(storage_root(None, &home).unwrap(), home.join(".claude"));
+    }
+
+    #[test]
+    fn a_relative_config_dir_is_refused() {
+        let home = std::env::temp_dir();
+        assert!(matches!(
+            storage_root(Some(&OsString::from("custom")), &home),
+            Err(ArchiveError::Unsupported(_))
+        ));
     }
 }

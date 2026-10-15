@@ -1,8 +1,9 @@
 use std::fs;
-use std::io;
+use std::io::{self, Write};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
 
-use hub_agent::archive::{ArchiveError, SessionArchive};
+use hub_agent::archive::{ArchiveError, SessionArchive, place_all};
 use hub_claude::archive::ClaudeArchive;
 use hub_core::domain::{AbsolutePath, SessionId};
 use hub_core::snapshot::{BackendData, RelPath};
@@ -231,4 +232,61 @@ fn import_needs_the_transcript_itself_not_a_nested_namesake() {
 
     assert!(matches!(result, Err(ArchiveError::Malformed(_))));
     assert_eq!(fs::read_dir(fresh.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn a_crashed_import_is_not_the_session_and_does_not_block_a_retry() {
+    let root = claude_home();
+    let snapshot = tempfile::tempdir().unwrap();
+    let exported = archive(root.path()).export(&id(), &cwd(), snapshot.path()).unwrap();
+    let fresh = tempfile::tempdir().unwrap();
+    let transcript = rel(&format!("projects/-work-shop/{ID}.jsonl"));
+
+    // The side files are in place, the transcript is half written when the hub dies.
+    let crashed = catch_unwind(AssertUnwindSafe(|| {
+        let pairs: Vec<_> =
+            exported.files.iter().map(|file| (file.clone(), file.clone())).collect();
+        place_all(snapshot.path(), fresh.path(), &pairs, &transcript, |file, mut from, out| {
+            if *file == transcript {
+                out.write_all(b"{\"type\":")?;
+                panic!("the hub was killed mid-import");
+            }
+            io::copy(&mut from, out).map(drop)
+        })
+    }));
+
+    assert!(crashed.is_err());
+    assert!(
+        rel(&format!("projects/-work-shop/{ID}/tool-results/t.txt")).under(fresh.path()).is_file()
+    );
+    let target = archive(fresh.path());
+    assert!(!target.present(&id(), &cwd(), &exported.data).unwrap());
+    target.import(&id(), &exported.data, &exported.files, snapshot.path(), &cwd()).unwrap();
+    assert!(target.present(&id(), &cwd(), &exported.data).unwrap());
+    assert_eq!(
+        fs::read_to_string(transcript.under(fresh.path())).unwrap(),
+        "{\"type\":\"user\"}\n"
+    );
+}
+
+#[test]
+fn a_failed_side_file_leaves_no_transcript_behind() {
+    let root = claude_home();
+    let snapshot = tempfile::tempdir().unwrap();
+    let exported = archive(root.path()).export(&id(), &cwd(), snapshot.path()).unwrap();
+    let fresh = tempfile::tempdir().unwrap();
+    write(fresh.path(), &format!("projects/-work-shop/{ID}/tool-results/t.txt"), "already here");
+
+    let result = archive(fresh.path()).import(
+        &id(),
+        &exported.data,
+        &exported.files,
+        snapshot.path(),
+        &cwd(),
+    );
+
+    assert!(
+        matches!(result, Err(ArchiveError::Io(ref error)) if error.kind() == io::ErrorKind::AlreadyExists)
+    );
+    assert!(!archive(fresh.path()).present(&id(), &cwd(), &exported.data).unwrap());
 }

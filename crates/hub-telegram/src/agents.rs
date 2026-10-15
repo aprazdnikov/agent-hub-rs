@@ -114,7 +114,8 @@ async fn archive(
             let root = hub_claude::archive::storage_root(
                 env::var_os("CLAUDE_CONFIG_DIR").as_deref(),
                 home,
-            );
+            )
+            .map_err(|error| error.to_string())?;
             Arc::new(ClaudeArchive::new(root, version.to_string()))
         }
         BackendKind::Codex => {
@@ -122,7 +123,8 @@ async fn archive(
                 .map_err(|error| error.to_string())?;
             let version =
                 hub_codex::version::check(&cli).await.map_err(|error| error.to_string())?;
-            let root = hub_codex::archive::storage_root(env::var_os("CODEX_HOME").as_deref(), home);
+            let root = hub_codex::archive::storage_root(env::var_os("CODEX_HOME").as_deref(), home)
+                .map_err(|error| error.to_string())?;
             Arc::new(CodexArchive::new(root, version.to_string()))
         }
         BackendKind::Qwen => {

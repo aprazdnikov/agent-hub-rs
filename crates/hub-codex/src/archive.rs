@@ -14,12 +14,16 @@ use hub_core::snapshot::{BackendData, RelPath};
 const SESSIONS: &str = "sessions";
 const ARCHIVED: &str = "archived_sessions";
 
-/// `$CODEX_HOME`, or `~/.codex` when it is unset or empty.
-#[must_use]
-pub fn storage_root(codex_home: Option<&OsStr>, home: &Path) -> PathBuf {
-    match codex_home.filter(|dir| !dir.is_empty()) {
-        Some(dir) => PathBuf::from(dir),
-        None => home.join(".codex"),
+/// `$CODEX_HOME`, or `~/.codex` when it is unset or empty. A relative value (Codex resolves it
+/// against its own cwd, which differs per topic) is refused.
+///
+/// # Errors
+/// `Unsupported` for a relative value.
+pub fn storage_root(codex_home: Option<&OsStr>, home: &Path) -> Result<PathBuf, ArchiveError> {
+    match codex_home.filter(|dir| !dir.is_empty()).map(PathBuf::from) {
+        Some(dir) if dir.is_absolute() => Ok(dir),
+        Some(_) => Err(ArchiveError::Unsupported("CODEX_HOME: нужен абсолютный путь".to_owned())),
+        None => Ok(home.join(".codex")),
     }
 }
 
@@ -98,10 +102,14 @@ impl SessionArchive for CodexArchive {
         _cwd: &AbsolutePath,
         dest: &Path,
     ) -> Result<Exported, ArchiveError> {
-        let files = self.live(file_stem(session)?)?;
+        let id = file_stem(session)?;
+        let files = self.live(id)?;
         if files.is_empty() {
             return Err(ArchiveError::NotFound);
         }
+        // Only what import can put back: a rollout outside its dated directory would make an
+        // unrestorable snapshot.
+        files.iter().try_for_each(|file| target_of(file, id).map(drop))?;
         export_files(&self.root, &files, dest)?;
         Ok(Exported { files, data: BackendData::Codex, agent_version: self.version.clone() })
     }
@@ -134,13 +142,13 @@ impl SessionArchive for CodexArchive {
             .iter()
             .map(|file| Ok((file.clone(), target_of(file, id)?)))
             .collect::<Result<Vec<_>, ArchiveError>>()?;
-        if pairs.is_empty() {
+        let Some((_, presence)) = pairs.last() else {
             return Err(ArchiveError::Malformed("в снимке нет rollout-файла Codex".to_owned()));
-        }
+        };
         if !self.rollouts(SESSIONS, id)?.is_empty() || !self.rollouts(ARCHIVED, id)?.is_empty() {
             return Err(ArchiveError::Ambiguous);
         }
-        place_all(src, &self.root, &pairs, copy_plain)
+        place_all(src, &self.root, &pairs, presence, copy_plain)
     }
 }
 
@@ -172,9 +180,19 @@ mod tests {
 
     #[test]
     fn codex_home_overrides_the_home_default() {
-        let home = Path::new("home");
-        assert_eq!(storage_root(Some(OsStr::new("c")), home), PathBuf::from("c"));
-        assert_eq!(storage_root(Some(OsStr::new("")), home), home.join(".codex"));
-        assert_eq!(storage_root(None, home), home.join(".codex"));
+        let home = std::env::temp_dir();
+        let custom = home.join("c");
+        assert_eq!(storage_root(Some(custom.as_os_str()), &home).unwrap(), custom);
+        assert_eq!(storage_root(Some(OsStr::new("")), &home).unwrap(), home.join(".codex"));
+        assert_eq!(storage_root(None, &home).unwrap(), home.join(".codex"));
+    }
+
+    #[test]
+    fn a_relative_codex_home_is_refused() {
+        let home = std::env::temp_dir();
+        assert!(matches!(
+            storage_root(Some(OsStr::new("c")), &home),
+            Err(ArchiveError::Unsupported(_))
+        ));
     }
 }

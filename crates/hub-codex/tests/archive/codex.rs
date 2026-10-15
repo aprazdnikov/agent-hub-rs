@@ -209,3 +209,23 @@ fn a_linked_rollout_is_skipped() {
         Err(ArchiveError::NotFound)
     ));
 }
+
+#[test]
+fn a_leftover_temporary_file_is_not_a_rollout() {
+    let root = tempfile::tempdir().unwrap();
+    write(root.path(), "sessions/2026/10/09/.agent-hub-0123456789abcdef0123456789abcdef.tmp");
+    assert!(!archive(root.path()).present(&id(), &cwd(), &BackendData::Codex).unwrap());
+}
+
+#[test]
+fn export_refuses_a_rollout_that_import_could_not_place() {
+    let root = tempfile::tempdir().unwrap();
+    write(root.path(), &format!("sessions/2026/10/09/{}", live_name()));
+    write(root.path(), &format!("sessions/2026/10/08/rollout-2026-10-09T01-00-00-{ID}_2.jsonl"));
+    let dest = tempfile::tempdir().unwrap();
+
+    let exported = archive(root.path()).export(&id(), &cwd(), dest.path());
+
+    assert!(matches!(exported, Err(ArchiveError::Malformed(_))));
+    assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
+}

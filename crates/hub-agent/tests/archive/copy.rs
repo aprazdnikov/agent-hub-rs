@@ -5,7 +5,7 @@ use std::path::Path;
 use hub_agent::archive::{
     ArchiveError, Entry, collect_tree, copy_plain, entry_under, export_files, place_all,
 };
-use hub_core::snapshot::RelPath;
+use hub_core::snapshot::{FILES_LIMIT, RelPath};
 
 fn rel(raw: &str) -> RelPath {
     RelPath::parse(raw).unwrap()
@@ -100,7 +100,7 @@ fn a_file_in_place_of_a_destination_directory_is_malformed() {
     write(&src.path().join("a"), "a");
     write(&dest.path().join("x"), "a file, not a directory");
 
-    let result = place_all(src.path(), dest.path(), &[pair("a", "x/a")], copy_plain);
+    let result = place_all(src.path(), dest.path(), &[pair("a", "x/a")], &rel("x/a"), copy_plain);
 
     assert!(matches!(result, Err(ArchiveError::Malformed(_))));
     assert_eq!(fs::read_to_string(dest.path().join("x")).unwrap(), "a file, not a directory");
@@ -110,7 +110,7 @@ fn a_file_in_place_of_a_destination_directory_is_malformed() {
 fn a_missing_source_file_is_malformed_and_nothing_is_created() {
     let (src, dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
 
-    let result = place_all(src.path(), dest.path(), &[pair("a", "x/a")], copy_plain);
+    let result = place_all(src.path(), dest.path(), &[pair("a", "x/a")], &rel("x/a"), copy_plain);
 
     assert!(matches!(result, Err(ArchiveError::Malformed(_))));
     assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
@@ -137,7 +137,7 @@ fn a_linked_destination_file_is_not_written_through() {
     write(&outside.path().join("target"), "old");
     std::os::unix::fs::symlink(outside.path().join("target"), dest.path().join("a")).unwrap();
 
-    let result = place_all(src.path(), dest.path(), &[pair("a", "a")], copy_plain);
+    let result = place_all(src.path(), dest.path(), &[pair("a", "a")], &rel("a"), copy_plain);
 
     assert!(
         matches!(result, Err(ArchiveError::Io(ref error)) if error.kind() == io::ErrorKind::AlreadyExists)
@@ -184,8 +184,13 @@ fn placing_never_overwrites_and_rolls_back() {
     write(&src.path().join("b"), "new b");
     write(&rel("x/b").under(dest.path()), "old b");
 
-    let result =
-        place_all(src.path(), dest.path(), &[pair("a", "x/a"), pair("b", "x/b")], copy_plain);
+    let result = place_all(
+        src.path(),
+        dest.path(),
+        &[pair("a", "x/a"), pair("b", "x/b")],
+        &rel("x/b"),
+        copy_plain,
+    );
 
     assert!(
         matches!(result, Err(ArchiveError::Io(ref error)) if error.kind() == io::ErrorKind::AlreadyExists)
@@ -204,6 +209,7 @@ fn a_failed_write_leaves_nothing_behind() {
         src.path(),
         dest.path(),
         &[pair("a", "x/a"), pair("b", "x/b")],
+        &rel("x/b"),
         |file, from, out| {
             if file.as_str() == "b" {
                 Err(io::Error::other("boom"))
@@ -221,11 +227,17 @@ fn a_failed_write_leaves_nothing_behind() {
 fn placed_files_carry_what_the_writer_wrote() {
     let (src, dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
     write(&src.path().join("a"), "abc");
-    place_all(src.path(), dest.path(), &[pair("a", "y/a")], |_file, mut from: File, out| {
-        let mut text = String::new();
-        from.read_to_string(&mut text)?;
-        out.write_all(text.to_uppercase().as_bytes())
-    })
+    place_all(
+        src.path(),
+        dest.path(),
+        &[pair("a", "y/a")],
+        &rel("y/a"),
+        |_file, mut from: File, out| {
+            let mut text = String::new();
+            from.read_to_string(&mut text)?;
+            out.write_all(text.to_uppercase().as_bytes())
+        },
+    )
     .unwrap();
     assert_eq!(fs::read_to_string(rel("y/a").under(dest.path())).unwrap(), "ABC");
 }
@@ -238,7 +250,8 @@ fn a_linked_parent_on_the_destination_side_is_refused() {
     write(&src.path().join("a"), "a");
     std::os::unix::fs::symlink(outside.path(), dest.path().join("x")).unwrap();
 
-    let result = place_all(src.path(), dest.path(), &[pair("a", "x/sub/a")], copy_plain);
+    let result =
+        place_all(src.path(), dest.path(), &[pair("a", "x/sub/a")], &rel("x/sub/a"), copy_plain);
 
     assert!(matches!(result, Err(ArchiveError::Link(_))));
     assert_eq!(
@@ -260,9 +273,180 @@ fn a_linked_parent_on_the_snapshot_side_is_refused() {
         src.path(),
         dest.path(),
         &[pair("projects/p/id.jsonl", "projects/p/id.jsonl")],
+        &rel("projects/p/id.jsonl"),
         copy_plain,
     );
 
     assert!(matches!(result, Err(ArchiveError::Link(_))));
     assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
+}
+
+/// The first half of a file a crash cut short.
+fn half(out: &mut File) -> io::Result<()> {
+    out.write_all(b"{\"half\"")?;
+    out.sync_all()
+}
+
+fn names_in(dir: &Path) -> Vec<String> {
+    let mut names: Vec<String> = fs::read_dir(dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+        .collect();
+    names.sort();
+    names
+}
+
+#[test]
+fn a_crash_mid_write_leaves_no_final_file_and_does_not_block_a_retry() {
+    let (src, dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write(&src.path().join("a"), "{\"whole\":true}\n");
+
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        place_all(src.path(), dest.path(), &[pair("a", "x/a")], &rel("x/a"), |_file, _from, out| {
+            half(out)?;
+            panic!("the hub was killed mid-import");
+        })
+    }));
+
+    assert!(crashed.is_err());
+    assert!(!rel("x/a").under(dest.path()).exists(), "a partial file under the final name");
+    let leftovers = names_in(&dest.path().join("x"));
+    assert_eq!(leftovers.len(), 1, "{leftovers:?}");
+    place_all(src.path(), dest.path(), &[pair("a", "x/a")], &rel("x/a"), copy_plain).unwrap();
+    assert_eq!(fs::read_to_string(rel("x/a").under(dest.path())).unwrap(), "{\"whole\":true}\n");
+    assert!(names_in(&dest.path().join("x")).contains(&leftovers[0]), "not ours to remove");
+}
+
+#[test]
+fn the_presence_file_is_placed_after_every_other_file() {
+    let (src, dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write(&src.path().join("a"), "a");
+    write(&src.path().join("b"), "b");
+
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        place_all(
+            src.path(),
+            dest.path(),
+            &[pair("a", "x/a"), pair("b", "x/b")],
+            &rel("x/a"),
+            |file, from, out| {
+                if file.as_str() == "b" {
+                    half(out)?;
+                    panic!("the hub was killed mid-import");
+                }
+                copy_plain(file, from, out)
+            },
+        )
+    }));
+
+    assert!(crashed.is_err());
+    assert!(!rel("x/a").under(dest.path()).exists(), "the session looks present");
+    assert!(!rel("x/b").under(dest.path()).exists());
+}
+
+#[test]
+fn placing_without_the_presence_file_is_refused() {
+    let (src, dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write(&src.path().join("a"), "a");
+
+    let result = place_all(src.path(), dest.path(), &[pair("a", "x/a")], &rel("x/b"), copy_plain);
+
+    assert!(matches!(result, Err(ArchiveError::Malformed(_))));
+    assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn export_refuses_more_files_than_a_manifest_holds() {
+    let (root, dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write(&root.path().join("a"), "a");
+
+    let result = export_files(root.path(), &vec![rel("a"); FILES_LIMIT + 1], dest.path());
+
+    assert!(matches!(result, Err(ArchiveError::Malformed(_))));
+    assert_eq!(fs::read_dir(dest.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn a_retry_after_a_crash_keeps_the_files_already_placed() {
+    let (src, dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    for name in ["a", "b", "c"] {
+        write(&src.path().join(name), name);
+    }
+    let pairs = [pair("a", "x/a"), pair("b", "x/b"), pair("c", "x/c")];
+
+    let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        place_all(src.path(), dest.path(), &pairs, &rel("x/a"), |file, from, out| {
+            if file.as_str() == "c" {
+                half(out)?;
+                panic!("the hub was killed mid-import");
+            }
+            copy_plain(file, from, out)
+        })
+    }));
+    assert!(crashed.is_err());
+    assert!(rel("x/b").under(dest.path()).is_file() && !rel("x/a").under(dest.path()).exists());
+
+    place_all(src.path(), dest.path(), &pairs, &rel("x/a"), copy_plain).unwrap();
+
+    for name in ["a", "b", "c"] {
+        assert_eq!(fs::read_to_string(rel(&format!("x/{name}")).under(dest.path())).unwrap(), name);
+    }
+}
+
+#[test]
+fn an_existing_file_with_other_bytes_is_refused_and_kept() {
+    let (src, dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write(&src.path().join("a"), "new a");
+    write(&src.path().join("b"), "new b");
+    write(&rel("x/b").under(dest.path()), "old b");
+
+    let result = place_all(
+        src.path(),
+        dest.path(),
+        &[pair("a", "x/a"), pair("b", "x/b")],
+        &rel("x/a"),
+        copy_plain,
+    );
+
+    assert!(
+        matches!(result, Err(ArchiveError::Io(ref error)) if error.kind() == io::ErrorKind::AlreadyExists)
+    );
+    assert_eq!(fs::read_to_string(rel("x/b").under(dest.path())).unwrap(), "old b");
+    assert_eq!(names_in(&dest.path().join("x")), ["b"], "no temporary file left");
+}
+
+#[test]
+fn an_existing_presence_file_is_refused_even_with_the_same_bytes() {
+    let (src, dest) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write(&src.path().join("a"), "a");
+    write(&rel("x/a").under(dest.path()), "a");
+
+    let result = place_all(src.path(), dest.path(), &[pair("a", "x/a")], &rel("x/a"), copy_plain);
+
+    assert!(
+        matches!(result, Err(ArchiveError::Io(ref error)) if error.kind() == io::ErrorKind::AlreadyExists)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn an_existing_link_is_never_taken_for_a_placed_file() {
+    let (src, dest, outside) =
+        (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    write(&src.path().join("a"), "a");
+    write(&src.path().join("b"), "b");
+    write(&outside.path().join("b"), "b");
+    fs::create_dir(dest.path().join("x")).unwrap();
+    std::os::unix::fs::symlink(outside.path().join("b"), rel("x/b").under(dest.path())).unwrap();
+
+    let result = place_all(
+        src.path(),
+        dest.path(),
+        &[pair("a", "x/a"), pair("b", "x/b")],
+        &rel("x/a"),
+        copy_plain,
+    );
+
+    assert!(result.is_err());
+    assert!(!rel("x/a").under(dest.path()).exists());
 }

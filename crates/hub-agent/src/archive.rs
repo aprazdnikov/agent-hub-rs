@@ -3,25 +3,31 @@
 //! Archives block (plain `std::fs`, child processes): call them from `spawn_blocking`.
 //! Only what a backend lists is copied. Every component below a trusted root is checked
 //! with `symlink_metadata`: a link anywhere on the way is refused, never followed.
-//! Destination directories are made one component at a time, files with `create_new`, so
-//! nothing in the agent's storage is overwritten; snapshot files are private.
+//! Destination directories are made one component at a time, files with `create_new` (agent
+//! files under a temporary name, then hard-linked to the final one), so nothing in the agent's
+//! storage is overwritten; snapshot files are private.
 //!
 //! Residual risk: a process of the same user that writes into these `0700` directories can
 //! swap a checked component for a link between the check and the `open`/`remove_file` that
 //! follows it (TOCTOU). `O_NOFOLLOW` needs `libc`/`unsafe`, which the workspace forbids, so the
-//! final destination file is guarded by `create_new` and a source by the check right before
-//! its `open`.
+//! final destination file is guarded by `create_new`/`hard_link` (neither follows a link in the
+//! last component) and a source by the check right before its `open`.
 
 use std::fs::{self, DirBuilder, File, OpenOptions};
-use std::io;
+use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
 
 use hub_core::domain::{AbsolutePath, SessionId};
-use hub_core::snapshot::{BackendData, PathError, RelPath};
+use hub_core::snapshot::{BackendData, FILES_LIMIT, PathError, RelPath};
 
 const ID_LIMIT: usize = 128;
 const TREE_DEPTH: usize = 16;
+/// Bounds a walk, not a snapshot: Codex scans every thread's rollouts under `sessions/`, far
+/// more than one snapshot may hold; `export_files` applies the snapshot's own `FILES_LIMIT`.
 const TREE_ENTRIES: usize = 100_000;
+
+/// A file in the snapshot and where it goes in the agent's storage.
+pub type Pair = (RelPath, RelPath);
 
 /// What `export` put into the snapshot's `agent/` directory.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,8 +314,14 @@ fn walk(
 
 /// Copies `files` from `root` into `dest` under the same relative paths, private and checked
 /// component by component on both sides. `dest` is a staging directory the caller removes as a
-/// whole on failure, so a partial copy is not cleaned up here.
+/// whole on failure, so a partial copy is not cleaned up here. More files than a manifest holds
+/// (`FILES_LIMIT`) are refused before anything is copied.
 pub fn export_files(root: &Path, files: &[RelPath], dest: &Path) -> Result<(), ArchiveError> {
+    if files.len() > FILES_LIMIT {
+        return Err(ArchiveError::Malformed(format!(
+            "у сессии больше {FILES_LIMIT} файлов — снимок их не вместит"
+        )));
+    }
     files.iter().try_for_each(|file| {
         let mut from = open_under(root, file)?;
         let mut out = create_under(dest, file)?;
@@ -320,38 +332,166 @@ pub fn export_files(root: &Path, files: &[RelPath], dest: &Path) -> Result<(), A
 }
 
 /// Writes every `(from, to)` pair — `from` under `src`, `to` under `dest` — through `write`,
-/// which gets the opened, checked source. Each `to` is created anew; on the first failure every
-/// file created so far is removed, so a failed import leaves the agent's storage as it was.
-/// Missing parent directories are created and may stay behind empty.
+/// which gets the opened, checked source. Pairs are placed in order, except that the pair whose
+/// `to` is `presence` — the file by which the agent finds the session — goes last, so an import
+/// cut short leaves a session the agent does not see and a repeated `/restore` imports anew.
+///
+/// Each file is written under a temporary name in its target directory (`create_new`, `0600`,
+/// synced) and then hard-linked to its final name, which fails if that name exists: a crash
+/// leaves at most a temporary file, never a partial file under the final name. A file system
+/// without hard links (`Unsupported`) falls back to writing the final name with `create_new`.
+/// On the first failure every file created so far is removed, so a failed import leaves the
+/// agent's storage as it was. Missing parent directories are created and may stay behind empty;
+/// a temporary file left by a crash stays behind too: it is not ours to tell apart from the
+/// agent's own files later, and the agent ignores it.
+///
+/// A retry after such a crash finds the files placed before it: a regular file that already
+/// holds exactly the bytes to be written is kept (and is not removed on rollback, this run did
+/// not create it); different bytes, a link, or an existing `presence` file are refused.
 pub fn place_all(
     src: &Path,
     dest: &Path,
-    pairs: &[(RelPath, RelPath)],
+    pairs: &[Pair],
+    presence: &RelPath,
     mut write: impl FnMut(&RelPath, File, &mut File) -> io::Result<()>,
 ) -> Result<(), ArchiveError> {
+    let (last, first): (Vec<&Pair>, Vec<&Pair>) = pairs.iter().partition(|(_, to)| to == presence);
+    if last.is_empty() {
+        return Err(ArchiveError::Malformed(format!("{presence}: нет среди файлов снимка")));
+    }
+    let ordered = first
+        .into_iter()
+        .map(|pair| (pair, Existing::KeepIfSame))
+        .chain(last.into_iter().map(|pair| (pair, Existing::Refuse)));
     let mut created: Vec<PathBuf> = Vec::new();
-    for (from, to) in pairs {
-        if let Err(error) = place(src, from, dest, to, &mut write) {
+    for ((from, to), existing) in ordered {
+        let target = Target { dest, to, existing };
+        if let Err(error) = place(src, from, &target, &mut write, &mut created) {
             remove_placed(created.iter().rev(), "restored files left behind");
             return Err(error);
         }
-        created.push(to.under(dest));
     }
     Ok(())
 }
 
+/// `to` with its last component replaced by a fresh temporary name: the same directory, so the
+/// hard link stays on one file system, and a name no agent reads as a session file.
+fn temporary_beside(to: &RelPath) -> Result<RelPath, ArchiveError> {
+    let name = format!(".agent-hub-{}.tmp", uuid::Uuid::new_v4().simple());
+    let parts: Vec<&str> = to.parts().collect();
+    let parents = parts.split_last().map_or(&[][..], |(_, parents)| parents);
+    let all: Vec<&str> = parents.iter().copied().chain([name.as_str()]).collect();
+    Ok(RelPath::from_parts(&all)?)
+}
+
+/// What placing does when the final name is already taken.
+#[derive(Debug, Clone, Copy)]
+enum Existing {
+    /// The file the agent finds the session by: if it is there, the session already is.
+    Refuse,
+    /// Left by an import cut short: kept when it is a regular file with the same bytes.
+    KeepIfSame,
+}
+
+/// Where one file goes.
+struct Target<'a> {
+    dest: &'a Path,
+    to: &'a RelPath,
+    existing: Existing,
+}
+
+/// Places one file; whatever it leaves in `dest` is pushed to `created`, a failure removes what
+/// it wrote itself.
 fn place(
     src: &Path,
     from: &RelPath,
-    dest: &Path,
-    to: &RelPath,
+    target: &Target<'_>,
     write: &mut impl FnMut(&RelPath, File, &mut File) -> io::Result<()>,
+    created: &mut Vec<PathBuf>,
 ) -> Result<(), ArchiveError> {
+    let Target { dest, to, existing: _ } = *target;
     let source = open_under(src, from)?;
-    let mut out = create_under(dest, to)?;
+    let temporary = temporary_beside(to)?;
+    let mut out = create_under(dest, &temporary)?;
+    let temporary = temporary.under(dest);
     let written = write(from, source, &mut out).and_then(|()| out.sync_all());
     drop(out);
-    written.map_err(|error| {
+    let linked = written.map_err(ArchiveError::from).and_then(|()| {
+        match fs::hard_link(&temporary, to.under(dest)) {
+            Ok(()) => Ok(Placed::New),
+            Err(error) if error.kind() == io::ErrorKind::Unsupported => {
+                copy_new(&temporary, dest, to)
+                    .map(|()| Placed::New)
+                    .or_else(|error| taken(error, target, &temporary))
+            }
+            Err(error) => taken(error.into(), target, &temporary),
+        }
+    });
+    match linked {
+        Ok(Placed::New) => created.push(to.under(dest)),
+        Ok(Placed::Kept) => {}
+        Err(error) => {
+            remove_placed([temporary].iter(), "half-written file left behind");
+            return Err(error);
+        }
+    }
+    if let Err(error) = fs::remove_file(&temporary) {
+        // The final file is complete; the leftover is a second name for it, removed on rollback.
+        tracing::warn!(error = ?error.kind(), "temporary restore file left behind");
+        created.push(temporary);
+    }
+    Ok(())
+}
+
+/// Whether this run created the final file or found it already in place.
+#[derive(Debug, Clone, Copy)]
+enum Placed {
+    New,
+    Kept,
+}
+
+/// The final name is taken (`error`): kept only if `target` allows it and it is a regular file
+/// holding exactly the bytes of `temporary`; anything else is the original error.
+fn taken(
+    error: ArchiveError,
+    target: &Target<'_>,
+    temporary: &Path,
+) -> Result<Placed, ArchiveError> {
+    let Target { dest, to, existing } = *target;
+    let exists =
+        matches!(&error, ArchiveError::Io(io) if io.kind() == io::ErrorKind::AlreadyExists);
+    match existing {
+        Existing::KeepIfSame if exists => {}
+        Existing::KeepIfSame | Existing::Refuse => return Err(error),
+    }
+    if entry_under(dest, to)? == Entry::File && same_bytes(temporary, &to.under(dest))? {
+        Ok(Placed::Kept)
+    } else {
+        Err(error)
+    }
+}
+
+fn same_bytes(left: &Path, right: &Path) -> io::Result<bool> {
+    let (left, right) = (File::open(left)?, File::open(right)?);
+    if left.metadata()?.len() != right.metadata()?.len() {
+        return Ok(false);
+    }
+    for (left, right) in BufReader::new(left).bytes().zip(BufReader::new(right).bytes()) {
+        if left? != right? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
+/// The fallback without hard links: the written temporary file copied to `to` with
+/// `create_new`; a partial copy is removed.
+fn copy_new(temporary: &Path, dest: &Path, to: &RelPath) -> Result<(), ArchiveError> {
+    let mut from = File::open(temporary)?;
+    let mut out = create_under(dest, to)?;
+    let copied = io::copy(&mut from, &mut out).and_then(|_| out.sync_all());
+    drop(out);
+    copied.map_err(|error| {
         remove_placed([to.under(dest)].iter(), "half-written file left behind");
         error.into()
     })
