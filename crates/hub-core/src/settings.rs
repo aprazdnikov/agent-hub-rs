@@ -857,7 +857,8 @@ pub struct SettingsFile {
     pub qwen: QwenFile,
     #[serde(default)]
     pub hermes: HermesFile,
-    #[serde(default)]
+    /// Left out when it holds nothing: versions before 0.5.0 refuse an unknown `[snapshots]`.
+    #[serde(default, skip_serializing_if = "SnapshotsFile::is_empty")]
     pub snapshots: SnapshotsFile,
     #[serde(default)]
     pub timeouts: TimeoutsFile,
@@ -929,6 +930,13 @@ pub struct SnapshotsFile {
     pub dir: Option<String>,
 }
 
+impl SnapshotsFile {
+    fn is_empty(&self) -> bool {
+        let Self { dir } = self;
+        dir.is_none()
+    }
+}
+
 /// Secrets the file does not hold, read from the keyring by the caller.
 pub struct Keys {
     pub token: String,
@@ -951,7 +959,9 @@ pub struct UpdatesFile {
 
 impl SettingsFile {
     #[must_use]
-    pub fn from_settings(settings: &Settings) -> Self {
+    /// `home` tells the default snapshots directory apart: it is not written, so the file stays
+    /// readable by versions that do not know `[snapshots]`.
+    pub fn from_settings(settings: &Settings, home: &Path) -> Self {
         Self {
             telegram: TelegramFile {
                 chat: settings.telegram.chat.0,
@@ -986,7 +996,10 @@ impl SettingsFile {
                 profile: settings.hermes.profile.clone(),
                 model: settings.hermes.model.clone(),
             },
-            snapshots: SnapshotsFile { dir: Some(settings.snapshots_dir.display().to_string()) },
+            snapshots: SnapshotsFile {
+                dir: (settings.snapshots_dir != home.join(DEFAULT_SNAPSHOTS_DIR))
+                    .then(|| settings.snapshots_dir.display().to_string()),
+            },
             timeouts: TimeoutsFile {
                 approval_seconds: Some(settings.timeouts.approval.as_secs()),
                 background_seconds: Some(settings.timeouts.background.as_secs()),
@@ -1160,10 +1173,21 @@ mod tests {
     }
 
     #[test]
+    fn a_default_snapshots_dir_stays_out_of_the_file() {
+        let settings = draft().parse(&home()).unwrap();
+        let text = toml::to_string(&SettingsFile::from_settings(&settings, &home())).unwrap();
+        assert!(!text.contains("snapshots"), "{text}");
+        let file: SettingsFile = toml::from_str(&text).unwrap();
+        let keys =
+            Keys { token: "123:abc".to_owned(), api_key: String::new(), qwen_key: String::new() };
+        assert_eq!(file.to_draft(keys).unwrap().parse(&home()).unwrap(), settings);
+    }
+
+    #[test]
     fn snapshots_dir_round_trips_through_the_file() {
         let settings =
             Draft { snapshots_dir: "~/snaps".to_owned(), ..draft() }.parse(&home()).unwrap();
-        let file = SettingsFile::from_settings(&settings);
+        let file = SettingsFile::from_settings(&settings, &home());
         let keys =
             Keys { token: "123:abc".to_owned(), api_key: String::new(), qwen_key: String::new() };
         assert_eq!(file.to_draft(keys).unwrap().parse(&home()).unwrap(), settings);
@@ -1265,7 +1289,7 @@ mod tests {
     #[test]
     fn file_round_trips_through_draft() {
         let settings = draft().parse(&home()).unwrap();
-        let file = SettingsFile::from_settings(&settings);
+        let file = SettingsFile::from_settings(&settings, &home());
         let keys = Keys {
             token: settings.telegram.token.expose().to_owned(),
             api_key: String::new(),
@@ -1277,7 +1301,7 @@ mod tests {
 
     #[test]
     fn file_with_unknown_permission_mode_is_rejected() {
-        let mut file = SettingsFile::from_settings(&draft().parse(&home()).unwrap());
+        let mut file = SettingsFile::from_settings(&draft().parse(&home()).unwrap(), &home());
         file.claude.permission_mode = Some("yolo".to_owned());
         let keys = Keys { token: String::new(), api_key: String::new(), qwen_key: String::new() };
         assert_eq!(file.to_draft(keys).unwrap_err().field, Field::PermissionMode);
@@ -1343,7 +1367,7 @@ mod tests {
             ..draft()
         };
         let settings = input.parse(&home()).unwrap();
-        let text = toml::to_string(&SettingsFile::from_settings(&settings)).unwrap();
+        let text = toml::to_string(&SettingsFile::from_settings(&settings, &home())).unwrap();
         let file: SettingsFile = toml::from_str(&text).unwrap();
         let keys = Keys { token: input.token, api_key: String::new(), qwen_key: String::new() };
         assert_eq!(
@@ -1458,7 +1482,7 @@ mod tests {
     #[test]
     fn codex_file_round_trips_through_draft_without_the_key() {
         let settings = codex_draft().parse(&home()).unwrap();
-        let file = SettingsFile::from_settings(&settings);
+        let file = SettingsFile::from_settings(&settings, &home());
         let keys = Keys {
             token: settings.telegram.token.expose().to_owned(),
             api_key: "sk-test".to_owned(),
@@ -1591,7 +1615,7 @@ root = \"~/w\"
     #[test]
     fn qwen_file_round_trips_through_draft_without_the_key() {
         let settings = qwen_draft().parse(&home()).unwrap();
-        let file = SettingsFile::from_settings(&settings);
+        let file = SettingsFile::from_settings(&settings, &home());
         let keys = Keys {
             token: settings.telegram.token.expose().to_owned(),
             api_key: String::new(),

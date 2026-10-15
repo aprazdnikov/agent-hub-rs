@@ -61,8 +61,8 @@ fn run() -> anyhow::Result<()> {
     let _guard = logging::init(&dirs.logs(), logs.clone())?;
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "agent-hub started");
     let home = home_or_root();
-    let store = FileSettings::new(dirs.settings(), Box::new(Keyring));
-    let loaded = store.load(&home);
+    let store = FileSettings::new(dirs.settings(), home.clone(), Box::new(Keyring));
+    let loaded = store.load();
     if let Err(error) = &loaded {
         tracing::error!(%error, "settings not loaded");
     }
