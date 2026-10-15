@@ -287,7 +287,7 @@ fn walk(
             .to_str()
             .and_then(|name| RelPath::parse(&format!("{dir}/{name}")).ok());
         let Some(child) = child else {
-            tracing::warn!(%dir, "agent file with an unusable name skipped");
+            tracing::warn!("agent file with an unusable name skipped");
             continue;
         };
         // `DirEntry::file_type` does not follow links.
@@ -332,9 +332,7 @@ pub fn place_all(
     let mut created: Vec<PathBuf> = Vec::new();
     for (from, to) in pairs {
         if let Err(error) = place(src, from, dest, to, &mut write) {
-            for path in created.iter().rev() {
-                remove_placed(path, "restored file left behind");
-            }
+            remove_placed(created.iter().rev(), "restored files left behind");
             return Err(error);
         }
         created.push(to.under(dest));
@@ -354,16 +352,19 @@ fn place(
     let written = write(from, source, &mut out).and_then(|()| out.sync_all());
     drop(out);
     written.map_err(|error| {
-        remove_placed(&to.under(dest), "half-written file left behind");
+        remove_placed([to.under(dest)].iter(), "half-written file left behind");
         error.into()
     })
 }
 
-/// Rollback is best effort: the original error is what the caller reports, a file that could
-/// not be removed is logged by path (no content).
-fn remove_placed(path: &Path, what: &'static str) {
-    if let Err(cleanup) = fs::remove_file(path) {
-        tracing::warn!(path = %path.display(), error = %cleanup, "{what}");
+/// Rollback is best effort: the original error is what the caller reports. Files that could not
+/// be removed are logged by count and io error kind only — agent-storage paths encode the user's
+/// working directory and stay out of the logs.
+fn remove_placed<'a>(paths: impl Iterator<Item = &'a PathBuf>, what: &'static str) {
+    let kinds: Vec<io::ErrorKind> =
+        paths.filter_map(|path| fs::remove_file(path).err().map(|error| error.kind())).collect();
+    if !kinds.is_empty() {
+        tracing::warn!(left = kinds.len(), errors = ?kinds, "{what}");
     }
 }
 
