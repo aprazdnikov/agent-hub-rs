@@ -1,7 +1,7 @@
 //! Snapshots on disk: `<dir>/snapshots/<name>/{manifest.json, agent/…}`. A snapshot is
 //! written in a private staging directory and renamed into place, so it is whole or absent.
 
-use std::fs::{self, File};
+use std::fs;
 use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
@@ -247,7 +247,7 @@ fn refused(name: &SnapshotName, error: ArchiveError) -> SnapshotError {
 /// Makes the rename durable; a failure only weakens durability, so it is logged.
 #[cfg(unix)]
 fn sync_dir(dir: &Path) {
-    if let Err(error) = File::open(dir).and_then(|dir| dir.sync_all()) {
+    if let Err(error) = fs::File::open(dir).and_then(|dir| dir.sync_all()) {
         tracing::warn!(kind = ?error.kind(), "snapshot directory not synced");
     }
 }
