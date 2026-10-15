@@ -1750,6 +1750,7 @@ dependencies = [
  "rstest",
  "serde_json",
  "subtle",
+ "tempfile",
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
