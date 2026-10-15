@@ -9,6 +9,7 @@ pub mod paths;
 pub mod press;
 pub mod sender;
 mod session;
+pub mod snapshots;
 pub mod telegram;
 #[cfg(test)]
 mod testing;
