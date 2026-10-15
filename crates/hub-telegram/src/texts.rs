@@ -45,6 +45,8 @@ pub const SESSION_BUSY_ELSEWHERE: &str = "⚠️ Сессия сейчас вы�
                                           дождитесь его конца или /stop там и повторите команду";
 pub const SESSION_RESERVED: &str =
     "⏳ С этой сессией сейчас работает /save или /restore в другой теме — подождите.";
+pub const RESTORE_FILES_KEPT: &str = "Файлы сессии уже восстановлены: повторный /restore только \
+                                      привяжет её к теме.";
 pub const RESTORE_NOT_PERSISTED: &str =
     "⚠️ Восстановление не сохранено: привязки тем не записались на диск, темы не изменены";
 const SNAPSHOT_LIST_LIMIT: usize = 30;

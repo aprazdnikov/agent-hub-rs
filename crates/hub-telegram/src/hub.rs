@@ -676,7 +676,19 @@ impl<A: Agents> Hub<A> {
         tokio::spawn(async move {
             let text = match tokio::task::spawn_blocking(move || store.list()).await {
                 Ok(Ok(manifests)) => texts::snapshot_list(&manifests),
-                Ok(Err(error)) => texts::warning(&error),
+                Ok(Err(error)) => {
+                    // The error names the snapshots directory: only its io kind is logged.
+                    let kind = match &error {
+                        SnapshotError::Io(io) => Some(io.kind()),
+                        SnapshotError::Exists(_)
+                        | SnapshotError::Missing(_)
+                        | SnapshotError::Corrupt { .. }
+                        | SnapshotError::Manifest(_)
+                        | SnapshotError::Archive(_) => None,
+                    };
+                    tracing::warn!(error = ?kind, "snapshots not listed");
+                    texts::warning(&error)
+                }
                 Err(error) => {
                     tracing::error!(panic = error.is_panic(), "snapshot list crashed");
                     texts::INTERNAL_ERROR.to_owned()
@@ -796,13 +808,23 @@ impl<A: Agents> Hub<A> {
     /// One session, one topic: every other holder is reset and `key` bound, persisted as one
     /// save; only a successful save changes the hub's bindings and tells the topics.
     fn rebind(&mut self, key: TopicKey, restoration: Restoration) {
-        let Restoration { name, session, imported: _imported } = restoration;
+        let Restoration { name, session, imported } = restoration;
         let holders = holders(&self.topics, key, &session);
-        let busy = |topic: &TopicKey| {
-            self.running.contains_key(topic) || self.snapshotting.contains(topic)
+        let involved = || std::iter::once(&key).chain(&holders);
+        let refusal = if involved().any(|topic| self.running.contains_key(topic)) {
+            Some(texts::SESSION_BUSY_ELSEWHERE)
+        } else if involved().any(|topic| self.snapshotting.contains(topic)) {
+            Some(texts::SESSION_RESERVED)
+        } else {
+            None
         };
-        if busy(&key) || holders.iter().any(busy) {
-            self.say(Target::Topic(key), texts::SESSION_BUSY_ELSEWHERE.to_owned());
+        if let Some(refusal) = refusal {
+            let text = if imported {
+                format!("{refusal}\n{}", texts::RESTORE_FILES_KEPT)
+            } else {
+                refusal.to_owned()
+            };
+            self.say(Target::Topic(key), text);
             return;
         }
         let next = {
@@ -1089,8 +1111,8 @@ mod tests {
         messenger: Arc<FakeMessenger>,
         agents: Arc<FakeAgents>,
         store: MemoryStore,
-        _settings: watch::Sender<Arc<Settings>>,
-        _root: tempfile::TempDir,
+        settings: watch::Sender<Arc<Settings>>,
+        root: tempfile::TempDir,
     }
 
     impl World {
@@ -1147,7 +1169,7 @@ mod tests {
             home: std::env::temp_dir(),
             bot: "agent_hub_bot".to_owned(),
         });
-        World { handle, messenger, agents, store, _settings: settings_tx, _root: root }
+        World { handle, messenger, agents, store, settings: settings_tx, root }
     }
 
     fn inbound(thread: Option<i32>, message: i32, content: Content) -> HubMessage {
@@ -1751,5 +1773,54 @@ mod tests {
         world.send(text(Some(7), 4, "/saves")).await;
         eventually("listed", || said(&world, "💾 Снимки, новые сверху:\npochinit-testy-")).await;
         assert!(world.texts().iter().any(|t| t.ends_with(" · Починить тесты")));
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_from_outside_the_root_needs_a_directory_inside_it() {
+        let world = world(FakeAgents::default());
+        saved_snap(&world).await;
+        world.agents.archive.forget();
+        let narrower = Settings {
+            workspace_root: world.root.path().join("project"),
+            ..Settings::clone(&world.settings.borrow())
+        };
+        world.settings.send(Arc::new(narrower)).unwrap();
+
+        world.send(text(Some(8), 2, "/restore snap")).await;
+
+        eventually("outside", || {
+            world.texts().iter().any(|t| t.starts_with("⚠️") && t.contains("вне корня"))
+        })
+        .await;
+        assert!(world.agents.archive.imports().is_empty(), "nothing imported");
+        let topics = world.store.last().unwrap();
+        assert_eq!(topics.get(&KEY).and_then(|s| s.session.clone()), SessionId::parse("s-1"));
+        assert!(!topics.contains_key(&OTHER));
+    }
+
+    #[tokio::test]
+    async fn a_restore_held_up_by_a_snapshot_elsewhere_says_a_repeat_only_rebinds() {
+        let world = world(FakeAgents::default());
+        saved_snap(&world).await;
+        bound(&world, THIRD, "s-2").await;
+        world.send(text(Some(9), 3, "/save other")).await;
+        eventually("saved", || said(&world, "💾 Сохранено: other")).await;
+        world.agents.archive.forget();
+        let (release, held) = std::sync::mpsc::channel();
+        *world.agents.archive.hold_import.lock().unwrap() = Some(held);
+        world.send(text(Some(7), 4, "/restore other")).await;
+        eventually("import paused", || world.agents.archive.importing.load(Ordering::SeqCst)).await;
+
+        world.send(text(Some(8), 5, "/restore snap")).await;
+
+        let refused = format!("{}\n{}", texts::SESSION_RESERVED, texts::RESTORE_FILES_KEPT);
+        eventually("refused", || count(&world, &refused) == 1).await;
+        assert_eq!(bound_to(&world, KEY), SessionId::parse("s-1"));
+        release.send(()).unwrap();
+        eventually("other restored", || said(&world, "♻️ Восстановлено: other")).await;
+        world.send(text(Some(8), 6, "/restore snap")).await;
+        eventually("rebound", || said(&world, "♻️ Восстановлено: snap")).await;
+        assert_eq!(world.agents.archive.imports(), ["s-1", "s-2"], "the repeat imported nothing");
+        assert_eq!(bound_to(&world, OTHER), SessionId::parse("s-1"));
     }
 }
