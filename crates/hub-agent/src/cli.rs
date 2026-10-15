@@ -67,15 +67,27 @@ pub async fn version_output(cli: &Path) -> Result<String, VersionError> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
 /// Without it every CLI process flashes a console window under the desktop app.
 #[cfg(windows)]
 pub fn hide_window(command: &mut Command) {
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     command.creation_flags(CREATE_NO_WINDOW);
 }
 
 #[cfg(not(windows))]
 pub fn hide_window(_command: &mut Command) {}
+
+/// The same for a blocking child started from `spawn_blocking`.
+#[cfg(windows)]
+pub fn hide_std_window(command: &mut std::process::Command) {
+    use std::os::windows::process::CommandExt;
+    command.creation_flags(CREATE_NO_WINDOW);
+}
+
+#[cfg(not(windows))]
+pub fn hide_std_window(_command: &mut std::process::Command) {}
 
 #[cfg(test)]
 mod tests {

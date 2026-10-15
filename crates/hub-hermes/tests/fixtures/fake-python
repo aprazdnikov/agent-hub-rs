@@ -1,0 +1,25 @@
+#!/bin/sh
+# Stands in for Hermes's Python: records its arguments and answers as the `mode` file beside
+# the symlink says. Checked in once (per-test executables race with spawns: ETXTBSY).
+dir=$(dirname "$0")
+mode=$(cat "$dir/mode")
+printf '%s\n' "$@" > "$dir/argv.txt"
+result=
+out=
+for arg in "$@"; do
+  case "$arg" in
+    --result=*) result=${arg#--result=} ;;
+    --out=*) out=${arg#--out=} ;;
+  esac
+done
+case "$mode" in
+  present) printf '{"ok":true,"present":true}' > "$result" ;;
+  absent) printf '{"ok":true,"present":false}' > "$result" ;;
+  export) printf '{"id":"s-1","segments":[]}' > "$out"; printf '{"ok":true,"found":true}' > "$result" ;;
+  missing) printf '{"ok":true,"found":false}' > "$result" ;;
+  imported) printf '{"ok":true,"imported":1,"skipped":0}' > "$result" ;;
+  exists) printf '{"ok":false,"error":"exists","detail":"the session is already in state.db"}' > "$result" ;;
+  schema) printf '{"ok":false,"error":"schema","detail":"code schema 32"}' > "$result" ;;
+  garbage) printf 'not json' > "$result" ;;
+  silent) echo "Traceback: boom" >&2 ;;
+esac

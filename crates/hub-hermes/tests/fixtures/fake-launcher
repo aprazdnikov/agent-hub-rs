@@ -1,0 +1,4 @@
+#!/bin/sh
+# Stands in for the published POSIX launcher; tests hard-link it beside a `python3` symlink to
+# fake-python, so the launcher's own arguments reach the recorder.
+exec "$(dirname "$0")/python3" "$@"
