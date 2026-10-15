@@ -135,8 +135,12 @@ impl SessionArchive for ClaudeArchive {
                 }
             })
             .collect::<Result<Vec<_>, _>>()?;
-        if !files.iter().any(|file| file.parts().next_back() == Some(transcript.as_str())) {
+        let exact = RelPath::from_parts(&[PROJECTS, project, &transcript])?;
+        if !files.contains(&exact) {
             return Err(ArchiveError::Malformed("в снимке нет транскрипта Claude".to_owned()));
+        }
+        if self.projects_with(stem)?.iter().any(|other| other != project) {
+            return Err(ArchiveError::Ambiguous);
         }
         place_all(src, &self.root, &pairs, copy_plain)
     }

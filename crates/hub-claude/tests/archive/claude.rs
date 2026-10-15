@@ -197,3 +197,38 @@ fn a_linked_projects_directory_is_refused_on_export_and_import() {
         "nothing written outside the root"
     );
 }
+
+#[test]
+fn import_refuses_a_second_copy_in_another_project() {
+    let root = claude_home();
+    let snapshot = tempfile::tempdir().unwrap();
+    let exported = archive(root.path()).export(&id(), &cwd(), snapshot.path()).unwrap();
+    let target = tempfile::tempdir().unwrap();
+    write(target.path(), &format!("projects/-elsewhere/{ID}.jsonl"), "{}\n");
+
+    let result = archive(target.path()).import(
+        &id(),
+        &exported.data,
+        &exported.files,
+        snapshot.path(),
+        &cwd(),
+    );
+
+    assert!(matches!(result, Err(ArchiveError::Ambiguous)));
+    assert!(!rel("projects/-work-shop").under(target.path()).exists(), "nothing written");
+}
+
+#[test]
+fn import_needs_the_transcript_itself_not_a_nested_namesake() {
+    let snapshot = tempfile::tempdir().unwrap();
+    let nested = format!("projects/-work-shop/{ID}/x/{ID}.jsonl");
+    write(snapshot.path(), &nested, "{}\n");
+    let fresh = tempfile::tempdir().unwrap();
+    let data = BackendData::Claude { project: rel("-work-shop") };
+
+    let result =
+        archive(fresh.path()).import(&id(), &data, &[rel(&nested)], snapshot.path(), &cwd());
+
+    assert!(matches!(result, Err(ArchiveError::Malformed(_))));
+    assert_eq!(fs::read_dir(fresh.path()).unwrap().count(), 0);
+}
