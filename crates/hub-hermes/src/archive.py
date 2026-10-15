@@ -144,8 +144,10 @@ def read_payload(path: str, session: str) -> list[dict[str, Any]]:
     segments = payload.get("segments") or [payload]
     if not isinstance(segments, list) or not all(isinstance(s, dict) for s in segments):
         raise Refused("payload", "segments are not objects")
-    if session not in [str(s.get("id") or "") for s in segments]:
-        raise Refused("payload", "the session is not in the payload")
+    # The tip must be the last row written: ``present`` looks only for it, so a lineage cut
+    # short by a crash can never pass for a finished import.
+    if str(payload.get("id") or "") != session or str(segments[-1].get("id") or "") != session:
+        raise Refused("payload", "the session is not the tip of the payload")
     return segments
 
 

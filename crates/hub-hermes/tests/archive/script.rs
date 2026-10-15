@@ -144,6 +144,24 @@ fn a_payload_without_the_session_is_refused() {
 }
 
 #[test]
+fn a_session_that_is_not_the_tip_of_the_payload_is_refused() {
+    if !python_available("a_session_that_is_not_the_tip_of_the_payload_is_refused") {
+        return;
+    }
+    let root = seeded_root();
+    let target = root.path().join("profiles").join("work");
+    schema_db(&target, 31);
+    let out = root.path().join("middle.json");
+    let payload = json!({"id": "s-1", "segments": [{"id": "s-0"}, {"id": "s-1"}, {"id": "s-2"}]});
+    fs::write(&out, payload.to_string()).unwrap();
+    let input = format!("--in={}", out.display());
+    let refused =
+        run(root.path(), &["import", "--session=s-1", "--profile=work", &input, "--cwd=/new"]);
+    assert_eq!(refused["error"], "payload");
+    assert!(!target.join("sessions.json").exists(), "nothing may be written");
+}
+
+#[test]
 fn an_unknown_session_is_not_found() {
     if !python_available("an_unknown_session_is_not_found") {
         return;
