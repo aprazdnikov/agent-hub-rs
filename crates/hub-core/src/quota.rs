@@ -10,6 +10,8 @@ use crate::render::truncate;
 
 /// Longest plan, window name or refusal taken from an agent's answer.
 pub const LABEL_LIMIT: usize = 32;
+/// Longest refusal text taken from an agent's answer.
+pub const REASON_LIMIT: usize = 160;
 /// Most windows kept per backend, so the card always fits one Telegram message.
 pub const WINDOW_LIMIT: usize = 8;
 
@@ -25,9 +27,13 @@ impl Label {
     /// `None` when nothing printable is left.
     #[must_use]
     pub fn new(raw: &str) -> Option<Self> {
+        Self::bounded(raw, LABEL_LIMIT)
+    }
+
+    fn bounded(raw: &str, limit: usize) -> Option<Self> {
         let printable: String = raw.chars().filter(|c| !c.is_control()).collect();
         let trimmed = printable.trim();
-        (!trimmed.is_empty()).then(|| Self(truncate(trimmed, LABEL_LIMIT)))
+        (!trimmed.is_empty()).then(|| Self(truncate(trimmed, limit)))
     }
 
     #[must_use]
@@ -129,10 +135,11 @@ impl QuotaReport {
         Self { backend, plan: None, windows: Vec::new(), source: QuotaSource::NotReported }
     }
 
-    /// `reason` is cleaned and bounded like any agent text.
+    /// `reason` is cleaned like any agent text and bounded by `REASON_LIMIT`.
     #[must_use]
     pub fn unavailable(backend: BackendKind, reason: &str) -> Self {
-        let label = Label::new(reason).unwrap_or_else(|| Label(UNKNOWN_REASON.to_owned()));
+        let label = Label::bounded(reason, REASON_LIMIT)
+            .unwrap_or_else(|| Label(UNKNOWN_REASON.to_owned()));
         Self { backend, plan: None, windows: Vec::new(), source: QuotaSource::Unavailable(label) }
     }
 
@@ -240,13 +247,26 @@ mod tests {
 
     #[test]
     fn a_refusal_is_cleaned_and_bounded() {
-        let raw = format!("\u{1b}[31m{}\n", "я".repeat(100));
+        let raw = format!("\u{1b}[31m{}\n", "я".repeat(200));
         let report = QuotaReport::unavailable(BackendKind::Codex, &raw);
         let QuotaSource::Unavailable(reason) = report.source else {
             panic!("expected Unavailable");
         };
-        assert_eq!(reason.as_str().chars().count(), LABEL_LIMIT);
+        assert_eq!(reason.as_str().chars().count(), REASON_LIMIT);
         assert!(!reason.as_str().chars().any(char::is_control));
+    }
+
+    #[test]
+    fn a_spec_length_refusal_survives_whole() {
+        let raw = "вход по API-ключу — лимитов подписки нет";
+        let report = QuotaReport::unavailable(BackendKind::Codex, raw);
+        assert_eq!(report.source, QuotaSource::Unavailable(Label(raw.to_owned())));
+    }
+
+    #[test]
+    fn an_empty_refusal_gets_the_fallback_text() {
+        let report = QuotaReport::unavailable(BackendKind::Codex, " \n ");
+        assert_eq!(report.source, QuotaSource::Unavailable(Label(UNKNOWN_REASON.to_owned())));
     }
 
     #[test]

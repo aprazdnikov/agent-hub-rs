@@ -489,13 +489,16 @@ mod tests {
     #[test]
     fn unavailable_and_empty_reports_say_why() {
         let reports = [
-            QuotaReport::unavailable(BackendKind::Codex, "вход по API-ключу"),
+            QuotaReport::unavailable(
+                BackendKind::Codex,
+                "вход по API-ключу — лимитов подписки нет",
+            ),
             QuotaReport::fresh(BackendKind::Claude, Some(label("Pro")), Vec::new()),
         ];
         assert_eq!(
             card(&reports),
             "📊 <b>Лимиты подписок</b> · 16.10 14:05\n\
-             <b>Codex</b> ⚠️ вход по API-ключу\n\
+             <b>Codex</b> ⚠️ вход по API-ключу — лимитов подписки нет\n\
              <b>Claude</b> (Pro)\n  нет данных"
         );
         assert_eq!(
