@@ -77,6 +77,32 @@ impl Sender {
         }
     }
 
+    /// Like `one` for an edit: one retry after a flood wait, and plain text when Telegram
+    /// rejects the markup, so the message never keeps its old text over a formatting bug.
+    pub async fn edit_html(&self, chat: ChatId, message: MessageId, html: String) {
+        let mut text = html;
+        let mut format = Format::Html;
+        let mut waited = false;
+        loop {
+            match self.messenger.edit(chat, message, text.clone(), format).await {
+                Ok(()) => return,
+                Err(SendError::RetryAfter(wait)) if !waited => {
+                    waited = true;
+                    tokio::time::sleep(wait.min(MAX_RETRY_WAIT)).await;
+                }
+                Err(SendError::Rejected(_)) if format == Format::Html => {
+                    tracing::warn!("telegram rejected an edit's formatting, editing as plain text");
+                    text = plain(&text);
+                    format = Format::Plain;
+                }
+                Err(SendError::RetryAfter(_) | SendError::Rejected(_) | SendError::Failed(_)) => {
+                    tracing::warn!("telegram edit given up");
+                    return;
+                }
+            }
+        }
+    }
+
     pub async fn edit_keyboard(
         &self,
         chat: ChatId,
@@ -187,6 +213,49 @@ mod tests {
             setup(FakeMessenger::with_sends(vec![Err(SendError::Rejected("bad".to_owned()))]));
         assert!(sender.one(Target::Topic(KEY), Outgoing::plain("x".to_owned())).await.is_none());
         assert!(messenger.sent_texts().is_empty());
+    }
+
+    const CHAT: ChatId = ChatId(-100);
+    const CARD: MessageId = MessageId(4);
+
+    fn edited(messenger: &FakeMessenger) -> Vec<(String, Format)> {
+        messenger
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::Edit { chat: CHAT, message: CARD, text, format } => Some((text, format)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_rejected_html_edit_is_redone_as_plain_text() {
+        let (sender, messenger) = setup(FakeMessenger::with_edits(vec![Err(SendError::Rejected(
+            "can't parse entities".to_owned(),
+        ))]));
+        sender.edit_html(CHAT, CARD, "<b>a &amp; b</b>".to_owned()).await;
+        assert_eq!(edited(&messenger), [("a & b".to_owned(), Format::Plain)]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_html_edit_waits_out_one_flood_wait() {
+        let wait = || Err(SendError::RetryAfter(Duration::from_secs(3)));
+        let (sender, messenger) = setup(FakeMessenger::with_edits(vec![wait()]));
+        sender.edit_html(CHAT, CARD, "<b>x</b>".to_owned()).await;
+        assert_eq!(edited(&messenger), [("<b>x</b>".to_owned(), Format::Html)]);
+
+        let (sender, messenger) = setup(FakeMessenger::with_edits(vec![wait(), wait()]));
+        sender.edit_html(CHAT, CARD, "<b>x</b>".to_owned()).await;
+        assert!(edited(&messenger).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rejected_plain_edit_is_given_up() {
+        let rejected = || Err(SendError::Rejected("bad".to_owned()));
+        let (sender, messenger) = setup(FakeMessenger::with_edits(vec![rejected(), rejected()]));
+        sender.edit_html(CHAT, CARD, "<b>x</b>".to_owned()).await;
+        assert!(edited(&messenger).is_empty());
     }
 
     #[tokio::test]

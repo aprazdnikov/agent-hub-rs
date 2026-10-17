@@ -26,6 +26,7 @@ pub(crate) enum Call {
 pub(crate) struct FakeMessenger {
     calls: Mutex<Vec<Call>>,
     sends: Mutex<VecDeque<Result<(), SendError>>>,
+    edits: Mutex<VecDeque<Result<(), SendError>>>,
     pub(crate) files: HashMap<String, Vec<u8>>,
     next: AtomicI32,
 }
@@ -34,6 +35,12 @@ impl FakeMessenger {
     /// Outcomes of the next sends, in order; afterwards every send succeeds.
     pub(crate) fn with_sends(sends: Vec<Result<(), SendError>>) -> Self {
         Self { sends: Mutex::new(sends.into()), ..Self::default() }
+    }
+
+    /// Outcomes of the next edits, in order; afterwards every edit succeeds. A failed edit
+    /// is not recorded.
+    pub(crate) fn with_edits(edits: Vec<Result<(), SendError>>) -> Self {
+        Self { edits: Mutex::new(edits.into()), ..Self::default() }
     }
 
     pub(crate) fn calls(&self) -> Vec<Call> {
@@ -88,8 +95,9 @@ impl Messenger for FakeMessenger {
         text: String,
         format: Format,
     ) -> BoxFuture<'_, Result<(), SendError>> {
-        self.record(Call::Edit { chat, message, text, format });
-        Box::pin(async { Ok(()) })
+        let scripted = self.edits.lock().unwrap().pop_front().unwrap_or(Ok(()));
+        let result = scripted.map(|()| self.record(Call::Edit { chat, message, text, format }));
+        Box::pin(async move { result })
     }
 
     fn edit_keyboard(

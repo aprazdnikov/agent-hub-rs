@@ -963,7 +963,9 @@ impl<A: Agents> Hub<A> {
     }
 
     /// Runs the poll outside the hub; whatever happens, the hub hears back exactly once, so
-    /// `polling` never stays set.
+    /// `polling` never stays set. That holds because only the quotas run in an inner task that
+    /// may panic: the outer task awaits just the placeholder (`Sender::one` / `Sender::edit`,
+    /// which are panic-free) and the mailbox send.
     fn poll(
         &self,
         chat: ChatId,
@@ -1007,7 +1009,7 @@ impl<A: Agents> Hub<A> {
         let default = self.settings.borrow().default_backend;
         let card = render_limits(&limits::ordered(reports, default), now, &chrono::Local);
         tokio::spawn(async move {
-            sender.edit(chat, message, card, Format::Html).await;
+            sender.edit_html(chat, message, card).await;
             sender.edit_keyboard(chat, message, limits::refresh_keyboard()).await;
         });
     }
@@ -1055,6 +1057,7 @@ mod tests {
     use super::*;
     use crate::inbound::{Attachment, FileRef};
     use crate::limits::{self, Outcome};
+    use crate::messenger::SendError;
     use crate::testing::{Call, FakeMessenger};
 
     const KEY: TopicKey = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
@@ -1478,6 +1481,29 @@ mod tests {
             })
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn a_card_telegram_cannot_parse_is_shown_as_plain_text_with_its_button() {
+        let messenger = FakeMessenger::with_edits(vec![Err(SendError::Rejected(
+            "can't parse entities".to_owned(),
+        ))]);
+        let world = world_with(FakeAgents::polling(vec![vec![claude_max(62)]]), messenger);
+        world.send(text(Some(7), 1, "/limits")).await;
+
+        eventually("refresh button", || {
+            world.messenger.calls().contains(&Call::EditKeyboard {
+                chat: ChatId(-100),
+                message: MessageId(1),
+                keyboard: limits::refresh_keyboard(),
+            })
+        })
+        .await;
+        let edits = edits(&world, 1);
+        assert!(
+            matches!(edits.as_slice(), [(card, Format::Plain)] if card.contains("Claude (Max)") && !card.contains('<')),
+            "{edits:?}"
+        );
     }
 
     #[tokio::test]
