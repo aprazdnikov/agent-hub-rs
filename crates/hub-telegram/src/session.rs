@@ -157,6 +157,13 @@ async fn relay(
                 tracing::warn!(%reason, "turn failed");
                 sender.text(Target::Topic(key), &texts::failure(&reason)).await;
             }
+            AgentEvent::Quota(update) => {
+                tracing::debug!(
+                    backend = update.backend.name(),
+                    windows = update.windows.len(),
+                    "quota update not cached yet"
+                );
+            }
         }
     }
 }

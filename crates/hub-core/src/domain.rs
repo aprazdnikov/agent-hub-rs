@@ -2,6 +2,8 @@ use std::path::{Path, PathBuf};
 
 use rust_decimal::Decimal;
 
+use crate::quota::QuotaUpdate;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ChatId(pub i64);
 
@@ -285,6 +287,8 @@ pub enum AgentEvent {
     Finished(Finished),
     Failed(String),
     BackgroundAbandoned(Vec<String>),
+    /// Subscription limits a live session reported.
+    Quota(QuotaUpdate),
 }
 
 #[cfg(test)]

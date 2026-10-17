@@ -6,6 +6,7 @@ pub mod escape;
 mod ids;
 pub mod markdown;
 pub mod questions;
+pub mod quota;
 pub mod render;
 pub mod settings;
 pub mod snapshot;
