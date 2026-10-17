@@ -3,6 +3,7 @@ pub mod channel;
 pub mod download;
 pub mod hub;
 pub mod inbound;
+pub mod limits;
 mod menu;
 pub mod messenger;
 pub mod paths;
