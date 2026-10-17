@@ -1,12 +1,23 @@
 //! Subscription limits from the Claude CLI: the `get_usage` control reply and
 //! `rate_limit_event`. Both are untrusted: strings pass `Label`, numbers `Percent`.
 
+use std::io;
+use std::path::Path;
+use std::process::Stdio;
+use std::time::Duration;
+
 use chrono::{DateTime, Utc};
+use futures::StreamExt;
+use hub_agent::cli::hide_window;
 use hub_core::domain::BackendKind;
 use hub_core::quota::{Label, Percent, QuotaReport, QuotaUpdate, UsageWindow, WindowKind};
 use serde::Deserialize;
-use serde_json::Value;
+use serde_json::{Value, json};
+use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
+use tokio::process::Command;
+use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
+use crate::outgoing::{self, ENTRYPOINT};
 use crate::wire::RateLimitInfo;
 
 pub const NO_SUBSCRIPTION: &str = "вход не через подписку claude.ai — лимитов подписки нет";
@@ -25,12 +36,56 @@ pub enum Scale {
 /// What the live check found (task 1 of the plan); `get_usage` is 0–100 by the SDK types.
 pub const EVENT_SCALE: Scale = Scale::Fraction;
 
+/// How the probe asks; the live check (task 1 of the plan) picks it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Handshake {
+    /// `get_usage` right away.
+    Direct,
+    /// A minimal `initialize` first, as SDK hosts do.
+    InitializeFirst,
+    /// The CLI does not answer without a prompt: `/limits` uses the cache only.
+    CacheOnly,
+}
+
+pub const HANDSHAKE: Handshake = Handshake::InitializeFirst;
+
+/// No prompt, no settings, no MCP servers, no hooks: the run only answers control requests.
+pub const PROBE_ARGS: [&str; 7] = [
+    "--input-format",
+    "stream-json",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--setting-sources=",
+    "--strict-mcp-config",
+];
+/// Below the hub's 20 s outer timeout, which also has to cover the 5 s shutdown.
+pub const ANSWER_TIMEOUT: Duration = Duration::from_secs(10);
+// After stdin closes the CLI exits on its own; this bounds the wait before killing it.
+const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
+const USAGE_REQUEST: &str = "hub-usage";
+const INITIALIZE_REQUEST: &str = "hub-usage-initialize";
+const LINE_LIMIT: usize = 1024 * 1024;
+const LINES_LIMIT: usize = 64;
+
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProbeError {
     #[error("Claude отклонил запрос лимитов: {0}")]
     Rejected(String),
     #[error("непонятный ответ Claude о лимитах")]
     Shape,
+    #[error("проба лимитов Claude отключена: CLI не отвечает без сообщения")]
+    Disabled,
+    #[error("не удалось запустить Claude: {0}")]
+    Spawn(io::ErrorKind),
+    #[error("Claude не ответил о лимитах за {} с", ANSWER_TIMEOUT.as_secs())]
+    Timeout,
+    #[error("Claude завершился, не ответив о лимитах")]
+    NoAnswer,
+    #[error("ответ Claude о лимитах длиннее {} КиБ", LINE_LIMIT / 1024)]
+    TooLarge,
+    #[error("ошибка обмена с Claude: {0}")]
+    Io(io::ErrorKind),
 }
 
 impl ProbeError {
@@ -40,8 +95,110 @@ impl ProbeError {
         match self {
             Self::Rejected(_) => "rejected",
             Self::Shape => "shape",
+            Self::Disabled => "disabled",
+            Self::Spawn(_) => "spawn",
+            Self::Timeout => "timeout",
+            Self::NoAnswer => "no_answer",
+            Self::TooLarge => "too_large",
+            Self::Io(_) => "io",
         }
     }
+}
+
+/// The control requests of one probe; `None` when the probe is off.
+#[must_use]
+pub fn requests(handshake: Handshake) -> Option<Vec<Value>> {
+    let usage = outgoing::control_request(
+        USAGE_REQUEST,
+        json!({"subtype": "get_usage", "skip_behaviors": true}),
+    );
+    match handshake {
+        Handshake::Direct => Some(vec![usage]),
+        Handshake::InitializeFirst => {
+            Some(vec![outgoing::control_request(INITIALIZE_REQUEST, outgoing::initialize()), usage])
+        }
+        Handshake::CacheOnly => None,
+    }
+}
+
+/// Asks a short-lived CLI for the plan limits. It never gets a prompt, so it starts no turn
+/// and writes no session; its stderr is dropped, so nothing of it reaches the log.
+pub async fn probe(cli: &Path) -> Result<QuotaReport, ProbeError> {
+    let requests = requests(HANDSHAKE).ok_or(ProbeError::Disabled)?;
+    let mut command = Command::new(cli);
+    command
+        .args(PROBE_ARGS)
+        .current_dir(std::env::temp_dir())
+        .env(ENTRYPOINT.0, ENTRYPOINT.1)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    hide_window(&mut command);
+    let mut child = command.spawn().map_err(|error| ProbeError::Spawn(error.kind()))?;
+    let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
+        return Err(ProbeError::Io(io::ErrorKind::BrokenPipe));
+    };
+    let answer = exchange(stdout, stdin, &requests, ANSWER_TIMEOUT).await;
+    if tokio::time::timeout(EXIT_TIMEOUT, child.wait()).await.is_err()
+        && let Err(error) = child.kill().await
+    {
+        tracing::warn!(error = ?error.kind(), "claude usage probe could not be killed");
+    }
+    answer
+}
+
+/// Writes `requests`, reads at most `LINES_LIMIT` lines of at most `LINE_LIMIT` bytes for the
+/// usage answer within `wait`, then closes `writer` whatever happened, so the CLI sees EOF.
+pub async fn exchange<R, W>(
+    reader: R,
+    mut writer: W,
+    requests: &[Value],
+    wait: Duration,
+) -> Result<QuotaReport, ProbeError>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let asked = async {
+        for request in requests {
+            let line = format!("{request}\n");
+            writer
+                .write_all(line.as_bytes())
+                .await
+                .map_err(|error| ProbeError::Io(error.kind()))?;
+        }
+        writer.flush().await.map_err(|error| ProbeError::Io(error.kind()))?;
+        let mut lines =
+            FramedRead::new(reader, LinesCodec::new_with_max_length(LINE_LIMIT)).take(LINES_LIMIT);
+        while let Some(line) = lines.next().await {
+            let line = line.map_err(|error| match error {
+                LinesCodecError::MaxLineLengthExceeded => ProbeError::TooLarge,
+                LinesCodecError::Io(error) => ProbeError::Io(error.kind()),
+            })?;
+            if let Some(reply) = usage_reply(&line) {
+                return parse_reply(&reply);
+            }
+        }
+        Err(ProbeError::NoAnswer)
+    };
+    let answer = tokio::time::timeout(wait, asked).await.unwrap_or(Err(ProbeError::Timeout));
+    if let Err(error) = writer.shutdown().await {
+        tracing::debug!(error = ?error.kind(), "claude usage probe stdin did not close");
+    }
+    answer
+}
+
+/// The `response` of the `control_response` that answers the usage request; other lines and
+/// lines that are not JSON are skipped.
+fn usage_reply(line: &str) -> Option<Value> {
+    let mut message: Value = serde_json::from_str(line).ok()?;
+    let answers = message.get("type").and_then(Value::as_str) == Some("control_response")
+        && message.pointer("/response/request_id").and_then(Value::as_str) == Some(USAGE_REQUEST);
+    if !answers {
+        return None;
+    }
+    message.get_mut("response").map(Value::take)
 }
 
 #[derive(Deserialize)]
@@ -338,5 +495,157 @@ mod tests {
         #[case] expected: Option<QuotaUpdate>,
     ) {
         assert_eq!(event_update(&info(raw), scale), expected);
+    }
+
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
+
+    const WAIT: Duration = Duration::from_secs(5);
+
+    fn usage_request() -> Value {
+        json!({"type": "control_request", "request_id": "hub-usage",
+               "request": {"subtype": "get_usage", "skip_behaviors": true}})
+    }
+
+    fn answer(body: &Value) -> String {
+        json!({"type": "control_response",
+               "response": {"subtype": "success", "request_id": "hub-usage", "response": body}})
+        .to_string()
+    }
+
+    enum Then {
+        /// Keep stdout open: the probe must stop on its own.
+        Wait,
+        /// Close stdout, as an exiting CLI does.
+        Exit,
+    }
+
+    /// The CLI side: reads `expect` request lines, writes `lines`, then checks that the probe
+    /// closes stdin.
+    async fn fake_cli(
+        theirs: DuplexStream,
+        expect: usize,
+        lines: Vec<String>,
+        then: Then,
+    ) -> Vec<Value> {
+        let (read, mut write) = tokio::io::split(theirs);
+        let mut input = BufReader::new(read).lines();
+        let mut seen = Vec::new();
+        for _ in 0..expect {
+            let line = input.next_line().await.unwrap().unwrap();
+            seen.push(serde_json::from_str(&line).unwrap());
+        }
+        for line in lines {
+            write.write_all(format!("{line}\n").as_bytes()).await.unwrap();
+        }
+        match then {
+            Then::Wait => {}
+            Then::Exit => write.shutdown().await.unwrap(),
+        }
+        assert_eq!(input.next_line().await.unwrap(), None, "the probe must close stdin");
+        seen
+    }
+
+    async fn run(
+        handshake: Handshake,
+        lines: Vec<String>,
+        then: Then,
+        wait: Duration,
+    ) -> (Result<QuotaReport, ProbeError>, Vec<Value>) {
+        let requests = requests(handshake).unwrap();
+        let (ours, theirs) = tokio::io::duplex(1 << 16);
+        let cli = tokio::spawn(fake_cli(theirs, requests.len(), lines, then));
+        let (read, write) = tokio::io::split(ours);
+        let outcome = exchange(read, write, &requests, wait).await;
+        (outcome, cli.await.unwrap())
+    }
+
+    fn recorded() -> Value {
+        serde_json::from_str(RECORDED).unwrap()
+    }
+
+    #[tokio::test]
+    async fn initialize_first_then_the_answer_among_other_lines() {
+        let lines = vec![
+            json!({"type": "control_response", "response": {"subtype": "success", "request_id": "hub-usage-initialize", "response": {}}}).to_string(),
+            "not json".to_owned(),
+            json!({"type": "system", "subtype": "status"}).to_string(),
+            answer(&recorded()),
+        ];
+        let (outcome, seen) = run(Handshake::InitializeFirst, lines, Then::Wait, WAIT).await;
+        let report = outcome.unwrap();
+        assert_eq!(report.plan.as_ref().map(Label::as_str), Some("Max"));
+        assert_eq!(
+            seen,
+            [
+                json!({"type": "control_request", "request_id": "hub-usage-initialize",
+                       "request": {"subtype": "initialize", "hooks": null}}),
+                usage_request(),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn direct_sends_only_get_usage_and_never_a_prompt() {
+        let (outcome, seen) =
+            run(Handshake::Direct, vec![answer(&recorded())], Then::Wait, WAIT).await;
+        assert!(outcome.is_ok());
+        assert_eq!(seen, [usage_request()]);
+    }
+
+    #[test]
+    fn cache_only_runs_no_cli() {
+        assert_eq!(requests(Handshake::CacheOnly), None);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_shape_is_an_error() {
+        let lines = vec![answer(&json!({"rate_limits": 5}))];
+        let (outcome, _seen) = run(Handshake::Direct, lines, Then::Wait, WAIT).await;
+        assert_eq!(outcome, Err(ProbeError::Shape));
+    }
+
+    #[tokio::test]
+    async fn silence_times_out_and_closes_stdin() {
+        let (outcome, _seen) =
+            run(Handshake::Direct, Vec::new(), Then::Wait, Duration::from_millis(100)).await;
+        assert_eq!(outcome, Err(ProbeError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn exit_without_an_answer() {
+        let lines =
+            vec![json!({"type": "system", "subtype": "init", "session_id": "s"}).to_string()];
+        let (outcome, _seen) = run(Handshake::Direct, lines, Then::Exit, WAIT).await;
+        assert_eq!(outcome, Err(ProbeError::NoAnswer));
+    }
+
+    #[tokio::test]
+    async fn too_many_lines_without_an_answer() {
+        let lines = vec![json!({"type": "system", "subtype": "status"}).to_string(); 65];
+        let (outcome, _seen) = run(Handshake::Direct, lines, Then::Wait, WAIT).await;
+        assert_eq!(outcome, Err(ProbeError::NoAnswer));
+    }
+
+    #[tokio::test]
+    async fn a_huge_line_is_refused() {
+        let lines = vec!["x".repeat(1024 * 1024 + 1)];
+        let (outcome, _seen) = run(Handshake::Direct, lines, Then::Exit, WAIT).await;
+        assert_eq!(outcome, Err(ProbeError::TooLarge));
+    }
+
+    #[test]
+    fn the_probe_loads_no_settings_and_no_mcp_servers() {
+        assert!(PROBE_ARGS.contains(&"--setting-sources="));
+        assert!(PROBE_ARGS.contains(&"--strict-mcp-config"));
+        assert!(
+            !PROBE_ARGS.iter().any(|arg| arg.starts_with("--resume") || *arg == "--mcp-config")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_cli_is_a_spawn_error() {
+        let outcome = probe(&std::env::temp_dir().join("definitely-not-claude")).await;
+        // `Disabled` if the live check turned the probe off.
+        assert!(matches!(outcome, Err(ProbeError::Spawn(_) | ProbeError::Disabled)), "{outcome:?}");
     }
 }
