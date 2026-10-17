@@ -3,8 +3,10 @@
 //! never logs in with the configured key, never opens a thread and never logs the server's
 //! stderr or answers.
 
+use std::future::Future;
 use std::io;
 use std::path::Path;
+use std::time::Duration;
 
 use chrono::DateTime;
 use hub_agent::rpc::{RpcClient, RpcError};
@@ -20,6 +22,9 @@ pub const NOT_LOGGED_IN: &str = "Codex не авторизован — лими�
 // The spec's card names the windows by position, not by duration.
 const PRIMARY: &str = "основное";
 const SECONDARY: &str = "недельное";
+/// The whole read; with the server's 5 s stop it stays below the hub's 20 s outer timeout,
+/// so the server is always stopped, never killed by a drop.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProbeError {
@@ -29,6 +34,8 @@ pub enum ProbeError {
     Rpc(#[from] RpcError),
     #[error("непонятный ответ Codex о лимитах")]
     Shape,
+    #[error("Codex не ответил о лимитах за {} с", PROBE_TIMEOUT.as_secs())]
+    Timeout,
 }
 
 impl ProbeError {
@@ -40,7 +47,7 @@ impl ProbeError {
             Self::Rpc(RpcError::Remote { .. }) => "remote",
             Self::Rpc(RpcError::Closed) => "closed",
             Self::Rpc(RpcError::Protocol(_)) => "protocol",
-            Self::Rpc(RpcError::Timeout { .. }) => "timeout",
+            Self::Rpc(RpcError::Timeout { .. }) | Self::Timeout => "timeout",
             Self::Shape => "shape",
         }
     }
@@ -50,12 +57,22 @@ impl ProbeError {
 ///
 /// # Errors
 /// `Spawn` when the CLI does not start, `Rpc` when the exchange fails, `Shape` when the
-/// answer is not a rate-limits read.
+/// answer is not a rate-limits read, `Timeout` when it takes longer than `PROBE_TIMEOUT`.
 pub async fn probe(cli: &Path) -> Result<QuotaReport, ProbeError> {
     let server = AppServer::spawn(cli, refusing(), Stderr::Discard)
         .map_err(|error| ProbeError::Spawn(error.kind()))?;
-    let report = read(&server.client).await;
-    server.stop().await;
+    let client = server.client.clone();
+    bounded(&client, server.stop()).await
+}
+
+/// `read` within `PROBE_TIMEOUT`, then `stop` whatever the outcome.
+async fn bounded(
+    client: &RpcClient,
+    stop: impl Future<Output = ()>,
+) -> Result<QuotaReport, ProbeError> {
+    let report =
+        tokio::time::timeout(PROBE_TIMEOUT, read(client)).await.unwrap_or(Err(ProbeError::Timeout));
+    stop.await;
     report
 }
 
@@ -193,7 +210,6 @@ mod tests {
     #[case::clamped(json!({"primary": {"usedPercent": 150}, "secondary": {"usedPercent": -5}}), Ok((None, vec![window("основное", 100, None), window("недельное", 0, None)])))]
     #[case::pro_lite(json!({"planType": "prolite"}), Ok((Some(label("ChatGPT Pro Lite")), Vec::new())))]
     #[case::unknown_plan(json!({"planType": "weird_plan"}), Ok((Some(label("ChatGPT weird_plan")), Vec::new())))]
-    #[case::long_plan_is_bounded(json!({"planType": "self_serve_business_usage_based"}), Ok((Label::new("ChatGPT self_serve_business_usage_based"), Vec::new())))]
     #[case::bad_percent(json!({"primary": {"usedPercent": "x"}}), Err(ProbeError::Shape))]
     #[case::not_an_object(json!([1]), Err(ProbeError::Shape))]
     fn snapshots_are_read_tolerantly(
@@ -201,6 +217,16 @@ mod tests {
         #[case] expected: Result<(Option<Label>, Vec<UsageWindow>), ProbeError>,
     ) {
         assert_eq!(parse_snapshot(&snapshot), expected);
+    }
+
+    #[test]
+    fn a_long_plan_is_bounded() {
+        let (plan, windows) =
+            parse_snapshot(&json!({"planType": "self_serve_business_usage_based"})).unwrap();
+        let plan = plan.unwrap();
+        assert_eq!(plan.as_str(), "ChatGPT self_serve_business_usa…");
+        assert!(plan.as_str().chars().count() <= hub_core::quota::LABEL_LIMIT);
+        assert!(windows.is_empty());
     }
 
     #[rstest]
@@ -318,6 +344,32 @@ mod tests {
             vec![Ok(json!({})), Ok(json!({"account": {"type": "chatgpt"}})), Ok(json!({}))];
         let (report, _seen) = probe_over_pair(replies, Duration::from_secs(5)).await;
         assert_eq!(report, Err(ProbeError::Shape));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_server_times_out_and_is_still_stopped() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // The per-request deadline is far beyond the probe's own one.
+        let (connection, peer) = pair(refusing(), Duration::from_mins(1));
+        let server = tokio::spawn(server(peer, Vec::new()));
+        let stopped = Arc::new(AtomicBool::new(false));
+        let stop = {
+            let stopped = Arc::clone(&stopped);
+            let client = connection.client.clone();
+            async move {
+                stopped.store(true, Ordering::SeqCst);
+                client.close();
+            }
+        };
+        let started = tokio::time::Instant::now();
+        let report = bounded(&connection.client, stop).await;
+        assert_eq!(report, Err(ProbeError::Timeout));
+        assert_eq!(report.unwrap_err().kind(), "timeout");
+        assert!(stopped.load(Ordering::SeqCst), "the server is stopped, not dropped");
+        assert_eq!(started.elapsed(), PROBE_TIMEOUT);
+        assert_eq!(methods(&server.await.unwrap()), ["initialize"]);
     }
 
     #[tokio::test]

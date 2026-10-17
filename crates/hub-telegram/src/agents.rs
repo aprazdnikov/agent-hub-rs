@@ -201,7 +201,8 @@ async fn quotas(settings: &Settings) -> Vec<Outcome> {
                                 "Codex app-server не ответил о лимитах".to_owned()
                             }
                             hub_codex::usage::ProbeError::Spawn(_)
-                            | hub_codex::usage::ProbeError::Shape => error.to_string(),
+                            | hub_codex::usage::ProbeError::Shape
+                            | hub_codex::usage::ProbeError::Timeout => error.to_string(),
                         };
                         failed(backend, error.kind(), reason)
                     })
