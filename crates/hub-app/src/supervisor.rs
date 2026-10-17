@@ -487,6 +487,8 @@ mod tests {
                             | HubMessage::Bind { .. }
                             | HubMessage::Ended { .. }
                             | HubMessage::Snapshot(_)
+                            | HubMessage::Quota(_)
+                            | HubMessage::Limits(_)
                             | HubMessage::Shutdown(_) => "other".to_owned(),
                         };
                         recorder.messages.lock().unwrap().push(line);

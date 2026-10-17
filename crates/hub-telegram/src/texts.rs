@@ -52,8 +52,6 @@ pub const RESTORE_NOT_PERSISTED: &str =
 pub const LIMITS_COLLECTING: &str = "⏳ Собираю…";
 pub const LIMITS_REFRESH: &str = "🔄 Обновить";
 pub const LIMITS_BUSY: &str = "⏳ Опрос уже идёт — подождите.";
-// Until the hub answers /limits (task 12 of the plan).
-pub const LIMITS_PENDING: &str = "Лимиты подписок появятся в следующей версии";
 const SNAPSHOT_LIST_LIMIT: usize = 30;
 const SNAPSHOT_LIST_TEXT_LIMIT: usize = 3500;
 const APPROVAL_TEXT_LIMIT: usize = 3500;

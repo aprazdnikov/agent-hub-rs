@@ -2,10 +2,12 @@
 //! without waiting on the network; sessions run in their own tasks and report back.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::Utc;
 use futures::future::BoxFuture;
 use hub_agent::archive::SessionArchive;
 use hub_agent::conversation::Conversation;
@@ -16,7 +18,8 @@ use hub_core::commands::{
 use hub_core::domain::{
     AbsolutePath, BackendKind, ChatId, MessageId, Prompt, SessionId, TopicKey, TopicSession,
 };
-use hub_core::quota::QuotaReport;
+use hub_core::quota::{QuotaReport, QuotaUpdate};
+use hub_core::render::render_limits;
 use hub_core::settings::Settings;
 use hub_core::snapshot::{SnapshotName, default_name};
 use hub_core::topics::Topics;
@@ -28,7 +31,8 @@ use tokio_util::sync::CancellationToken;
 use crate::channel::{Shared, lock};
 use crate::download::download;
 use crate::inbound::{Content, Inbound, Press, Turn};
-use crate::messenger::{Messenger, Target};
+use crate::limits::{self, Outcome, QuotaCache};
+use crate::messenger::{Format, Messenger, Outgoing, Target};
 use crate::paths::{CwdError, resolve_cwd, workspace_root};
 use crate::press;
 use crate::sender::Sender;
@@ -108,11 +112,26 @@ pub enum HubMessage {
     Reset(TopicKey),
     /// A `/save` or `/restore` reached a decision point or finished its file work.
     Snapshot(SnapshotDone),
+    /// A live session reported subscription limits.
+    Quota(QuotaUpdate),
+    /// A `/limits` poll finished.
+    Limits(LimitsDone),
     Shutdown(oneshot::Sender<()>),
 }
 
 /// A message of a snapshot job; only the hub reads it.
 pub struct SnapshotDone(pub(crate) Done);
+
+/// A finished `/limits` poll; only the hub makes and reads it.
+pub struct LimitsDone(Polled);
+
+struct Polled {
+    chat: ChatId,
+    /// The message to turn into the card; `None` when the placeholder was not delivered.
+    message: Option<MessageId>,
+    /// `None` when the poll crashed.
+    outcomes: Option<Vec<Outcome>>,
+}
 
 pub struct HubSetup<A> {
     pub agents: Arc<A>,
@@ -161,6 +180,10 @@ struct Hub<A> {
     /// Agent sessions a snapshot job works on, and the topic that asked: no second job and
     /// no turn of any topic bound to them until the hub has processed the result.
     reserved: HashMap<Reservation, TopicKey>,
+    /// The last subscription limits live sessions reported, the card's fallback.
+    quotas: QuotaCache,
+    /// A `/limits` poll runs: each one starts up to two agent processes, so one at a time.
+    polling: bool,
 }
 
 #[must_use]
@@ -188,6 +211,8 @@ pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
         snapshotting: HashSet::new(),
         naming: HashSet::new(),
         reserved: HashMap::new(),
+        quotas: QuotaCache::default(),
+        polling: false,
     };
     let task = tokio::spawn(hub.run(inbox));
     HubHandle { mailbox, views: watched, registries, task }
@@ -222,12 +247,18 @@ impl<A: Agents> Hub<A> {
                 }
             }
             HubMessage::Press(pressed) => {
-                tokio::spawn(press::handle(
-                    Arc::clone(&self.registries),
-                    self.sender.clone(),
-                    pressed,
-                ));
+                if pressed.data == limits::REFRESH {
+                    self.refresh(pressed);
+                } else {
+                    tokio::spawn(press::handle(
+                        Arc::clone(&self.registries),
+                        self.sender.clone(),
+                        pressed,
+                    ));
+                }
             }
+            HubMessage::Quota(update) => self.quotas.apply(update, Utc::now()),
+            HubMessage::Limits(LimitsDone(polled)) => self.limits_done(polled),
             HubMessage::Deliver { key, prompt } => self.deliver(key, prompt),
             HubMessage::FlushAlbum(group) => {
                 let parts = self.albums.remove(&group).unwrap_or_default();
@@ -299,13 +330,16 @@ impl<A: Agents> Hub<A> {
         }
     }
 
-    fn outside_topic(&self, inbound: Inbound) {
+    fn outside_topic(&mut self, inbound: Inbound) {
         let target = Target::Reply { chat: inbound.chat, message: inbound.message };
         match inbound.content {
             Content::Text(text) => match parse_input(&text, &self.bot) {
                 Input::Command { command: Command::Help, .. } => {
                     let root = self.settings.borrow().workspace_root.clone();
                     self.say(target, texts::help(&root));
+                }
+                Input::Command { command: Command::Limits, .. } => {
+                    self.limits(target, inbound.chat);
                 }
                 Input::Command { .. } | Input::Text => {
                     self.say(target, texts::CREATE_TOPIC.to_owned());
@@ -416,7 +450,7 @@ impl<A: Agents> Hub<A> {
             Command::Save => self.save(key, args),
             Command::Saves => self.saves(key),
             Command::Restore => self.restore(key, args),
-            Command::Limits => self.say(Target::Topic(key), texts::LIMITS_PENDING.to_owned()),
+            Command::Limits => self.limits(Target::Topic(key), chat),
         }
     }
 
@@ -895,6 +929,89 @@ impl<A: Agents> Hub<A> {
         running
     }
 
+    /// `/limits`: a placeholder now, the card once every found CLI answered or timed out.
+    fn limits(&mut self, target: Target, chat: ChatId) {
+        if self.polling {
+            self.say(target, texts::LIMITS_BUSY.to_owned());
+            return;
+        }
+        self.polling = true;
+        let sender = self.sender.clone();
+        self.poll(chat, async move {
+            sender.one(target, Outgoing::plain(texts::LIMITS_COLLECTING.to_owned())).await
+        });
+    }
+
+    /// «Обновить» redraws its own message; a press while a poll runs, or while the hub stops,
+    /// only stops the button's spinner.
+    fn refresh(&mut self, pressed: Press) {
+        let Press { callback, user: _, chat, message, html: _, data: _ } = pressed;
+        let sender = self.sender.clone();
+        tokio::spawn(async move { sender.answer(callback, None).await });
+        let idle = !self.polling && self.shutdown.is_none();
+        let (Some(chat), Some(message), true) = (chat, message, idle) else {
+            return;
+        };
+        self.polling = true;
+        let sender = self.sender.clone();
+        self.poll(chat, async move {
+            // Dropping the keyboard here also stops further presses on this card.
+            let text = texts::LIMITS_COLLECTING.to_owned();
+            sender.edit(chat, message, text, Format::Plain).await;
+            Some(message)
+        });
+    }
+
+    /// Runs the poll outside the hub; whatever happens, the hub hears back exactly once, so
+    /// `polling` never stays set.
+    fn poll(
+        &self,
+        chat: ChatId,
+        placeholder: impl Future<Output = Option<MessageId>> + Send + 'static,
+    ) {
+        let agents = Arc::clone(&self.agents);
+        let mailbox = self.mailbox.clone();
+        tokio::spawn(async move {
+            let message = placeholder.await;
+            let outcomes = match message {
+                None => None,
+                Some(_) => match tokio::spawn(async move { agents.quotas().await }).await {
+                    Ok(outcomes) => Some(outcomes),
+                    Err(error) => {
+                        tracing::error!(panic = error.is_panic(), "limits poll crashed");
+                        None
+                    }
+                },
+            };
+            // The hub is gone only during shutdown, when the card no longer matters.
+            let _ = mailbox
+                .send(HubMessage::Limits(LimitsDone(Polled { chat, message, outcomes })))
+                .await;
+        });
+    }
+
+    fn limits_done(&mut self, polled: Polled) {
+        self.polling = false;
+        let Polled { chat, message, outcomes } = polled;
+        let Some(message) = message else { return };
+        let sender = self.sender.clone();
+        let Some(outcomes) = outcomes else {
+            let text = texts::INTERNAL_ERROR.to_owned();
+            tokio::spawn(async move { sender.edit(chat, message, text, Format::Plain).await });
+            return;
+        };
+        let now = Utc::now();
+        let reports: Vec<QuotaReport> =
+            outcomes.into_iter().map(|outcome| self.quotas.settle(outcome, now)).collect();
+        tracing::info!(backends = reports.len(), "limits card");
+        let default = self.settings.borrow().default_backend;
+        let card = render_limits(&limits::ordered(reports, default), now, &chrono::Local);
+        tokio::spawn(async move {
+            sender.edit(chat, message, card, Format::Html).await;
+            sender.edit_keyboard(chat, message, limits::refresh_keyboard()).await;
+        });
+    }
+
     fn say(&self, target: Target, text: String) {
         let sender = self.sender.clone();
         tokio::spawn(async move { sender.text(target, &text).await });
@@ -923,7 +1040,7 @@ impl<A: Agents> Hub<A> {
 mod tests {
     use std::collections::{HashSet, VecDeque};
     use std::sync::Mutex as StdMutex;
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::time::Duration;
 
     use hub_agent::archive::{ArchiveError, Exported};
@@ -931,11 +1048,13 @@ mod tests {
         AgentEvent, BackendKind, ChatId, Finished, Question, Selection, ThreadId, Usage, UserId,
     };
     use hub_core::questions::{Answer, QuestionId};
+    use hub_core::quota::{Label, Percent, QuotaUpdate, UsageWindow, WindowKind};
     use hub_core::settings::Draft;
     use hub_core::snapshot::{BackendData, RelPath};
 
     use super::*;
     use crate::inbound::{Attachment, FileRef};
+    use crate::limits::{self, Outcome};
     use crate::testing::{Call, FakeMessenger};
 
     const KEY: TopicKey = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
@@ -953,6 +1072,13 @@ mod tests {
         archive: Arc<FakeArchive>,
         /// The next `archive` lookup panics, as a bug in a backend would.
         crash_archive: AtomicBool,
+        /// Outcomes of the next polls, in order; afterwards a poll finds no CLI.
+        quotas: StdMutex<VecDeque<Vec<Outcome>>>,
+        /// The next poll waits until this is released.
+        hold_quotas: StdMutex<Option<oneshot::Receiver<()>>>,
+        /// The next poll panics, as a bug in a probe would.
+        crash_quotas: AtomicBool,
+        polls: AtomicUsize,
     }
 
     impl FakeAgents {
@@ -967,7 +1093,17 @@ mod tests {
 
     impl Agents for FakeAgents {
         fn quotas(&self) -> BoxFuture<'_, Vec<(BackendKind, Result<QuotaReport, String>)>> {
-            Box::pin(async { Vec::new() })
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            let outcomes = self.quotas.lock().unwrap().pop_front().unwrap_or_default();
+            let hold = self.hold_quotas.lock().unwrap().take();
+            let crash = self.crash_quotas.swap(false, Ordering::SeqCst);
+            Box::pin(async move {
+                if let Some(release) = hold {
+                    let _ = release.await;
+                }
+                assert!(!crash, "опрос упал");
+                outcomes
+            })
         }
 
         fn archive<'a>(
@@ -1265,6 +1401,219 @@ mod tests {
             call,
             Call::Send { target: Target::Reply { message: MessageId(3), .. }, .. }
         )));
+    }
+
+    impl FakeAgents {
+        fn polling(polls: Vec<Vec<Outcome>>) -> Self {
+            Self { quotas: StdMutex::new(polls.into()), ..Self::default() }
+        }
+    }
+
+    fn five_hour(percent: i64) -> Vec<UsageWindow> {
+        vec![UsageWindow {
+            kind: WindowKind::FiveHour,
+            percent: Percent::from_int(percent),
+            resets_at: None,
+        }]
+    }
+
+    fn claude_max(percent: i64) -> Outcome {
+        (
+            BackendKind::Claude,
+            Ok(QuotaReport::fresh(BackendKind::Claude, Label::new("Max"), five_hour(percent))),
+        )
+    }
+
+    fn press(callback: &str, message: i32, data: &str) -> HubMessage {
+        HubMessage::Press(Press {
+            callback: callback.to_owned(),
+            user: UserId(1),
+            chat: Some(ChatId(-100)),
+            message: Some(MessageId(message)),
+            html: None,
+            data: data.to_owned(),
+        })
+    }
+
+    /// Texts the message `id` was edited to, in order.
+    fn edits(world: &World, id: i32) -> Vec<(String, Format)> {
+        world
+            .messenger
+            .calls()
+            .into_iter()
+            .filter_map(|call| {
+                let Call::Edit { chat: _, message, text, format } = call else { return None };
+                (message == MessageId(id)).then_some((text, format))
+            })
+            .collect()
+    }
+
+    fn has_card(world: &World, id: i32, needle: &str) -> bool {
+        edits(world, id)
+            .iter()
+            .any(|(text, format)| *format == Format::Html && text.contains(needle))
+    }
+
+    #[tokio::test]
+    async fn limits_turn_a_placeholder_into_the_card() {
+        let world = world(FakeAgents::polling(vec![vec![
+            claude_max(62),
+            (BackendKind::Qwen, Ok(QuotaReport::not_reported(BackendKind::Qwen))),
+        ]]));
+        world.send(text(Some(7), 1, "/limits")).await;
+
+        eventually("card", || has_card(&world, 1, "<b>Claude</b> (Max)")).await;
+        assert!(world.messenger.calls().contains(&Call::Send {
+            target: Target::Topic(KEY),
+            message: Outgoing::plain(texts::LIMITS_COLLECTING.to_owned()),
+            id: MessageId(1),
+        }));
+        assert!(has_card(&world, 1, "62%"));
+        assert!(has_card(&world, 1, "Qwen — квоты подписки агент не сообщает"));
+        eventually("refresh button", || {
+            world.messenger.calls().contains(&Call::EditKeyboard {
+                chat: ChatId(-100),
+                message: MessageId(1),
+                keyboard: limits::refresh_keyboard(),
+            })
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn limits_work_in_the_general_chat() {
+        let world = world(FakeAgents::polling(vec![vec![claude_max(5)]]));
+        world.send(text(None, 3, "/limits")).await;
+        eventually("card", || has_card(&world, 1, "5%")).await;
+        assert!(world.messenger.calls().iter().any(|call| matches!(
+            call,
+            Call::Send { target: Target::Reply { message: MessageId(3), .. }, message, .. }
+                if message.text == texts::LIMITS_COLLECTING
+        )));
+    }
+
+    #[tokio::test]
+    async fn the_default_backend_is_listed_first() {
+        let codex = (
+            BackendKind::Codex,
+            Ok(QuotaReport::unavailable(
+                BackendKind::Codex,
+                "вход по API-ключу — лимитов подписки нет",
+            )),
+        );
+        let agents = FakeAgents::polling(vec![vec![claude_max(1), codex]]);
+        let world = world_from(agents, FakeMessenger::default(), BackendKind::Codex);
+        world.send(text(Some(7), 1, "/limits")).await;
+        eventually("card", || has_card(&world, 1, "<b>Claude</b>")).await;
+        let (card, _) =
+            edits(&world, 1).into_iter().find(|(_, format)| *format == Format::Html).unwrap();
+        let codex = card.find("<b>Codex</b>").unwrap();
+        let claude = card.find("<b>Claude</b>").unwrap();
+        assert!(codex < claude, "{card}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_probe_falls_back_to_what_a_session_reported() {
+        let update = QuotaUpdate::new(BackendKind::Claude, None, five_hour(40));
+        let world = world(FakeAgents {
+            scripts: StdMutex::new(
+                vec![Script::Say(vec![AgentEvent::Quota(update), finished()])].into(),
+            ),
+            ..FakeAgents::polling(vec![vec![(BackendKind::Claude, Err("тайм-аут".to_owned()))]])
+        });
+        world.send(text(Some(7), 1, "сделай")).await;
+        eventually("finished", || world.texts().iter().any(|t| t == "✅ Готово · ходов: 1")).await;
+        world.send(text(Some(7), 2, "/limits")).await;
+        let id = || {
+            world
+                .texts()
+                .iter()
+                .position(|t| t == texts::LIMITS_COLLECTING)
+                .map(|i| i32::try_from(i).unwrap() + 1)
+        };
+        eventually("cached card", || id().is_some_and(|id| has_card(&world, id, "40%"))).await;
+        assert!(id().is_some_and(|id| has_card(&world, id, "(на ")));
+    }
+
+    #[tokio::test]
+    async fn a_failure_without_a_cache_shows_its_reason() {
+        let failed = (BackendKind::Claude, Err("Claude не ответил о лимитах за 15 с".to_owned()));
+        let world = world(FakeAgents::polling(vec![vec![failed]]));
+        world.send(text(Some(7), 1, "/limits")).await;
+        eventually("card", || has_card(&world, 1, "⚠️ Claude не ответил о лимитах за 15 с")).await;
+    }
+
+    #[tokio::test]
+    async fn refresh_redraws_the_same_message() {
+        let world = world(FakeAgents::polling(vec![vec![claude_max(62)], vec![claude_max(70)]]));
+        world.send(text(Some(7), 1, "/limits")).await;
+        eventually("card", || has_card(&world, 1, "62%")).await;
+
+        world.send(press("c1", 1, limits::REFRESH)).await;
+
+        eventually("redrawn", || has_card(&world, 1, "70%")).await;
+        assert!(edits(&world, 1).contains(&(texts::LIMITS_COLLECTING.to_owned(), Format::Plain)));
+        eventually("answered", || {
+            world
+                .messenger
+                .calls()
+                .contains(&Call::Answer { callback: "c1".to_owned(), text: None })
+        })
+        .await;
+        assert_eq!(world.texts(), [texts::LIMITS_COLLECTING], "no new message");
+    }
+
+    #[tokio::test]
+    async fn presses_and_commands_wait_while_a_poll_runs() {
+        let (release, held) = oneshot::channel();
+        let agents = FakeAgents::polling(vec![vec![claude_max(10)]]);
+        *agents.hold_quotas.lock().unwrap() = Some(held);
+        let world = world(agents);
+        world.send(text(Some(7), 1, "/limits")).await;
+        eventually("placeholder", || world.texts() == [texts::LIMITS_COLLECTING]).await;
+
+        world.send(press("c2", 1, limits::REFRESH)).await;
+        world.send(text(Some(7), 2, "/limits")).await;
+        eventually("busy", || world.texts().contains(&texts::LIMITS_BUSY.to_owned())).await;
+        eventually("answered", || {
+            world
+                .messenger
+                .calls()
+                .contains(&Call::Answer { callback: "c2".to_owned(), text: None })
+        })
+        .await;
+        assert!(edits(&world, 1).is_empty(), "a press during a poll changes nothing");
+
+        release.send(()).unwrap();
+        eventually("card", || has_card(&world, 1, "10%")).await;
+        assert_eq!(world.agents.polls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_crashed_poll_frees_the_next_one() {
+        let agents = FakeAgents::polling(vec![Vec::new(), vec![claude_max(33)]]);
+        agents.crash_quotas.store(true, Ordering::SeqCst);
+        let world = world(agents);
+        world.send(text(Some(7), 1, "/limits")).await;
+        eventually("internal error", || {
+            edits(&world, 1).contains(&(texts::INTERNAL_ERROR.to_owned(), Format::Plain))
+        })
+        .await;
+        world.send(text(Some(7), 2, "/limits")).await;
+        eventually("second card", || has_card(&world, 2, "33%")).await;
+    }
+
+    #[tokio::test]
+    async fn other_presses_still_reach_approvals_and_questions() {
+        let world = world(FakeAgents::default());
+        world.send(press("c3", 1, "ap:allow:unknown")).await;
+        eventually("stale answer", || {
+            world.messenger.calls().contains(&Call::Answer {
+                callback: "c3".to_owned(),
+                text: Some(texts::APPROVAL_STALE.to_owned()),
+            })
+        })
+        .await;
     }
 
     #[tokio::test]

@@ -161,8 +161,10 @@ async fn relay(
                 tracing::debug!(
                     backend = update.backend.name(),
                     windows = update.windows().len(),
-                    "quota update not cached yet"
+                    "quota update"
                 );
+                // The hub is gone only during shutdown, when the cache no longer matters.
+                let _ = mailbox.send(HubMessage::Quota(update)).await;
             }
         }
     }
