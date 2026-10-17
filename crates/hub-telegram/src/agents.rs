@@ -3,8 +3,9 @@
 use std::env;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
-use futures::future::BoxFuture;
+use futures::future::{BoxFuture, join_all};
 use hub_agent::archive::SessionArchive;
 use hub_agent::conversation::Conversation;
 use hub_claude::archive::ClaudeArchive;
@@ -12,6 +13,7 @@ use hub_claude::backend::ClaudeBackend;
 use hub_codex::archive::CodexArchive;
 use hub_codex::backend::CodexBackend;
 use hub_core::domain::{AgentEvent, BackendKind, Prompt, TopicSession};
+use hub_core::quota::QuotaReport;
 use hub_core::settings::Settings;
 use hub_hermes::archive::HermesArchive;
 use hub_hermes::backend::HermesBackend;
@@ -20,6 +22,7 @@ use hub_qwen::backend::QwenBackend;
 use tokio::sync::{mpsc, watch};
 
 use crate::hub::Agents;
+use crate::limits::Outcome;
 
 pub struct HubAgents {
     settings: watch::Receiver<Arc<Settings>>,
@@ -96,6 +99,11 @@ impl Agents for HubAgents {
         let settings = Arc::clone(&self.settings.borrow());
         Box::pin(async move { archive(backend, &settings, home).await })
     }
+
+    fn quotas(&self) -> BoxFuture<'_, Vec<Outcome>> {
+        let settings = Arc::clone(&self.settings.borrow());
+        Box::pin(async move { quotas(&settings).await })
+    }
 }
 
 /// The same CLI and environment the backend runs with: the storage root follows the variables
@@ -153,6 +161,75 @@ async fn archive(
         }
     };
     Ok(archive)
+}
+
+/// Per backend, on top of the probes' own deadlines; dropping a probe kills its process.
+const QUOTA_TIMEOUT: Duration = Duration::from_secs(20);
+const QUOTA_TIMEOUT_TEXT: &str = "проба не ответила за 20 с";
+
+/// Probes of every found CLI, side by side: one backend's failure or timeout leaves the
+/// others alone. A CLI that is not found is skipped, as the card shows found agents only.
+async fn quotas(settings: &Settings) -> Vec<Outcome> {
+    let probes = BackendKind::ALL.into_iter().filter_map(|backend| {
+        let probe: BoxFuture<'static, Result<QuotaReport, String>> = match backend {
+            BackendKind::Claude => {
+                let cli = hub_claude::version::locate(settings.claude.cli.as_deref()).ok()?;
+                Box::pin(async move {
+                    hub_claude::usage::probe(&cli).await.map_err(|error| {
+                        let reason = match &error {
+                            hub_claude::usage::ProbeError::Rejected(_) => {
+                                "Claude отклонил запрос лимитов".to_owned()
+                            }
+                            hub_claude::usage::ProbeError::Shape
+                            | hub_claude::usage::ProbeError::Disabled
+                            | hub_claude::usage::ProbeError::Spawn(_)
+                            | hub_claude::usage::ProbeError::Timeout
+                            | hub_claude::usage::ProbeError::NoAnswer
+                            | hub_claude::usage::ProbeError::TooLarge
+                            | hub_claude::usage::ProbeError::Io(_) => error.to_string(),
+                        };
+                        failed(backend, error.kind(), reason)
+                    })
+                })
+            }
+            BackendKind::Codex => {
+                let cli = hub_codex::version::locate(settings.codex.cli.as_deref()).ok()?;
+                Box::pin(async move {
+                    hub_codex::usage::probe(&cli).await.map_err(|error| {
+                        let reason = match &error {
+                            hub_codex::usage::ProbeError::Rpc(_) => {
+                                "Codex app-server не ответил о лимитах".to_owned()
+                            }
+                            hub_codex::usage::ProbeError::Spawn(_)
+                            | hub_codex::usage::ProbeError::Shape => error.to_string(),
+                        };
+                        failed(backend, error.kind(), reason)
+                    })
+                })
+            }
+            BackendKind::Qwen => {
+                hub_qwen::version::locate(settings.qwen.cli.as_deref()).ok()?;
+                Box::pin(async { Ok(QuotaReport::not_reported(BackendKind::Qwen)) })
+            }
+            BackendKind::Hermes => {
+                hub_hermes::version::locate(settings.hermes.cli.as_deref()).ok()?;
+                Box::pin(async { Ok(QuotaReport::not_reported(BackendKind::Hermes)) })
+            }
+        };
+        Some(async move {
+            let outcome = tokio::time::timeout(QUOTA_TIMEOUT, probe)
+                .await
+                .unwrap_or_else(|_| Err(failed(backend, "timeout", QUOTA_TIMEOUT_TEXT.to_owned())));
+            (backend, outcome)
+        })
+    });
+    join_all(probes).await
+}
+
+/// Logs the backend and the kind of failure only: the text can carry the agent's words.
+fn failed(backend: BackendKind, kind: &'static str, text: String) -> String {
+    tracing::warn!(backend = backend.name(), error = kind, "quota probe failed");
+    text
 }
 
 async fn refuse(
@@ -321,5 +398,43 @@ mod tests {
             matches!(received.recv().await, Some(AgentEvent::Failed(reason)) if reason.contains("Hermes"))
         );
         assert_eq!(inbox.try_recv().unwrap().text(), "later");
+    }
+
+    #[tokio::test]
+    async fn quotas_probe_every_configured_cli_and_isolate_failures() {
+        let root = std::env::temp_dir();
+        let missing = root.join("definitely-not-an-agent-binary").display().to_string();
+        let mut form = Draft {
+            token: "1:a".to_owned(),
+            chat: "-100".to_owned(),
+            users: "1".to_owned(),
+            workspace_root: root.display().to_string(),
+            ..Draft::default()
+        };
+        form.cli.clone_from(&missing);
+        form.codex.cli.clone_from(&missing);
+        form.qwen.cli.clone_from(&missing);
+        form.hermes.cli = missing;
+        let agents =
+            HubAgents::new(watch::Sender::new(Arc::new(form.parse(&root).unwrap())).subscribe());
+
+        let outcomes = agents.quotas().await;
+
+        let backends: Vec<_> = outcomes.iter().map(|(backend, _)| *backend).collect();
+        assert_eq!(backends, BackendKind::ALL);
+        let [(_, claude), (_, codex), (_, qwen), (_, hermes)] = outcomes.as_slice() else {
+            panic!("{outcomes:?}");
+        };
+        assert!(
+            matches!(claude, Err(reason) if reason.starts_with("не удалось запустить Claude")
+                || reason.starts_with("проба лимитов Claude отключена")),
+            "{claude:?}"
+        );
+        assert!(
+            matches!(codex, Err(reason) if reason.starts_with("не удалось запустить Codex app-server")),
+            "{codex:?}"
+        );
+        assert_eq!(qwen, &Ok(QuotaReport::not_reported(BackendKind::Qwen)));
+        assert_eq!(hermes, &Ok(QuotaReport::not_reported(BackendKind::Hermes)));
     }
 }

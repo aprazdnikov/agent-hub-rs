@@ -16,6 +16,7 @@ use hub_core::commands::{
 use hub_core::domain::{
     AbsolutePath, BackendKind, ChatId, MessageId, Prompt, SessionId, TopicKey, TopicSession,
 };
+use hub_core::quota::QuotaReport;
 use hub_core::settings::Settings;
 use hub_core::snapshot::{SnapshotName, default_name};
 use hub_core::topics::Topics;
@@ -60,6 +61,10 @@ pub trait Agents: Send + Sync + 'static {
         backend: BackendKind,
         home: &'a Path,
     ) -> BoxFuture<'a, Result<Arc<dyn SessionArchive>, String>>;
+
+    /// Subscription limits of every backend whose CLI is found, in `BackendKind::ALL` order;
+    /// `Err` is a probe failure or timeout, which the hub may answer from its cache.
+    fn quotas(&self) -> BoxFuture<'_, Vec<(BackendKind, Result<QuotaReport, String>)>>;
 }
 
 pub trait TopicStore: Send + 'static {
@@ -961,6 +966,10 @@ mod tests {
     }
 
     impl Agents for FakeAgents {
+        fn quotas(&self) -> BoxFuture<'_, Vec<(BackendKind, Result<QuotaReport, String>)>> {
+            Box::pin(async { Vec::new() })
+        }
+
         fn archive<'a>(
             &'a self,
             _backend: BackendKind,
