@@ -8,9 +8,9 @@ use chrono::{DateTime, Utc};
 use crate::domain::BackendKind;
 use crate::render::truncate;
 
-/// Longest plan, window name or refusal taken from an agent's answer.
+/// Longest plan or window name taken from an agent's answer (`Label::new`).
 pub const LABEL_LIMIT: usize = 32;
-/// Longest refusal text taken from an agent's answer.
+/// Longest refusal text taken from an agent's answer (`QuotaReport::unavailable`).
 pub const REASON_LIMIT: usize = 160;
 /// Most windows kept per backend, so the card always fits one Telegram message.
 pub const WINDOW_LIMIT: usize = 8;
@@ -18,8 +18,9 @@ pub const WINDOW_LIMIT: usize = 8;
 /// Shown when an agent's refusal text is empty once cleaned.
 const UNKNOWN_REASON: &str = "причина не указана";
 
-/// Agent text fit for a card: no control characters, trimmed, non-empty, at most
-/// `LABEL_LIMIT` chars.
+/// Agent text fit for a card: no control characters, trimmed, non-empty. The bound depends
+/// on the constructor: `LABEL_LIMIT` chars from `Label::new` (plans, window names),
+/// `REASON_LIMIT` chars for the refusal reason built by `QuotaReport::unavailable`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Label(String);
 
