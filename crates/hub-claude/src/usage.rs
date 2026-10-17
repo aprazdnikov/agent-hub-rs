@@ -26,16 +26,6 @@ const OVERAGE_INCLUDED: &str = "7 дней, включённые модели";
 /// `resetsAt` above this is in milliseconds: in seconds it stays below until the year 5138.
 const MILLIS_FROM: i64 = 100_000_000_000;
 
-/// The unit of `utilization` in `rate_limit_event`, which the SDK leaves undocumented.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Scale {
-    Fraction,
-    Percent,
-}
-
-/// What the live check found (task 1 of the plan); `get_usage` is 0–100 by the SDK types.
-pub const EVENT_SCALE: Scale = Scale::Fraction;
-
 /// How the probe asks; the live check (task 1 of the plan) picks it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Handshake {
@@ -67,6 +57,7 @@ const USAGE_REQUEST: &str = "hub-usage";
 const INITIALIZE_REQUEST: &str = "hub-usage-initialize";
 const LINE_LIMIT: usize = 1024 * 1024;
 const LINES_LIMIT: usize = 64;
+const PROBE_DIR_PREFIX: &str = "agent-hub-usage-";
 
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum ProbeError {
@@ -123,23 +114,29 @@ pub fn requests(handshake: Handshake) -> Option<Vec<Value>> {
 
 /// Asks a short-lived CLI for the plan limits. It never gets a prompt, so it starts no turn
 /// and writes no session; its stderr is dropped, so nothing of it reaches the log.
+///
+/// # Errors
+/// `Disabled` when the probe is off, `Spawn` when its directory or the CLI cannot be made,
+/// the exchange's errors otherwise.
 pub async fn probe(cli: &Path) -> Result<QuotaReport, ProbeError> {
     let requests = requests(HANDSHAKE).ok_or(ProbeError::Disabled)?;
-    let mut command = Command::new(cli);
-    command
-        .args(PROBE_ARGS)
-        .current_dir(std::env::temp_dir())
-        .env(ENTRYPOINT.0, ENTRYPOINT.1)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true);
-    hide_window(&mut command);
-    let mut child = command.spawn().map_err(|error| ProbeError::Spawn(error.kind()))?;
+    // Not the shared temp dir: nobody else can plant `.claude/` or `.mcp.json` in this one.
+    let workdir = private_dir().map_err(|error| ProbeError::Spawn(error.kind()))?;
+    let answer = run(cli, workdir.path(), &requests).await;
+    // Only now: the child has exited or been killed, so nothing runs in the directory.
+    if let Err(error) = workdir.close() {
+        tracing::debug!(error = ?error.kind(), "claude usage probe directory not removed");
+    }
+    answer
+}
+
+async fn run(cli: &Path, workdir: &Path, requests: &[Value]) -> Result<QuotaReport, ProbeError> {
+    let mut child =
+        probe_command(cli, workdir).spawn().map_err(|error| ProbeError::Spawn(error.kind()))?;
     let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
         return Err(ProbeError::Io(io::ErrorKind::BrokenPipe));
     };
-    let answer = exchange(stdout, stdin, &requests, ANSWER_TIMEOUT).await;
+    let answer = exchange(stdout, stdin, requests, ANSWER_TIMEOUT).await;
     if tokio::time::timeout(EXIT_TIMEOUT, child.wait()).await.is_err()
         && let Err(error) = child.kill().await
     {
@@ -148,8 +145,38 @@ pub async fn probe(cli: &Path) -> Result<QuotaReport, ProbeError> {
     answer
 }
 
+/// A fresh directory only this user can enter (0700 on Unix; on Windows the per-user temp
+/// dir already is private); it is removed when dropped.
+fn private_dir() -> io::Result<tempfile::TempDir> {
+    let mut builder = tempfile::Builder::new();
+    builder.prefix(PROBE_DIR_PREFIX);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    builder.tempdir()
+}
+
+fn probe_command(cli: &Path, workdir: &Path) -> Command {
+    let mut command = Command::new(cli);
+    command
+        .args(PROBE_ARGS)
+        .current_dir(workdir)
+        .env(ENTRYPOINT.0, ENTRYPOINT.1)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    hide_window(&mut command);
+    command
+}
+
 /// Writes `requests`, reads at most `LINES_LIMIT` lines of at most `LINE_LIMIT` bytes for the
 /// usage answer within `wait`, then closes `writer` whatever happened, so the CLI sees EOF.
+///
+/// # Errors
+/// `Timeout`, `NoAnswer`, `TooLarge`, `Io`, or the reply's own error.
 pub async fn exchange<R, W>(
     reader: R,
     mut writer: W,
@@ -184,8 +211,11 @@ where
     };
     let answer = tokio::time::timeout(wait, asked).await.unwrap_or(Err(ProbeError::Timeout));
     if let Err(error) = writer.shutdown().await {
-        tracing::debug!(error = ?error.kind(), "claude usage probe stdin did not close");
+        tracing::debug!(error = ?error.kind(), "claude usage probe stdin shutdown failed");
     }
+    // Tokio's `ChildStdin::poll_shutdown` does not close the pipe (on Unix it is a no-op): the
+    // CLI sees EOF only once the writer is dropped, here.
+    drop(writer);
     answer
 }
 
@@ -240,7 +270,7 @@ struct Window {
 #[derive(Deserialize)]
 struct ModelWindow {
     #[serde(default)]
-    display_name: String,
+    display_name: Option<String>,
     #[serde(default)]
     utilization: Option<f64>,
     #[serde(default)]
@@ -250,7 +280,7 @@ struct ModelWindow {
 #[derive(Deserialize)]
 struct Extra {
     #[serde(default)]
-    is_enabled: bool,
+    is_enabled: Option<bool>,
     #[serde(default)]
     utilization: Option<f64>,
 }
@@ -309,11 +339,11 @@ fn windows(limits: RateLimits) -> Vec<UsageWindow> {
     });
     let models = model_scoped.unwrap_or_default().into_iter().filter_map(|model| {
         let ModelWindow { display_name, utilization, resets_at } = model;
-        let kind = WindowKind::WeekModel(Label::new(&display_name)?);
+        let kind = WindowKind::WeekModel(Label::new(display_name.as_deref()?)?);
         usage_window(kind, utilization, resets_at.as_deref())
     });
     let extra = extra_usage
-        .filter(|extra| extra.is_enabled)
+        .filter(|extra| extra.is_enabled == Some(true))
         .and_then(|extra| usage_window(WindowKind::Extra, extra.utilization, None));
     named.chain(models).chain(extra).collect()
 }
@@ -341,7 +371,7 @@ fn plan_name(raw: &str) -> Option<Label> {
 /// The one window a `rate_limit_event` reports; `None` when it names no known window or no
 /// usage (CLI 2.1.28x sends only `status`, see the fixtures).
 #[must_use]
-pub fn event_update(info: &RateLimitInfo, scale: Scale) -> Option<QuotaUpdate> {
+pub fn event_update(info: &RateLimitInfo) -> Option<QuotaUpdate> {
     let kind = match info.rate_limit_type.as_ref()?.as_str()? {
         "five_hour" => WindowKind::FiveHour,
         "seven_day" => WindowKind::Week,
@@ -352,10 +382,9 @@ pub fn event_update(info: &RateLimitInfo, scale: Scale) -> Option<QuotaUpdate> {
         _ => return None,
     };
     let raw = info.utilization.as_ref()?.as_f64()?;
-    let value = match scale {
-        Scale::Fraction => raw * 100.0,
-        Scale::Percent => raw,
-    };
+    // The SDK leaves the unit undocumented: up to 1 is a fraction, above it percent. Exactly 1
+    // reads as 100 %, never as 1 %.
+    let value = if raw <= 1.0 { raw * 100.0 } else { raw };
     let resets_at = info.resets_at.as_ref().and_then(Value::as_i64).and_then(unix_time);
     let window = UsageWindow { kind, percent: Percent::new(value)?, resets_at };
     Some(QuotaUpdate::new(BackendKind::Claude, None, vec![window]))
@@ -440,6 +469,14 @@ mod tests {
         json!({"rate_limits": {"extra_usage": {"is_enabled": true, "utilization": 40.0}}}),
         Ok(fresh(None, vec![window(WindowKind::Extra, 40, None)]))
     )]
+    #[case::null_model_name_skips_the_model(
+        json!({"rate_limits": {"model_scoped": [{"display_name": null, "utilization": 5}, {"display_name": "Fable", "utilization": 6}]}}),
+        Ok(fresh(None, vec![window(model("Fable"), 6, None)]))
+    )]
+    #[case::null_extra_flag_skips_extra_usage(
+        json!({"rate_limits": {"five_hour": {"utilization": 3}, "extra_usage": {"is_enabled": null, "utilization": 40.0}}}),
+        Ok(fresh(None, vec![window(WindowKind::FiveHour, 3, None)]))
+    )]
     #[case::wrong_type(json!({"rate_limits": {"five_hour": {"utilization": "a lot"}}}), Err(ProbeError::Shape))]
     #[case::no_limits(json!({"rate_limits_available": true, "rate_limits": null}), Err(ProbeError::Shape))]
     #[case::not_an_object(json!("usage"), Err(ProbeError::Shape))]
@@ -482,19 +519,29 @@ mod tests {
     }
 
     #[rstest]
-    #[case::fraction(json!({"status": "allowed", "rateLimitType": "five_hour", "utilization": 0.62, "resetsAt": 1_792_160_000}), Scale::Fraction, Some(update(WindowKind::FiveHour, 62, Some("2026-10-16T14:13:20Z"))))]
-    #[case::percent(json!({"status": "allowed_warning", "rateLimitType": "seven_day", "utilization": 81}), Scale::Percent, Some(update(WindowKind::Week, 81, None)))]
-    #[case::millis(json!({"rateLimitType": "seven_day_opus", "utilization": 0.5, "resetsAt": 1_792_160_000_000_i64}), Scale::Fraction, Some(update(model("Opus"), 50, Some("2026-10-16T14:13:20Z"))))]
-    #[case::fractional_reset(json!({"rateLimitType": "overage", "utilization": 0.1, "resetsAt": 1.5}), Scale::Fraction, Some(update(WindowKind::Extra, 10, None)))]
-    #[case::status_only(json!({"status": "allowed"}), Scale::Fraction, None)]
-    #[case::unknown_window(json!({"rateLimitType": "one_day", "utilization": 0.1}), Scale::Fraction, None)]
-    #[case::bad_utilization(json!({"rateLimitType": "five_hour", "utilization": "high"}), Scale::Fraction, None)]
+    #[case::fraction(json!({"status": "allowed", "rateLimitType": "five_hour", "utilization": 0.62, "resetsAt": 1_792_160_000}), Some(update(WindowKind::FiveHour, 62, Some("2026-10-16T14:13:20Z"))))]
+    #[case::percent(json!({"status": "allowed_warning", "rateLimitType": "seven_day", "utilization": 81}), Some(update(WindowKind::Week, 81, None)))]
+    #[case::millis(json!({"rateLimitType": "seven_day_opus", "utilization": 0.5, "resetsAt": 1_792_160_000_000_i64}), Some(update(model("Opus"), 50, Some("2026-10-16T14:13:20Z"))))]
+    #[case::fractional_reset(json!({"rateLimitType": "overage", "utilization": 0.1, "resetsAt": 1.5}), Some(update(WindowKind::Extra, 10, None)))]
+    #[case::status_only(json!({"status": "allowed"}), None)]
+    #[case::unknown_window(json!({"rateLimitType": "one_day", "utilization": 0.1}), None)]
+    #[case::bad_utilization(json!({"rateLimitType": "five_hour", "utilization": "high"}), None)]
     fn rate_limit_events_update_one_window(
         #[case] raw: Value,
-        #[case] scale: Scale,
         #[case] expected: Option<QuotaUpdate>,
     ) {
-        assert_eq!(event_update(&info(raw), scale), expected);
+        assert_eq!(event_update(&info(raw)), expected);
+    }
+
+    #[rstest]
+    #[case::fraction(0.62, 62)]
+    #[case::percent(62.0, 62)]
+    #[case::whole_fraction(1.0, 100)]
+    #[case::zero(0.0, 0)]
+    #[case::just_above_one(1.5, 2)]
+    fn event_utilization_is_read_in_either_unit(#[case] utilization: f64, #[case] percent: i64) {
+        let raw = json!({"rateLimitType": "five_hour", "utilization": utilization});
+        assert_eq!(event_update(&info(raw)), Some(update(WindowKind::FiveHour, percent, None)));
     }
 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
@@ -640,6 +687,35 @@ mod tests {
         assert!(
             !PROBE_ARGS.iter().any(|arg| arg.starts_with("--resume") || *arg == "--mcp-config")
         );
+    }
+
+    #[test]
+    fn the_probe_runs_in_its_own_fresh_directory() {
+        let first = private_dir().unwrap();
+        let second = private_dir().unwrap();
+        assert_ne!(first.path(), second.path());
+        assert!(first.path().is_dir());
+        assert!(first.path().starts_with(std::env::temp_dir()));
+        assert_ne!(first.path(), std::env::temp_dir());
+
+        let command = probe_command(Path::new("claude"), first.path());
+        let command = command.as_std();
+        assert_eq!(command.get_current_dir(), Some(first.path()));
+        assert_eq!(command.get_args().collect::<Vec<_>>(), PROBE_ARGS);
+
+        let path = first.path().to_owned();
+        drop(first);
+        assert!(!path.exists(), "the directory goes away with the probe");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_probe_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = private_dir().unwrap();
+        let mode = std::fs::metadata(dir.path()).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700);
     }
 
     #[tokio::test]

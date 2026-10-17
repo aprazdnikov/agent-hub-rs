@@ -9,7 +9,6 @@ mod tests {
     use hub_agent::channel::UserChannel;
     use hub_agent::conversation::{Conversation, Limits};
     use hub_claude::session::converse;
-    use hub_claude::usage::{EVENT_SCALE, Scale};
     use hub_core::domain::BackendKind;
     use hub_core::domain::{
         AgentEvent, Decision, Denied, FileDelivery, Finished, OutgoingFile, Prompt, Question,
@@ -254,17 +253,13 @@ mod tests {
 
     #[tokio::test]
     async fn rate_limit_events_become_quota_updates() {
-        let utilization = match EVENT_SCALE {
-            Scale::Fraction => 0.62,
-            Scale::Percent => 62.0,
-        };
         let mut harness = Harness::start(FakeChannel::allowing(), limits());
         harness.cli.handshake().await;
         harness.cli.send(&rate_limit(&json!({"status": "allowed"}))).await;
         harness
             .cli
             .send(&rate_limit(&json!({"status": "allowed_warning", "rateLimitType": "five_hour",
-                                      "utilization": utilization, "resetsAt": 1_792_160_000})))
+                                      "utilization": 0.62, "resetsAt": 1_792_160_000})))
             .await;
         harness.cli.send(&text("Привет")).await;
         harness.cli.send(&result(None)).await;

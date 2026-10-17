@@ -254,7 +254,7 @@ impl State {
                 Flow::Stop
             }
             Incoming::RateLimitEvent { rate_limit_info } => {
-                let Some(update) = usage::event_update(&rate_limit_info, usage::EVENT_SCALE) else {
+                let Some(update) = usage::event_update(&rate_limit_info) else {
                     return Flow::Continue;
                 };
                 if self.emit(AgentEvent::Quota(update)).await { Flow::Continue } else { Flow::Stop }
