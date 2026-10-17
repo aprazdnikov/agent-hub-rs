@@ -95,6 +95,7 @@ impl SessionActivity {
             | Incoming::ControlRequest { .. }
             | Incoming::ControlResponse { .. }
             | Incoming::ControlCancelRequest { .. }
+            | Incoming::RateLimitEvent { .. }
             | Incoming::Other => {}
         }
     }

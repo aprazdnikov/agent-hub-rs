@@ -6,5 +6,6 @@ pub mod outgoing;
 pub mod permissions;
 pub mod session;
 pub mod tracker;
+pub mod usage;
 pub mod version;
 pub mod wire;

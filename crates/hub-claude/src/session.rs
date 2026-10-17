@@ -256,6 +256,7 @@ impl State {
             | Incoming::Assistant(_)
             | Incoming::User(_)
             | Incoming::Result(_)
+            | Incoming::RateLimitEvent { .. }
             | Incoming::Other => {
                 self.activity.observe(&message);
                 let background = self.activity.background().len();

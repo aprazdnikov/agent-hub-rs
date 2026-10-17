@@ -38,6 +38,7 @@ impl SessionTracker {
             | Incoming::ControlRequest { .. }
             | Incoming::ControlResponse { .. }
             | Incoming::ControlCancelRequest { .. }
+            | Incoming::RateLimitEvent { .. }
             | Incoming::Other => {}
         }
         events
@@ -56,6 +57,7 @@ fn session_of(message: &Incoming) -> Option<SessionId> {
         | Incoming::ControlRequest { .. }
         | Incoming::ControlResponse { .. }
         | Incoming::ControlCancelRequest { .. }
+        | Incoming::RateLimitEvent { .. }
         | Incoming::Other => None,
     }
 }

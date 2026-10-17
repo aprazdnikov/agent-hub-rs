@@ -10,6 +10,11 @@ pub enum Incoming {
     Assistant(Assistant),
     User(User),
     Result(Outcome),
+    /// Plan usage of one rate-limit window, sent when it changes.
+    RateLimitEvent {
+        #[serde(default)]
+        rate_limit_info: RateLimitInfo,
+    },
     ControlRequest {
         request_id: String,
         request: ControlRequest,
@@ -20,7 +25,7 @@ pub enum Incoming {
     ControlCancelRequest {
         request_id: String,
     },
-    /// Kinds this hub does not act on: rate limits, command lifecycle, stream events, …
+    /// Kinds this hub does not act on: command lifecycle, stream events, …
     #[serde(other)]
     Other,
 }
@@ -148,6 +153,19 @@ pub enum ControlReply {
     },
 }
 
+/// `SDKRateLimitInfo`, only what the `/limits` card uses. Kept as raw values: an unexpected
+/// type must not make the whole line unreadable.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RateLimitInfo {
+    #[serde(default)]
+    pub rate_limit_type: Option<Value>,
+    #[serde(default)]
+    pub utilization: Option<Value>,
+    #[serde(default)]
+    pub resets_at: Option<Value>,
+}
+
 pub fn parse_line(line: &str) -> Result<Incoming, serde_json::Error> {
     serde_json::from_str(line)
 }
@@ -266,7 +284,6 @@ mod tests {
     }
 
     #[rstest]
-    #[case(json!({"type": "rate_limit_event", "rate_limit_info": {}}), Incoming::Other)]
     #[case(json!({"type": "system", "subtype": "thinking_tokens"}), Incoming::System(System::Other))]
     #[case(
         json!({"type": "control_request", "request_id": "r", "request": {"subtype": "hook_callback"}}),
@@ -274,6 +291,17 @@ mod tests {
     )]
     fn unknown_kinds_are_tolerated(#[case] value: serde_json::Value, #[case] expected: Incoming) {
         assert_eq!(parse(&value), expected);
+    }
+
+    #[rstest]
+    #[case(json!({"type": "rate_limit_event", "rate_limit_info": {"status": "allowed"}}), RateLimitInfo::default())]
+    #[case(json!({"type": "rate_limit_event"}), RateLimitInfo::default())]
+    #[case(
+        json!({"type": "rate_limit_event", "rate_limit_info": {"rateLimitType": "five_hour", "utilization": 0.5, "resetsAt": 1, "isUsingOverage": false}}),
+        RateLimitInfo { rate_limit_type: Some(json!("five_hour")), utilization: Some(json!(0.5)), resets_at: Some(json!(1)) }
+    )]
+    fn rate_limit_events_are_parsed(#[case] value: serde_json::Value, #[case] info: RateLimitInfo) {
+        assert_eq!(parse(&value), Incoming::RateLimitEvent { rate_limit_info: info });
     }
 
     #[test]
@@ -285,7 +313,14 @@ mod tests {
                 let kind: serde_json::Value = serde_json::from_str(line).unwrap();
                 let known = matches!(
                     kind["type"].as_str(),
-                    Some("assistant" | "user" | "result" | "control_request" | "control_response")
+                    Some(
+                        "assistant"
+                            | "user"
+                            | "result"
+                            | "control_request"
+                            | "control_response"
+                            | "rate_limit_event"
+                    )
                 );
                 assert!(!known || message != Incoming::Other, "{name}: {line}");
             }
