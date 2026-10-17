@@ -160,7 +160,7 @@ async fn relay(
             AgentEvent::Quota(update) => {
                 tracing::debug!(
                     backend = update.backend.name(),
-                    windows = update.windows.len(),
+                    windows = update.windows().len(),
                     "quota update not cached yet"
                 );
             }
