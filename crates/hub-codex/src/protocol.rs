@@ -15,6 +15,8 @@ use serde_json::{Map, Value, json};
 
 use hub_agent::rpc::{Notification, RpcError};
 
+use crate::usage;
+
 // Approvals go to the human in Telegram, never to Codex's own reviewer agent.
 const APPROVALS_REVIEWER: &str = "user";
 pub const SHELL: &str = "shell";
@@ -260,6 +262,10 @@ impl TurnTracker {
                 Ok(Translation::default())
             }
             "turn/completed" => self.completed(params),
+            // Account-wide, not per thread: any session may see it; the hub merges it.
+            "account/rateLimits/updated" => {
+                Ok(Translation::of(usage::update_from(params).map(AgentEvent::Quota)))
+            }
             _ => Ok(Translation::default()),
         }
     }
@@ -290,6 +296,7 @@ mod tests {
     use std::path::PathBuf;
 
     use hub_core::domain::{AbsolutePath, BackendKind, ImageMediaType};
+    use hub_core::quota::{Label, Percent, QuotaUpdate, UsageWindow, WindowKind};
     use hub_core::settings::{Approval, Sandbox};
     use rstest::rstest;
 
@@ -497,11 +504,21 @@ mod tests {
         assert!(matches!(outcome, Err(RpcError::Protocol(_))));
     }
 
+    fn other_window(name: &str, percent: i64) -> UsageWindow {
+        UsageWindow {
+            kind: WindowKind::Other(Label::new(name).unwrap()),
+            percent: Percent::from_int(percent),
+            resets_at: None,
+        }
+    }
+
     #[rstest]
     #[case(notification("item/completed", json!({"item": {"type": "agentMessage", "text": "Готово"}})), vec![AgentEvent::AssistantText("Готово".to_owned())])]
     #[case(notification("item/completed", json!({"item": {"type": "agentMessage", "text": " "}})), vec![])]
     #[case(notification("item/started", json!({"item": {"type": "webSearch", "query": "q"}})), vec![AgentEvent::ToolCall(ToolUse { tool: "web_search".to_owned(), summary: "q".to_owned() })])]
     #[case(notification("item/agentMessage/delta", json!({"delta": "Го"})), vec![])]
+    #[case(notification("account/rateLimits/updated", json!({"rateLimits": {"primary": {"usedPercent": 30, "resetsAt": null}, "planType": null}})), vec![AgentEvent::Quota(QuotaUpdate::new(BackendKind::Codex, None, vec![other_window("основное", 30)]))])]
+    #[case(notification("account/rateLimits/updated", json!({"rateLimits": {"primary": null}})), vec![])]
     fn notifications_become_events(
         #[case] incoming: Notification,
         #[case] events: Vec<AgentEvent>,

@@ -159,7 +159,8 @@ mod tests {
     use std::time::Duration;
 
     use hub_agent::conversation::Limits;
-    use hub_core::domain::{Finished, Usage};
+    use hub_core::domain::{BackendKind, Finished, Usage};
+    use hub_core::quota::{Label, Percent, QuotaUpdate, UsageWindow, WindowKind};
     use serde_json::json;
     use tokio::task::JoinHandle;
     use tokio_util::sync::CancellationToken;
@@ -297,6 +298,28 @@ mod tests {
             drain(&mut harness.events),
             [AgentEvent::AssistantText("Привет".to_owned()), finished]
         );
+    }
+
+    #[tokio::test]
+    async fn rate_limit_updates_reach_the_hub_mid_turn() {
+        let mut harness = start(FakeThread::default());
+        harness
+            .notify
+            .send(Notification {
+                method: "account/rateLimits/updated".to_owned(),
+                params: json!({"rateLimits": {"secondary": {"usedPercent": 12}, "planType": "plus"}}),
+            })
+            .unwrap();
+        harness.notify.send(completed("u-1")).unwrap();
+        let (_inbox, outcome) = harness.done.await.unwrap();
+        assert_eq!(outcome, Ok(()));
+        let window = UsageWindow {
+            kind: WindowKind::Other(Label::new("недельное").unwrap()),
+            percent: Percent::from_int(12),
+            resets_at: None,
+        };
+        let update = QuotaUpdate::new(BackendKind::Codex, Label::new("ChatGPT Plus"), vec![window]);
+        assert_eq!(drain(&mut harness.events).first(), Some(&AgentEvent::Quota(update)));
     }
 
     #[tokio::test]
