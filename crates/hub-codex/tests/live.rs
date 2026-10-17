@@ -13,11 +13,13 @@ mod tests {
     use hub_agent::conversation::{Conversation, Limits};
     use hub_codex::archive::{CodexArchive, storage_root};
     use hub_codex::backend::CodexBackend;
+    use hub_codex::usage;
     use hub_codex::version::{check, locate};
     use hub_core::domain::{
         AbsolutePath, AgentEvent, BackendKind, Decision, FileDelivery, OutgoingFile, Prompt,
         Question, QuestionsOutcome, SessionId, ToolRequest, TopicSession, Usage,
     };
+    use hub_core::quota::QuotaSource;
     use hub_core::settings::{Approval, CodexSettings, Sandbox};
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
@@ -79,6 +81,27 @@ mod tests {
             ),
             "{seen:?}"
         );
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a logged-in codex"]
+    async fn live_usage_probe_reads_the_limits() {
+        if std::env::var_os("AGENT_HUB_LIVE_CODEX").is_none() {
+            return;
+        }
+        let cli = locate(None).unwrap();
+        check(&cli).await.unwrap();
+        let report = usage::probe(&cli).await.unwrap();
+        assert_eq!(report.backend, BackendKind::Codex);
+        assert!(
+            match &report.source {
+                QuotaSource::Fresh => !report.windows().is_empty(),
+                QuotaSource::Unavailable(_) => report.windows().is_empty(),
+                QuotaSource::Cached { .. } | QuotaSource::NotReported => false,
+            },
+            "{report:?}"
+        );
+        assert!(report.windows().iter().all(|window| window.percent.get() <= 100));
     }
 
     fn home() -> PathBuf {

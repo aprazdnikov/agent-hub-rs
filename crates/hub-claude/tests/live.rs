@@ -13,11 +13,13 @@ mod tests {
     use hub_agent::conversation::{Conversation, Limits};
     use hub_claude::archive::{ClaudeArchive, storage_root};
     use hub_claude::backend::ClaudeBackend;
+    use hub_claude::usage;
     use hub_claude::version::{check, locate};
     use hub_core::domain::{
         AbsolutePath, AgentEvent, BackendKind, Decision, FileDelivery, OutgoingFile, Prompt,
         Question, QuestionsOutcome, SessionId, ToolRequest, TopicSession,
     };
+    use hub_core::quota::QuotaSource;
     use hub_core::settings::{ClaudeSettings, PermissionMode};
     use tokio::sync::mpsc;
     use tokio_util::sync::CancellationToken;
@@ -70,6 +72,27 @@ mod tests {
             seen.push(event);
         }
         assert!(seen.iter().any(|event| matches!(event, AgentEvent::Finished(_))), "{seen:?}");
+    }
+
+    #[tokio::test]
+    #[ignore = "talks to the real agent CLI"]
+    async fn live_usage_probe_answers_without_a_turn() {
+        if std::env::var_os("AGENT_HUB_LIVE_CLI").is_none() {
+            return;
+        }
+        let cli = locate(None).unwrap();
+        check(&cli).await.unwrap();
+        let report = usage::probe(&cli).await.unwrap();
+        assert_eq!(report.backend, BackendKind::Claude);
+        assert!(
+            match &report.source {
+                QuotaSource::Fresh => !report.windows().is_empty(),
+                QuotaSource::Unavailable(_) => report.windows().is_empty(),
+                QuotaSource::Cached { .. } | QuotaSource::NotReported => false,
+            },
+            "{report:?}"
+        );
+        assert!(report.windows().iter().all(|window| window.percent.get() <= 100));
     }
 
     fn home() -> PathBuf {
