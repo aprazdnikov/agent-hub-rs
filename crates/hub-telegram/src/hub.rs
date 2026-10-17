@@ -411,6 +411,7 @@ impl<A: Agents> Hub<A> {
             Command::Save => self.save(key, args),
             Command::Saves => self.saves(key),
             Command::Restore => self.restore(key, args),
+            Command::Limits => self.say(Target::Topic(key), texts::LIMITS_PENDING.to_owned()),
         }
     }
 

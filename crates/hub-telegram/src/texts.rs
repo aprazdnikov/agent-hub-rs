@@ -49,6 +49,11 @@ pub const RESTORE_FILES_KEPT: &str = "Файлы сессии уже восст�
                                       привяжет её к теме.";
 pub const RESTORE_NOT_PERSISTED: &str =
     "⚠️ Восстановление не сохранено: привязки тем не записались на диск, темы не изменены";
+pub const LIMITS_COLLECTING: &str = "⏳ Собираю…";
+pub const LIMITS_REFRESH: &str = "🔄 Обновить";
+pub const LIMITS_BUSY: &str = "⏳ Опрос уже идёт — подождите.";
+// Until the hub answers /limits (task 12 of the plan).
+pub const LIMITS_PENDING: &str = "Лимиты подписок появятся в следующей версии";
 const SNAPSHOT_LIST_LIMIT: usize = 30;
 const SNAPSHOT_LIST_TEXT_LIMIT: usize = 3500;
 const APPROVAL_TEXT_LIMIT: usize = 3500;
@@ -276,10 +281,18 @@ mod tests {
         assert!(
             text.contains("/restore <имя> [каталог] — продолжить сессию из снимка в этой теме")
         );
+        assert!(text.contains("/limits — лимиты подписок агентов"));
         for command in Command::ALL {
             assert!(text.contains(&format!("/{}", command.name())));
             assert!(text.contains(command.description()));
         }
+    }
+
+    #[test]
+    fn limits_texts_match_the_spec() {
+        assert_eq!(LIMITS_COLLECTING, "⏳ Собираю…");
+        assert_eq!(LIMITS_REFRESH, "🔄 Обновить");
+        assert_eq!(LIMITS_BUSY, "⏳ Опрос уже идёт — подождите.");
     }
 
     #[test]

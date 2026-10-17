@@ -12,19 +12,21 @@ pub enum Command {
     Stop,
     Status,
     Backend,
+    Limits,
     Save,
     Saves,
     Restore,
 }
 
 impl Command {
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 11] = [
         Self::New,
         Self::Backend,
         Self::Cwd,
         Self::Reset,
         Self::Stop,
         Self::Status,
+        Self::Limits,
         Self::Save,
         Self::Saves,
         Self::Restore,
@@ -41,6 +43,7 @@ impl Command {
             Self::Stop => "stop",
             Self::Status => "status",
             Self::Backend => "backend",
+            Self::Limits => "limits",
             Self::Save => "save",
             Self::Saves => "saves",
             Self::Restore => "restore",
@@ -57,6 +60,7 @@ impl Command {
             Self::Stop => "прервать текущую задачу",
             Self::Status => "состояние сессии",
             Self::Backend => "сменить агента в этой теме (сброс контекста)",
+            Self::Limits => "лимиты подписок агентов",
             Self::Save => "сохранить снимок сессии этой темы",
             Self::Saves => "список снимков",
             Self::Restore => "продолжить сессию из снимка в этой теме",
@@ -71,7 +75,7 @@ impl Command {
             Self::Cwd => " <путь>",
             Self::Save => " [имя]",
             Self::Restore => " <имя> [каталог]",
-            Self::Help | Self::Reset | Self::Stop | Self::Status | Self::Saves => "",
+            Self::Help | Self::Reset | Self::Stop | Self::Status | Self::Saves | Self::Limits => "",
         }
     }
 
@@ -218,17 +222,17 @@ mod tests {
             assert!((1..=256).contains(&command.description().chars().count()));
             assert_eq!(Command::parse(name), Some(command));
         }
-        assert_eq!(names.len(), 10);
+        assert_eq!(names.len(), 11);
     }
 
     #[test]
-    fn snapshot_commands_sit_before_help() {
+    fn limits_sit_after_status_and_snapshots_before_help() {
         let names: Vec<_> = Command::ALL.into_iter().map(Command::name).collect();
         assert_eq!(
             names,
             [
-                "new", "backend", "cwd", "reset", "stop", "status", "save", "saves", "restore",
-                "help"
+                "new", "backend", "cwd", "reset", "stop", "status", "limits", "save", "saves",
+                "restore", "help"
             ]
         );
     }
@@ -369,6 +373,8 @@ mod tests {
     #[case("/save snap", Input::Command { command: Command::Save, args: vec!["snap"] })]
     #[case("/saves", Input::Command { command: Command::Saves, args: vec![] })]
     #[case("/restore snap shop", Input::Command { command: Command::Restore, args: vec!["snap", "shop"] })]
+    #[case("/limits", Input::Command { command: Command::Limits, args: vec![] })]
+    #[case("/limits@agent_hub_bot", Input::Command { command: Command::Limits, args: vec![] })]
     #[case("/start", Input::Command { command: Command::Help, args: vec![] })]
     #[case("/STOP", Input::Command { command: Command::Stop, args: vec![] })]
     #[case("/cwd@agent_hub_bot x", Input::Command { command: Command::Cwd, args: vec!["x"] })]
