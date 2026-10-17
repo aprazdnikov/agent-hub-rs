@@ -34,6 +34,9 @@ impl QuotaCache {
     /// cached one of its kind, others keep their values, a missing plan keeps the cached plan.
     /// An update never clears data.
     pub fn apply(&mut self, update: QuotaUpdate, at: DateTime<Utc>) {
+        if update.windows().is_empty() && update.plan.is_none() {
+            return;
+        }
         let backend = update.backend;
         let entry = self.entries.entry(backend).or_insert_with(|| Cached {
             plan: None,
@@ -173,8 +176,16 @@ mod tests {
         cache.apply(update(BackendKind::Claude, None, Vec::new()), at(T2));
         assert_eq!(
             cache.settle((BackendKind::Claude, Err("сбой".to_owned())), at(T3)),
-            cached(BackendKind::Claude, Some("Max"), vec![window(WindowKind::Week, 7)], T2)
+            cached(BackendKind::Claude, Some("Max"), vec![window(WindowKind::Week, 7)], T1)
         );
+    }
+
+    #[test]
+    fn an_empty_update_creates_no_entry() {
+        let mut cache = QuotaCache::default();
+        cache.apply(update(BackendKind::Claude, None, Vec::new()), at(T1));
+        let report = cache.settle((BackendKind::Claude, Err("сбой".to_owned())), at(T2));
+        assert!(matches!(report.source, QuotaSource::Unavailable(_)), "{report:?}");
     }
 
     #[test]
