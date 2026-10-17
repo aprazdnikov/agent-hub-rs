@@ -9,10 +9,13 @@ mod tests {
     use hub_agent::channel::UserChannel;
     use hub_agent::conversation::{Conversation, Limits};
     use hub_claude::session::converse;
+    use hub_claude::usage::{EVENT_SCALE, Scale};
+    use hub_core::domain::BackendKind;
     use hub_core::domain::{
         AgentEvent, Decision, Denied, FileDelivery, Finished, OutgoingFile, Prompt, Question,
         QuestionAnswer, QuestionsOutcome, SessionId, ToolRequest, Usage,
     };
+    use hub_core::quota::{Percent, QuotaUpdate, UsageWindow, WindowKind};
     use rust_decimal::Decimal;
     use serde_json::{Value, json};
     use tokio::io::{
@@ -243,6 +246,44 @@ mod tests {
             ]
         );
         assert!(leftover.try_recv().is_err());
+    }
+
+    fn rate_limit(info: &Value) -> Value {
+        json!({"type": "rate_limit_event", "rate_limit_info": info, "uuid": "u", "session_id": "s"})
+    }
+
+    #[tokio::test]
+    async fn rate_limit_events_become_quota_updates() {
+        let utilization = match EVENT_SCALE {
+            Scale::Fraction => 0.62,
+            Scale::Percent => 62.0,
+        };
+        let mut harness = Harness::start(FakeChannel::allowing(), limits());
+        harness.cli.handshake().await;
+        harness.cli.send(&rate_limit(&json!({"status": "allowed"}))).await;
+        harness
+            .cli
+            .send(&rate_limit(&json!({"status": "allowed_warning", "rateLimitType": "five_hour",
+                                      "utilization": utilization, "resetsAt": 1_792_160_000})))
+            .await;
+        harness.cli.send(&text("Привет")).await;
+        harness.cli.send(&result(None)).await;
+
+        let (events, _leftover, _cli) = harness.finish().await;
+        let window = UsageWindow {
+            kind: WindowKind::FiveHour,
+            percent: Percent::from_int(62),
+            resets_at: Some("2026-10-16T14:13:20Z".parse().unwrap()),
+        };
+        assert_eq!(
+            events,
+            [
+                AgentEvent::Quota(QuotaUpdate::new(BackendKind::Claude, None, vec![window])),
+                AgentEvent::SessionStarted(session()),
+                AgentEvent::AssistantText("Привет".to_owned()),
+                finished(0)
+            ]
+        );
     }
 
     #[tokio::test]

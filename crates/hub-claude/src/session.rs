@@ -22,6 +22,7 @@ use crate::mcp::{self, McpStep};
 use crate::outgoing;
 use crate::permissions::{self, Route};
 use crate::tracker::SessionTracker;
+use crate::usage;
 use crate::wire::{self, ControlReply, ControlRequest, Incoming};
 use hub_agent::channel::UserChannel;
 use hub_agent::conversation::Conversation;
@@ -252,11 +253,16 @@ impl State {
                     .await;
                 Flow::Stop
             }
+            Incoming::RateLimitEvent { rate_limit_info } => {
+                let Some(update) = usage::event_update(&rate_limit_info, usage::EVENT_SCALE) else {
+                    return Flow::Continue;
+                };
+                if self.emit(AgentEvent::Quota(update)).await { Flow::Continue } else { Flow::Stop }
+            }
             Incoming::System(_)
             | Incoming::Assistant(_)
             | Incoming::User(_)
             | Incoming::Result(_)
-            | Incoming::RateLimitEvent { .. }
             | Incoming::Other => {
                 self.activity.observe(&message);
                 let background = self.activity.background().len();
