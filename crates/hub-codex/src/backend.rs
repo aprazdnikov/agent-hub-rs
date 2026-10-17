@@ -64,7 +64,7 @@ impl CodexBackend {
             let channel = Arc::clone(&channel);
             Box::pin(async move { requests::answer(channel.as_ref(), &method, params).await })
         });
-        let mut server = match AppServer::spawn(&self.cli, handler) {
+        let mut server = match AppServer::spawn(&self.cli, handler, Stderr::Log) {
             Ok(server) => server,
             Err(error) => {
                 fail(&conversation, format!("Не удалось запустить Codex: {error}")).await;
@@ -181,7 +181,7 @@ async fn open(
 }
 
 /// The handshake, then how Codex is logged in.
-async fn handshake(client: &RpcClient) -> Result<CodexAuth, RpcError> {
+pub(crate) async fn handshake(client: &RpcClient) -> Result<CodexAuth, RpcError> {
     client.request(Call::Initialize.method(), initialize_params()).await?;
     client.notify(Call::Initialized.method()).await?;
     Ok(auth_state(&client.request(Call::AccountRead.method(), json!({})).await?))
@@ -226,40 +226,61 @@ pub enum ProbeError {
     Rpc(#[from] RpcError),
 }
 
+/// For runs that serve no requests of the agent: every one is answered "unsupported".
+pub(crate) fn refusing() -> Handler {
+    Arc::new(|method, _params| Box::pin(async move { Err(RequestError::Unsupported(method)) }))
+}
+
 pub async fn probe_auth(cli: &Path, settings: &CodexSettings) -> Result<CodexAuth, ProbeError> {
-    let refuse: Handler =
-        Arc::new(|method, _params| Box::pin(async move { Err(RequestError::Unsupported(method)) }));
-    let server = AppServer::spawn(cli, refuse).map_err(ProbeError::Spawn)?;
+    let server = AppServer::spawn(cli, refusing(), Stderr::Log).map_err(ProbeError::Spawn)?;
     let auth = probe(&server.client, settings).await;
     server.stop().await;
     Ok(auth?)
 }
 
-struct AppServer {
-    client: RpcClient,
+/// Where the app-server's stderr goes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Stderr {
+    /// Line by line into the log.
+    Log,
+    /// Dropped: a run that must not leak the server's text anywhere.
+    Discard,
+}
+
+pub(crate) struct AppServer {
+    pub(crate) client: RpcClient,
     notifications: mpsc::UnboundedReceiver<Notification>,
     reader: JoinHandle<()>,
     child: Child,
 }
 
 impl AppServer {
-    fn spawn(cli: &Path, handler: Handler) -> io::Result<Self> {
+    pub(crate) fn spawn(cli: &Path, handler: Handler, stderr: Stderr) -> io::Result<Self> {
         let mut command = Command::new(cli);
         command
             .arg("app-server")
             .env_remove(HIDDEN_FROM_CHILD)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
+            .stderr(match stderr {
+                Stderr::Log => Stdio::piped(),
+                Stderr::Discard => Stdio::null(),
+            })
             .kill_on_drop(true);
         hide_window(&mut command);
         let mut child = command.spawn()?;
-        let (Some(stdin), Some(stdout), Some(stderr)) =
-            (child.stdin.take(), child.stdout.take(), child.stderr.take())
-        else {
+        let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             return Err(io::Error::other("app-server started without standard streams"));
         };
-        tokio::spawn(log_stderr(stderr));
+        match stderr {
+            Stderr::Log => {
+                let Some(piped) = child.stderr.take() else {
+                    return Err(io::Error::other("app-server started without standard streams"));
+                };
+                tokio::spawn(log_stderr(piped));
+            }
+            Stderr::Discard => {}
+        }
         let wire =
             Wire { peer: "codex app-server", envelope: Envelope::Bare, timeout: REQUEST_TIMEOUT };
         let Connection { client, notifications, reader } =
@@ -267,7 +288,7 @@ impl AppServer {
         Ok(Self { client, notifications, reader, child })
     }
 
-    async fn stop(mut self) {
+    pub(crate) async fn stop(mut self) {
         self.client.close();
         if tokio::time::timeout(EXIT_TIMEOUT, self.child.wait()).await.is_err() {
             tracing::warn!("codex app-server did not exit on stdin close, killing it");

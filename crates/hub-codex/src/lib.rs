@@ -5,4 +5,5 @@ pub mod requests;
 pub mod session;
 #[cfg(test)]
 mod testing;
+pub mod usage;
 pub mod version;

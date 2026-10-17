@@ -1,6 +1,5 @@
 //! The app-server side of a duplex pipe, and a scripted human, for tests.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -8,7 +7,7 @@ use tokio::io::{
     AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, Lines, ReadHalf, WriteHalf,
 };
 
-use hub_agent::rpc::{Connection, Envelope, Handler, RequestError, Wire, connect};
+use hub_agent::rpc::{Connection, Envelope, Handler, Wire, connect};
 
 pub struct Peer {
     lines: Lines<BufReader<ReadHalf<DuplexStream>>>,
@@ -40,9 +39,7 @@ pub fn pair(handler: Handler, timeout: Duration) -> (Connection, Peer) {
     (connection, Peer { lines: BufReader::new(their_read).lines(), writer: their_write })
 }
 
-pub fn refusing() -> Handler {
-    Arc::new(|method, _params| Box::pin(async move { Err(RequestError::Unsupported(method)) }))
-}
+pub(crate) use crate::backend::refusing;
 
 use std::sync::Mutex;
 
