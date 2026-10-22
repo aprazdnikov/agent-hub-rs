@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agent-hub — агенты Claude, Codex, Qwen и Hermes в Telegram</title>
+<meta name="description" content="Каждая тема Telegram-группы — отдельная сессия Claude Code, Codex, Qwen или Hermes на вашем компьютере. Задачи с телефона, разрешения кнопками.">
+<meta property="og:type" content="website">
+<meta property="og:title" content="agent-hub — агенты работают, пока вы в дороге">
+<meta property="og:description" content="Каждая тема Telegram-группы — отдельная сессия Claude Code, Codex, Qwen или Hermes на вашем компьютере.">
+<meta property="og:url" content="https://aprazdnikov.github.io/agent-hub-rs/">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232b7de9'/%3E%3Cpath d='M8 16h16M16 8v16' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700&family=Onest:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one narrow column; hero splits text | phone with a forum, then short blocks, one CTA at the end */
+:root {
+  --bg: #f3f5f8;
+  --surface: #ffffff;
+  --ink: #142033;
+  --muted: #5b6b80;
+  --line: #d9e0ea;
+  --accent: #2b7de9;
+  --accent-ink: #ffffff;
+  --ok: #1f9d55;
+  --wait: #c27b0c;
+  --chat: #e7eef7;
+  --bubble: #ffffff;
+  --mine: #d7ecff;
+  --display: "Unbounded", "Segoe UI", system-ui, sans-serif;
+  --body: "Onest", "Segoe UI", system-ui, sans-serif;
+  --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #0e1520; --surface: #151f2e; --ink: #e6edf6; --muted: #93a3b8; --line: #263347;
+    --accent: #5aa2ff; --accent-ink: #08111d; --ok: #4cc785; --wait: #e6a640;
+    --chat: #101a28; --bubble: #1b2738; --mine: #1d3a5c; color-scheme: dark;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #0e1520; --surface: #151f2e; --ink: #e6edf6; --muted: #93a3b8; --line: #263347;
+  --accent: #5aa2ff; --accent-ink: #08111d; --ok: #4cc785; --wait: #e6a640;
+  --chat: #101a28; --bubble: #1b2738; --mine: #1d3a5c; color-scheme: dark;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 400 17px/1.55 var(--body); }
+.wrap { max-width: 1040px; margin: 0 auto; padding-inline: 20px; padding-block: 0 64px; }
+a { color: var(--accent); }
+
+nav { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-block: 24px 0; flex-wrap: wrap; }
+.logo { font: 700 18px var(--display); letter-spacing: -.01em; }
+.logo span { color: var(--accent); }
+nav .links { display: flex; gap: 20px; font-size: 15px; }
+nav .links a { color: var(--muted); text-decoration: none; }
+
+.hero { display: grid; grid-template-columns: 1.1fr .9fr; gap: 48px; align-items: center; padding-block: 56px 40px; }
+.hero > * { min-width: 0; }
+h1 { font: 700 clamp(30px, 5vw, 50px)/1.08 var(--display); letter-spacing: -.02em; margin: 0 0 20px; text-wrap: balance; }
+.lead { font-size: 19px; color: var(--muted); max-width: 34em; margin: 0 0 28px; }
+.lead b { color: var(--ink); font-weight: 600; }
+.cta { display: flex; gap: 12px; flex-wrap: wrap; }
+.btn { display: inline-flex; align-items: center; gap: 8px; padding: 13px 20px; border-radius: 10px; font: 600 16px var(--body); text-decoration: none; border: 1px solid var(--line); color: var(--ink); background: var(--surface); }
+.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.btn:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
+.fine { margin-top: 16px; font-size: 14px; color: var(--muted); }
+
+/* phone with a Telegram forum */
+.phone { background: var(--chat); border: 1px solid var(--line); border-radius: 28px; padding: 14px; max-width: 380px; width: 100%; justify-self: center; box-shadow: 0 24px 60px -30px rgba(20, 32, 51, .45); }
+.phone header { display: flex; justify-content: space-between; font: 600 14px var(--body); padding: 4px 6px 12px; }
+.phone header small { color: var(--muted); font-weight: 400; }
+.topics { display: grid; gap: 6px; margin-bottom: 12px; }
+.topic { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; background: var(--bubble); border-radius: 12px; padding: 9px 12px; font-size: 14px; }
+.topic b { font-weight: 600; }
+.topic .who { font: 12px var(--mono); color: var(--muted); }
+.st { font-size: 12px; font-weight: 600; align-self: center; grid-row: span 2; }
+.st.ok { color: var(--ok); } .st.wait { color: var(--wait); } .st.run { color: var(--accent); }
+.msg { background: var(--bubble); border-radius: 14px; padding: 10px 12px; font-size: 14px; line-height: 1.45; }
+.msg + .msg { margin-top: 8px; }
+.msg.mine { background: var(--mine); margin-left: 40px; }
+.msg code { font: 12.5px var(--mono); }
+.keys { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 8px; }
+.keys span { text-align: center; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 7px; font-size: 13px; font-weight: 600; color: var(--accent); }
+
+.story { display: grid; grid-template-columns: auto 1fr; gap: 28px; align-items: center; background: var(--surface); border: 1px solid var(--line); border-radius: 18px; padding: 28px 32px; margin-block: 8px 56px; }
+.story .num { font: 700 56px/1 var(--display); color: var(--accent); font-variant-numeric: tabular-nums; }
+.story .num small { display: block; font: 500 14px var(--body); color: var(--muted); margin-top: 6px; }
+.story p { margin: 0; max-width: 40em; }
+
+h2 { font: 700 clamp(22px, 3vw, 30px)/1.2 var(--display); letter-spacing: -.01em; margin: 0 0 24px; text-wrap: balance; }
+.features { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 32px 40px; margin-bottom: 64px; }
+.feature h3 { font: 600 18px var(--body); margin: 0 0 6px; }
+.feature p { margin: 0; color: var(--muted); }
+.feature code { font: 14px var(--mono); color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; }
+
+.flow { overflow-x: auto; margin-bottom: 64px; }
+.flow ol { display: flex; gap: 12px; list-style: none; padding: 0; margin: 0; min-width: 640px; }
+.flow li { flex: 1; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 16px; font-size: 15px; position: relative; }
+.flow li b { display: block; font: 600 15px var(--body); margin-bottom: 4px; }
+.flow li span { color: var(--muted); font-size: 14px; }
+.flow li + li::before { content: "→"; position: absolute; left: -12px; top: 50%; transform: translate(-50%, -50%); color: var(--muted); }
+.flow p { color: var(--muted); font-size: 15px; margin: 14px 0 0; }
+
+.steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; counter-reset: s; margin-bottom: 64px; }
+.steps div { counter-increment: s; }
+.steps div::before { content: counter(s); display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%; background: var(--accent); color: var(--accent-ink); font: 700 15px var(--display); margin-bottom: 10px; }
+.steps b { display: block; margin-bottom: 4px; }
+.steps span { color: var(--muted); font-size: 15px; }
+
+.final { text-align: left; background: var(--ink); color: var(--bg); border-radius: 20px; padding: 36px 32px; display: grid; gap: 20px; }
+.final h2 { color: var(--bg); margin: 0; }
+.final p { margin: 0; opacity: .8; max-width: 40em; }
+.final .btn { background: transparent; color: var(--bg); border-color: color-mix(in srgb, var(--bg) 35%, transparent); }
+.final .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+
+@media (max-width: 760px) {
+  .hero { grid-template-columns: 1fr; gap: 36px; padding-block: 32px 24px; }
+  .features, .steps { grid-template-columns: 1fr; }
+  .story { grid-template-columns: 1fr; padding: 22px; gap: 12px; }
+  nav .links { display: none; }
+}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <nav>
+    <div class="logo">agent<span>-</span>hub</div>
+    <div class="links"><a href="#how">Как устроено</a><a href="#start">Начать</a><a href="https://github.com/aprazdnikov/agent-hub-rs">GitHub</a></div>
+  </nav>
+
+  <section class="hero">
+    <div>
+      <h1>Агенты работают, пока вы в дороге</h1>
+      <p class="lead">Каждая тема Telegram-группы — отдельная сессия <b>Claude Code, Codex, Qwen или Hermes</b> на вашем компьютере. Ставите задачу с телефона, разрешаете команды кнопкой, получаете результат.</p>
+      <div class="cta">
+        <a class="btn primary" href="https://github.com/aprazdnikov/agent-hub-rs/releases/latest">Скачать</a>
+        <a class="btn" href="https://github.com/aprazdnikov/agent-hub-rs">★ Звезда на GitHub</a>
+      </div>
+      <p class="fine">Для Windows, macOS и Linux · открытый код · без стороннего сервера</p>
+    </div>
+
+    <div class="phone" aria-label="Пример форум-группы в Telegram">
+      <header>Мои агенты <small>4 темы</small></header>
+      <div class="topics">
+        <div class="topic"><b>backend: тесты</b><span class="st ok">✅ готово</span><span class="who">Claude · ~/shop/backend</span></div>
+        <div class="topic"><b>agent-hub: релиз</b><span class="st run">⏳ работает</span><span class="who">Codex · ~/agent-hub</span></div>
+        <div class="topic"><b>миграция БД</b><span class="st wait">❓ ждёт вас</span><span class="who">Claude · ~/shop/db</span></div>
+      </div>
+      <div class="msg mine">Прогони миграции на тестовой базе и покажи diff схемы</div>
+      <div class="msg">Нужно разрешение на команду:<br><code>make migrate ENV=test</code>
+        <div class="keys"><span>Разрешить</span><span>Отклонить</span></div>
+      </div>
+    </div>
+  </section>
+
+  <section class="story">
+    <div class="num">6+<small>задач за 3–4 часа</small></div>
+    <p>Пришлось срочно уехать, а задач было много. Пока ездил, в шести темах шли шесть сессий: я ставил задачи, отвечал на вопросы и подтверждал команды с телефона. Вернулся к готовым результатам.</p>
+  </section>
+
+  <section>
+    <h2>Что умеет</h2>
+    <div class="features">
+      <div class="feature"><h3>Тема — это сессия</h3><p>Создали тему — получили агента в своей рабочей директории. Темы работают параллельно, контекст переживает перезапуски.</p></div>
+      <div class="feature"><h3>Разрешения кнопками</h3><p>Команды и правки файлов агент спрашивает кнопками прямо в теме. Вопросы с вариантами ответа тоже.</p></div>
+      <div class="feature"><h3>Снимки сессий</h3><p><code>/save</code> сохраняет сессию, <code>/restore</code> продолжает её в новой теме.</p></div>
+      <div class="feature"><h3>Лимиты подписок</h3><p><code>/limits</code> показывает, сколько осталось в окнах Claude и Codex и когда сброс.</p></div>
+    </div>
+  </section>
+
+  <section id="how" class="flow">
+    <h2>Как устроено</h2>
+    <ol>
+      <li><b>Telegram</b><span>форум-группа, темы</span></li>
+      <li><b>Ваш бот</b><span>токен от @BotFather</span></li>
+      <li><b>agent-hub</b><span>приложение в трее на вашем компьютере</span></li>
+      <li><b>CLI агентов</b><span>claude, codex, qwen, hermes</span></li>
+    </ol>
+    <p>Код и ключи остаются на вашем компьютере. Пишут боту только пользователи из вашего списка.</p>
+  </section>
+
+  <section id="start">
+    <h2>Начать за 5 минут</h2>
+    <div class="steps">
+      <div><b>Скачайте</b><span>архив своей платформы со страницы релизов</span></div>
+      <div><b>Создайте бота и группу</b><span>включите темы, сделайте бота администратором</span></div>
+      <div><b>Вставьте токен</b><span>в окно настроек — и создайте первую тему</span></div>
+    </div>
+  </section>
+
+  <section class="final">
+    <h2>Попробуйте на своих задачах</h2>
+    <p>agent-hub — открытый проект на Rust. Если пригодился, поставьте звезду. Нашли ошибку или хотите новый агент — приходите с issue и PR.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/aprazdnikov/agent-hub-rs/releases/latest">Скачать</a>
+      <a class="btn" href="https://github.com/aprazdnikov/agent-hub-rs">★ GitHub</a>
+      <a class="btn" href="https://github.com/aprazdnikov/agent-hub-rs/issues">Issues</a>
+    </div>
+  </section>
+</div>
+</body>
+</html>

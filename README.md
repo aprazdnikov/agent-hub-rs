@@ -2,6 +2,8 @@
 
 [![Architecture diagram](https://gitdiagram.com/diagram-badge.svg)](https://gitdiagram.com/aprazdnikov/agent-hub-rs?utm_source=readme&utm_medium=badge)
 
+Сайт: **[aprazdnikov.github.io/agent-hub-rs](https://aprazdnikov.github.io/agent-hub-rs/)**
+
 **Каждая тема Telegram-группы — отдельная сессия Claude Code, Codex, Qwen Code или Hermes на вашем компьютере.**
 
 Создали тему «Починить тесты в backend» — получили новую сессию агента. Пишете в тему задачу,
