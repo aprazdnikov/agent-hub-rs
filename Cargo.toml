@@ -3,7 +3,7 @@ resolver = "3"
 members = ["crates/hub-core", "crates/hub-agent", "crates/hub-claude", "crates/hub-codex", "crates/hub-qwen", "crates/hub-hermes", "crates/hub-telegram", "crates/hub-app"]
 
 [workspace.package]
-version = "0.6.1"
+version = "0.6.2"
 edition = "2024"
 rust-version = "1.96"
 license = "MIT"
