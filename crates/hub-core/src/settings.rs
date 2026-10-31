@@ -273,6 +273,14 @@ pub struct HermesSettings {
     pub model: Option<String>,
 }
 
+/// Overrides only; authentication and provider setup remain with the `OpenCode` operator.
+/// `model` is an `OpenCode` model id: `provider/model`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpencodeSettings {
+    pub cli: Option<PathBuf>,
+    pub model: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
     pub approval: Duration,
@@ -290,6 +298,7 @@ pub struct Settings {
     pub codex: CodexSettings,
     pub qwen: QwenSettings,
     pub hermes: HermesSettings,
+    pub opencode: OpencodeSettings,
     pub timeouts: Timeouts,
     pub updates: UpdateCheck,
 }
@@ -311,6 +320,13 @@ pub enum Field {
     Codex(CodexField),
     Qwen(QwenField),
     Hermes(HermesField),
+    Opencode(OpencodeField),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpencodeField {
+    Cli,
+    Model,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -431,6 +447,22 @@ impl HermesDraft {
 }
 
 /// The settings form as typed by the user.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct OpencodeDraft {
+    pub cli: String,
+    pub model: String,
+}
+
+impl OpencodeDraft {
+    fn parse(&self, home: &Path, errors: &mut Vec<FieldError>) -> Option<OpencodeSettings> {
+        let Self { cli, model } = self;
+        let cli = check(errors, Field::Opencode(OpencodeField::Cli), parse_cli(cli, home));
+        let model = check(errors, Field::Opencode(OpencodeField::Model), parse_model(model));
+        Some(OpencodeSettings { cli: cli?, model: model? })
+    }
+}
+
+/// The settings form as typed by the user.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Draft {
     pub token: String,
@@ -446,6 +478,7 @@ pub struct Draft {
     pub codex: CodexDraft,
     pub qwen: QwenDraft,
     pub hermes: HermesDraft,
+    pub opencode: OpencodeDraft,
     pub approval_timeout: String,
     pub background_timeout: String,
     pub updates: UpdateCheck,
@@ -467,6 +500,7 @@ impl Default for Draft {
             codex: CodexDraft::default(),
             qwen: QwenDraft::default(),
             hermes: HermesDraft::default(),
+            opencode: OpencodeDraft::default(),
             approval_timeout: DEFAULT_APPROVAL_TIMEOUT.as_secs().to_string(),
             background_timeout: DEFAULT_BACKGROUND_TIMEOUT.as_secs().to_string(),
             updates: UpdateCheck::Enabled,
@@ -490,6 +524,7 @@ impl fmt::Debug for Draft {
             codex,
             qwen,
             hermes,
+            opencode,
             approval_timeout,
             background_timeout,
             updates,
@@ -508,6 +543,7 @@ impl fmt::Debug for Draft {
             .field("codex", codex)
             .field("qwen", qwen)
             .field("hermes", hermes)
+            .field("opencode", opencode)
             .field("approval_timeout", approval_timeout)
             .field("background_timeout", background_timeout)
             .field("updates", updates)
@@ -545,6 +581,7 @@ impl Draft {
             .map_err(|error| errors.push(error))
             .ok();
         let hermes = self.hermes.parse(home, &mut errors);
+        let opencode = self.opencode.parse(home, &mut errors);
         let approval =
             check(&mut errors, Field::ApprovalTimeout, parse_seconds(&self.approval_timeout));
         let background =
@@ -565,6 +602,7 @@ impl Draft {
             Some(qwen_model),
             Some(endpoint),
             Some(hermes),
+            Some(opencode),
             Some(approval),
             Some(background),
         ) = (
@@ -583,6 +621,7 @@ impl Draft {
             qwen_model,
             endpoint,
             hermes,
+            opencode,
             approval,
             background,
         )
@@ -609,6 +648,7 @@ impl Draft {
                 endpoint,
             },
             hermes,
+            opencode,
             timeouts: Timeouts { approval, background },
             updates: self.updates,
         })
@@ -690,6 +730,15 @@ impl Draft {
                     .unwrap_or_default(),
                 profile: settings.hermes.profile.clone().unwrap_or_default(),
                 model: settings.hermes.model.clone().unwrap_or_default(),
+            },
+            opencode: OpencodeDraft {
+                cli: settings
+                    .opencode
+                    .cli
+                    .as_ref()
+                    .map(|cli| cli.display().to_string())
+                    .unwrap_or_default(),
+                model: settings.opencode.model.clone().unwrap_or_default(),
             },
             approval_timeout: settings.timeouts.approval.as_secs().to_string(),
             background_timeout: settings.timeouts.background.as_secs().to_string(),
@@ -857,6 +906,8 @@ pub struct SettingsFile {
     pub qwen: QwenFile,
     #[serde(default)]
     pub hermes: HermesFile,
+    #[serde(default)]
+    pub opencode: OpencodeFile,
     /// Left out when it holds nothing: versions before 0.5.0 refuse an unknown `[snapshots]`.
     #[serde(default, skip_serializing_if = "SnapshotsFile::is_empty")]
     pub snapshots: SnapshotsFile,
@@ -920,6 +971,14 @@ pub struct QwenFile {
 pub struct HermesFile {
     pub cli: Option<String>,
     pub profile: Option<String>,
+    pub model: Option<String>,
+}
+
+/// `OpenCode` overrides; credentials remain in the operator's own `OpenCode` setup.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OpencodeFile {
+    pub cli: Option<String>,
     pub model: Option<String>,
 }
 
@@ -995,6 +1054,10 @@ impl SettingsFile {
                 cli: settings.hermes.cli.as_ref().map(|cli| cli.display().to_string()),
                 profile: settings.hermes.profile.clone(),
                 model: settings.hermes.model.clone(),
+            },
+            opencode: OpencodeFile {
+                cli: settings.opencode.cli.as_ref().map(|cli| cli.display().to_string()),
+                model: settings.opencode.model.clone(),
             },
             snapshots: SnapshotsFile {
                 dir: (settings.snapshots_dir != home.join(DEFAULT_SNAPSHOTS_DIR))
@@ -1081,6 +1144,10 @@ impl SettingsFile {
                 cli: self.hermes.cli.clone().unwrap_or_default(),
                 profile: self.hermes.profile.clone().unwrap_or_default(),
                 model: self.hermes.model.clone().unwrap_or_default(),
+            },
+            opencode: OpencodeDraft {
+                cli: self.opencode.cli.clone().unwrap_or_default(),
+                model: self.opencode.model.clone().unwrap_or_default(),
             },
             approval_timeout: self
                 .timeouts
@@ -1427,6 +1494,83 @@ mod tests {
     }
 
     #[test]
+    fn opencode_file_section_and_default_are_supported() {
+        let text = "[telegram]\nchat = -100\nusers = [1]\n\
+                    [workspace]\nroot = \"~/w\"\n\
+                    [agents]\ndefault = \"opencode\"\n\
+                    [opencode]\ncli = \"~/bin/opencode\"\nmodel = \"opencode/big-pickle\"\n";
+        let file: SettingsFile = toml::from_str(text).unwrap();
+        let keys =
+            Keys { token: "1:a".to_owned(), api_key: String::new(), qwen_key: String::new() };
+        let settings = file.to_draft(keys).unwrap().parse(&home()).unwrap();
+        assert_eq!(
+            (settings.default_backend.name(), settings.opencode),
+            (
+                "opencode",
+                OpencodeSettings {
+                    cli: Some(home().join("bin/opencode")),
+                    model: Some("opencode/big-pickle".to_owned()),
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn opencode_defaults_preserve_the_operators_setup() {
+        assert_eq!(
+            draft().parse(&home()).unwrap().opencode,
+            OpencodeSettings { cli: None, model: None }
+        );
+    }
+
+    #[test]
+    fn opencode_draft_and_file_round_trip() {
+        let input = Draft {
+            default_backend: BackendKind::Opencode,
+            opencode: OpencodeDraft {
+                cli: " ~/bin/opencode ".to_owned(),
+                model: " anthropic/claude-sonnet-4 ".to_owned(),
+            },
+            ..draft()
+        };
+        let settings = input.parse(&home()).unwrap();
+        let text = toml::to_string(&SettingsFile::from_settings(&settings, &home())).unwrap();
+        let file: SettingsFile = toml::from_str(&text).unwrap();
+        let keys = Keys { token: input.token, api_key: String::new(), qwen_key: String::new() };
+        assert_eq!(
+            (
+                Draft::from_settings(&settings).parse(&home()).unwrap(),
+                file.to_draft(keys).unwrap().parse(&home()).unwrap(),
+            ),
+            (settings.clone(), settings)
+        );
+    }
+
+    #[rstest]
+    #[case::relative_cli(OpencodeDraft { cli: "opencode".to_owned(), model: String::new() }, OpencodeField::Cli)]
+    #[case::spaced_model(OpencodeDraft { cli: String::new(), model: "bad model".to_owned() }, OpencodeField::Model)]
+    fn opencode_invalid_values_report_their_field(
+        #[case] opencode: OpencodeDraft,
+        #[case] field: OpencodeField,
+    ) {
+        let errors = Draft { opencode, ..draft() }.parse(&home()).unwrap_err();
+        assert_eq!(
+            errors.iter().map(|error| error.field).collect::<Vec<_>>(),
+            [Field::Opencode(field)]
+        );
+    }
+
+    #[rstest]
+    #[case("api_key")]
+    #[case("profile")]
+    fn opencode_file_rejects_unsupported_fields(#[case] name: &str) {
+        let text = format!(
+            "[telegram]\nchat = -100\nusers = [1]\n[workspace]\nroot = \"~/w\"\n[opencode]\n{name} = \"x\"\n"
+        );
+        assert!(toml::from_str::<SettingsFile>(&text).is_err());
+    }
+
+    #[test]
     fn debug_output_hides_token() {
         let settings = draft().parse(&home()).unwrap();
         assert!(!format!("{settings:?}").contains("123:abc"));
@@ -1511,6 +1655,7 @@ root = \"~/w\"
         assert_eq!(draft.codex, CodexDraft::default());
         assert_eq!(draft.qwen, QwenDraft::default());
         assert_eq!(draft.hermes, HermesDraft::default());
+        assert_eq!(draft.opencode, OpencodeDraft::default());
     }
 
     #[rstest]

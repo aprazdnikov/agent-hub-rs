@@ -3,11 +3,11 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>agent-hub — агенты Claude, Codex, Qwen и Hermes в Telegram</title>
-<meta name="description" content="Каждая тема Telegram-группы — отдельная сессия Claude Code, Codex, Qwen или Hermes на вашем компьютере. Задачи с телефона, разрешения кнопками.">
+<title>agent-hub — агенты Claude, Codex, Qwen, Hermes и OpenCode в Telegram</title>
+<meta name="description" content="Каждая тема Telegram-группы — отдельная сессия Claude Code, Codex, Qwen, Hermes или OpenCode на вашем компьютере. Задачи с телефона, разрешения кнопками.">
 <meta property="og:type" content="website">
 <meta property="og:title" content="agent-hub — агенты работают, пока вы в дороге">
-<meta property="og:description" content="Каждая тема Telegram-группы — отдельная сессия Claude Code, Codex, Qwen или Hermes на вашем компьютере.">
+<meta property="og:description" content="Каждая тема Telegram-группы — отдельная сессия Claude Code, Codex, Qwen, Hermes или OpenCode на вашем компьютере.">
 <meta property="og:url" content="https://aprazdnikov.github.io/agent-hub-rs/">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232b7de9'/%3E%3Cpath d='M8 16h16M16 8v16' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
@@ -127,13 +127,13 @@ h2 { font: 700 clamp(22px, 3vw, 30px)/1.2 var(--display); letter-spacing: -.01em
 <div class="wrap">
   <nav>
     <div class="logo">agent<span>-</span>hub</div>
-    <div class="links"><a href="#how">Как устроено</a><a href="#start">Начать</a><a href="https://github.com/aprazdnikov/agent-hub-rs">GitHub</a></div>
+    <div class="links"><a href="#agents">Агенты</a><a href="#how">Как устроено</a><a href="#start">Начать</a><a href="https://github.com/aprazdnikov/agent-hub-rs">GitHub</a></div>
   </nav>
 
   <section class="hero">
     <div>
       <h1>Агенты работают, пока вы в дороге</h1>
-      <p class="lead">Каждая тема Telegram-группы — отдельная сессия <b>Claude Code, Codex, Qwen или Hermes</b> на вашем компьютере. Ставите задачу с телефона, разрешаете команды кнопкой, получаете результат.</p>
+      <p class="lead">Каждая тема Telegram-группы — отдельная сессия <b>Claude Code, Codex, Qwen, Hermes или OpenCode</b> на вашем компьютере. Ставите задачу с телефона, разрешаете команды кнопкой, получаете результат.</p>
       <div class="cta">
         <a class="btn primary" href="https://github.com/aprazdnikov/agent-hub-rs/releases/latest">Скачать</a>
         <a class="btn" href="https://github.com/aprazdnikov/agent-hub-rs">★ Звезда на GitHub</a>
@@ -170,13 +170,25 @@ h2 { font: 700 clamp(22px, 3vw, 30px)/1.2 var(--display); letter-spacing: -.01em
     </div>
   </section>
 
+  <section id="agents">
+    <h2>Пять агентов на выбор</h2>
+    <div class="features">
+      <div class="feature"><h3>Claude Code</h3><p>Основной агент: подписка Claude, лимиты в <code>/limits</code>, снимки сессий.</p></div>
+      <div class="feature"><h3>Codex</h3><p>Подписка ChatGPT или API-ключ OpenAI, песочница и одобрения, снимки сессий.</p></div>
+      <div class="feature"><h3>Qwen Code</h3><p>Бесплатный вход или любой OpenAI-совместимый адрес; досылка сообщений посреди хода.</p></div>
+      <div class="feature"><h3>Hermes</h3><p>Профили, память и скиллы Hermes; хаб запускает <code>hermes acp</code> и не трогает его ключи.</p></div>
+      <div class="feature"><h3>OpenCode — новый в 0.7.0</h3><p>Открытый агент с бесплатным провайдером: <code>npm i -g opencode-ai</code>, и тема уже работает через <code>opencode acp</code>. Модель в формате <code>провайдер/модель</code> задаётся в настройках; вход и разрешения инструментов — в самом OpenCode.</p></div>
+    </div>
+    <p>Агент выбирается на уровне темы: <code>/new opencode ~/shop</code> или <code>/backend opencode</code>. Один и тот же бот ведёт темы разных агентов параллельно.</p>
+  </section>
+
   <section id="how" class="flow">
     <h2>Как устроено</h2>
     <ol>
       <li><b>Telegram</b><span>форум-группа, темы</span></li>
       <li><b>Ваш бот</b><span>токен от @BotFather</span></li>
       <li><b>agent-hub</b><span>приложение в трее на вашем компьютере</span></li>
-      <li><b>CLI агентов</b><span>claude, codex, qwen, hermes</span></li>
+      <li><b>CLI агентов</b><span>claude, codex, qwen, hermes, opencode</span></li>
     </ol>
     <p>Код и ключи остаются на вашем компьютере. Пишут боту только пользователи из вашего списка.</p>
   </section>

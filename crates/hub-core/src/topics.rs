@@ -148,6 +148,18 @@ mod tests {
     }
 
     #[test]
+    fn opencode_topic_state_round_trips_with_version_one() {
+        let raw = format!(
+            r#"{{"version":1,"topics":[{{"chat_id":1,"thread_id":2,"backend":"opencode","cwd":{},"session_id":"o-1"}}]}}"#,
+            json_path("opencode")
+        );
+        let topics = parse_state(&raw).unwrap();
+        let dumped: serde_json::Value =
+            serde_json::from_str(&dump_state(&topics).unwrap()).unwrap();
+        assert_eq!(dumped, serde_json::from_str::<serde_json::Value>(&raw).unwrap());
+    }
+
+    #[test]
     fn python_written_state_is_read() {
         let raw = format!(
             r#"{{

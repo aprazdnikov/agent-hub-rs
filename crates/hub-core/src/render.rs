@@ -58,10 +58,12 @@ pub fn truncate(text: &str, limit: usize) -> String {
 pub fn format_finished(finished: &Finished) -> String {
     let usage = match &finished.usage {
         Usage::Claude { turns, cost } => format!(" · ходов: {turns}{}", cost_text(*cost)),
-        Usage::Codex { tokens } | Usage::Qwen { tokens } | Usage::Hermes { tokens } => tokens
-            .map_or_else(String::new, |tokens| {
-                format!(" · токенов в сессии: {}", group_thousands(tokens))
-            }),
+        Usage::Codex { tokens }
+        | Usage::Qwen { tokens }
+        | Usage::Hermes { tokens }
+        | Usage::Opencode { tokens } => tokens.map_or_else(String::new, |tokens| {
+            format!(" · токенов в сессии: {}", group_thousands(tokens))
+        }),
     };
     let pending = if finished.background == 0 {
         String::new()
@@ -222,6 +224,7 @@ const fn backend_title(kind: BackendKind) -> &'static str {
         BackendKind::Codex => "Codex",
         BackendKind::Qwen => "Qwen",
         BackendKind::Hermes => "Hermes",
+        BackendKind::Opencode => "OpenCode",
     }
 }
 
@@ -351,6 +354,18 @@ mod tests {
             session: SessionId::parse("h").unwrap(),
             usage: Usage::Hermes { tokens },
             background,
+        };
+        assert_eq!(format_finished(&finished), expected);
+    }
+
+    #[rstest]
+    #[case(None, "✅ Готово")]
+    #[case(Some(14_735), "✅ Готово · токенов в сессии: 14 735")]
+    fn opencode_finished_line(#[case] tokens: Option<u64>, #[case] expected: &str) {
+        let finished = Finished {
+            session: SessionId::parse("o").unwrap(),
+            usage: Usage::Opencode { tokens },
+            background: 0,
         };
         assert_eq!(format_finished(&finished), expected);
     }

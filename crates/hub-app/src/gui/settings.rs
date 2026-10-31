@@ -5,8 +5,8 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 use hub_core::domain::BackendKind;
 use hub_core::settings::{
-    ApiEndpoint, Approval, CodexField, Draft, Field, FieldError, HermesField, PermissionMode,
-    QwenApproval, QwenField, Sandbox, Settings, UpdateCheck,
+    ApiEndpoint, Approval, CodexField, Draft, Field, FieldError, HermesField, OpencodeField,
+    PermissionMode, QwenApproval, QwenField, Sandbox, Settings, UpdateCheck,
 };
 
 use crate::gui::log::LogAction;
@@ -129,6 +129,8 @@ impl SettingsForm {
             self.qwen(ui, &errors, endpoint);
             ui.separator();
             self.hermes(ui, &errors);
+            ui.separator();
+            self.opencode(ui, &errors);
             ui.separator();
             self.timeouts(ui, &errors);
         });
@@ -414,6 +416,29 @@ impl SettingsForm {
         ui.label("Вход и провайдер настраиваются в Hermes (`hermes setup`). Хаб запускает `hermes acp`, не меняя профиль и его секреты. Новые сообщения во время работы ждут следующего хода.");
     }
 
+    fn opencode(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
+        ui.heading("OpenCode");
+        ui.horizontal(|ui| {
+            ui.label("Путь к opencode");
+            ui.add(egui::TextEdit::singleline(&mut self.draft.opencode.cli).hint_text("из PATH"));
+            if ui.button("Выбрать…").clicked()
+                && let Some(path) = pick_file(&self.draft.opencode.cli)
+            {
+                self.draft.opencode.cli = path;
+            }
+        });
+        messages(ui, errors, Field::Opencode(OpencodeField::Cli));
+        ui.horizontal(|ui| {
+            ui.label("Модель");
+            ui.add(
+                egui::TextEdit::singleline(&mut self.draft.opencode.model)
+                    .hint_text("провайдер/модель из настроек OpenCode"),
+            );
+        });
+        messages(ui, errors, Field::Opencode(OpencodeField::Model));
+        ui.label("Вход и провайдеры настраиваются в OpenCode (`opencode auth login`). Хаб запускает `opencode acp`, не меняя его конфигурацию и секреты. Новые сообщения во время работы ждут следующего хода.");
+    }
+
     fn timeouts(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
         ui.heading("Таймауты и обновления");
         ui.horizontal(|ui| {
@@ -509,6 +534,8 @@ mod tests {
             .collect();
         assert!(labels.iter().any(|label| label == "Hermes"), "Hermes section missing");
         assert!(labels.iter().any(|label| label == "Профиль"), "Hermes profile missing");
+        assert!(labels.iter().any(|label| label == "OpenCode"), "OpenCode section missing");
+        assert!(labels.iter().any(|label| label == "Путь к opencode"), "OpenCode cli missing");
     }
 
     #[test]
