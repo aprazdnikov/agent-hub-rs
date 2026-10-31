@@ -127,7 +127,7 @@ h2 { font: 700 clamp(22px, 3vw, 30px)/1.2 var(--display); letter-spacing: -.01em
 <div class="wrap">
   <nav>
     <div class="logo">agent<span>-</span>hub</div>
-    <div class="links"><a href="#how">Как устроено</a><a href="#start">Начать</a><a href="https://github.com/aprazdnikov/agent-hub-rs">GitHub</a></div>
+    <div class="links"><a href="#agents">Агенты</a><a href="#how">Как устроено</a><a href="#start">Начать</a><a href="https://github.com/aprazdnikov/agent-hub-rs">GitHub</a></div>
   </nav>
 
   <section class="hero">
@@ -168,6 +168,18 @@ h2 { font: 700 clamp(22px, 3vw, 30px)/1.2 var(--display); letter-spacing: -.01em
       <div class="feature"><h3>Снимки сессий</h3><p><code>/save</code> сохраняет сессию, <code>/restore</code> продолжает её в новой теме.</p></div>
       <div class="feature"><h3>Лимиты подписок</h3><p><code>/limits</code> показывает, сколько осталось в окнах Claude и Codex и когда сброс.</p></div>
     </div>
+  </section>
+
+  <section id="agents">
+    <h2>Пять агентов на выбор</h2>
+    <div class="features">
+      <div class="feature"><h3>Claude Code</h3><p>Основной агент: подписка Claude, лимиты в <code>/limits</code>, снимки сессий.</p></div>
+      <div class="feature"><h3>Codex</h3><p>Подписка ChatGPT или API-ключ OpenAI, песочница и одобрения, снимки сессий.</p></div>
+      <div class="feature"><h3>Qwen Code</h3><p>Бесплатный вход или любой OpenAI-совместимый адрес; досылка сообщений посреди хода.</p></div>
+      <div class="feature"><h3>Hermes</h3><p>Профили, память и скиллы Hermes; хаб запускает <code>hermes acp</code> и не трогает его ключи.</p></div>
+      <div class="feature"><h3>OpenCode — новый в 0.7.0</h3><p>Открытый агент с бесплатным провайдером: <code>npm i -g opencode-ai</code>, и тема уже работает через <code>opencode acp</code>. Модель в формате <code>провайдер/модель</code> задаётся в настройках; вход и разрешения инструментов — в самом OpenCode.</p></div>
+    </div>
+    <p>Агент выбирается на уровне темы: <code>/new opencode ~/shop</code> или <code>/backend opencode</code>. Один и тот же бот ведёт темы разных агентов параллельно.</p>
   </section>
 
   <section id="how" class="flow">
