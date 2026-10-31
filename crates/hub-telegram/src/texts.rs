@@ -256,7 +256,7 @@ mod tests {
     fn unknown_backend_lists_the_known_ones() {
         assert_eq!(
             unknown_backend("gpt"),
-            "⚠️ Неизвестный бэкенд gpt. Доступны: claude, codex, qwen, hermes"
+            "⚠️ Неизвестный бэкенд gpt. Доступны: claude, codex, qwen, hermes, opencode"
         );
     }
 
@@ -267,12 +267,12 @@ mod tests {
         assert!(text.starts_with("Каждая тема этой группы — отдельная сессия агента."));
         assert!(text.contains(".agent-hub/uploads"));
         assert!(text.contains(&root.as_path().display().to_string()));
-        assert!(text.ends_with("Бэкенды: claude, codex, qwen, hermes"));
+        assert!(text.ends_with("Бэкенды: claude, codex, qwen, hermes, opencode"));
         assert!(text.contains(
-            "/new [claude|codex|qwen|hermes] [путь] — новая сессия в этой теме (сброс контекста)"
+            "/new [claude|codex|qwen|hermes|opencode] [путь] — новая сессия в этой теме (сброс контекста)"
         ));
         assert!(text.contains(
-            "/backend [claude|codex|qwen|hermes] — сменить агента в этой теме (сброс контекста)"
+            "/backend [claude|codex|qwen|hermes|opencode] — сменить агента в этой теме (сброс контекста)"
         ));
         assert!(text.contains("/save [имя] — сохранить снимок сессии этой темы"));
         assert!(text.contains("/saves — список снимков"));

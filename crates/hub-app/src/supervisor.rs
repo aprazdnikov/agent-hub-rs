@@ -50,6 +50,8 @@ pub enum AgentAuth {
     Qwen(QwenAuth),
     /// Hermes owns its provider credentials; starting ACP does not prove model sign-in.
     Hermes,
+    /// `OpenCode` owns its provider credentials; starting ACP does not prove model sign-in.
+    Opencode,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

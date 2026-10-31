@@ -45,10 +45,12 @@ pub enum BackendKind {
     Codex,
     Qwen,
     Hermes,
+    Opencode,
 }
 
 impl BackendKind {
-    pub const ALL: [Self; 4] = [Self::Claude, Self::Codex, Self::Qwen, Self::Hermes];
+    pub const ALL: [Self; 5] =
+        [Self::Claude, Self::Codex, Self::Qwen, Self::Hermes, Self::Opencode];
 
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -57,6 +59,7 @@ impl BackendKind {
             Self::Codex => "codex",
             Self::Qwen => "qwen",
             Self::Hermes => "hermes",
+            Self::Opencode => "opencode",
         }
     }
 
@@ -269,6 +272,7 @@ pub enum Usage {
     Codex { tokens: Option<u64> },
     Qwen { tokens: Option<u64> },
     Hermes { tokens: Option<u64> },
+    Opencode { tokens: Option<u64> },
 }
 
 /// One agent turn ended; `background` tasks keep running and report in later turns.
@@ -318,6 +322,8 @@ mod tests {
     #[case("CODEX", Some(BackendKind::Codex))]
     #[case("qwen", Some(BackendKind::Qwen))]
     #[case("Qwen", Some(BackendKind::Qwen))]
+    #[case("opencode", Some(BackendKind::Opencode))]
+    #[case("OpenCode", Some(BackendKind::Opencode))]
     #[case("gpt", None)]
     fn backend_kind_parses_case_insensitively(
         #[case] raw: &str,
@@ -338,7 +344,7 @@ mod tests {
     fn backend_list_includes_hermes_once() {
         assert_eq!(
             BackendKind::ALL.into_iter().map(BackendKind::name).collect::<Vec<_>>(),
-            ["claude", "codex", "qwen", "hermes"]
+            ["claude", "codex", "qwen", "hermes", "opencode"]
         );
     }
 

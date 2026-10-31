@@ -17,6 +17,7 @@ use hub_core::quota::QuotaReport;
 use hub_core::settings::Settings;
 use hub_hermes::archive::HermesArchive;
 use hub_hermes::backend::HermesBackend;
+use hub_opencode::backend::OpencodeBackend;
 use hub_qwen::archive::QwenArchive;
 use hub_qwen::backend::QwenBackend;
 use tokio::sync::{mpsc, watch};
@@ -71,6 +72,16 @@ impl Agents for HubAgents {
                     match hub_hermes::version::locate(settings.hermes.cli.as_deref()) {
                         Ok(cli) => {
                             HermesBackend::new(cli, settings.hermes.clone())
+                                .run(session, prompt, inbox, conversation)
+                                .await
+                        }
+                        Err(error) => refuse(&conversation, error.to_string(), inbox).await,
+                    }
+                }
+                BackendKind::Opencode => {
+                    match hub_opencode::version::locate(settings.opencode.cli.as_deref()) {
+                        Ok(cli) => {
+                            OpencodeBackend::new(cli, settings.opencode.clone())
                                 .run(session, prompt, inbox, conversation)
                                 .await
                         }
@@ -159,6 +170,17 @@ async fn archive(
                     .map_err(|error| error.to_string())?;
             Arc::new(archive)
         }
+        BackendKind::Opencode => {
+            // The CLI is checked first so a missing or broken binary is reported as such.
+            // OpenCode keeps sessions in its own SQLite database; snapshots are not implemented.
+            let cli = hub_opencode::version::locate(settings.opencode.cli.as_deref())
+                .map_err(|error| error.to_string())?;
+            hub_opencode::version::check(&cli).await.map_err(|error| error.to_string())?;
+            return Err(
+                "Снимки и перенос сессий OpenCode не поддерживаются; история остаётся у агента"
+                    .to_owned(),
+            );
+        }
     };
     Ok(archive)
 }
@@ -215,6 +237,10 @@ async fn quotas(settings: &Settings) -> Vec<Outcome> {
             BackendKind::Hermes => {
                 hub_hermes::version::locate(settings.hermes.cli.as_deref()).ok()?;
                 Box::pin(async { Ok(QuotaReport::not_reported(BackendKind::Hermes)) })
+            }
+            BackendKind::Opencode => {
+                hub_opencode::version::locate(settings.opencode.cli.as_deref()).ok()?;
+                Box::pin(async { Ok(QuotaReport::not_reported(BackendKind::Opencode)) })
             }
         };
         Some(async move {
@@ -287,6 +313,7 @@ mod tests {
         form.codex.cli = missing.display().to_string();
         form.qwen.cli = missing.display().to_string();
         form.hermes.cli = missing.display().to_string();
+        form.opencode.cli = missing.display().to_string();
         let agents =
             HubAgents::new(watch::Sender::new(Arc::new(form.parse(&root).unwrap())).subscribe());
         for backend in BackendKind::ALL {
@@ -402,6 +429,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn opencode_topics_run_the_configured_opencode_and_preserve_inbox() {
+        let root = std::env::temp_dir();
+        let mut form = Draft {
+            token: "1:a".to_owned(),
+            chat: "-100".to_owned(),
+            users: "1".to_owned(),
+            workspace_root: root.display().to_string(),
+            ..Draft::default()
+        };
+        form.opencode.cli = root.join("definitely-not-opencode-binary").display().to_string();
+        let agents =
+            HubAgents::new(watch::Sender::new(Arc::new(form.parse(&root).unwrap())).subscribe());
+        let session = TopicSession::fresh(BackendKind::Opencode, AbsolutePath::new(root).unwrap());
+        let (events, mut received) = mpsc::channel(4);
+        let conversation = Conversation {
+            channel: Arc::new(Allowing),
+            events,
+            cancel: CancellationToken::new(),
+            limits: Limits::new(Duration::from_secs(1)),
+        };
+        let (queued, inbox) = mpsc::channel(1);
+        queued.send(Prompt::new("later".to_owned(), Vec::new()).unwrap()).await.unwrap();
+        let mut inbox = agents
+            .run(&session, Prompt::new("hi".to_owned(), Vec::new()).unwrap(), inbox, conversation)
+            .await;
+        assert!(
+            matches!(received.recv().await, Some(AgentEvent::Failed(reason)) if reason.contains("OpenCode"))
+        );
+        assert_eq!(inbox.try_recv().unwrap().text(), "later");
+    }
+
+    #[tokio::test]
     async fn quotas_probe_every_configured_cli_and_isolate_failures() {
         let root = std::env::temp_dir();
         let missing = root.join("definitely-not-an-agent-binary").display().to_string();
@@ -415,7 +474,8 @@ mod tests {
         form.cli.clone_from(&missing);
         form.codex.cli.clone_from(&missing);
         form.qwen.cli.clone_from(&missing);
-        form.hermes.cli = missing;
+        form.hermes.cli.clone_from(&missing);
+        form.opencode.cli = missing;
         let agents =
             HubAgents::new(watch::Sender::new(Arc::new(form.parse(&root).unwrap())).subscribe());
 
@@ -423,7 +483,8 @@ mod tests {
 
         let backends: Vec<_> = outcomes.iter().map(|(backend, _)| *backend).collect();
         assert_eq!(backends, BackendKind::ALL);
-        let [(_, claude), (_, codex), (_, qwen), (_, hermes)] = outcomes.as_slice() else {
+        let [(_, claude), (_, codex), (_, qwen), (_, hermes), (_, opencode)] = outcomes.as_slice()
+        else {
             panic!("{outcomes:?}");
         };
         assert!(
@@ -437,5 +498,6 @@ mod tests {
         );
         assert_eq!(qwen, &Ok(QuotaReport::not_reported(BackendKind::Qwen)));
         assert_eq!(hermes, &Ok(QuotaReport::not_reported(BackendKind::Hermes)));
+        assert_eq!(opencode, &Ok(QuotaReport::not_reported(BackendKind::Opencode)));
     }
 }

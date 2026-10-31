@@ -34,6 +34,8 @@ pub enum AgentError {
     Qwen(#[from] hub_qwen::version::CliError),
     #[error(transparent)]
     Hermes(#[from] hub_hermes::version::CliError),
+    #[error(transparent)]
+    Opencode(#[from] hub_opencode::version::CliError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -74,6 +76,12 @@ async fn check_agent(kind: BackendKind, settings: &Settings) -> Result<AgentStat
             let version = hub_hermes::version::check(&cli).await?;
             // No trial session: Hermes owns its profiles, credentials and session database.
             Ok(AgentState::Ready { version: version.to_string(), auth: Some(AgentAuth::Hermes) })
+        }
+        BackendKind::Opencode => {
+            let cli = hub_opencode::version::locate(settings.opencode.cli.as_deref())?;
+            let version = hub_opencode::version::check(&cli).await?;
+            // No trial session: OpenCode owns its providers, credentials and session database.
+            Ok(AgentState::Ready { version: version.to_string(), auth: Some(AgentAuth::Opencode) })
         }
         BackendKind::Qwen => {
             let cli = hub_qwen::version::locate(settings.qwen.cli.as_deref())?;
@@ -259,6 +267,41 @@ mod tests {
             statuses(BackendKind::Hermes, vec![(BackendKind::Hermes, Err(error))]),
             Err(AgentError::Hermes(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn configured_missing_opencode_is_reported_without_telegram() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut form = Draft {
+            token: "1:a".to_owned(),
+            chat: "-100".to_owned(),
+            users: "1".to_owned(),
+            workspace_root: dir.path().display().to_string(),
+            ..Draft::default()
+        };
+        form.opencode.cli = dir.path().join("missing-opencode").display().to_string();
+        let settings = form.parse(dir.path()).unwrap();
+        let error = check_agent(BackendKind::Opencode, &settings).await.unwrap_err();
+        assert!(matches!(error, AgentError::Opencode(_)));
+        assert!(matches!(
+            statuses(BackendKind::Opencode, vec![(BackendKind::Opencode, Err(error))]),
+            Err(AgentError::Opencode(_))
+        ));
+    }
+
+    #[test]
+    fn optional_missing_opencode_does_not_block_the_default() {
+        let missing = AgentError::Opencode(hub_opencode::version::CliError::Missing);
+        let statuses = statuses(
+            BackendKind::Claude,
+            vec![
+                (BackendKind::Claude, Ok(ready("2.1.287"))),
+                (BackendKind::Opencode, Err(missing)),
+            ],
+        )
+        .unwrap();
+        assert!(statuses.iter().any(|status| status.kind == BackendKind::Opencode
+            && matches!(status.state, AgentState::Unavailable(_))));
     }
 
     #[test]
