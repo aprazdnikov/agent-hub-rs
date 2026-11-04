@@ -1,5 +1,9 @@
 # Hermes backend: implementation plan
 
+> Исторический план реализации этапа [v0.4.0](https://github.com/aprazdnikov/agent-hub-rs/tree/v0.4.0). Реализация этапа включена в этот релиз; документ сохраняет решения и порядок работы того времени.
+> Команды и инструкции ниже относятся к завершённому этапу. Исходные чекбоксы сохранены; они не служат текущим списком задач и не подтверждают выполнение каждой отдельной проверки.
+> [Каталог документов](../README.md) · [Порядок этапов и последующие изменения](../history.md).
+
 **Goal:** add Hermes as a fourth per-topic agent without introducing another Telegram gateway.
 
 **Architecture:** `hub-hermes` owns Hermes ACP protocol and subprocess lifecycle. It depends only on `hub-core` and `hub-agent`, using the existing JSON-RPC client, `Conversation`, `UserChannel`, cancellation and authenticated loopback MCP server. Telegram and the desktop application select it through `BackendKind::Hermes`.

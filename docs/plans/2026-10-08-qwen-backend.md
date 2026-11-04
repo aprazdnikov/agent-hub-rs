@@ -1,5 +1,9 @@
 # Бэкенд Qwen — план реализации
 
+> Исторический план реализации этапа [v0.3.0](https://github.com/aprazdnikov/agent-hub-rs/tree/v0.3.0). Реализация этапа включена в этот релиз; документ сохраняет решения и порядок работы того времени.
+> Команды и инструкции ниже относятся к завершённому этапу. Исходные чекбоксы сохранены; они не служат текущим списком задач и не подтверждают выполнение каждой отдельной проверки.
+> [Каталог документов](../README.md) · [Порядок этапов и последующие изменения](../history.md).
+
 > **For the implementer:** Use `executing-plans` (или superpowers:subagent-driven-development) to execute this plan task-by-task. Шаги размечены чекбоксами (`- [ ]`).
 
 **Goal:** Qwen Code (`qwen --acp`) как третий агент рядом с Claude и Codex, выбираемый на уровне темы, с тем же поведением, что у Codex; релиз 0.3.0.
@@ -8,7 +12,7 @@
 
 **Tech stack:** Rust 2024 (1.96), tokio, tokio-util (`LinesCodec`, `CancellationToken`, `DropGuard`), hyper 1 (`http1`, `server`), hyper-util (`tokio`), http-body-util, subtle, uuid v4, serde_json, thiserror, base64, eframe, keyring; тесты — rstest, insta, `tokio::io::duplex`, сырой TCP к `127.0.0.1`.
 
-**Spec:** `docs/superpowers/specs/2026-10-08-qwen-backend-design.md` (решения не меняются; расхождения с исходниками Qwen — ниже).
+**Спецификация:** [2026-10-08-qwen-backend-design.md](../specs/2026-10-08-qwen-backend-design.md) (решения не меняются; расхождения с исходниками Qwen — ниже).
 
 **Constraints:**
 - Линты рабочего пространства: `warnings = "deny"`, `unsafe_code = "forbid"`, `clippy::pedantic = deny`, `unwrap_used`/`expect_used`/`panic`/`indexing_slicing = deny` вне тестов (`clippy.toml` разрешает их в тестах). Никаких `#[allow]` в продакшен-коде; никаких `_ =>` на собственных enum.

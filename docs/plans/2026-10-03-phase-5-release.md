@@ -1,5 +1,9 @@
 # Фаза 5: автообновление, CI, релизы, README
 
+> Исторический план реализации этапа [v0.1.0](https://github.com/aprazdnikov/agent-hub-rs/tree/v0.1.0). Реализация этапа включена в этот релиз; документ сохраняет решения и порядок работы того времени.
+> Команды и инструкции ниже относятся к завершённому этапу. Исходные чекбоксы сохранены; они не служат текущим списком задач и не подтверждают выполнение каждой отдельной проверки.
+> [Каталог документов](../README.md) · [Порядок этапов и последующие изменения](../history.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Приложение само находит новую версию в GitHub Releases и ставит её по кнопке с проверкой SHA-256; репозиторий получает CI на трёх ОС, `cargo deny`, релизную сборку по тегу для четырёх таргетов, иконку приложения и README под десктоп.
@@ -8,7 +12,7 @@
 
 **Tech Stack:** Rust 1.96, reqwest 0.12 (rustls, уже в дереве через teloxide), sha2 0.11, self-replace 1.5, winresource 0.1 (только Windows), GitHub Actions (`Swatinem/rust-cache`, `softprops/action-gh-release`), cargo-deny, actionlint (в Docker).
 
-**Spec:** `docs/superpowers/specs/2026-10-02-agent-hub-rs-design.md` (разделы «CI, релизы, автообновление», «README», «Таймауты и лимиты», «Типы ошибок»).
+**Спецификация:** [2026-10-02-agent-hub-rs-design.md](../specs/2026-10-02-agent-hub-rs-design.md) (разделы «CI, релизы, автообновление», «README», «Таймауты и лимиты», «Типы ошибок»).
 
 ## Global Constraints
 
@@ -41,7 +45,7 @@
 
 **Files:**
 - Create: `crates/hub-app/src/updates.rs`
-- Modify: `Cargo.toml` (`sha2 = "0.11"`), `crates/hub-app/Cargo.toml` (`serde`, `serde_json`, `sha2`), `crates/hub-app/src/lib.rs` (`pub mod updates;`), `docs/superpowers/specs/2026-10-02-agent-hub-rs-design.md`
+- Modify: `Cargo.toml` (`sha2 = "0.11"`), `crates/hub-app/Cargo.toml` (`serde`, `serde_json`, `sha2`), `crates/hub-app/src/lib.rs` (`pub mod updates;`), `docs/specs/2026-10-02-agent-hub-rs-design.md`
 
 **Interfaces:**
 - Produces: `updates::{Version { major, minor, patch } (Ord, Display, parse(&str) -> Option<Version>), Target::{WindowsX64, MacArm, MacX64, LinuxX64} (current() -> Option<Target>, triple() -> &'static str, binary() -> String), Release { version, assets: Vec<Asset> }, Asset { name, url }, ReleaseError, parse_release(&str) -> Result<Release, ReleaseError>, Offer { version, binary: String, checksum: String }, offer(&Release, Version, Target) -> Option<Offer>, ChecksumError::{Malformed, Mismatch}, verify(&[u8], &str) -> Result<(), ChecksumError>}`.
@@ -333,7 +337,7 @@ Expected: PASS (60 + 22 = 82 теста).
 - [ ] **Step 6: Commit**
 
 ```bash
-git add Cargo.toml Cargo.lock crates/hub-app docs/superpowers/specs/2026-10-02-agent-hub-rs-design.md
+git add Cargo.toml Cargo.lock crates/hub-app docs/specs/2026-10-02-agent-hub-rs-design.md
 git commit -m "hub-app: ядро обновлений — версии, релиз, файл платформы, SHA-256"
 ```
 

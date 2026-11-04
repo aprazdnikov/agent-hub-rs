@@ -1,5 +1,9 @@
 # Фаза 3: hub-telegram — план реализации
 
+> Исторический план реализации этапа [v0.1.0](https://github.com/aprazdnikov/agent-hub-rs/tree/v0.1.0). Реализация этапа включена в этот релиз; документ сохраняет решения и порядок работы того времени.
+> Команды и инструкции ниже относятся к завершённому этапу. Исходные чекбоксы сохранены; они не служат текущим списком задач и не подтверждают выполнение каждой отдельной проверки.
+> [Каталог документов](../README.md) · [Порядок этапов и последующие изменения](../history.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Крейт `hub-telegram` — Telegram-оболочка agent-hub: актор `Hub` (темы, сессии, команды, альбомы), `TelegramChannel` (подтверждения, вопросы, `send_file`), загрузка вложений, проверки путей на файловой системе и обвязка teloxide 0.17.
@@ -8,7 +12,7 @@
 
 **Tech Stack:** Rust 1.96, teloxide 0.17 (`rustls`), tokio 1.53, tokio-util 0.7, futures 0.3, dunce 1.0, uuid 1.26, tracing 0.1; тесты — rstest, tempfile 3.27, serde_json.
 
-**Spec:** `docs/superpowers/specs/2026-10-02-agent-hub-rs-design.md`
+**Спецификация:** [2026-10-02-agent-hub-rs-design.md](../specs/2026-10-02-agent-hub-rs-design.md)
 
 ## Global Constraints
 
@@ -38,7 +42,7 @@
 ### Task 1: Крейт и проверки путей
 
 **Files:**
-- Modify: `Cargo.toml` (members, workspace.dependencies), `docs/superpowers/specs/2026-10-02-agent-hub-rs-design.md`
+- Modify: `Cargo.toml` (members, workspace.dependencies), `docs/specs/2026-10-02-agent-hub-rs-design.md`
 - Create: `crates/hub-telegram/Cargo.toml`, `crates/hub-telegram/src/lib.rs`, `crates/hub-telegram/src/paths.rs`
 
 **Interfaces:**

@@ -1,5 +1,9 @@
 # Снимки сессий — план реализации
 
+> Исторический план реализации этапа [v0.5.0](https://github.com/aprazdnikov/agent-hub-rs/tree/v0.5.0). Реализация этапа включена в этот релиз; документ сохраняет решения и порядок работы того времени.
+> Команды и инструкции ниже относятся к завершённому этапу. Исходные чекбоксы сохранены; они не служат текущим списком задач и не подтверждают выполнение каждой отдельной проверки.
+> [Каталог документов](../README.md) · [Порядок этапов и последующие изменения](../history.md).
+
 > **For the implementer:** Use `executing-plans` (или superpowers:subagent-driven-development) to execute this plan task-by-task. Шаги размечены чекбоксами (`- [ ]`).
 
 **Goal:** команды `/save [имя]`, `/saves`, `/restore <имя> [каталог]` сохраняют данные хаба и историю агента темы в каталог снимков и разворачивают снимок в другой теме для Claude, Codex, Qwen и Hermes; релиз 0.5.0.
@@ -8,7 +12,7 @@
 
 **Tech stack:** Rust 2024 (1.96), tokio (`spawn_blocking`), serde/serde_json, thiserror, uuid v4, chrono 0.4.45 (`clock`, уже в `Cargo.lock`), tempfile (уже в `Cargo.lock`); тесты — rstest, tempfile, `#[ignore]` живые тесты; Python ≥ 3.11 внутри Hermes.
 
-**Spec:** `docs/superpowers/specs/2026-10-09-session-snapshots-design.md` (решения не меняются; расхождения с исходниками агентов и кодом — ниже).
+**Спецификация:** [2026-10-09-session-snapshots-design.md](../specs/2026-10-09-session-snapshots-design.md) (решения не меняются; расхождения с исходниками агентов и кодом — ниже).
 
 **Constraints:**
 - Линты рабочего пространства (`Cargo.toml:56-67`): `warnings = "deny"`, `unsafe_code = "forbid"`, `clippy::pedantic = deny`, `unwrap_used`/`expect_used`/`panic`/`indexing_slicing = deny` вне тестов (`clippy.toml` разрешает их в тестовых функциях и `#[cfg(test)]`-модулях; файлы в `tests/` с помощниками вне `#[test]` ставят `#![allow(clippy::unwrap_used)]` в точке входа, как `crates/hub-hermes/tests/acp.rs:2`). Никаких `#[allow]` в продакшен-коде, никаких `_ =>` на собственных enum, никакой индексации срезов (`get`, `split_first`, шаблоны срезов).

@@ -1,5 +1,9 @@
 # Фаза 4: hub-app — приложение с окном и треем
 
+> Исторический план реализации этапа [v0.1.0](https://github.com/aprazdnikov/agent-hub-rs/tree/v0.1.0). Реализация этапа включена в этот релиз; документ сохраняет решения и порядок работы того времени.
+> Команды и инструкции ниже относятся к завершённому этапу. Исходные чекбоксы сохранены; они не служат текущим списком задач и не подтверждают выполнение каждой отдельной проверки.
+> [Каталог документов](../README.md) · [Порядок этапов и последующие изменения](../history.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Бинарник `agent-hub`: супервизор бота поверх `hub-telegram`, хранилища настроек (`settings.toml` + keyring) и тем (`topics.json`), лог в файл и в окно, окно eframe с вкладками Статус/Темы/Лог/Настройки, иконка в трее, запрет второго экземпляра.
@@ -8,7 +12,7 @@
 
 **Tech Stack:** Rust 1.96, eframe/egui 0.36, tray-icon 0.26 (на Linux бэкенд `ksni`), keyring 4.2 (API `v1`), directories 6, rfd 0.17, toml 1.1, tracing-subscriber 0.3, tracing-appender 0.2, tempfile 3, anyhow 1, tokio.
 
-**Spec:** `docs/superpowers/specs/2026-10-02-agent-hub-rs-design.md` (разделы «Архитектура», «Хранение», «Настройки», «Snapshot и лог», «GUI и трей», «Ошибки и надёжность»).
+**Спецификация:** [2026-10-02-agent-hub-rs-design.md](../specs/2026-10-02-agent-hub-rs-design.md) (разделы «Архитектура», «Хранение», «Настройки», «Snapshot и лог», «GUI и трей», «Ошибки и надёжность»).
 
 ## Global Constraints
 
@@ -45,7 +49,7 @@
 ### Task 1: Крейт hub-app, каталоги, атомарная запись, single-instance
 
 **Files:**
-- Modify: `Cargo.toml` (members, workspace.dependencies), `docs/superpowers/specs/2026-10-02-agent-hub-rs-design.md`
+- Modify: `Cargo.toml` (members, workspace.dependencies), `docs/specs/2026-10-02-agent-hub-rs-design.md`
 - Create: `crates/hub-app/Cargo.toml`, `crates/hub-app/src/lib.rs`, `crates/hub-app/src/main.rs`, `crates/hub-app/src/dirs.rs`, `crates/hub-app/src/atomic.rs`, `crates/hub-app/src/instance.rs`
 
 **Interfaces:**
@@ -329,7 +333,7 @@ Expected: PASS (4 теста).
 - [ ] **Step 6: Commit**
 
 ```bash
-git add Cargo.toml Cargo.lock crates/hub-app docs/superpowers/specs/2026-10-02-agent-hub-rs-design.md
+git add Cargo.toml Cargo.lock crates/hub-app docs/specs/2026-10-02-agent-hub-rs-design.md
 git commit -m "hub-app: каталоги, атомарная запись и единственный экземпляр"
 ```
 

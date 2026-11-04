@@ -1,5 +1,9 @@
 # Фаза 2: hub-claude — план реализации
 
+> Исторический план реализации этапа [v0.1.0](https://github.com/aprazdnikov/agent-hub-rs/tree/v0.1.0). Реализация этапа включена в этот релиз; документ сохраняет решения и порядок работы того времени.
+> Команды и инструкции ниже относятся к завершённому этапу. Исходные чекбоксы сохранены; они не служат текущим списком задач и не подтверждают выполнение каждой отдельной проверки.
+> [Каталог документов](../README.md) · [Порядок этапов и последующие изменения](../history.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Крейт `hub-claude` — разговор с `claude` CLI по протоколу stream-json: разбор сообщений, ответы на control-запросы (подтверждения, вопросы, in-process MCP `send_file`), отслеживание фоновых задач, запуск процесса и проверка версии CLI.
@@ -8,11 +12,11 @@
 
 **Tech Stack:** Rust 1.96, tokio 1.53 (process, io-util, time, sync, macros), tokio-util 0.7 (codec, CancellationToken), futures 0.3, serde_json 1, base64 0.23, uuid 1.26, which 8, tracing 0.1, insta 1.48.
 
-**Spec:** `docs/superpowers/specs/2026-10-02-agent-hub-rs-design.md`
+**Спецификация:** [2026-10-02-agent-hub-rs-design.md](../specs/2026-10-02-agent-hub-rs-design.md)
 
 ## Global Constraints
 
-- Ограничения фазы 1 (`docs/superpowers/plans/2026-10-02-phase-1-hub-core.md`, раздел Global Constraints) действуют без изменений.
+- Ограничения фазы 1 (`docs/plans/2026-10-02-phase-1-hub-core.md`, раздел Global Constraints) действуют без изменений.
 - Минимальная версия CLI — `2.1.280`; таймауты: `initialize` 60 с, `claude --version` 10 с, завершение процесса после закрытия stdin 5 с, окно settling 30 с.
 - Предел строки stdout CLI — 16 МБ.
 - Аргументы CLI: `--output-format stream-json --verbose --input-format stream-json --permission-prompt-tool stdio --permission-mode <mode> [--model M] [--max-budget-usd B] [--resume=<id>] --setting-sources=user,project,local --replay-user-messages --mcp-config {"mcpServers":{"agent-hub":{"type":"sdk","name":"agent-hub"}}}`; окружение `CLAUDE_CODE_ENTRYPOINT=sdk-rs`; на Windows `CREATE_NO_WINDOW`.
@@ -41,7 +45,7 @@
 - Modify: `Cargo.toml` (members, workspace.dependencies)
 - Create: `crates/hub-claude/Cargo.toml`, `crates/hub-claude/src/lib.rs`, `crates/hub-claude/src/wire.rs`
 - Add (already captured): `crates/hub-claude/tests/fixtures/{approval,question,sendfile,background}.jsonl`
-- Modify: `docs/superpowers/specs/2026-10-02-agent-hub-rs-design.md` (раздел «hub-claude: протокол CLI → Контракт» и «Тестирование»)
+- Modify: `docs/specs/2026-10-02-agent-hub-rs-design.md` (раздел «hub-claude: протокол CLI → Контракт» и «Тестирование»)
 
 **Interfaces:**
 - Produces: `wire::Incoming::{System(System), Assistant(Assistant), User(User), Result(Outcome), ControlRequest { request_id, request }, ControlResponse { response }, ControlCancelRequest { request_id }, Other}`, `wire::System::{Init { session_id }, TaskStarted { task_id, description, is_backgrounded }, TaskUpdated { task_id, patch }, TaskNotification { task_id }, Other}`, `wire::TaskPatch { status }`, `wire::Assistant { message: AssistantBody { content: Vec<Block> }, session_id }`, `wire::Block::{Text { text }, ToolUse { name, input }, Other}`, `wire::User { uuid }`, `wire::Outcome { subtype, is_error, num_turns, session_id, total_cost_usd: Option<Number>, result, origin: Option<Value> }` + `Outcome::injected()`, `wire::ControlRequest::{CanUseTool { tool_name, input }, McpMessage { server_name, message }, Other}`, `wire::ControlReply::{Success { request_id }, Error { request_id, error }}`, `wire::parse_line(&str) -> Result<Incoming, serde_json::Error>`.

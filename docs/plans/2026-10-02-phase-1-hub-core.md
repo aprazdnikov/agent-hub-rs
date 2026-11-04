@@ -1,5 +1,9 @@
 # Фаза 1: hub-core — план реализации
 
+> Исторический план реализации этапа [v0.1.0](https://github.com/aprazdnikov/agent-hub-rs/tree/v0.1.0). Реализация этапа включена в этот релиз; документ сохраняет решения и порядок работы того времени.
+> Команды и инструкции ниже относятся к завершённому этапу. Исходные чекбоксы сохранены; они не служат текущим списком задач и не подтверждают выполнение каждой отдельной проверки.
+> [Каталог документов](../README.md) · [Порядок этапов и последующие изменения](../history.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Cargo workspace и крейт `hub-core` — функциональное ядро agent-hub-rs без I/O: доменные типы, форматирование, Markdown → Telegram HTML, кнопки подтверждений и вопросов, вложения, команды, настройки, формат `topics.json`.
@@ -8,7 +12,7 @@
 
 **Tech Stack:** Rust 1.96 (edition 2024), pulldown-cmark 0.13, rust_decimal 1.43, serde 1, serde_json 1, thiserror 2, rstest 0.27.
 
-**Spec:** `docs/superpowers/specs/2026-10-02-agent-hub-rs-design.md`
+**Спецификация:** [2026-10-02-agent-hub-rs-design.md](../specs/2026-10-02-agent-hub-rs-design.md)
 
 ## Дорожная карта
 
@@ -47,7 +51,7 @@
 - Create: `Cargo.toml`, `rust-toolchain.toml`, `clippy.toml`, `rustfmt.toml`
 - Create: `crates/hub-core/Cargo.toml`, `crates/hub-core/src/lib.rs`, `crates/hub-core/src/domain.rs`, `crates/hub-core/src/ids.rs`
 - Modify: `.gitignore` (убрать JetBrains-комментарии не нужно; добавить `/target` уже есть — без изменений)
-- Modify: `docs/superpowers/specs/2026-10-02-agent-hub-rs-design.md` (уточнения раздела крейтов)
+- Modify: `docs/specs/2026-10-02-agent-hub-rs-design.md` (уточнения раздела крейтов)
 
 **Interfaces:**
 - Produces: `ChatId(i64)`, `ThreadId(i32)`, `UserId(u64)`, `MessageId(i32)`, `TopicKey { chat, thread }`, `SessionId::parse(&str) -> Option<SessionId>`, `SessionId::as_str`, `BackendKind::{Claude, ALL, name(), parse()}`, `AbsolutePath::new(PathBuf) -> Option<_>`, `AbsolutePath::as_path`, `TopicSession { backend, cwd, session }`, `TopicSession::fresh`, `TopicSession::with_session`, `ToolRequest { tool, summary }`, `ToolUse { tool, summary }`, `Denied { reason }`, `Denied::new`, `Decision::{Allowed, Denied}`, `Selection::{Single, Multiple}`, `QuestionOption { label, description }`, `Question::new(text, header, options, selection) -> Option<Question>` + геттеры `text() header() options() selection()`, `QuestionAnswer { question, answer }`, `QuestionsOutcome::{Answered(Vec<QuestionAnswer>), Denied(Denied)}`, `OutgoingFile { path, caption }`, `FileDelivery::{Delivered, Denied}`, `ImageMediaType::{Jpeg, Png, Gif, Webp}` + `mime()`, `Image { media, data }`, `Prompt::new(String, Vec<Image>) -> Option<Prompt>` + `text() images()`, `Finished { session, turns, cost, background }`, `AgentEvent::{SessionStarted, AssistantText, ToolCall(ToolUse), Finished, Failed, BackgroundAbandoned}`, `ids::hex(&[u8]) -> String` (crate-private).
@@ -537,7 +541,7 @@ Expected: PASS, без предупреждений. Если `warnings = "deny"
 
 - [ ] **Step 6: Уточнить спеку**
 
-В `docs/superpowers/specs/2026-10-02-agent-hub-rs-design.md`, раздел «Cargo workspace», заменить строки таблицы `hub-core` и `hub-claude`:
+В `docs/specs/2026-10-02-agent-hub-rs-design.md`, раздел «Cargo workspace», заменить строки таблицы `hub-core` и `hub-claude`:
 
 ```markdown
 | `hub-core` | Функциональное ядро без I/O: доменные типы, разбор настроек и формы, раскрытие путей workspace (без обращения к ФС), имена и пути вложений, разбор команд, Markdown → Telegram HTML, разбиение сообщений, callback_data, реестры подтверждений и вопросов (обобщённые по ответчику), формат `topics.json` | serde, serde_json, pulldown-cmark, rust_decimal, thiserror |

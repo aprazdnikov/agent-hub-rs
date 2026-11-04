@@ -1,5 +1,9 @@
 # План: бэкенд OpenCode
 
+> Исторический план реализации этапа [v0.7.0](https://github.com/aprazdnikov/agent-hub-rs/tree/v0.7.0). Реализация этапа включена в этот релиз; документ сохраняет решения и порядок работы того времени.
+> Команды и инструкции ниже относятся к завершённому этапу. Исходные чекбоксы сохранены; они не служат текущим списком задач и не подтверждают выполнение каждой отдельной проверки.
+> [Каталог документов](../README.md) · [Порядок этапов и последующие изменения](../history.md).
+
 Спецификация: [2026-10-31-opencode-backend-design.md](../specs/2026-10-31-opencode-backend-design.md).
 
 1. **Контракт** — живые пробы `opencode acp` (1.19.5): `initialize`, `session/new` (configOptions, modes build/plan), `session/load` (replay до ответа), `session/set_model` (`провайдер/модель`), `session/prompt` (`stopReason`, `usage.totalTokens`), форма `session/request_permission` (once/always/reject) по встроенному коду SDK.

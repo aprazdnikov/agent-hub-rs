@@ -1,5 +1,9 @@
 # Лимиты подписок — план реализации
 
+> Исторический план реализации этапа [v0.6.0](https://github.com/aprazdnikov/agent-hub-rs/tree/v0.6.0). Реализация этапа включена в этот релиз; документ сохраняет решения и порядок работы того времени.
+> Команды и инструкции ниже относятся к завершённому этапу. Исходные чекбоксы сохранены; они не служат текущим списком задач и не подтверждают выполнение каждой отдельной проверки.
+> [Каталог документов](../README.md) · [Порядок этапов и последующие изменения](../history.md).
+
 > **For the implementer:** Use `executing-plans` (или superpowers:subagent-driven-development) to execute this plan task-by-task. Шаги размечены чекбоксами (`- [ ]`).
 
 **Goal:** команда `/limits` (в теме и в общем чате группы) показывает карточку с израсходованными лимитами подписок Claude и Codex — процент по окну, полоса из 10 делений, время сброса, тариф; кнопка «🔄 Обновить» перерисовывает то же сообщение; при сбое пробы — последние данные из живых сессий с пометкой «(на ЧЧ:ММ)»; релиз 0.6.0.
@@ -8,7 +12,7 @@
 
 **Tech stack:** Rust 2024 (1.96), tokio (`process`, `time`, `io-util`), serde/serde_json, chrono 0.4.45 (`clock`, `std` — уже в `Cargo.lock` с `iana-time-zone`/`windows-link`; часовой пояс компьютера — `chrono::Local`, `chrono-tz` не нужен и в lock отсутствует), futures (`join_all`), thiserror; тесты — rstest, `tokio::io::duplex` вместо поддельного процесса (одинаково на Linux, macOS и Windows), `#[ignore]` живые тесты.
 
-**Spec:** `docs/superpowers/specs/2026-10-16-subscription-limits-design.md` (решения не меняются; расхождения с исходниками агентов и кодом — ниже).
+**Спецификация:** [2026-10-16-subscription-limits-design.md](../specs/2026-10-16-subscription-limits-design.md) (решения не меняются; расхождения с исходниками агентов и кодом — ниже).
 
 **Constraints:**
 - Линты рабочего пространства (`Cargo.toml:56-67`): `warnings = "deny"`, `unsafe_code = "forbid"`, `clippy::pedantic = deny`, `unwrap_used`/`expect_used`/`panic`/`indexing_slicing = deny` вне тестов (`clippy.toml` разрешает их в тестовых функциях и `#[cfg(test)]`-модулях). Никаких `#[allow]` в продакшен-коде, никаких `_ =>` на собственных enum (`WindowKind`, `QuotaSource`, `BackendKind`, `Incoming`, `HubMessage`, `ProbeError`…), никакой индексации срезов, никаких `as`-приведений чисел (`cast_*` входят в pedantic): `f64 → u8` — через `percent`, `i32 → u8` — `u8::try_from(clamp)`.

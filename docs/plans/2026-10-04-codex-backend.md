@@ -1,5 +1,9 @@
 # Бэкенд Codex — план реализации
 
+> Исторический план реализации этапа [v0.2.0](https://github.com/aprazdnikov/agent-hub-rs/tree/v0.2.0). Реализация этапа включена в этот релиз; документ сохраняет решения и порядок работы того времени.
+> Команды и инструкции ниже относятся к завершённому этапу. Исходные чекбоксы сохранены; они не служат текущим списком задач и не подтверждают выполнение каждой отдельной проверки.
+> [Каталог документов](../README.md) · [Порядок этапов и последующие изменения](../history.md).
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** OpenAI Codex как второй агент рядом с Claude, выбираемый на уровне темы, с поведением Python-версии agent-hub.
@@ -8,7 +12,7 @@
 
 **Tech Stack:** Rust 2024 (1.96), tokio, tokio-util (`LinesCodec`, `CancellationToken`), serde_json, thiserror, base64, which, keyring, eframe; тесты — rstest, insta, `tokio::io::duplex`.
 
-**Spec:** `docs/superpowers/specs/2026-10-04-codex-backend-design.md`
+**Спецификация:** [2026-10-04-codex-backend-design.md](../specs/2026-10-04-codex-backend-design.md)
 
 ## Global Constraints
 
