@@ -9,6 +9,7 @@ use futures::future::BoxFuture;
 use hub_core::domain::{ChatId, MessageId, TopicKey};
 use hub_core::questions::Button;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::oneshot;
 
 use crate::messenger::{Format, Messenger, Outgoing, SendError, Target};
 
@@ -25,8 +26,10 @@ pub(crate) enum Call {
 #[derive(Default)]
 pub(crate) struct FakeMessenger {
     calls: Mutex<Vec<Call>>,
+    send_attempts: Mutex<Vec<Outgoing>>,
     sends: Mutex<VecDeque<Result<(), SendError>>>,
     edits: Mutex<VecDeque<Result<(), SendError>>>,
+    edit_delay: Mutex<Option<oneshot::Receiver<()>>>,
     pub(crate) files: HashMap<String, Vec<u8>>,
     next: AtomicI32,
 }
@@ -45,6 +48,17 @@ impl FakeMessenger {
 
     pub(crate) fn calls(&self) -> Vec<Call> {
         self.calls.lock().unwrap().clone()
+    }
+
+    pub(crate) fn send_attempts(&self) -> Vec<Outgoing> {
+        self.send_attempts.lock().unwrap().clone()
+    }
+
+    /// Hold the next edit until the test explicitly releases it.
+    pub(crate) fn delay_next_edit(&self) -> oneshot::Sender<()> {
+        let (release, wait) = oneshot::channel();
+        *self.edit_delay.lock().unwrap() = Some(wait);
+        release
     }
 
     /// Texts of delivered messages, in order.
@@ -79,6 +93,7 @@ impl Messenger for FakeMessenger {
         target: Target,
         message: Outgoing,
     ) -> BoxFuture<'_, Result<MessageId, SendError>> {
+        self.send_attempts.lock().unwrap().push(message.clone());
         let scripted = self.sends.lock().unwrap().pop_front().unwrap_or(Ok(()));
         let result = scripted.map(|()| {
             let id = MessageId(self.next.fetch_add(1, Ordering::SeqCst) + 1);
@@ -96,8 +111,13 @@ impl Messenger for FakeMessenger {
         format: Format,
     ) -> BoxFuture<'_, Result<(), SendError>> {
         let scripted = self.edits.lock().unwrap().pop_front().unwrap_or(Ok(()));
-        let result = scripted.map(|()| self.record(Call::Edit { chat, message, text, format }));
-        Box::pin(async move { result })
+        let delay = self.edit_delay.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some(delay) = delay {
+                let _ = delay.await;
+            }
+            scripted.map(|()| self.record(Call::Edit { chat, message, text, format }))
+        })
     }
 
     fn edit_keyboard(

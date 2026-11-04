@@ -70,30 +70,70 @@ pub fn parse_callback_data(data: &str) -> Option<ApprovalAnswer> {
     }
 }
 
-/// Open approval requests; `R` is whatever delivers the decision back to the asker.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalOutcome {
+    Answered(Verdict),
+    TimedOut,
+}
+
+#[derive(Debug)]
+enum ApprovalState<R> {
+    Pending(R),
+    Finished(ApprovalOutcome),
+}
+
+/// Approval state until the asker takes the outcome or cancels. `R` only wakes the asker;
+/// the registry retains the authoritative outcome even if notification is delayed or lost.
+/// Callers must serialize access to this registry (including `resolve`, `finish`, and `close`).
 #[derive(Debug)]
 pub struct ApprovalRegistry<R> {
-    pending: HashMap<ApprovalId, R>,
+    requests: HashMap<ApprovalId, ApprovalState<R>>,
 }
 
 impl<R> Default for ApprovalRegistry<R> {
     fn default() -> Self {
-        Self { pending: HashMap::new() }
+        Self { requests: HashMap::new() }
     }
 }
 
 impl<R> ApprovalRegistry<R> {
     pub fn open(&mut self, id: ApprovalId, responder: R) {
-        self.pending.insert(id, responder);
+        self.requests.insert(id, ApprovalState::Pending(responder));
     }
 
     pub fn close(&mut self, id: &ApprovalId) {
-        self.pending.remove(id);
+        self.requests.remove(id);
     }
 
-    /// The responder and decision; `None` when the request is gone (answered, timed out, stopped).
-    pub fn resolve(&mut self, answer: &ApprovalAnswer) -> Option<(R, Decision)> {
-        self.pending.remove(&answer.id).map(|responder| (responder, answer.verdict.decision()))
+    /// Commits a button answer and returns its notifier only to the winning handler.
+    /// A successful notification is not evidence that the asker received it.
+    pub fn resolve(&mut self, answer: &ApprovalAnswer) -> Option<R> {
+        self.complete(&answer.id, ApprovalOutcome::Answered(answer.verdict))
+    }
+
+    /// Takes the committed outcome, committing a timeout only if no answer won first.
+    /// An absent (closed) request is also denied. No tombstones remain after this call.
+    pub fn finish(&mut self, id: &ApprovalId) -> ApprovalOutcome {
+        self.complete(id, ApprovalOutcome::TimedOut);
+        match self.requests.remove(id) {
+            Some(ApprovalState::Finished(outcome)) => outcome,
+            Some(ApprovalState::Pending(_)) | None => ApprovalOutcome::TimedOut,
+        }
+    }
+
+    /// The only Pending -> Finished transition. The caller's lock makes the first
+    /// transition authoritative for both button handlers and the timeout path.
+    fn complete(&mut self, id: &ApprovalId, outcome: ApprovalOutcome) -> Option<R> {
+        let state = self.requests.get_mut(id)?;
+        match state {
+            ApprovalState::Pending(_) => {
+                match std::mem::replace(state, ApprovalState::Finished(outcome)) {
+                    ApprovalState::Pending(responder) => Some(responder),
+                    ApprovalState::Finished(_) => None,
+                }
+            }
+            ApprovalState::Finished(_) => None,
+        }
     }
 }
 
@@ -131,7 +171,7 @@ mod tests {
         registry.open(id(), "responder");
 
         let answer = ApprovalAnswer { id: id(), verdict: Verdict::Allow };
-        assert_eq!(registry.resolve(&answer), Some(("responder", Decision::Allowed)));
+        assert_eq!(registry.resolve(&answer), Some("responder"));
         assert_eq!(registry.resolve(&answer), None);
     }
 
@@ -142,6 +182,66 @@ mod tests {
         registry.close(&id());
 
         assert_eq!(registry.resolve(&ApprovalAnswer { id: id(), verdict: Verdict::Allow }), None);
+    }
+
+    #[test]
+    fn committed_answer_survives_timeout_before_notification() {
+        let mut registry = ApprovalRegistry::default();
+        registry.open(id(), "notifier");
+        let notifier = registry.resolve(&ApprovalAnswer { id: id(), verdict: Verdict::Allow });
+
+        // The button handler has not notified the waiter yet; the timer fires first.
+        assert_eq!(registry.finish(&id()), ApprovalOutcome::Answered(Verdict::Allow));
+        assert!(notifier.is_some());
+        assert!(registry.requests.is_empty());
+    }
+
+    #[test]
+    fn timeout_prevents_a_button_from_changing_the_result() {
+        let mut registry = ApprovalRegistry::default();
+        registry.open(id(), ());
+
+        assert_eq!(registry.finish(&id()), ApprovalOutcome::TimedOut);
+        assert_eq!(registry.resolve(&ApprovalAnswer { id: id(), verdict: Verdict::Allow }), None);
+    }
+
+    #[test]
+    fn close_discards_an_unconsumed_answer() {
+        let mut registry = ApprovalRegistry::default();
+        registry.open(id(), ());
+        registry.resolve(&ApprovalAnswer { id: id(), verdict: Verdict::Allow });
+        registry.close(&id());
+
+        assert!(registry.requests.is_empty());
+    }
+
+    #[test]
+    fn competing_threads_only_commit_one_answer() {
+        use std::sync::{Barrier, Mutex};
+
+        let mut registry = ApprovalRegistry::default();
+        registry.open(id(), ());
+        let registry = Mutex::new(registry);
+        let start = Barrier::new(2);
+        let accepted = std::thread::scope(|scope| {
+            let attempt = |verdict| {
+                start.wait();
+                let accepted = registry
+                    .lock()
+                    .unwrap()
+                    .resolve(&ApprovalAnswer { id: id(), verdict })
+                    .is_some();
+                accepted.then_some(verdict)
+            };
+            let allow = scope.spawn(move || attempt(Verdict::Allow));
+            let deny = scope.spawn(move || attempt(Verdict::Deny));
+            [allow.join().unwrap(), deny.join().unwrap()]
+        });
+
+        let ([Some(winner), None] | [None, Some(winner)]) = accepted else {
+            panic!("exactly one button must be accepted");
+        };
+        assert_eq!(registry.lock().unwrap().finish(&id()), ApprovalOutcome::Answered(winner));
     }
 
     #[test]

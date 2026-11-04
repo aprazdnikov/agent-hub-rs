@@ -4,25 +4,18 @@ use hub_core::questions::{self, Press as Pressed};
 
 use crate::channel::{Shared, lock};
 use crate::inbound::Press;
-use crate::messenger::Format;
 use crate::sender::Sender;
 use crate::texts;
 
 pub async fn handle(registries: Shared, sender: Sender, press: Press) {
     if let Some(answer) = approvals::parse_callback_data(&press.data) {
         let resolved = lock(&registries).approvals.resolve(&answer);
-        let delivered = resolved.and_then(|(responder, decision)| {
-            responder.send(decision.clone()).is_ok().then_some(decision)
-        });
-        match delivered {
-            Some(decision) => {
+        match resolved {
+            Some(responder) => {
+                // The registry has committed the answer. This only wakes the asker,
+                // which reads that outcome and owns the final message edit.
+                let _ = responder.send(());
                 sender.answer(press.callback, None).await;
-                if let (Some(chat), Some(message), Some(html)) =
-                    (press.chat, press.message, press.html)
-                {
-                    let text = format!("{html}\n\n{}", texts::verdict(&decision));
-                    sender.edit(chat, message, text, Format::Html).await;
-                }
             }
             None => {
                 sender.answer(press.callback, Some(texts::APPROVAL_STALE)).await;

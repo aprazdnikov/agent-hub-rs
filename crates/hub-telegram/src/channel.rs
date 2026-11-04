@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use hub_agent::channel::UserChannel;
-use hub_core::approvals::{ApprovalId, ApprovalRegistry, Verdict, callback_data};
+use hub_core::approvals::{ApprovalId, ApprovalOutcome, ApprovalRegistry, Verdict, callback_data};
 use hub_core::attachments::MAX_SEND_BYTES;
 use hub_core::domain::{
     AbsolutePath, Decision, Denied, FileDelivery, OutgoingFile, Question, QuestionAnswer,
@@ -26,7 +26,7 @@ use crate::texts;
 
 #[derive(Default)]
 pub struct Registries {
-    pub approvals: ApprovalRegistry<oneshot::Sender<Decision>>,
+    pub approvals: ApprovalRegistry<oneshot::Sender<()>>,
     pub questions: QuestionRegistry<oneshot::Sender<Answer>>,
 }
 
@@ -65,7 +65,7 @@ impl TelegramChannel {
 
     async fn approval(&self, tool: ToolRequest) -> Decision {
         let id = ApprovalId::from_random(random_id());
-        let (responder, decision) = oneshot::channel();
+        let (responder, notification) = oneshot::channel();
         lock(&self.registries).approvals.open(id.clone(), responder);
         let _open = OpenApproval { registries: &self.registries, id: id.clone() };
         let text = texts::approval_html(&tool);
@@ -81,15 +81,25 @@ impl TelegramChannel {
         let Some(message) = self.sender.one(Target::Topic(self.key), outgoing).await else {
             return Decision::Denied(Denied::new(texts::APPROVAL_UNSENT));
         };
-        match tokio::time::timeout(self.timeout, decision).await {
-            Ok(Ok(decision)) => decision,
-            Ok(Err(_)) => Decision::Denied(Denied::new(texts::no_answer(self.timeout))),
-            Err(_) => {
-                let expired = format!("{text}\n\n⌛ Нет ответа — запрещено");
-                self.sender.edit(self.key.chat, message, expired, Format::Html).await;
-                Decision::Denied(Denied::new(texts::no_answer(self.timeout)))
+        // Notification is only a wake-up. Even when timeout wins the future poll, a
+        // button may already have committed its answer under the registry lock.
+        let _ = tokio::time::timeout(self.timeout, notification).await;
+        let outcome = lock(&self.registries).approvals.finish(&id);
+        let (decision, verdict) = match outcome {
+            ApprovalOutcome::Answered(verdict) => {
+                let decision = verdict.decision();
+                let line = texts::verdict(&decision);
+                (decision, line)
             }
-        }
+            ApprovalOutcome::TimedOut => (
+                Decision::Denied(Denied::new(texts::no_answer(self.timeout))),
+                "⌛ Нет ответа — запрещено",
+            ),
+        };
+        // Only the asker edits the final text, after the registry is closed and unlocked.
+        let shown = format!("{text}\n\n{verdict}");
+        self.sender.edit(self.key.chat, message, shown, Format::Html).await;
+        decision
     }
 
     async fn questions(&self, questions: Vec<Question>) -> QuestionsOutcome {
@@ -206,7 +216,7 @@ mod tests {
 
     use super::*;
     use crate::inbound::Press;
-    use crate::messenger::Messenger;
+    use crate::messenger::{Messenger, SendError};
     use crate::paths::workspace_root;
     use crate::press;
     use crate::testing::{Call, FakeMessenger};
@@ -222,9 +232,13 @@ mod tests {
     }
 
     fn setup(timeout: Duration) -> Setup {
+        setup_with_messenger(timeout, FakeMessenger::default())
+    }
+
+    fn setup_with_messenger(timeout: Duration, messenger: FakeMessenger) -> Setup {
         let dir = tempfile::tempdir().unwrap();
         let cwd = workspace_root(dir.path()).unwrap();
-        let messenger = Arc::new(FakeMessenger::default());
+        let messenger = Arc::new(messenger);
         let sender = Sender::new(Arc::clone(&messenger) as Arc<dyn Messenger>);
         let registries = Shared::default();
         let channel = Arc::new(TelegramChannel::new(
@@ -284,6 +298,220 @@ mod tests {
         Call::Answer { callback: "cb".to_owned(), text: Some(text.to_owned()) }
     }
 
+    fn approval_edits(messenger: &FakeMessenger) -> Vec<String> {
+        messenger
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::Edit { text, .. } => Some(text),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn approval_waiter_updates_the_original_message_without_callback_html() {
+        let setup = setup(Duration::from_secs(5));
+        let mut request = Box::pin(setup.channel.request(bash()));
+        assert!(futures::poll!(&mut request).is_pending());
+        let (message, rows) = setup.messenger.last_keyboard().unwrap();
+        let mut pressed = press(&button(&rows, 0, 0), message);
+        pressed.html = None;
+        press::handle(Arc::clone(&setup.registries), setup.sender.clone(), pressed).await;
+
+        assert_eq!(request.await, Decision::Allowed);
+        let edits: Vec<_> = setup
+            .messenger
+            .calls()
+            .into_iter()
+            .filter(|call| matches!(call, Call::Edit { .. }))
+            .collect();
+        assert_eq!(
+            edits,
+            [Call::Edit {
+                chat: KEY.chat,
+                message,
+                text: "🔐 <b>Bash</b>\n<pre>ls</pre>\n\n✅ Разрешено".to_owned(),
+                format: Format::Html,
+            }]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn committed_approval_wins_when_timeout_fires_before_notification() {
+        let setup = setup(Duration::from_secs(5));
+        let mut request = Box::pin(setup.channel.request(bash()));
+        assert!(futures::poll!(&mut request).is_pending());
+        let (_, rows) = setup.messenger.last_keyboard().unwrap();
+        let answer = hub_core::approvals::parse_callback_data(&button(&rows, 0, 0)).unwrap();
+
+        // Stop the button path between committing the result and sending its wake-up.
+        // The receiver stays pending, so the wait MUST take its timeout branch.
+        let notification = lock(&setup.registries).approvals.resolve(&answer).unwrap();
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        assert_eq!(request.await, Decision::Allowed);
+        assert_eq!(
+            approval_edits(&setup.messenger),
+            ["🔐 <b>Bash</b>\n<pre>ls</pre>\n\n✅ Разрешено"]
+        );
+        assert!(notification.send(()).is_err(), "the timed-out receiver was dropped");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timeout_wins_and_an_already_created_press_is_stale() {
+        let setup = setup(Duration::from_secs(5));
+        let mut request = Box::pin(setup.channel.request(bash()));
+        assert!(futures::poll!(&mut request).is_pending());
+        let (message, rows) = setup.messenger.last_keyboard().unwrap();
+        let pending_press = press::handle(
+            Arc::clone(&setup.registries),
+            setup.sender.clone(),
+            press(&button(&rows, 0, 0), message),
+        );
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        assert_eq!(request.await, Decision::Denied(Denied::new("Нет ответа пользователя за 5 с")));
+        pending_press.await;
+        assert!(setup.messenger.calls().contains(&stale("Запрос уже неактуален")));
+        assert_eq!(
+            approval_edits(&setup.messenger),
+            ["🔐 <b>Bash</b>\n<pre>ls</pre>\n\n⌛ Нет ответа — запрещено"]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_buttons_commit_only_one_decision() {
+        let setup = setup(Duration::from_secs(5));
+        let mut request = Box::pin(setup.channel.request(bash()));
+        assert!(futures::poll!(&mut request).is_pending());
+        let (message, rows) = setup.messenger.last_keyboard().unwrap();
+        let mut deny = press(&button(&rows, 0, 1), message);
+        deny.callback = "deny".to_owned();
+
+        futures::join!(
+            press::handle(
+                Arc::clone(&setup.registries),
+                setup.sender.clone(),
+                press(&button(&rows, 0, 0), message)
+            ),
+            press::handle(Arc::clone(&setup.registries), setup.sender.clone(), deny),
+        );
+
+        assert_eq!(request.await, Decision::Allowed);
+        let answers: Vec<_> = setup
+            .messenger
+            .calls()
+            .into_iter()
+            .filter(|call| matches!(call, Call::Answer { .. }))
+            .collect();
+        assert_eq!(
+            answers,
+            [
+                Call::Answer { callback: "cb".to_owned(), text: None },
+                Call::Answer {
+                    callback: "deny".to_owned(),
+                    text: Some("Запрос уже неактуален".to_owned())
+                },
+            ]
+        );
+        assert_eq!(
+            approval_edits(&setup.messenger),
+            ["🔐 <b>Bash</b>\n<pre>ls</pre>\n\n✅ Разрешено"]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::allowed(Some(0), Decision::Allowed, "✅ Разрешено")]
+    #[case::denied(Some(1), Verdict::Deny.decision(), "❌ Запрещено")]
+    #[case::timed_out(
+        None,
+        Decision::Denied(Denied::new("Нет ответа пользователя за 5 с")),
+        "⌛ Нет ответа — запрещено"
+    )]
+    #[tokio::test(start_paused = true)]
+    async fn late_press_during_a_delayed_edit_cannot_change_the_outcome(
+        #[case] chosen: Option<usize>,
+        #[case] expected: Decision,
+        #[case] line: &str,
+    ) {
+        let setup = setup(Duration::from_secs(5));
+        let release = setup.messenger.delay_next_edit();
+        let mut request = Box::pin(setup.channel.request(bash()));
+        assert!(futures::poll!(&mut request).is_pending());
+        let (message, rows) = setup.messenger.last_keyboard().unwrap();
+        if let Some(column) = chosen {
+            press::handle(
+                Arc::clone(&setup.registries),
+                setup.sender.clone(),
+                press(&button(&rows, 0, column), message),
+            )
+            .await;
+        } else {
+            tokio::time::advance(Duration::from_secs(5)).await;
+        }
+
+        // The outcome is committed, but the final Telegram edit is still in flight.
+        assert!(futures::poll!(&mut request).is_pending());
+        assert!(approval_edits(&setup.messenger).is_empty());
+        press::handle(
+            Arc::clone(&setup.registries),
+            setup.sender.clone(),
+            press(&button(&rows, 0, 0), message),
+        )
+        .await;
+        assert!(setup.messenger.calls().contains(&stale("Запрос уже неактуален")));
+        tokio::time::advance(Duration::from_secs(5)).await;
+        release.send(()).unwrap();
+
+        assert_eq!(request.await, expected);
+        assert_eq!(
+            approval_edits(&setup.messenger),
+            [format!("🔐 <b>Bash</b>\n<pre>ls</pre>\n\n{line}")]
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_a_wait_makes_an_already_created_press_stale() {
+        let setup = setup(Duration::from_secs(5));
+        let mut request = Box::pin(setup.channel.request(bash()));
+        assert!(futures::poll!(&mut request).is_pending());
+        let (message, rows) = setup.messenger.last_keyboard().unwrap();
+        let pending_press = press::handle(
+            Arc::clone(&setup.registries),
+            setup.sender.clone(),
+            press(&button(&rows, 0, 0), message),
+        );
+        drop(request);
+
+        pending_press.await;
+        assert!(setup.messenger.calls().contains(&stale("Запрос уже неактуален")));
+        assert!(approval_edits(&setup.messenger).is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn failed_approval_delivery_closes_the_request() {
+        let setup = setup_with_messenger(
+            Duration::from_secs(5),
+            FakeMessenger::with_sends(vec![Err(SendError::Failed("offline".to_owned()))]),
+        );
+        assert_eq!(
+            setup.channel.request(bash()).await,
+            Decision::Denied(Denied::new("Не удалось отправить запрос подтверждения в Telegram"))
+        );
+        let attempted = setup.messenger.send_attempts();
+        let [message] = attempted.as_slice() else { panic!("one approval send expected") };
+        press::handle(
+            Arc::clone(&setup.registries),
+            setup.sender.clone(),
+            press(&button(&message.keyboard, 0, 0), MessageId(1)),
+        )
+        .await;
+
+        assert!(setup.messenger.calls().contains(&stale("Запрос уже неактуален")));
+        assert!(approval_edits(&setup.messenger).is_empty());
+    }
+
     #[tokio::test]
     async fn approval_is_asked_with_buttons_and_resolved_by_a_press() {
         let setup = setup(Duration::from_secs(5));
@@ -300,7 +528,7 @@ mod tests {
         assert!(setup.messenger.calls().contains(&Call::Edit {
             chat: KEY.chat,
             message,
-            text: "🔐 <b>Bash</b>\n\n✅ Разрешено".to_owned(),
+            text: "🔐 <b>Bash</b>\n<pre>ls</pre>\n\n✅ Разрешено".to_owned(),
             format: Format::Html,
         }));
     }
