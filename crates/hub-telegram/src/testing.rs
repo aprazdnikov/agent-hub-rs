@@ -33,6 +33,7 @@ impl crate::actions::ActionRunner for FakeActionRunner {
 pub(crate) enum Call {
     Send { target: Target, message: Outgoing, id: MessageId },
     Edit { chat: ChatId, message: MessageId, text: String, format: Format },
+    EditCard { chat: ChatId, message: MessageId, card: Outgoing },
     EditKeyboard { chat: ChatId, message: MessageId, keyboard: Vec<Vec<Button>> },
     Answer { callback: String, text: Option<String> },
     Document { key: TopicKey, path: PathBuf, caption: String },
@@ -43,6 +44,7 @@ pub(crate) enum Call {
 pub(crate) struct FakeMessenger {
     calls: Mutex<Vec<Call>>,
     send_attempts: Mutex<Vec<Outgoing>>,
+    card_attempts: Mutex<Vec<Outgoing>>,
     sends: Mutex<VecDeque<Result<(), SendError>>>,
     edits: Mutex<VecDeque<Result<(), SendError>>>,
     edit_delay: Mutex<Option<oneshot::Receiver<()>>>,
@@ -69,6 +71,10 @@ impl FakeMessenger {
 
     pub(crate) fn send_attempts(&self) -> Vec<Outgoing> {
         self.send_attempts.lock().unwrap().clone()
+    }
+
+    pub(crate) fn card_attempts(&self) -> Vec<Outgoing> {
+        self.card_attempts.lock().unwrap().clone()
     }
 
     /// Hold the next edit until the test explicitly releases it.
@@ -111,6 +117,22 @@ impl FakeMessenger {
 }
 
 impl Messenger for FakeMessenger {
+    fn edit_card(
+        &self,
+        chat: ChatId,
+        message: MessageId,
+        card: Outgoing,
+    ) -> BoxFuture<'_, Result<(), SendError>> {
+        self.card_attempts.lock().unwrap().push(card.clone());
+        let scripted = self.edits.lock().unwrap().pop_front().unwrap_or(Ok(()));
+        let delay = self.edit_delay.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some(delay) = delay {
+                let _ = delay.await;
+            }
+            scripted.map(|()| self.record(Call::EditCard { chat, message, card }))
+        })
+    }
     fn send(
         &self,
         target: Target,

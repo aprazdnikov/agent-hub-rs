@@ -16,6 +16,17 @@ impl Progress {
     pub fn snapshot(&self) -> TaskProgress {
         self.0.borrow().clone()
     }
+    pub async fn finished(&self) {
+        let mut changes = self.0.subscribe();
+        loop {
+            if changes.borrow_and_update().is_finished() {
+                return;
+            }
+            if changes.changed().await.is_err() {
+                return;
+            }
+        }
+    }
     pub fn executing(&self) {
         self.0.send_modify(|p| p.executing(Instant::now()));
     }

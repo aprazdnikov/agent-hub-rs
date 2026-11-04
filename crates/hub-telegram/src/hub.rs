@@ -178,6 +178,7 @@ pub struct HubHandle {
 }
 
 struct Live {
+    card: Option<crate::progress_card::Card>,
     progress: Progress,
     parameters: Effective,
     inbox: mpsc::Sender<Prompt>,
@@ -186,6 +187,7 @@ struct Live {
 }
 
 struct Hub<A> {
+    cards: crate::progress_card::Cards,
     results: LastResults,
     outbox: Outbox,
     actions: Actions,
@@ -241,6 +243,7 @@ pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
     let (views, watched) = watch::channel(Vec::new());
     let registries = Shared::default();
     let hub = Hub {
+        cards: crate::progress_card::Cards::default(),
         outbox: Outbox::new(results.clone(), Sender::new(messenger.clone()), settings.clone()),
         results: LastResults::new(results),
         actions: Actions::new(action_runner),
@@ -306,7 +309,24 @@ impl<A: Agents> Hub<A> {
     }
 
     fn press(&mut self, pressed: Press) {
-        if pressed.data.starts_with(options::PREFIX) {
+        if pressed.data.starts_with(crate::progress_card::PREFIX) {
+            if self.shutdown.is_none() {
+                let key = crate::progress_card::target(&pressed, &self.settings.borrow().telegram);
+                let stopped = key.is_some_and(|key| {
+                    self.running.get(&key).is_some_and(|live| {
+                        !live.cancel.is_cancelled()
+                            && !live.progress.snapshot().is_finished()
+                            && live.card.as_ref().is_some_and(|card| card.matches(&pressed.data))
+                    }) && self.stop(key)
+                });
+                self.cards.answer(
+                    self.sender.clone(),
+                    pressed.callback,
+                    stopped,
+                    self.settings.clone(),
+                );
+            }
+        } else if pressed.data.starts_with(options::PREFIX) {
             if self.shutdown.is_none() {
                 self.option_press(pressed);
             }
@@ -394,6 +414,7 @@ impl<A: Agents> Hub<A> {
             }
             HubMessage::Snapshot(SnapshotDone(done)) => self.snapshot_done(done),
             HubMessage::Shutdown(done) => {
+                self.cards.shutdown();
                 self.actions.shutdown();
                 self.doctors.shutdown();
                 self.results.shutdown();
@@ -762,10 +783,13 @@ impl<A: Agents> Hub<A> {
         self.generation += 1;
         let cancel = CancellationToken::new();
         let progress = Progress::new();
+        let card =
+            self.cards.start(key, progress.clone(), self.sender.clone(), self.settings.clone());
         self.last_progress.remove(&key);
         self.running.insert(
             key,
             Live {
+                card: card.clone(),
                 progress: progress.clone(),
                 parameters,
                 inbox,
@@ -774,6 +798,7 @@ impl<A: Agents> Hub<A> {
             },
         );
         let run = Run {
+            card,
             progress,
             key,
             session,
@@ -1537,6 +1562,7 @@ mod tests {
         Collect(usize),
         Stream(mpsc::Receiver<AgentEvent>),
         Approval,
+        Question,
         Crash,
     }
 
@@ -1610,6 +1636,29 @@ mod tests {
                 self.scripts.lock().unwrap().pop_front().unwrap_or(Script::Say(Vec::new()));
             Box::pin(async move {
                 match script {
+                    Script::Question => {
+                        use hub_core::domain::{
+                            Question, QuestionOption, QuestionsOutcome, Selection,
+                        };
+                        let question = Question::new(
+                            "Продолжить?".into(),
+                            "Выбор".into(),
+                            vec![QuestionOption {
+                                label: "Продолжить".into(),
+                                description: String::new(),
+                            }],
+                            Selection::Single,
+                        )
+                        .unwrap();
+                        let requested = conversation.channel.ask(vec![question]);
+                        tokio::select! {
+                            () = conversation.cancel.cancelled() => {},
+                            answer = requested => {
+                                assert!(matches!(answer, QuestionsOutcome::Answered(_)));
+                                conversation.events.send(finished()).await.unwrap();
+                            }
+                        }
+                    }
                     Script::Crash => panic!("test session crash"),
                     Script::Approval => {
                         let requested =
@@ -1831,6 +1880,7 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("project")).unwrap();
         let settings = Draft {
+            progress_mode: hub_core::settings::ProgressMode::Detailed,
             token: "1:a".to_owned(),
             chat: "-100".to_owned(),
             users: "1".to_owned(),
@@ -2047,6 +2097,198 @@ mod tests {
 
     fn phase(world: &World) -> Option<hub_core::progress::Phase> {
         world.handle.views.borrow().iter().find(|v| v.key == KEY).map(|v| v.progress.phase())
+    }
+
+    fn compact(world: &World) {
+        world.settings.send_modify(|s| {
+            Arc::make_mut(s).progress_mode = hub_core::settings::ProgressMode::Compact;
+        });
+    }
+
+    async fn stop_button(world: &World) -> Press {
+        eventually("progress card", || world.messenger.calls().iter().any(|call| matches!(call,
+            Call::Send { message, .. } if message.keyboard.iter().flatten().any(|b| b.data.starts_with(crate::progress_card::PREFIX))
+        ))).await;
+        let (message, data) = world
+            .messenger
+            .calls()
+            .into_iter()
+            .rev()
+            .find_map(|call| match call {
+                Call::Send { id, message, .. } => message
+                    .keyboard
+                    .into_iter()
+                    .flatten()
+                    .find(|b| b.data.starts_with(crate::progress_card::PREFIX))
+                    .map(|b| (id, b.data)),
+                _ => None,
+            })
+            .unwrap();
+        Press {
+            callback: uuid::Uuid::new_v4().to_string(),
+            user: UserId(1),
+            chat: Some(KEY.chat),
+            message: Some(message),
+            html: None,
+            data,
+        }
+    }
+
+    #[tokio::test]
+    async fn compact_card_preserves_final_result_boundaries_while_creation_is_stalled() {
+        let (events, received) = mpsc::channel(8);
+        let world = world(FakeAgents::scripted(vec![Script::Stream(received)]));
+        compact(&world);
+        let release = world.messenger.delay_next_send();
+        world.send(text(Some(7), 1, "work")).await;
+        eventually("card started", || !world.messenger.send_attempts().is_empty()).await;
+        assert!(world.messenger.send_attempts()[0].text.contains("Прогресс задачи"));
+        for event in [
+            AgentEvent::AssistantText("explanation".into()),
+            AgentEvent::ToolCall(hub_core::domain::ToolUse {
+                tool: "test".into(),
+                summary: "private command".into(),
+            }),
+            AgentEvent::AssistantText("final answer".into()),
+            finished(),
+        ] {
+            events.send(event).await.unwrap();
+        }
+        drop(events);
+        eventually("saved and ended despite stalled card", || {
+            world.results.records.lock().unwrap().contains_key(&KEY) && !world.running()
+        })
+        .await;
+        assert_eq!(world.results.records.lock().unwrap()[&KEY].text(), "final answer");
+        eventually("answer delivered", || world.texts().iter().any(|t| t.contains("final answer")))
+            .await;
+        assert!(world.texts().iter().any(|t| t == "explanation"));
+        assert!(!world.texts().iter().any(|t| t.contains("private command")));
+        release.send(()).unwrap();
+        world.send(text(Some(7), 2, "/last")).await;
+        eventually("last reply", || {
+            world.texts().iter().any(|t| t.contains("Последний сохранённый ответ"))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn compact_stop_rejects_unauthorized_and_previous_runs_including_restart() {
+        let mut world = world(FakeAgents::scripted(vec![
+            Script::UntilStopped,
+            Script::UntilStopped,
+            Script::UntilStopped,
+        ]));
+        compact(&world);
+        world.send(text(Some(7), 1, "first")).await;
+        let old = stop_button(&world).await;
+        for (index, mut invalid) in [old.clone(), old.clone()].into_iter().enumerate() {
+            if index == 0 {
+                invalid.user = UserId(999);
+            } else {
+                invalid.chat = Some(ChatId(-200));
+            }
+            invalid.callback = uuid::Uuid::new_v4().to_string();
+            world.send(HubMessage::Press(invalid.clone())).await;
+            eventually("refused", || world.messenger.calls().iter().any(|c| matches!(c, Call::Answer {callback, text: Some(t)} if callback == &invalid.callback && t.contains("недоступна")))).await;
+            assert!(world.running());
+        }
+        world.send(HubMessage::Press(old.clone())).await;
+        eventually("stopped", || !world.running()).await;
+        world.send(text(Some(7), 2, "second")).await;
+        eventually("second running", || world.agents.prompts().len() == 2 && world.running()).await;
+        let mut stale = old.clone();
+        stale.callback = "old-run".into();
+        world.send(HubMessage::Press(stale)).await;
+        eventually("old refused", || world.messenger.calls().iter().any(|c| matches!(c, Call::Answer {callback, text: Some(t)} if callback == "old-run" && t.contains("недоступна")))).await;
+        assert!(world.running());
+        world.restart().await;
+        world.send(text(Some(7), 3, "third")).await;
+        eventually("third running", || world.agents.prompts().len() == 3 && world.running()).await;
+        let mut stale = old;
+        stale.callback = "old-restart".into();
+        world.send(HubMessage::Press(stale)).await;
+        eventually("restart refused", || world.messenger.calls().iter().any(|c| matches!(c, Call::Answer {callback, text: Some(t)} if callback == "old-restart" && t.contains("недоступна")))).await;
+        assert!(world.running());
+        world.send(text(Some(7), 4, "/stop")).await;
+        eventually("stopped third", || !world.running()).await;
+    }
+
+    #[tokio::test]
+    async fn compact_approval_remains_separate_and_stop_interrupts_wait() {
+        use hub_core::progress::Phase;
+        let world = world(FakeAgents::scripted(vec![Script::Approval]));
+        compact(&world);
+        world.send(text(Some(7), 1, "work")).await;
+        let stop = stop_button(&world).await;
+        eventually("approval", || phase(&world) == Some(Phase::AwaitingApproval)).await;
+        assert!(world.messenger.calls().iter().any(|c| matches!(c, Call::Send { id, message, .. } if Some(*id) != stop.message && !message.keyboard.is_empty())));
+        world.send(HubMessage::Press(stop)).await;
+        eventually("stopped waiting", || phase(&world) == Some(Phase::Stopped)).await;
+    }
+
+    #[tokio::test]
+    async fn compact_question_can_be_answered_while_card_is_visible() {
+        use hub_core::progress::Phase;
+        let world = world(FakeAgents::scripted(vec![Script::Question]));
+        compact(&world);
+        world.send(text(Some(7), 1, "work")).await;
+        let stop = stop_button(&world).await;
+        eventually("question waiting", || phase(&world) == Some(Phase::AwaitingAnswer)).await;
+        let choice = project_button(&world, "Продолжить").await;
+        assert_ne!(choice.message, stop.message);
+        world.send(HubMessage::Press(choice)).await;
+        eventually("question completed", || phase(&world) == Some(Phase::Completed)).await;
+    }
+
+    #[tokio::test]
+    async fn compact_mode_stays_frozen_and_failed_card_restores_tool_messages() {
+        let (events, received) = mpsc::channel(8);
+        let world = world(FakeAgents::scripted(vec![Script::Stream(received)]));
+        compact(&world);
+        world.send(text(Some(7), 1, "work")).await;
+        let _ = stop_button(&world).await;
+        world.settings.send_modify(|s| {
+            Arc::make_mut(s).progress_mode = hub_core::settings::ProgressMode::Detailed;
+        });
+        events
+            .send(AgentEvent::ToolCall(hub_core::domain::ToolUse {
+                tool: "test".into(),
+                summary: "hidden tool".into(),
+            }))
+            .await
+            .unwrap();
+        events.send(AgentEvent::AssistantText("finished".into())).await.unwrap();
+        events.send(finished()).await.unwrap();
+        drop(events);
+        eventually("done", || {
+            world.results.records.lock().unwrap().contains_key(&KEY) && !world.running()
+        })
+        .await;
+        assert!(!world.texts().iter().any(|t| t.contains("hidden tool")));
+
+        let (events, received) = mpsc::channel(8);
+        let world = world_from(
+            FakeAgents::scripted(vec![Script::Stream(received)]),
+            FakeMessenger::with_sends(vec![Err(crate::messenger::SendError::Failed(
+                "offline".into(),
+            ))]),
+            BackendKind::Claude,
+        );
+        compact(&world);
+        world.send(text(Some(7), 1, "work")).await;
+        eventually("failed card", || !world.messenger.send_attempts().is_empty()).await;
+        events
+            .send(AgentEvent::ToolCall(hub_core::domain::ToolUse {
+                tool: "test".into(),
+                summary: "visible fallback".into(),
+            }))
+            .await
+            .unwrap();
+        eventually("tool fallback", || {
+            world.texts().iter().any(|t| t.contains("visible fallback"))
+        })
+        .await;
     }
 
     #[tokio::test]

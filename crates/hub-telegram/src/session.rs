@@ -36,6 +36,7 @@ pub(crate) enum First {
 }
 
 pub(crate) struct Run<A> {
+    pub(crate) card: Option<crate::progress_card::Card>,
     pub(crate) progress: Progress,
     pub(crate) key: TopicKey,
     pub(crate) session: TopicSession,
@@ -72,6 +73,7 @@ impl<A: Agents> Run<A> {
 
     async fn converse(self) -> mpsc::Receiver<Prompt> {
         let Self {
+            card,
             progress,
             key,
             session,
@@ -141,6 +143,7 @@ impl<A: Agents> Run<A> {
                 &mailbox,
                 background,
                 ResultContext {
+                    card: card.as_ref(),
                     generation,
                     session: &session,
                     cancel: &cancel,
@@ -156,6 +159,7 @@ impl<A: Agents> Run<A> {
 }
 
 struct ResultContext<'a> {
+    card: Option<&'a crate::progress_card::Card>,
     progress: &'a Progress,
     generation: u64,
     session: &'a TopicSession,
@@ -235,7 +239,12 @@ async fn collect(
             AgentEvent::AssistantText(text) => pending.push(text, &output).await,
             AgentEvent::ToolCall(call) => {
                 pending.boundary(&output);
-                output.send(Style::Html, texts::tool_call_html(&call));
+                if let Some(card) = context.card {
+                    card.tool(&call.tool);
+                }
+                if context.card.is_none_or(|card| !card.compact()) {
+                    output.send(Style::Html, texts::tool_call_html(&call));
+                }
             }
             AgentEvent::Finished(finished) => {
                 let mut queued_footer = false;

@@ -78,6 +78,13 @@ pub trait Messenger: Send + Sync {
         message: MessageId,
         keyboard: Vec<Vec<Button>>,
     ) -> BoxFuture<'_, Result<(), SendError>>;
+    /// Replaces text and keyboard in one request (including an empty keyboard).
+    fn edit_card(
+        &self,
+        chat: ChatId,
+        message: MessageId,
+        card: Outgoing,
+    ) -> BoxFuture<'_, Result<(), SendError>>;
     fn answer(
         &self,
         callback: String,

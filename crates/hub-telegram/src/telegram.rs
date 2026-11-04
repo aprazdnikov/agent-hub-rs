@@ -189,6 +189,27 @@ fn thread(key: TopicKey) -> tg::ThreadId {
 }
 
 impl Messenger for TelegramMessenger {
+    fn edit_card(
+        &self,
+        chat: ChatId,
+        message: MessageId,
+        card: Outgoing,
+    ) -> BoxFuture<'_, Result<(), SendError>> {
+        Box::pin(async move {
+            let request = self
+                .bot
+                .edit_message_text(tg::ChatId(chat.0), tg::MessageId(message.0), card.text)
+                .reply_markup(markup(card.keyboard));
+            let request = match card.format {
+                Format::Html => request.parse_mode(ParseMode::Html),
+                Format::Plain => request,
+            };
+            match request.await {
+                Ok(_) | Err(RequestError::Api(teloxide::ApiError::MessageNotModified)) => Ok(()),
+                Err(error) => Err(sent(error)),
+            }
+        })
+    }
     fn send(
         &self,
         target: Target,
@@ -398,6 +419,63 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[rstest::rstest]
+    #[case(true)]
+    #[case(false)]
+    #[tokio::test]
+    async fn card_edit_sends_keyboard_atomically_and_accepts_unchanged_message(
+        #[case] active: bool,
+    ) {
+        use http_body_util::{BodyExt, Full};
+        use hyper::body::Bytes;
+        use hyper_util::rt::TokioIo;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let rows = if active {
+            vec![vec![Button { text: "Stop".into(), data: "stop".into() }]]
+        } else {
+            vec![]
+        };
+        let expected = serde_json::to_value(markup(rows.clone())).unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(
+                move |request: hyper::Request<hyper::body::Incoming>| {
+                    let expected = expected.clone();
+                    async move {
+                        assert!(request.uri().path().to_lowercase().ends_with("editmessagetext"));
+                        let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                        let params: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                        assert_eq!(params["text"], "status");
+                        assert_eq!(params["reply_markup"], expected);
+                        let body = json!({"ok": false, "error_code": 400, "description": "Bad Request: message is not modified: specified new message content and reply markup are exactly the same as a current content and reply markup of the message"});
+                        Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                            Bytes::from(body.to_string()),
+                        )))
+                    }
+                },
+            );
+            hyper::server::conn::http1::Builder::new()
+                .keep_alive(false)
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        });
+        let bot = Bot::new("1:test").set_api_url(format!("http://{address}/").parse().unwrap());
+        let messenger = TelegramMessenger { files: bot.clone(), bot };
+        assert_eq!(
+            messenger
+                .edit_card(
+                    ChatId(-100),
+                    MessageId(1),
+                    Outgoing::plain("status".into()).with_keyboard(rows)
+                )
+                .await,
+            Ok(())
+        );
+        server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn result_can_be_sent_after_original_command_message_is_deleted() {

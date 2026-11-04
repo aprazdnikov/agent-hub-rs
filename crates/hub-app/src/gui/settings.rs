@@ -9,7 +9,7 @@ use hub_core::domain::BackendKind;
 use hub_core::projects::{MAX_PROJECTS, ProjectDraft};
 use hub_core::settings::{
     ApiEndpoint, Approval, CodexField, Draft, Field, FieldError, HermesField, OpencodeField,
-    PermissionMode, QwenApproval, QwenField, Sandbox, Settings, UpdateCheck,
+    PermissionMode, ProgressMode, QwenApproval, QwenField, Sandbox, Settings, UpdateCheck,
 };
 
 use crate::gui::log::LogAction;
@@ -400,7 +400,7 @@ impl SettingsForm {
 
     fn telegram(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
         ui.heading("Telegram");
-        ui.label("Изменение этих полей перезапускает бота и останавливает сессии и пользовательские действия.");
+        ui.label("Изменение токена, chat_id или user_id перезапускает бота и останавливает сессии и пользовательские действия.");
         ui.horizontal(|ui| {
             ui.label("Токен бота");
             ui.add(
@@ -419,6 +419,12 @@ impl SettingsForm {
             ui.add(egui::TextEdit::singleline(&mut self.draft.users).hint_text("111, 222"));
         });
         messages(ui, errors, Field::Users);
+        ui.horizontal(|ui| {
+            ui.label("Прогресс задач");
+            ui.selectable_value(&mut self.draft.progress_mode, ProgressMode::Compact, "Компактный");
+            ui.selectable_value(&mut self.draft.progress_mode, ProgressMode::Detailed, "Подробный");
+        });
+        ui.label("Компактный: одна карточка вместо сообщений об инструментах. Применяется к следующим запускам без перезапуска бота.");
     }
 
     fn workspace(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {

@@ -112,6 +112,10 @@ pub struct TaskProgress {
 }
 impl TaskProgress {
     #[must_use]
+    pub fn is_finished(&self) -> bool {
+        self.ended.is_some()
+    }
+    #[must_use]
     pub fn new(now: Instant) -> Self {
         Self {
             base: Phase::Preparing,

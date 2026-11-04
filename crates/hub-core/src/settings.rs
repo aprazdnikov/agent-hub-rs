@@ -233,6 +233,18 @@ pub enum UpdateCheck {
     Disabled,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProgressMode {
+    #[default]
+    Compact,
+    Detailed,
+}
+
+fn is_default<T: Default + PartialEq>(value: &T) -> bool {
+    *value == T::default()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TelegramSettings {
     pub token: Token,
@@ -292,6 +304,7 @@ pub struct Timeouts {
 /// Parsed settings. `workspace_root` is absolute; whether it exists is checked by the shell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
+    pub progress_mode: ProgressMode,
     pub actions: Vec<Action>,
     pub projects: Vec<Project>,
     pub telegram: TelegramSettings,
@@ -471,6 +484,7 @@ impl OpencodeDraft {
 /// The settings form as typed by the user.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Draft {
+    pub progress_mode: ProgressMode,
     pub actions: Vec<ActionDraft>,
     pub projects: Vec<ProjectDraft>,
     pub token: String,
@@ -495,6 +509,7 @@ pub struct Draft {
 impl Default for Draft {
     fn default() -> Self {
         Self {
+            progress_mode: ProgressMode::default(),
             actions: Vec::new(),
             projects: Vec::new(),
             token: String::new(),
@@ -521,6 +536,7 @@ impl Default for Draft {
 impl fmt::Debug for Draft {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
+            progress_mode,
             actions,
             projects,
             token: _token,
@@ -542,6 +558,7 @@ impl fmt::Debug for Draft {
             updates,
         } = self;
         f.debug_struct("Draft")
+            .field("progress_mode", progress_mode)
             .field("actions", actions)
             .field("projects", projects)
             .field("token", &"***")
@@ -641,6 +658,7 @@ impl Draft {
             return Err(errors);
         };
         Ok(Settings {
+            progress_mode: self.progress_mode,
             actions,
             projects,
             telegram: TelegramSettings { token, chat, users },
@@ -665,6 +683,7 @@ impl Draft {
     #[must_use]
     pub fn from_settings(settings: &Settings) -> Self {
         Self {
+            progress_mode: settings.progress_mode,
             actions: settings.actions.iter().map(Action::to_draft).collect(),
             projects: settings.projects.iter().map(Project::to_draft).collect(),
             token: settings.telegram.token.expose().to_owned(),
@@ -934,6 +953,8 @@ pub struct SettingsFile {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct TelegramFile {
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub progress: ProgressMode,
     pub chat: i64,
     pub users: Vec<u64>,
 }
@@ -1039,6 +1060,7 @@ impl SettingsFile {
             actions: settings.actions.iter().map(Action::to_draft).collect(),
             projects: settings.projects.iter().map(Project::to_draft).collect(),
             telegram: TelegramFile {
+                progress: settings.progress_mode,
                 chat: settings.telegram.chat.0,
                 users: settings.telegram.users.iter().map(|user| user.0).collect(),
             },
@@ -1132,6 +1154,7 @@ impl SettingsFile {
         )?;
         let defaults = Draft::default();
         Ok(Draft {
+            progress_mode: self.telegram.progress,
             actions: self.actions.clone(),
             projects: self.projects.clone(),
             token,
@@ -1219,6 +1242,41 @@ mod tests {
             workspace_root: "~/Projects".to_owned(),
             ..Draft::default()
         }
+    }
+
+    #[test]
+    fn progress_mode_defaults_and_round_trips_without_changing_telegram_identity() {
+        let raw = "[telegram]\nchat = -100\nusers = [1]\n[workspace]\nroot = \"~/Projects\"\n";
+        let old: SettingsFile = toml::from_str(raw).unwrap();
+        assert_eq!(old.telegram.progress, ProgressMode::Compact);
+        let compact = draft().parse(&home()).unwrap();
+        for mode in [ProgressMode::Compact, ProgressMode::Detailed] {
+            let mut form = Draft::from_settings(&compact);
+            form.progress_mode = mode;
+            let settings = form.parse(&home()).unwrap();
+            assert_eq!(settings.telegram, compact.telegram);
+            assert_eq!(Draft::from_settings(&settings).progress_mode, mode);
+            let file = SettingsFile::from_settings(&settings, &home());
+            let encoded = toml::to_string(&file).unwrap();
+            assert_eq!(encoded.contains("progress ="), mode == ProgressMode::Detailed);
+            let loaded: SettingsFile = toml::from_str(&encoded).unwrap();
+            assert_eq!(loaded.telegram.progress, mode);
+            assert_eq!(
+                loaded
+                    .to_draft(Keys {
+                        token: "1:a".to_owned(),
+                        api_key: String::new(),
+                        qwen_key: String::new()
+                    })
+                    .unwrap()
+                    .progress_mode,
+                mode
+            );
+        }
+        assert!(
+            toml::from_str::<SettingsFile>(&raw.replace("chat =", "progress = \"other\"\nchat ="))
+                .is_err()
+        );
     }
 
     #[test]

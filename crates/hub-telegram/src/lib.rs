@@ -11,6 +11,7 @@ pub mod messenger;
 pub mod paths;
 pub mod press;
 mod progress;
+mod progress_card;
 mod projects;
 pub mod sender;
 mod session;
