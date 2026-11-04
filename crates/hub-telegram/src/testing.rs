@@ -225,26 +225,55 @@ pub struct MemoryResults {
         std::collections::HashMap<hub_core::domain::TopicKey, hub_core::results::SavedResult>,
     >,
     pub fail: std::sync::atomic::AtomicBool,
+    pub journal: Mutex<hub_core::results::Results>,
+    pub time: std::sync::atomic::AtomicI64,
+}
+impl MemoryResults {
+    pub fn now(&self) -> i64 {
+        let time = self.time.load(std::sync::atomic::Ordering::SeqCst);
+        if time == 0 { chrono::Utc::now().timestamp() } else { time }
+    }
 }
 impl crate::results::ResultStore for MemoryResults {
     fn save(
         &self,
-        record: hub_core::results::SavedResult,
-    ) -> futures::future::BoxFuture<'static, Result<(), String>> {
+        pending: hub_core::outbox::Pending,
+    ) -> BoxFuture<'static, Result<hub_core::outbox::SaveOutcome, String>> {
         let result = if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
             Err("диск полон".to_owned())
         } else {
-            self.records.lock().unwrap().insert(record.key(), record);
-            Ok(())
+            self.records.lock().unwrap().insert(pending.result().key(), pending.result().clone());
+            self.journal.lock().unwrap().enqueue(pending, self.now())
         };
         Box::pin(std::future::ready(result))
     }
     fn load(
         &self,
         key: hub_core::domain::TopicKey,
-    ) -> futures::future::BoxFuture<'static, Result<Option<hub_core::results::SavedResult>, String>>
-    {
+    ) -> BoxFuture<'static, Result<Option<hub_core::results::SavedResult>, String>> {
         let record = self.records.lock().unwrap().get(&key).cloned();
         Box::pin(std::future::ready(Ok(record)))
+    }
+    fn pending(
+        &self,
+        chat: hub_core::domain::ChatId,
+    ) -> BoxFuture<'static, Result<hub_core::outbox::Snapshot, String>> {
+        let result = if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            Err("диск полон".to_owned())
+        } else {
+            Ok(self.journal.lock().unwrap().snapshot(chat))
+        };
+        Box::pin(std::future::ready(result))
+    }
+    fn update(
+        &self,
+        change: hub_core::outbox::Change,
+    ) -> BoxFuture<'static, Result<Option<hub_core::outbox::Pending>, String>> {
+        let result = if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            Err("диск полон".to_owned())
+        } else {
+            self.journal.lock().unwrap().update(&change, self.now())
+        };
+        Box::pin(std::future::ready(result))
     }
 }

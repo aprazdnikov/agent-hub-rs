@@ -16,4 +16,5 @@ pub mod snapshot;
 pub mod topics;
 pub mod workspace;
 
+pub mod outbox;
 pub mod results;

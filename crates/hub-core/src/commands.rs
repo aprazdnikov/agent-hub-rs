@@ -9,6 +9,7 @@ pub enum Command {
     Projects,
     Doctor,
     Last,
+    Outbox,
     Help,
     New,
     Cwd,
@@ -23,7 +24,7 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Self; 15] = [
+    pub const ALL: [Self; 16] = [
         Self::New,
         Self::Backend,
         Self::Cwd,
@@ -35,6 +36,7 @@ impl Command {
         Self::Projects,
         Self::Doctor,
         Self::Last,
+        Self::Outbox,
         Self::Save,
         Self::Saves,
         Self::Restore,
@@ -48,6 +50,7 @@ impl Command {
             Self::Projects => "projects",
             Self::Doctor => "doctor",
             Self::Last => "last",
+            Self::Outbox => "outbox",
             Self::Help => "help",
             Self::New => "new",
             Self::Cwd => "cwd",
@@ -69,6 +72,7 @@ impl Command {
             Self::Projects => "выбрать проект для этой темы (сброс контекста)",
             Self::Doctor => "проверить каталог, CLI и ресурсы проекта",
             Self::Last => "повторить последний сохранённый ответ темы",
+            Self::Outbox => "очередь доставки: повторить или удалить ответ",
             Self::Help => "эта справка",
             Self::New => "новая сессия в этой теме (сброс контекста)",
             Self::Cwd => "сменить рабочую директорию (сброс контекста)",
@@ -100,7 +104,8 @@ impl Command {
             | Self::Actions
             | Self::Projects
             | Self::Doctor
-            | Self::Last => "",
+            | Self::Last
+            | Self::Outbox => "",
         }
     }
 
@@ -253,7 +258,7 @@ mod tests {
             assert!((1..=256).contains(&command.description().chars().count()));
             assert_eq!(Command::parse(name), Some(command));
         }
-        assert_eq!(names.len(), 15);
+        assert_eq!(names.len(), 16);
     }
 
     #[test]
@@ -263,7 +268,7 @@ mod tests {
             names,
             [
                 "new", "backend", "cwd", "reset", "stop", "status", "limits", "actions",
-                "projects", "doctor", "last", "save", "saves", "restore", "help"
+                "projects", "doctor", "last", "outbox", "save", "saves", "restore", "help"
             ]
         );
     }

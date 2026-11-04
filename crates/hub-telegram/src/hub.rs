@@ -36,6 +36,7 @@ use crate::download::download;
 use crate::inbound::{Content, Inbound, Press, Turn};
 use crate::limits::{self, Outcome, QuotaCache};
 use crate::messenger::{Format, Messenger, Outgoing, Target};
+use crate::outbox::{self, Outbox};
 use crate::paths::{CwdError, resolve_cwd, workspace_root};
 use crate::press;
 use crate::projects::{self, Projects, Stage};
@@ -175,6 +176,7 @@ struct Live {
 
 struct Hub<A> {
     results: LastResults,
+    outbox: Outbox,
     actions: Actions,
     doctors: Doctors,
     projects: Projects,
@@ -226,6 +228,7 @@ pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
     let (views, watched) = watch::channel(Vec::new());
     let registries = Shared::default();
     let hub = Hub {
+        outbox: Outbox::new(results.clone(), Sender::new(messenger.clone()), settings.clone()),
         results: LastResults::new(results),
         actions: Actions::new(action_runner),
         doctors: Doctors::new(doctor_runner),
@@ -293,7 +296,11 @@ impl<A: Agents> Hub<A> {
                 }
             }
             HubMessage::Press(pressed) => {
-                if pressed.data.starts_with(doctor::PREFIX) {
+                if pressed.data.starts_with(outbox::PREFIX) {
+                    if self.shutdown.is_none() {
+                        self.outbox.press(&pressed);
+                    }
+                } else if pressed.data.starts_with(doctor::PREFIX) {
                     if self.shutdown.is_none() {
                         let settings = self.settings.borrow();
                         if let Some(key) = self.doctors.press(
@@ -362,6 +369,7 @@ impl<A: Agents> Hub<A> {
                 self.actions.shutdown();
                 self.doctors.shutdown();
                 self.results.shutdown();
+                self.outbox.shutdown();
                 for live in self.running.values() {
                     live.cancel.cancel();
                 }
@@ -372,16 +380,19 @@ impl<A: Agents> Hub<A> {
     }
 
     fn save_result(&self, saved: SaveResult) {
-        let SaveResult { key, generation, record, reply } = saved;
-        if record.key() == key
+        let SaveResult { key, generation, pending, reply } = saved;
+        if pending.result().key() == key
             && self
                 .running
                 .get(&key)
                 .is_some_and(|live| live.generation == generation && !live.cancel.is_cancelled())
         {
-            let saving = self.results.store.save(record);
+            let saving = self.results.store.save(pending);
+            let wake = self.outbox.wake();
             tokio::spawn(async move {
-                let _ = reply.send(saving.await);
+                let result = saving.await;
+                wake.notify_one();
+                let _ = reply.send(result);
             });
         } else {
             let _ = reply.send(Err("Результат прежнего запуска не сохранён".to_owned()));
@@ -412,6 +423,9 @@ impl<A: Agents> Hub<A> {
             }
             Content::TopicRenamed { name } => self.rename(key, name.clone()),
             Content::Text(text) => match parse_input(text, &self.bot) {
+                Input::Command { command: Command::Outbox, .. } => {
+                    self.outbox.menu(key, inbound.user);
+                }
                 Input::Command { command: Command::Last, .. } => {
                     self.results.read(
                         key,
@@ -484,7 +498,7 @@ impl<A: Agents> Hub<A> {
         args: &[&str],
     ) {
         match command {
-            Command::Last => {} // Handled with the live user's identity in inbound().
+            Command::Last | Command::Outbox => {} // Handled with the live user's identity in inbound().
             Command::Projects => self.project_menu(key),
             Command::Doctor => {
                 let card = self.doctors.menu(key, &self.settings.borrow());
@@ -1507,7 +1521,7 @@ mod tests {
                 agents: Arc::clone(&self.agents),
                 messenger: self.messenger.clone(),
                 settings: self.settings.subscribe(),
-                topics: self.store.last().unwrap(),
+                topics: self.store.last().unwrap_or_default(),
                 titles: self.store.titles.lock().unwrap().clone(),
                 recent_projects: self.store.recent.lock().unwrap().clone(),
                 store: Box::new(self.store.clone()),
@@ -1726,6 +1740,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn outbox_command_does_not_start_a_model_or_bind_a_session() {
+        let world = world(FakeAgents::default());
+        world.send(text(Some(7), 1, "/outbox")).await;
+        eventually("empty outbox", || {
+            world.texts().iter().any(|text| text.contains("Ожидающих ответов в этой теме нет"))
+        })
+        .await;
+        assert!(world.agents.prompts().is_empty());
+        assert!(world.store.last().is_none());
+    }
+    #[tokio::test]
+    async fn outbox_restart_delivers_remaining_parts_without_a_prompt_or_last_command() {
+        use hub_core::outbox::{Action, Change, Pending};
+        let mut world = world(FakeAgents::default());
+        // Let the initial empty pump settle, then emulate a persisted partial delivery.
+        for _ in 0..20 {
+            tokio::task::yield_now().await;
+        }
+        let record = hub_core::results::SavedResult::new(
+            KEY,
+            "c".repeat(32),
+            chrono::Utc::now().timestamp(),
+            &TopicSession::fresh(
+                BackendKind::Codex,
+                AbsolutePath::new(world.root.path().to_path_buf()).unwrap(),
+            )
+            .with_session(SessionId::parse("saved-session")),
+            "answer ".repeat(700),
+        )
+        .unwrap();
+        let pending = Pending::new(record, "finished").unwrap();
+        let first = pending.chunks()[0].text.clone();
+        let second = pending.chunks()[1].text.clone();
+        world.results.save(pending.clone()).await.unwrap();
+        let claimed =
+            world.results.update(Change::new(&pending, Action::Claim)).await.unwrap().unwrap();
+        world.results.update(Change::new(&claimed, Action::Ack)).await.unwrap();
+        world.restart().await;
+        eventually("remaining part delivered automatically", || world.texts().contains(&second))
+            .await;
+        assert!(!world.texts().contains(&first));
+        assert!(world.agents.prompts().is_empty());
+        assert!(world.store.last().is_none());
+        assert!(world.results.pending(KEY.chat).await.unwrap().entries.is_empty());
+    }
+    #[tokio::test]
     async fn last_result_survives_failed_delivery_and_hub_restart() {
         let mut world = world_with(
             FakeAgents::scripted(vec![Script::Say(vec![
@@ -1772,10 +1832,10 @@ mod tests {
             world.results.records.lock().unwrap().contains_key(&KEY)
         })
         .await;
-        assert!(world.texts().is_empty());
+        assert!(!world.texts().iter().any(|text| text.contains("working")));
         release.send(()).unwrap();
         eventually("final delivered", || {
-            world.texts().iter().any(|t| t == "ready despite network")
+            world.texts().iter().any(|t| t.contains("ready despite network"))
         })
         .await;
     }
@@ -1825,7 +1885,8 @@ mod tests {
             world.texts().iter().any(|t| t.contains("не сохранён для /last: диск полон"))
         })
         .await;
-        eventually("answer delivered", || world.texts().iter().any(|t| t == "answer")).await;
+        eventually("answer delivered", || world.texts().iter().any(|t| t.contains("\nanswer\n")))
+            .await;
         assert!(world.results.records.lock().unwrap().is_empty());
     }
 
@@ -1848,7 +1909,12 @@ mod tests {
         .unwrap();
         let (reply, rejected) = oneshot::channel();
         world
-            .send(HubMessage::SaveResult(SaveResult { key: KEY, generation: 0, record, reply }))
+            .send(HubMessage::SaveResult(SaveResult {
+                key: KEY,
+                generation: 0,
+                pending: hub_core::outbox::Pending::new(record, "").unwrap(),
+                reply,
+            }))
             .await;
         assert!(rejected.await.unwrap().is_err());
         assert!(world.results.records.lock().unwrap().is_empty());
@@ -1997,7 +2063,12 @@ mod tests {
         world
             .handle
             .mailbox
-            .try_send(HubMessage::SaveResult(SaveResult { key: KEY, generation: 1, record, reply }))
+            .try_send(HubMessage::SaveResult(SaveResult {
+                key: KEY,
+                generation: 1,
+                pending: hub_core::outbox::Pending::new(record, "").unwrap(),
+                reply,
+            }))
             .unwrap();
         assert!(rejected.await.unwrap().is_err());
         assert!(world.results.records.lock().unwrap().is_empty());
@@ -2303,8 +2374,9 @@ mod tests {
         ])]));
         world.send(text(Some(7), 1, "сделай")).await;
 
-        eventually("finished", || world.texts().iter().any(|t| t == "✅ Готово · ходов: 1")).await;
-        assert!(world.texts().contains(&"<b>готово</b>".to_owned()));
+        eventually("finished", || world.texts().iter().any(|t| t.contains("✅ Готово · ходов: 1")))
+            .await;
+        assert!(world.texts().iter().any(|t| t.contains("<b>готово</b>")));
         assert_eq!(world.agents.prompts(), ["сделай"]);
         eventually("bound", || {
             world
@@ -2469,7 +2541,8 @@ mod tests {
             ..FakeAgents::polling(vec![vec![(BackendKind::Claude, Err("тайм-аут".to_owned()))]])
         });
         world.send(text(Some(7), 1, "сделай")).await;
-        eventually("finished", || world.texts().iter().any(|t| t == "✅ Готово · ходов: 1")).await;
+        eventually("finished", || world.texts().iter().any(|t| t.contains("✅ Готово · ходов: 1")))
+            .await;
         world.send(text(Some(7), 2, "/limits")).await;
         let id = || {
             world

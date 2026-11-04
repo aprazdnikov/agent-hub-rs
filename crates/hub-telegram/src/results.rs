@@ -1,11 +1,18 @@
 //! Persistence port for the last successful textual result of a topic.
 
 use futures::future::BoxFuture;
-use hub_core::{domain::TopicKey, results::SavedResult};
+use hub_core::{
+    domain::{ChatId, TopicKey},
+    outbox::{Change, Pending, SaveOutcome, Snapshot},
+    results::SavedResult,
+};
 
 pub trait ResultStore: Send + Sync + 'static {
     /// Enqueues synchronously, preserving the hub's save order before the future is polled.
-    fn save(&self, result: SavedResult) -> BoxFuture<'static, Result<(), String>>;
+    fn save(&self, pending: Pending) -> BoxFuture<'static, Result<SaveOutcome, String>>;
+    fn pending(&self, chat: ChatId) -> BoxFuture<'static, Result<Snapshot, String>>;
+    /// Enqueues synchronously. Network checkpoints (Ack/Fail/Plain) finish even if the caller is cancelled.
+    fn update(&self, change: Change) -> BoxFuture<'static, Result<Option<Pending>, String>>;
     fn load(&self, key: TopicKey) -> BoxFuture<'static, Result<Option<SavedResult>, String>>;
 }
 
@@ -28,8 +35,8 @@ use tokio::{
 pub struct SaveResult {
     pub(crate) key: TopicKey,
     pub(crate) generation: u64,
-    pub(crate) record: SavedResult,
-    pub(crate) reply: oneshot::Sender<Result<(), String>>,
+    pub(crate) pending: Pending,
+    pub(crate) reply: oneshot::Sender<Result<SaveOutcome, String>>,
 }
 
 pub struct LastResults {
@@ -136,8 +143,14 @@ mod tests {
         .unwrap()
     }
     impl ResultStore for Controlled {
-        fn save(&self, _result: SavedResult) -> BoxFuture<'static, Result<(), String>> {
-            Box::pin(async { Ok(()) })
+        fn save(&self, _pending: Pending) -> BoxFuture<'static, Result<SaveOutcome, String>> {
+            Box::pin(async { Ok(SaveOutcome::Queued) })
+        }
+        fn pending(&self, _chat: ChatId) -> BoxFuture<'static, Result<Snapshot, String>> {
+            Box::pin(async { Ok(Snapshot::default()) })
+        }
+        fn update(&self, _change: Change) -> BoxFuture<'static, Result<Option<Pending>, String>> {
+            Box::pin(async { Err("unused".to_owned()) })
         }
         fn load(&self, key: TopicKey) -> BoxFuture<'static, Result<Option<SavedResult>, String>> {
             self.loads.fetch_add(1, Ordering::SeqCst);

@@ -1,12 +1,14 @@
 //! Bounded last successful text results, independent of session bindings.
 
 use crate::domain::{BackendKind, ChatId, ThreadId, TopicKey, TopicSession};
+use crate::outbox::{self, Action, Change, Cooldown, Failure, Pending, SaveOutcome, Snapshot};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_RESULTS: usize = 100;
 pub const RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
-pub const MAX_FILE_BYTES: usize = MAX_RESULTS * (MAX_TEXT_BYTES + 8192 + 128) * 6 + 4096;
+pub const MAX_FILE_BYTES: usize =
+    MAX_RESULTS * (MAX_TEXT_BYTES + 8192 + 128) * 6 + outbox::MAX_BYTES * 6 + 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -41,7 +43,7 @@ impl SavedResult {
         record.validate()?;
         Ok(record)
     }
-    fn validate(&self) -> Result<(), String> {
+    pub(crate) fn validate(&self) -> Result<(), String> {
         if self.chat == 0
             || self.thread <= 0
             || self.run.len() != 32
@@ -89,12 +91,18 @@ impl SavedResult {
 #[derive(Default)]
 pub struct Results {
     records: Vec<SavedResult>,
+    outbox: Vec<Pending>,
+    cooldowns: Vec<Cooldown>,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct File {
     version: u32,
     results: Vec<SavedResult>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    outbox: Option<Vec<Pending>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    cooldowns: Option<Vec<Cooldown>>,
 }
 impl Results {
     pub fn parse(raw: &str, now: i64) -> Result<Self, String> {
@@ -103,7 +111,11 @@ impl Results {
         }
         let file: File =
             serde_json::from_str(raw).map_err(|_| "Повреждённый файл результатов".to_owned())?;
-        if file.version != 1 || file.results.len() > MAX_RESULTS {
+        if !matches!(file.version, 1 | 2)
+            || file.results.len() > MAX_RESULTS
+            || (file.version == 2 && (file.outbox.is_none() || file.cooldowns.is_none()))
+            || (file.version == 1 && (file.outbox.is_some() || file.cooldowns.is_some()))
+        {
             return Err("Некорректная версия или число результатов".to_owned());
         }
         let mut keys = std::collections::HashSet::new();
@@ -113,16 +125,47 @@ impl Results {
                 return Err("Повтор темы в файле результатов".to_owned());
             }
         }
-        let mut book = Self { records: file.results };
+        let pending = file.outbox.unwrap_or_default();
+        if pending.len() > outbox::MAX_PENDING
+            || pending.iter().map(Pending::bytes).sum::<usize>() > outbox::MAX_BYTES
+        {
+            return Err("Очередь доставки превышает допустимый размер".to_owned());
+        }
+        let mut runs = std::collections::HashSet::new();
+        for entry in &pending {
+            entry.validate()?;
+            if !runs.insert(entry.result().run()) {
+                return Err("Повтор хода в очереди доставки".to_owned());
+            }
+        }
+        let cooldowns = file.cooldowns.unwrap_or_default();
+        let mut chats = std::collections::HashSet::new();
+        if cooldowns.len() > MAX_RESULTS
+            || cooldowns
+                .iter()
+                .any(|item| item.chat == 0 || item.until < 0 || !chats.insert(item.chat))
+        {
+            return Err("Некорректные задержки очереди доставки".to_owned());
+        }
+        let mut book = Self { records: file.results, outbox: pending, cooldowns };
         book.prune(now);
         Ok(book)
     }
     fn prune(&mut self, now: i64) {
+        self.cooldowns.retain(|item| item.until > now);
+        self.outbox.retain(|entry| {
+            now.saturating_sub(entry.result().completed_at()) < outbox::RETENTION_SECONDS
+        });
         self.records.retain(|record| now.saturating_sub(record.completed_at) < RETENTION_SECONDS);
     }
     pub fn dump(&self) -> Result<String, String> {
-        serde_json::to_string(&File { version: 1, results: self.records.clone() })
-            .map_err(|_| "Не удалось сериализовать результаты".to_owned())
+        serde_json::to_string(&File {
+            version: 2,
+            results: self.records.clone(),
+            outbox: Some(self.outbox.clone()),
+            cooldowns: Some(self.cooldowns.clone()),
+        })
+        .map_err(|_| "Не удалось сериализовать результаты".to_owned())
     }
     pub fn save(&mut self, record: SavedResult, now: i64) {
         self.prune(now);
@@ -130,6 +173,75 @@ impl Results {
         self.records.insert(0, record);
         self.records.sort_by_key(|record| std::cmp::Reverse(record.completed_at));
         self.records.truncate(MAX_RESULTS);
+    }
+    pub fn enqueue(&mut self, pending: Pending, now: i64) -> Result<SaveOutcome, String> {
+        pending.validate()?;
+        self.prune(now);
+        if self.outbox.iter().any(|entry| entry.result().run() == pending.result().run()) {
+            return Err("Ход уже есть в очереди доставки".to_owned());
+        }
+        self.save(pending.result().clone(), now);
+        if self.outbox.len() >= outbox::MAX_PENDING
+            || self.outbox.iter().map(Pending::bytes).sum::<usize>() + pending.bytes()
+                > outbox::MAX_BYTES
+        {
+            return Ok(SaveOutcome::SavedOnly);
+        }
+        self.outbox.push(pending);
+        Ok(SaveOutcome::Queued)
+    }
+    #[must_use]
+    pub fn pending(&self, chat: ChatId) -> Vec<Pending> {
+        self.outbox.iter().filter(|entry| entry.result().key().chat == chat).cloned().collect()
+    }
+    #[must_use]
+    pub fn snapshot(&self, chat: ChatId) -> Snapshot {
+        Snapshot { entries: self.pending(chat), not_before: self.cooldown(chat) }
+    }
+    fn cooldown(&self, chat: ChatId) -> i64 {
+        self.cooldowns.iter().find(|item| item.chat == chat.0).map_or(0, |item| item.until)
+    }
+    pub fn update(&mut self, change: &Change, now: i64) -> Result<Option<Pending>, String> {
+        self.prune(now);
+        if matches!(change.action, Action::Claim) && self.cooldown(change.key.chat) > now {
+            return Err("Telegram просит подождать перед следующей отправкой".to_owned());
+        }
+        let cooldown = match change.action {
+            Action::Fail(Failure::RetryAfter(seconds)) => {
+                Some(now.saturating_add(i64::try_from(seconds).unwrap_or(i64::MAX)))
+            }
+            _ => None,
+        };
+        if cooldown.is_some()
+            && self.cooldowns.len() >= MAX_RESULTS
+            && !self.cooldowns.iter().any(|item| item.chat == change.key.chat.0)
+        {
+            return Err("Превышено число групп с задержкой отправки".to_owned());
+        }
+        let index = self
+            .outbox
+            .iter()
+            .position(|entry| {
+                entry.result().key() == change.key && entry.result().run() == change.run
+            })
+            .ok_or("Доставка уже удалена или истёк срок хранения")?;
+        let entry = self.outbox.get_mut(index).ok_or("Доставка уже удалена")?;
+        let result = if entry.apply(change, now)? {
+            self.outbox.remove(index);
+            None
+        } else {
+            Some(entry.clone())
+        };
+        if let Some(until) = cooldown {
+            if let Some(item) =
+                self.cooldowns.iter_mut().find(|item| item.chat == change.key.chat.0)
+            {
+                item.until = item.until.max(until);
+            } else {
+                self.cooldowns.push(Cooldown { chat: change.key.chat.0, until });
+            }
+        }
+        Ok(result)
     }
     #[must_use]
     pub fn get(&self, key: TopicKey) -> Option<&SavedResult> {
@@ -181,13 +293,21 @@ mod tests {
         let record = result(1, 0, "text");
         let duplicate = serde_json::to_string(&File {
             version: 1,
+            outbox: None,
+            cooldowns: None,
             results: vec![record.clone(), record.clone()],
         })
         .unwrap();
         assert!(Results::parse(&duplicate, 0).is_err());
         let mut invalid = record;
         invalid.text = "я".repeat(MAX_TEXT_BYTES);
-        let raw = serde_json::to_string(&File { version: 1, results: vec![invalid] }).unwrap();
+        let raw = serde_json::to_string(&File {
+            version: 1,
+            results: vec![invalid],
+            outbox: None,
+            cooldowns: None,
+        })
+        .unwrap();
         assert!(Results::parse(&raw, 0).is_err());
     }
 }

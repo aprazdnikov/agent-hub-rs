@@ -24,6 +24,7 @@ use crate::paths::{CwdError, inside};
 use crate::results::SaveResult;
 use crate::sender::Sender;
 use crate::texts;
+use hub_core::outbox::{Pending as Queued, SaveOutcome};
 use hub_core::results::{MAX_TEXT_BYTES, SavedResult};
 
 const EVENTS: usize = 256;
@@ -215,6 +216,7 @@ async fn collect(
                 output.send(Style::Html, texts::tool_call_html(&call));
             }
             AgentEvent::Finished(finished) => {
+                let mut queued_footer = false;
                 tracing::info!(usage = ?finished.usage, background = finished.background, "turn finished");
                 if !context.cancel.is_cancelled() {
                     if pending.overflow {
@@ -233,19 +235,34 @@ async fn collect(
                             chrono::Utc::now().timestamp(),
                             &session,
                             pending.text.clone(),
-                        );
-                        let saved = match record {
-                            Ok(record) => {
-                                save_result(mailbox, key, context.generation, record).await
+                        )
+                        .and_then(|record| Queued::new(record, &format_finished(&finished)));
+                        match record {
+                            Ok(prepared) => {
+                                let saved =
+                                    save_result(mailbox, key, context.generation, prepared.clone())
+                                        .await;
+                                let warning = match saved {
+                                    Ok(SaveOutcome::Queued) => None,
+                                    Ok(SaveOutcome::SavedOnly) => Some("⚠️ Очередь доставки заполнена. Ответ сохранён для /last, автоматического повтора не будет.".to_owned()),
+                                    Err(error) => {
+                                        tracing::warn!(%error, "result enqueue not confirmed");
+                                        Some(format!("⚠️ Ответ не сохранён для /last: {error}. Запись могла завершиться позже: возможен повтор частей с тем же ID."))
+                                    }
+                                };
+                                if let Some(warning) = warning {
+                                    output.send_all(Style::Plain, warning).await;
+                                    for chunk in prepared.chunks() {
+                                        output.send_all(Style::Html, chunk.text.clone()).await;
+                                    }
+                                }
+                                pending.text.clear();
+                                queued_footer = true;
                             }
-                            Err(error) => Err(error),
-                        };
-                        if let Err(error) = saved {
-                            tracing::warn!(%error, "last result not saved");
-                            output.final_message(
+                            Err(error) => output.final_message(
                                 Style::Plain,
                                 format!("⚠️ Ответ не сохранён для /last: {error}"),
-                            );
+                            ),
                         }
                     }
                 }
@@ -254,7 +271,9 @@ async fn collect(
                 }
                 pending.overflow = false;
                 bind(mailbox, key, finished.session.clone()).await;
-                output.final_message(Style::Plain, format_finished(&finished));
+                if !queued_footer {
+                    output.final_message(Style::Plain, format_finished(&finished));
+                }
             }
             AgentEvent::BackgroundAbandoned(tasks) => {
                 pending.boundary(&output);
@@ -278,11 +297,11 @@ async fn save_result(
     mailbox: &mpsc::Sender<HubMessage>,
     key: TopicKey,
     generation: u64,
-    record: SavedResult,
-) -> Result<(), String> {
+    pending: Queued,
+) -> Result<SaveOutcome, String> {
     let (reply, saved) = oneshot::channel();
     mailbox
-        .send(HubMessage::SaveResult(SaveResult { key, generation, record, reply }))
+        .send(HubMessage::SaveResult(SaveResult { key, generation, pending, reply }))
         .await
         .map_err(|_| "Бот уже остановлен".to_owned())?;
     tokio::time::timeout(Duration::from_secs(6), saved)
