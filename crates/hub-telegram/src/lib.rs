@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod agents;
 pub mod channel;
+pub mod doctor;
 pub mod download;
 pub mod hub;
 pub mod inbound;

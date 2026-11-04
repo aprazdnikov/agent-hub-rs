@@ -43,6 +43,7 @@ tokio = "1.53"
 tokio-util = "0.7"
 tracing = "0.1"
 uuid = "1.26"
+url = "2.5"
 which = "8.0"
 pulldown-cmark = { version = "0.13", default-features = false }
 rust_decimal = "1.43"

@@ -1253,6 +1253,7 @@ mod tests {
             cwd: "shop/backend".to_owned(),
             backend: "codex".to_owned(),
             actions: vec!["vpn".to_owned()],
+            checks: Vec::new(),
         }];
         let settings = draft.parse(&home()).unwrap();
         let raw = toml::to_string(&SettingsFile::from_settings(&settings, &home())).unwrap();
@@ -1270,6 +1271,37 @@ mod tests {
         assert!(
             draft.parse(&home()).unwrap_err().iter().any(|error| error.field == Field::Projects)
         );
+    }
+
+    #[test]
+    fn project_checks_survive_toml_and_are_optional_in_old_profiles() {
+        let old = r#"id = "one"
+name = "One"
+cwd = "."
+backend = "codex"
+"#;
+        let mut project: ProjectDraft = toml::from_str(old).unwrap();
+        assert!(project.checks.is_empty());
+        project.checks = vec![
+            crate::doctor::CheckDraft::Http {
+                name: "Health".to_owned(),
+                url: "https://host/health".to_owned(),
+                expected: 204,
+            },
+            crate::doctor::CheckDraft::Tcp {
+                name: "SSH".to_owned(),
+                host: "host".to_owned(),
+                port: 22,
+            },
+        ];
+        let mut draft = draft();
+        draft.projects = vec![project];
+        let settings = draft.parse(&home()).unwrap();
+        let raw = toml::to_string(&SettingsFile::from_settings(&settings, &home())).unwrap();
+        assert!(raw.contains("[[projects.checks]]"));
+        let restored: SettingsFile = toml::from_str(&raw).unwrap();
+        let keys = Keys { token: draft.token, api_key: String::new(), qwen_key: String::new() };
+        assert_eq!(restored.to_draft(keys).unwrap().parse(&home()).unwrap(), settings);
     }
 
     #[test]

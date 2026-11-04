@@ -96,6 +96,27 @@ impl Actions {
         id
     }
 
+    #[must_use]
+    pub fn states(&self, ids: &[String], configured: &[Action]) -> Vec<String> {
+        ids.iter()
+            .map(|id| {
+                let configured = configured.iter().find(|action| action.id() == id);
+                let running = self.running.get(id);
+                let name = configured
+                    .map(Action::name)
+                    .or_else(|| running.map(|run| run.action.name()))
+                    .unwrap_or(id);
+                let state = match running {
+                    Some(run) if run.cancel.is_cancelled() => "останавливается",
+                    Some(run) if configured != Some(&run.action) => "работает по прежней команде",
+                    Some(_) => "работает",
+                    None => "не запущен через бот",
+                };
+                format!("{name}: {state}")
+            })
+            .collect()
+    }
+
     pub fn menu(&mut self, configured: &[Action], target: Target, sender: Sender) {
         let mut actions = configured.to_vec();
         for running in self.running.values() {
@@ -369,12 +390,26 @@ mod tests {
             book.press(press(data, 1), &settings, Sender::new(messenger.clone()), mailbox.clone());
         }
         assert_eq!(book.running.len(), 1);
+        assert_eq!(book.states(&["vpn".to_owned()], &settings.actions), ["Рабочий VPN: работает"]);
+        let changed = super::tests::settings("echo different");
+        assert_eq!(
+            book.states(&["vpn".to_owned()], &changed.actions),
+            ["Рабочий VPN: работает по прежней команде"]
+        );
         let mut removed = settings.clone();
         removed.actions.clear();
         let stop = button(&mut book, &removed, &messenger).await;
         book.press(press(&stop, 1), &removed, Sender::new(messenger.clone()), mailbox);
+        assert_eq!(
+            book.states(&["vpn".to_owned()], &settings.actions),
+            ["Рабочий VPN: останавливается"]
+        );
         finish(&mut book, &mut inbox, &messenger).await;
         assert!(book.is_idle());
+        assert_eq!(
+            book.states(&["vpn".to_owned()], &settings.actions),
+            ["Рабочий VPN: не запущен через бот"]
+        );
         assert_eq!(runner.0.load(Ordering::SeqCst), 1);
         assert!(!messenger.sent_texts().join("\n").contains("private-command"));
     }

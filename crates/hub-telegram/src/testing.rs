@@ -189,3 +189,20 @@ impl Messenger for FakeMessenger {
         })
     }
 }
+
+pub struct FakeDoctorRunner;
+impl crate::doctor::DoctorRunner for FakeDoctorRunner {
+    fn run(
+        &self,
+        _project: hub_core::projects::Project,
+        _settings: std::sync::Arc<hub_core::settings::Settings>,
+    ) -> futures::future::BoxFuture<'static, Result<hub_core::doctor::Report, String>> {
+        Box::pin(async {
+            Ok(hub_core::doctor::Report {
+                directory: Ok("test directory".to_owned()),
+                cli: Ok("test cli".to_owned()),
+                resources: vec![],
+            })
+        })
+    }
+}

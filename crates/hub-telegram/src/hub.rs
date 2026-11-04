@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::actions::{self, ActionRunner, Actions};
 use crate::channel::{Shared, lock};
+use crate::doctor::{self, DoctorRunner, Doctors};
 use crate::download::download;
 use crate::inbound::{Content, Inbound, Press, Turn};
 use crate::limits::{self, Outcome, QuotaCache};
@@ -96,6 +97,7 @@ pub struct TopicView {
 
 pub enum HubMessage {
     ActionDone(actions::Done),
+    DoctorDone(crate::doctor::Done),
     Inbound(Inbound),
     Press(Press),
     /// A prompt whose attachments finished downloading.
@@ -141,6 +143,7 @@ struct Polled {
 
 pub struct HubSetup<A> {
     pub action_runner: Arc<dyn ActionRunner>,
+    pub doctor_runner: Arc<dyn DoctorRunner>,
     pub agents: Arc<A>,
     pub messenger: Arc<dyn Messenger>,
     pub settings: watch::Receiver<Arc<Settings>>,
@@ -168,6 +171,7 @@ struct Live {
 
 struct Hub<A> {
     actions: Actions,
+    doctors: Doctors,
     projects: Projects,
     agents: Arc<A>,
     sender: Sender,
@@ -202,6 +206,7 @@ pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
     let HubSetup {
         agents,
         action_runner,
+        doctor_runner,
         messenger,
         settings,
         topics,
@@ -216,6 +221,7 @@ pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
     let registries = Shared::default();
     let hub = Hub {
         actions: Actions::new(action_runner),
+        doctors: Doctors::new(doctor_runner),
         projects: Projects::new(recent_projects),
         agents,
         sender: Sender::new(messenger),
@@ -265,6 +271,12 @@ impl<A: Agents> Hub<A> {
 
     fn handle(&mut self, message: HubMessage) {
         match message {
+            HubMessage::DoctorDone(done) => self.doctors.complete(
+                &done,
+                &self.settings.borrow(),
+                &self.actions,
+                self.sender.clone(),
+            ),
             HubMessage::ActionDone(done) => self.actions.complete(done, self.sender.clone()),
             HubMessage::Inbound(inbound) => {
                 if self.shutdown.is_none() {
@@ -272,7 +284,23 @@ impl<A: Agents> Hub<A> {
                 }
             }
             HubMessage::Press(pressed) => {
-                if pressed.data.starts_with(projects::PREFIX) {
+                if pressed.data.starts_with(doctor::PREFIX) {
+                    if self.shutdown.is_none() {
+                        let settings = self.settings.borrow();
+                        if let Some(key) = self.doctors.press(
+                            pressed,
+                            &settings,
+                            self.sender.clone(),
+                            self.mailbox.clone(),
+                        ) {
+                            self.actions.menu(
+                                &settings.actions,
+                                Target::Topic(key),
+                                self.sender.clone(),
+                            );
+                        }
+                    }
+                } else if pressed.data.starts_with(projects::PREFIX) {
                     if self.shutdown.is_none() {
                         self.project_press(pressed);
                     }
@@ -323,6 +351,7 @@ impl<A: Agents> Hub<A> {
             HubMessage::Snapshot(SnapshotDone(done)) => self.snapshot_done(done),
             HubMessage::Shutdown(done) => {
                 self.actions.shutdown();
+                self.doctors.shutdown();
                 for live in self.running.values() {
                     live.cancel.cancel();
                 }
@@ -420,6 +449,10 @@ impl<A: Agents> Hub<A> {
     ) {
         match command {
             Command::Projects => self.project_menu(key),
+            Command::Doctor => {
+                let card = self.doctors.menu(key, &self.settings.borrow());
+                tokio::spawn(projects::send_card(self.sender.clone(), key, card));
+            }
             Command::Actions => self.actions.menu(
                 &self.settings.borrow().actions,
                 Target::Topic(key),
@@ -1431,6 +1464,7 @@ mod tests {
             (&mut self.handle.task).await.unwrap();
             self.handle = spawn(HubSetup {
                 action_runner: Arc::new(crate::testing::FakeActionRunner),
+                doctor_runner: Arc::new(crate::testing::FakeDoctorRunner),
                 agents: Arc::clone(&self.agents),
                 messenger: self.messenger.clone(),
                 settings: self.settings.subscribe(),
@@ -1489,6 +1523,7 @@ mod tests {
         let store = MemoryStore::default();
         let handle = spawn(HubSetup {
             action_runner: Arc::new(crate::testing::FakeActionRunner),
+            doctor_runner: Arc::new(crate::testing::FakeDoctorRunner),
             agents: Arc::clone(&agents),
             messenger: Arc::clone(&messenger) as Arc<dyn Messenger>,
             settings,
@@ -1618,6 +1653,7 @@ mod tests {
             cwd: "project".to_owned(),
             backend: "codex".to_owned(),
             actions: Vec::new(),
+            checks: Vec::new(),
         }];
         world.settings.send(Arc::new(draft.parse(&std::env::temp_dir()).unwrap())).unwrap();
     }
@@ -1646,6 +1682,39 @@ mod tests {
         let pick = project_button(world, "Бэкенд").await;
         world.send(HubMessage::Press(pick)).await;
         project_button(world, "Выбрать и сбросить").await
+    }
+
+    #[tokio::test]
+    async fn doctor_preserves_context_and_only_opens_the_actions_menu() {
+        let world = world(FakeAgents::default());
+        configure_project(&world);
+        bound(&world, KEY, "kept-session").await;
+        let before = world.store.last().unwrap();
+        world.send(text(Some(7), 1, "/doctor")).await;
+        let pick = project_button(&world, "Бэкенд").await;
+        world.send(HubMessage::Press(pick)).await;
+        let repeat = project_button(&world, "Повторить").await;
+        let actions = project_button(&world, "Действия").await;
+        eventually("doctor report", || world.texts().iter().any(|t| t.contains("test directory")))
+            .await;
+        world.send(HubMessage::Press(actions)).await;
+        eventually("actions menu", || {
+            world.texts().iter().any(|t| t.contains("Пользовательские действия"))
+        })
+        .await;
+        world.send(HubMessage::Press(repeat)).await;
+        eventually("second doctor report", || {
+            world.texts().iter().filter(|t| t.contains("Проверено:")).count() == 2
+        })
+        .await;
+        assert_eq!(world.store.last().unwrap(), before);
+        assert_eq!(bound_to(&world, KEY), SessionId::parse("kept-session"));
+        assert!(world.agents.prompts().is_empty());
+        assert!(!world.texts().iter().any(|t| t.contains("запуск команды")));
+        let (done, stopped) = oneshot::channel();
+        world.send(HubMessage::Shutdown(done)).await;
+        stopped.await.unwrap();
+        world.handle.task.await.unwrap();
     }
 
     #[tokio::test]

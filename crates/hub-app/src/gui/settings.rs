@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 
 use eframe::egui;
 use hub_core::actions::{ActionDraft, MAX_ACTIONS};
+use hub_core::doctor::{CheckDraft, MAX_CHECKS};
 use hub_core::domain::BackendKind;
 use hub_core::projects::{MAX_PROJECTS, ProjectDraft};
 use hub_core::settings::{
@@ -29,6 +30,74 @@ pub struct SettingsForm {
     synced: Option<Draft>,
     revealed: Revealed,
     confirming: bool,
+}
+
+fn project_checks(ui: &mut egui::Ui, checks: &mut Vec<CheckDraft>) {
+    ui.separator();
+    ui.label("Проверки ресурсов через /doctor");
+    ui.small("HTTP(S): GET без редиректов и авторизации. TCP: только подключение к порту.");
+    let mut remove = None;
+    for (index, check) in checks.iter_mut().enumerate() {
+        ui.push_id(("check", index), |ui| {
+            ui.group(|ui| {
+                let name = match check {
+                    CheckDraft::Http { name, .. } | CheckDraft::Tcp { name, .. } => name,
+                };
+                ui.horizontal(|ui| {
+                    ui.label("Название проверки");
+                    ui.text_edit_singleline(name);
+                    if ui.button("Удалить проверку").clicked() {
+                        remove = Some(index);
+                    }
+                });
+                match check {
+                    CheckDraft::Http { url, expected, .. } => {
+                        ui.horizontal(|ui| {
+                            ui.label("URL");
+                            ui.add(
+                                egui::TextEdit::singleline(url).hint_text("https://service/health"),
+                            );
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Ожидаемый HTTP-статус");
+                            ui.add(egui::DragValue::new(expected).range(200..=599));
+                        });
+                        ui.small(
+                            "Без логина, пароля, query и fragment. Не указывайте секреты в адресе.",
+                        );
+                    }
+                    CheckDraft::Tcp { host, port, .. } => {
+                        ui.horizontal(|ui| {
+                            ui.label("Хост или IP");
+                            ui.text_edit_singleline(host);
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("TCP-порт");
+                            ui.add(egui::DragValue::new(port).range(1..=65535));
+                        });
+                    }
+                }
+            });
+        });
+    }
+    if let Some(index) = remove {
+        checks.remove(index);
+    }
+    ui.horizontal(|ui| {
+        if ui.add_enabled(checks.len() < MAX_CHECKS, egui::Button::new("Добавить HTTP")).clicked()
+        {
+            checks.push(CheckDraft::Http {
+                name: String::new(),
+                url: String::new(),
+                expected: 200,
+            });
+        }
+        if ui.add_enabled(checks.len() < MAX_CHECKS, egui::Button::new("Добавить TCP")).clicked()
+        {
+            checks.push(CheckDraft::Tcp { name: String::new(), host: String::new(), port: 443 });
+        }
+        ui.label(format!("{}/{MAX_CHECKS}", checks.len()));
+    });
 }
 
 fn errors_for(errors: &[FieldError], field: Field) -> impl Iterator<Item = &str> {
@@ -193,6 +262,7 @@ impl SettingsForm {
                             }
                         }
                     }
+                    project_checks(ui, &mut project.checks);
                     // A removed action must be explicitly unlinked, not silently assigned to a new one.
                     let missing: Vec<_> = project
                         .actions
@@ -225,6 +295,7 @@ impl SettingsForm {
                 cwd: String::new(),
                 backend: self.draft.default_backend.name().to_owned(),
                 actions: Vec::new(),
+                checks: Vec::new(),
             });
         }
         messages(ui, errors, Field::Projects);
@@ -708,6 +779,20 @@ mod tests {
             cwd: String::new(),
         });
         click(&ctx, &mut form, "Добавить проект");
+        click(&ctx, &mut form, "Добавить HTTP");
+        assert!(matches!(
+            form.draft.projects.first().unwrap().checks.first(),
+            Some(CheckDraft::Http { expected: 200, .. })
+        ));
+        click(&ctx, &mut form, "Добавить TCP");
+        assert!(matches!(
+            form.draft.projects.first().unwrap().checks.last(),
+            Some(CheckDraft::Tcp { port: 443, .. })
+        ));
+        click(&ctx, &mut form, "Удалить проверку");
+        assert_eq!(form.draft.projects.first().unwrap().checks.len(), 1);
+        click(&ctx, &mut form, "Удалить проверку");
+        assert!(form.draft.projects.first().unwrap().checks.is_empty());
         let first = form.draft.projects.first().unwrap().id.clone();
         click(&ctx, &mut form, "VPN");
         assert_eq!(form.draft.projects.first().unwrap().actions, ["vpn"]);

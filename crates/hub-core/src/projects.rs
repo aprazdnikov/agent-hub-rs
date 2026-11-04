@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use serde::{Deserialize, Serialize};
 
 use crate::actions::Action;
+use crate::doctor::{self, Check, CheckDraft};
 use crate::domain::BackendKind;
 
 pub const MAX_PROJECTS: usize = 32;
@@ -19,6 +20,8 @@ pub struct ProjectDraft {
     pub backend: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checks: Vec<CheckDraft>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,6 +31,7 @@ pub struct Project {
     cwd: String,
     backend: BackendKind,
     actions: Vec<String>,
+    checks: Vec<Check>,
 }
 
 impl Project {
@@ -52,6 +56,10 @@ impl Project {
         &self.actions
     }
     #[must_use]
+    pub fn checks(&self) -> &[Check] {
+        &self.checks
+    }
+    #[must_use]
     pub fn to_draft(&self) -> ProjectDraft {
         ProjectDraft {
             id: self.id.clone(),
@@ -59,6 +67,7 @@ impl Project {
             cwd: self.cwd.clone(),
             backend: self.backend.name().to_owned(),
             actions: self.actions.clone(),
+            checks: self.checks.iter().map(Check::to_draft).collect(),
         }
     }
 }
@@ -108,12 +117,14 @@ pub fn parse(drafts: &[ProjectDraft], actions: &[Action]) -> Result<Vec<Project>
                     return Err(error("связанное действие отсутствует или указано дважды"));
                 }
             }
+            let checks = doctor::parse(&draft.checks).map_err(|reason| error(&reason))?;
             Ok(Project {
                 id: id.to_owned(),
                 name: name.to_owned(),
                 cwd: cwd.to_owned(),
                 backend,
                 actions: draft.actions.clone(),
+                checks,
             })
         })
         .collect()
@@ -167,6 +178,7 @@ mod tests {
             cwd: "проект с пробелами".to_owned(),
             backend: "codex".to_owned(),
             actions: vec![],
+            checks: Vec::new(),
         }
     }
 

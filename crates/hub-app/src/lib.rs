@@ -3,6 +3,7 @@ pub mod atomic;
 pub mod config;
 pub mod connector;
 pub mod dirs;
+pub mod doctor;
 pub mod error;
 pub mod github;
 pub mod gui;

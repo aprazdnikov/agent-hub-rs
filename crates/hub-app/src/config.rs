@@ -154,6 +154,7 @@ mod tests {
             cwd: project.display().to_string(),
             backend: "codex".to_owned(),
             actions: Vec::new(),
+            checks: Vec::new(),
         }];
         let settings = draft.parse(dir.path()).unwrap();
         let store = store(dir.path());
@@ -179,6 +180,7 @@ mod tests {
             cwd: "linked".to_owned(),
             backend: "codex".to_owned(),
             actions: Vec::new(),
+            checks: Vec::new(),
         }];
         let errors = project_errors(&draft.parse(dir.path()).unwrap(), dir.path());
         assert!(errors.iter().any(|error| error.message.contains("вне корня")));

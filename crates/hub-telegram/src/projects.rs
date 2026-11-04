@@ -203,6 +203,7 @@ mod tests {
                     cwd: "one".to_owned(),
                     backend: "claude".to_owned(),
                     actions: vec![],
+                    checks: Vec::new(),
                 },
                 ProjectDraft {
                     id: "two".to_owned(),
@@ -210,6 +211,7 @@ mod tests {
                     cwd: "two".to_owned(),
                     backend: "codex".to_owned(),
                     actions: vec![],
+                    checks: Vec::new(),
                 },
             ],
             ..Draft::default()
