@@ -522,6 +522,7 @@ mod tests {
             events,
             [
                 AgentEvent::SessionStarted(session_id()),
+                AgentEvent::TurnStarted,
                 AgentEvent::AssistantText("Привет".to_owned()),
                 AgentEvent::Finished(Finished {
                     session: session_id(),
@@ -559,6 +560,7 @@ mod tests {
             events,
             [
                 AgentEvent::SessionStarted(session_id()),
+                AgentEvent::TurnStarted,
                 AgentEvent::Finished(Finished {
                     session: session_id(),
                     usage: Usage::Qwen { tokens: None },
@@ -623,6 +625,7 @@ mod tests {
             events,
             [
                 AgentEvent::SessionStarted(session_id()),
+                AgentEvent::TurnStarted,
                 AgentEvent::Failed("Qwen: Internal error: quota exceeded".to_owned()),
             ]
         );
@@ -660,7 +663,11 @@ mod tests {
         server.await.unwrap();
         assert_eq!(
             collect(received).await,
-            [AgentEvent::SessionStarted(session_id()), AgentEvent::Failed(QWEN_FAILED.to_owned())]
+            [
+                AgentEvent::SessionStarted(session_id()),
+                AgentEvent::TurnStarted,
+                AgentEvent::Failed(QWEN_FAILED.to_owned())
+            ]
         );
     }
 
@@ -699,7 +706,7 @@ mod tests {
                 "hasQueuedPrompt": false
             }})
         );
-        assert_eq!(collect(received).await.len(), 2);
+        assert_eq!(collect(received).await.len(), 3);
     }
 
     #[tokio::test]

@@ -264,12 +264,28 @@ impl State {
             | Incoming::User(_)
             | Incoming::Result(_)
             | Incoming::Other => {
+                let previous = self.activity.phase();
+                let previous_background = self.activity.background().len();
                 self.activity.observe(&message);
                 let background = self.activity.background().len();
+                if previous != Phase::Busy && self.activity.phase() == Phase::Busy {
+                    self.emit(AgentEvent::TurnStarted).await;
+                }
+                if previous_background != background {
+                    self.emit(AgentEvent::BackgroundChanged(background)).await;
+                }
                 for event in self.tracker.translate(&message, background) {
                     if !self.emit(event).await {
                         return Flow::Stop;
                     }
+                }
+                // An already submitted prompt can still be waiting for acceptance when
+                // this result arrives. Its earlier TurnStarted preceded this result.
+                if matches!(&message, Incoming::Result(_))
+                    && self.activity.phase() == Phase::Busy
+                    && !self.emit(AgentEvent::TurnStarted).await
+                {
+                    return Flow::Stop;
                 }
                 Flow::Continue
             }
@@ -296,6 +312,9 @@ impl State {
         let uuid = Uuid::new_v4().to_string();
         self.write(&outgoing::user_message(prompt, &uuid)).await;
         self.activity.sent(uuid);
+        if !self.conversation.cancel.is_cancelled() {
+            self.emit(AgentEvent::TurnStarted).await;
+        }
     }
 
     /// Gives up when the conversation is stopped, so a CLI that does not read stdin cannot

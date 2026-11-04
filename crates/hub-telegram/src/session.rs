@@ -21,6 +21,7 @@ use crate::hub::{Agents, HubMessage};
 use crate::inbound::Turn;
 use crate::messenger::Target;
 use crate::paths::{CwdError, inside};
+use crate::progress::Progress;
 use crate::results::SaveResult;
 use crate::sender::Sender;
 use crate::texts;
@@ -35,6 +36,7 @@ pub(crate) enum First {
 }
 
 pub(crate) struct Run<A> {
+    pub(crate) progress: Progress,
     pub(crate) key: TopicKey,
     pub(crate) session: TopicSession,
     pub(crate) first: First,
@@ -54,19 +56,23 @@ impl<A: Agents> Run<A> {
     pub(crate) async fn execute(self) {
         let (key, generation) = (self.key, self.generation);
         let (sender, mailbox) = (self.sender.clone(), self.mailbox.clone());
+        let (progress, cancel) = (self.progress.clone(), self.cancel.clone());
         let inbox = if let Ok(inbox) = AssertUnwindSafe(self.converse()).catch_unwind().await {
             Some(inbox)
         } else {
             tracing::error!(chat = key.chat.0, thread = key.thread.0, "session crashed");
+            progress.observe(&AgentEvent::Failed(String::new()));
             sender.text(Target::Topic(key), texts::INTERNAL_ERROR).await;
             None
         };
+        progress.finish(cancel.is_cancelled());
         // The hub is gone only during shutdown, when leftover prompts no longer matter.
         let _ = mailbox.send(HubMessage::Ended { key, generation, inbox }).await;
     }
 
     async fn converse(self) -> mpsc::Receiver<Prompt> {
         let Self {
+            progress,
             key,
             session,
             first,
@@ -85,11 +91,13 @@ impl<A: Agents> Run<A> {
         let root = match root {
             Ok(root) => root,
             Err(error) => {
+                progress.observe(&AgentEvent::Failed(String::new()));
                 sender.text(Target::Topic(key), &texts::warning(&error)).await;
                 return inbox;
             }
         };
         if !inside(&root, &session.cwd) {
+            progress.observe(&AgentEvent::Failed(String::new()));
             sender.text(Target::Topic(key), &texts::outside_root(&session.cwd, &root)).await;
             return inbox;
         }
@@ -98,19 +106,23 @@ impl<A: Agents> Run<A> {
             First::Turn(turn) => match download(&sender, &session.cwd, turn).await {
                 Ok(prompt) => prompt,
                 Err(error) => {
+                    progress.observe(&AgentEvent::Failed(String::new()));
                     sender.text(Target::Topic(key), &texts::warning(&error)).await;
                     return inbox;
                 }
             },
         };
-        let channel = Arc::new(TelegramChannel::new(
-            sender.clone(),
-            key,
-            session.cwd.clone(),
-            home,
-            registries,
-            settings.timeouts.approval,
-        ));
+        let channel = Arc::new(
+            TelegramChannel::new(
+                sender.clone(),
+                key,
+                session.cwd.clone(),
+                home,
+                registries,
+                settings.timeouts.approval,
+            )
+            .with_progress(progress.clone()),
+        );
         let (events, received) = mpsc::channel(EVENTS);
         let conversation = Conversation {
             channel,
@@ -119,6 +131,7 @@ impl<A: Agents> Run<A> {
             limits: Limits::new(settings.timeouts.background),
         };
         let background = settings.timeouts.background;
+        progress.executing();
         let (inbox, ()) = tokio::join!(
             agents.run(&session, prompt, inbox, conversation, settings),
             relay(
@@ -127,7 +140,12 @@ impl<A: Agents> Run<A> {
                 key,
                 &mailbox,
                 background,
-                ResultContext { generation, session: &session, cancel: &cancel }
+                ResultContext {
+                    generation,
+                    session: &session,
+                    cancel: &cancel,
+                    progress: &progress
+                }
             ),
         );
         if cancel.is_cancelled() {
@@ -138,6 +156,7 @@ impl<A: Agents> Run<A> {
 }
 
 struct ResultContext<'a> {
+    progress: &'a Progress,
     generation: u64,
     session: &'a TopicSession,
     cancel: &'a CancellationToken,
@@ -208,8 +227,11 @@ async fn collect(
 ) {
     let mut pending = Pending::default();
     while let Some(event) = events.recv().await {
+        context.progress.observe(&event);
         match event {
-            AgentEvent::SessionStarted(session) => bind(mailbox, key, session).await,
+            AgentEvent::SessionStarted(session) => {
+                bind(mailbox, key, context.generation, session).await;
+            }
             AgentEvent::AssistantText(text) => pending.push(text, &output).await,
             AgentEvent::ToolCall(call) => {
                 pending.boundary(&output);
@@ -270,7 +292,7 @@ async fn collect(
                     output.final_message(Style::Markdown, std::mem::take(&mut pending.text));
                 }
                 pending.overflow = false;
-                bind(mailbox, key, finished.session.clone()).await;
+                bind(mailbox, key, context.generation, finished.session.clone()).await;
                 if !queued_footer {
                     output.final_message(Style::Plain, format_finished(&finished));
                 }
@@ -280,6 +302,7 @@ async fn collect(
                 tracing::warn!(tasks = tasks.len(), "background tasks abandoned");
                 output.send(Style::Plain, format_abandoned(&tasks, background));
             }
+            AgentEvent::TurnStarted | AgentEvent::BackgroundChanged(_) => {}
             AgentEvent::Failed(reason) => {
                 pending.boundary(&output);
                 tracing::warn!(%reason, "turn failed");
@@ -311,7 +334,12 @@ async fn save_result(
 }
 
 /// Persisted at once, so a crash mid-turn can still resume the session.
-async fn bind(mailbox: &mpsc::Sender<HubMessage>, key: TopicKey, session: SessionId) {
+async fn bind(
+    mailbox: &mpsc::Sender<HubMessage>,
+    key: TopicKey,
+    generation: u64,
+    session: SessionId,
+) {
     // The hub is gone only during shutdown.
-    let _ = mailbox.send(HubMessage::Bind { key, session }).await;
+    let _ = mailbox.send(HubMessage::Bind { key, generation: Some(generation), session }).await;
 }

@@ -87,6 +87,7 @@ async fn coalesced_updates_before_result_are_not_lost_or_mixed_with_other_sessio
         .await
         .unwrap()
         .unwrap();
+    assert_eq!(events.try_recv().unwrap(), AgentEvent::TurnStarted);
     assert_eq!(events.try_recv().unwrap(), AgentEvent::AssistantText("before".to_owned()));
     assert_eq!(
         events.try_recv().unwrap(),
@@ -127,6 +128,7 @@ async fn peer_eof_fails_an_inflight_prompt_without_waiting_for_control_timeout()
     .await
     .unwrap();
     assert!(matches!(result, Err(RpcError::Closed)));
+    assert_eq!(events.try_recv().unwrap(), AgentEvent::TurnStarted);
     assert!(events.try_recv().is_err());
     server.await.unwrap();
     reader.await.unwrap();

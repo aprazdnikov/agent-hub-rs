@@ -86,7 +86,10 @@ async fn relay<T: Thread>(
     let mut active = tokio::select! {
         biased;
         () = conversation.cancel.cancelled() => return Ok(()),
-        turn = thread.start_turn(&prompt) => Some(turn?),
+        turn = async {
+            emit(conversation, AgentEvent::TurnStarted).await;
+            thread.start_turn(&prompt).await
+        } => Some(turn?),
     };
     let mut inbox_open = true;
     while active.is_some() || !queued.is_empty() {
@@ -98,7 +101,7 @@ async fn relay<T: Thread>(
             next = inbox.recv(), if inbox_open => match next {
                 Some(prompt) => {
                     queued.push_back(prompt);
-                    active = deliver(thread, active, &mut queued).await?;
+                    active = deliver(thread, active, &mut queued, conversation).await?;
                 }
                 None => inbox_open = false,
             },
@@ -109,7 +112,7 @@ async fn relay<T: Thread>(
                     emit(conversation, event).await;
                 }
                 if completed.is_some() && completed == active {
-                    active = deliver(thread, None, &mut queued).await?;
+                    active = deliver(thread, None, &mut queued, conversation).await?;
                 }
             }
         }
@@ -125,12 +128,16 @@ async fn deliver<T: Thread>(
     thread: &T,
     active: Option<TurnId>,
     queued: &mut VecDeque<Prompt>,
+    conversation: &Conversation,
 ) -> Result<Option<TurnId>, RpcError> {
     let active = match active {
         Some(turn) => turn,
         None => match queued.pop_front() {
             None => return Ok(None),
-            Some(prompt) => thread.start_turn(&prompt).await?,
+            Some(prompt) => {
+                emit(conversation, AgentEvent::TurnStarted).await;
+                thread.start_turn(&prompt).await?
+            }
         },
     };
     while let Some(next) = queued.front() {
@@ -296,7 +303,7 @@ mod tests {
         });
         assert_eq!(
             drain(&mut harness.events),
-            [AgentEvent::AssistantText("Привет".to_owned()), finished]
+            [AgentEvent::TurnStarted, AgentEvent::AssistantText("Привет".to_owned()), finished]
         );
     }
 
@@ -319,7 +326,7 @@ mod tests {
             resets_at: None,
         };
         let update = QuotaUpdate::new(BackendKind::Codex, Label::new("ChatGPT Plus"), vec![window]);
-        assert_eq!(drain(&mut harness.events).first(), Some(&AgentEvent::Quota(update)));
+        assert_eq!(drain(&mut harness.events).get(1), Some(&AgentEvent::Quota(update)));
     }
 
     #[tokio::test]
@@ -335,11 +342,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_rejected_steer_waits_for_the_turn_and_starts_the_next() {
-        let harness = start(FakeThread::rejecting(1));
+        let mut harness = start(FakeThread::rejecting(1));
         harness.inbox.send(prompt("поздно")).await.unwrap();
         eventually("steer tried", || harness.thread.calls().len() == 2).await;
         harness.notify.send(completed("u-1")).unwrap();
         eventually("next turn", || harness.thread.calls().len() == 3).await;
+        let events = drain(&mut harness.events);
+        assert!(matches!(
+            events.as_slice(),
+            [AgentEvent::TurnStarted, AgentEvent::Finished(_), AgentEvent::TurnStarted]
+        ));
         harness.notify.send(completed("u-2")).unwrap();
         let (_inbox, outcome) = harness.done.await.unwrap();
         assert_eq!(outcome, Ok(()));
@@ -424,6 +436,9 @@ mod tests {
         harness.notify.send(failed).unwrap();
         let (_inbox, outcome) = harness.done.await.unwrap();
         assert_eq!(outcome, Ok(()));
-        assert_eq!(drain(&mut harness.events), [AgentEvent::Failed("quota".to_owned())]);
+        assert_eq!(
+            drain(&mut harness.events),
+            [AgentEvent::TurnStarted, AgentEvent::Failed("quota".to_owned())]
+        );
     }
 }

@@ -132,6 +132,9 @@ async fn relay<A: Agent>(
     let Turns { agent, notifications, drains } = turns;
     let mut next = Some(prompt);
     while let Some(prompt) = next.take() {
+        if !conversation.cancel.is_cancelled() {
+            emit(conversation, AgentEvent::TurnStarted).await;
+        }
         let turn = agent.prompt(&prompt);
         tokio::pin!(turn);
         let mut updates_open = true;
@@ -344,7 +347,7 @@ mod tests {
         });
         assert_eq!(
             drained(&mut harness.events),
-            [AgentEvent::AssistantText("Привет".to_owned()), finished]
+            [AgentEvent::TurnStarted, AgentEvent::AssistantText("Привет".to_owned()), finished]
         );
     }
 
@@ -361,11 +364,16 @@ mod tests {
 
     #[tokio::test]
     async fn a_prompt_after_the_last_drain_starts_the_next_turn() {
-        let harness = start();
+        let mut harness = start();
         eventually("started", || harness.agent.calls().len() == 1).await;
         harness.inbox.send(prompt("потом")).await.unwrap();
         harness.ends.send(Ok(StopReason::EndTurn)).unwrap();
         eventually("next turn", || harness.agent.calls().len() == 2).await;
+        let events = drained(&mut harness.events);
+        assert!(matches!(
+            events.as_slice(),
+            [AgentEvent::TurnStarted, AgentEvent::Finished(_), AgentEvent::TurnStarted]
+        ));
         harness.ends.send(Ok(StopReason::EndTurn)).unwrap();
         let (_inbox, outcome) = harness.done.await.unwrap();
         assert_eq!(outcome, Ok(()));

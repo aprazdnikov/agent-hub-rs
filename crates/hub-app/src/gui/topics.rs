@@ -2,6 +2,7 @@
 
 use eframe::egui;
 use hub_core::domain::{BackendKind, TopicKey};
+use hub_core::progress::Phase;
 use hub_telegram::hub::{TopicState, TopicView};
 
 use crate::gui::folder::{Destination, Opener};
@@ -20,6 +21,7 @@ struct TopicFilter {
     query: String,
     backend: Option<BackendKind>,
     state: Option<TopicState>,
+    phase: Option<Phase>,
 }
 
 impl TopicFilter {
@@ -27,6 +29,7 @@ impl TopicFilter {
         let query = self.query.trim().to_lowercase();
         self.backend.is_none_or(|kind| topic.session.backend == kind)
             && self.state.is_none_or(|state| topic.state == state)
+            && self.phase.is_none_or(|phase| topic.progress.phase() == phase)
             && (name(topic).to_lowercase().contains(&query)
                 || topic.session.cwd.as_path().to_string_lossy().to_lowercase().contains(&query))
     }
@@ -49,6 +52,9 @@ impl TopicsView {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot, send: &mut impl FnMut(Command)) {
+        if !snapshot.topics.is_empty() {
+            ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
+        }
         self.opener.poll(ui.ctx());
         self.filters(ui);
         if let Some(error) = self.opener.error() {
@@ -120,6 +126,14 @@ impl TopicsView {
                 self.filter = TopicFilter::default();
             }
         });
+        egui::ComboBox::from_id_salt("topic-phase")
+            .selected_text(self.filter.phase.map_or("Все этапы", Phase::label))
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut self.filter.phase, None, "Все этапы");
+                for phase in Phase::ALL {
+                    ui.selectable_value(&mut self.filter.phase, Some(phase), phase.label());
+                }
+            });
         ui.separator();
     }
 
@@ -184,7 +198,16 @@ impl TopicsView {
             }
         }
         let running = topic.state == TopicState::Running;
-        ui.label(state_text(topic.state));
+        ui.push_id((topic.key, "progress"), |ui| {
+            ui.vertical(|ui| {
+                ui.set_width(230.0);
+                ui.small(state_text(topic.state));
+                let summary = topic.progress.describe(std::time::Instant::now());
+                for line in summary.lines() {
+                    ui.add(egui::Label::new(line).truncate()).on_hover_text(&summary);
+                }
+            });
+        });
         ui.push_id((topic.key, "controls"), |ui| {
             ui.horizontal(|ui| {
                 if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
@@ -224,6 +247,7 @@ mod tests {
 
     fn topic(thread: i32, name: &str, backend: BackendKind, state: TopicState) -> TopicView {
         TopicView {
+            progress: hub_core::progress::TaskProgress::default(),
             parameters: String::new(),
             key: TopicKey { chat: ChatId(-1_001_234_567_890), thread: ThreadId(thread) },
             title: Some(name.to_owned()),
@@ -322,6 +346,31 @@ mod tests {
     }
 
     #[test]
+    fn detailed_phase_filter_keeps_waiting_tasks_busy_and_stop_targets_the_topic() {
+        let ctx = egui::Context::default();
+        let mut view = TopicsView::default();
+        let mut waiting = topic(7, "Permission", BackendKind::Claude, TopicState::Running);
+        let now = std::time::Instant::now();
+        waiting.progress = hub_core::progress::TaskProgress::new(now);
+        waiting.progress.wait_started(hub_core::progress::WaitKind::Approval, now);
+        let mut stopped = topic(8, "Stopped", BackendKind::Codex, TopicState::Waiting);
+        stopped.progress = hub_core::progress::TaskProgress::new(now);
+        stopped.progress.finish(true, now);
+        let snapshot = Snapshot { topics: vec![waiting, stopped], ..Snapshot::default() };
+        let mut commands = Vec::new();
+        click(&ctx, &mut view, &snapshot, "Все этапы", &mut commands);
+        click(&ctx, &mut view, &snapshot, "Ожидает разрешения", &mut commands);
+        let shown = labels(&draw(&ctx, &mut view, &snapshot));
+        assert!(shown.iter().any(|text| text == "Темы: 1 из 2"));
+        assert!(!shown.iter().any(|text| text == "Stopped"));
+        assert!(shown.iter().any(|text| text.starts_with("Длительность запуска:")));
+        click(&ctx, &mut view, &snapshot, "Reset", &mut commands);
+        assert!(view.resetting.is_none(), "a waiting task is still busy");
+        click(&ctx, &mut view, &snapshot, "Stop", &mut commands);
+        assert!(matches!(commands.as_slice(), [Command::StopTopic(key)] if key.thread.0 == 7));
+    }
+
+    #[test]
     fn topics_offer_search_and_navigation() {
         let ctx = egui::Context::default();
         let mut view = TopicsView::default();
@@ -356,7 +405,7 @@ mod tests {
         #[case] state: Option<TopicState>,
         #[case] expected: bool,
     ) {
-        let filter = TopicFilter { query: query.to_owned(), backend, state };
+        let filter = TopicFilter { query: query.to_owned(), backend, state, phase: None };
         assert_eq!(
             filter.matches(&topic(42, "Бэкенд", BackendKind::Claude, TopicState::Running)),
             expected

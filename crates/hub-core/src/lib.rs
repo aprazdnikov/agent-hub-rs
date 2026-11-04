@@ -7,6 +7,7 @@ pub mod domain;
 pub mod escape;
 mod ids;
 pub mod markdown;
+pub mod progress;
 pub mod projects;
 pub mod questions;
 pub mod quota;

@@ -286,12 +286,16 @@ pub struct Finished {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AgentEvent {
+    /// A new turn is being submitted, including queued turns within one process.
+    TurnStarted,
     SessionStarted(SessionId),
     AssistantText(String),
     ToolCall(ToolUse),
     Finished(Finished),
     Failed(String),
     BackgroundAbandoned(Vec<String>),
+    /// Observed background task count, including zero when all tasks have ended.
+    BackgroundChanged(usize),
     /// Subscription limits a live session reported.
     Quota(QuotaUpdate),
 }

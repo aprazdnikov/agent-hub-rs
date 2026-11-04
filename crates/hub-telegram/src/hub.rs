@@ -19,6 +19,7 @@ use hub_core::domain::{
     AbsolutePath, BackendKind, ChatId, MessageId, Prompt, SessionId, TopicKey, TopicSession, UserId,
 };
 use hub_core::options::Effective;
+use hub_core::progress::TaskProgress;
 use hub_core::projects::RecentProjects;
 use hub_core::quota::{QuotaReport, QuotaUpdate};
 use hub_core::render::render_limits;
@@ -41,6 +42,7 @@ use crate::options;
 use crate::outbox::{self, Outbox};
 use crate::paths::{CwdError, resolve_cwd, workspace_root};
 use crate::press;
+use crate::progress::Progress;
 use crate::projects::{self, Projects, Stage};
 use crate::results::{LastResults, ResultStore, SaveResult};
 use crate::sender::Sender;
@@ -94,6 +96,7 @@ pub enum TopicState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopicView {
+    pub progress: TaskProgress,
     pub parameters: String,
     pub key: TopicKey,
     pub title: Option<String>,
@@ -116,6 +119,8 @@ pub enum HubMessage {
     FlushAlbum(String),
     Bind {
         key: TopicKey,
+        /// Backend events carry their generation; direct administrative bindings use None.
+        generation: Option<u64>,
         session: SessionId,
     },
     /// A session task ended; `inbox` is gone only if the task crashed.
@@ -173,6 +178,7 @@ pub struct HubHandle {
 }
 
 struct Live {
+    progress: Progress,
     parameters: Effective,
     inbox: mpsc::Sender<Prompt>,
     cancel: CancellationToken,
@@ -195,6 +201,7 @@ struct Hub<A> {
     home: PathBuf,
     bot: String,
     running: HashMap<TopicKey, Live>,
+    last_progress: HashMap<TopicKey, TaskProgress>,
     albums: HashMap<String, Vec<Inbound>>,
     titles: Titles,
     generation: u64,
@@ -249,6 +256,7 @@ pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
         home,
         bot,
         running: HashMap::new(),
+        last_progress: HashMap::new(),
         albums: HashMap::new(),
         titles,
         generation: 0,
@@ -268,10 +276,16 @@ pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
 impl<A: Agents> Hub<A> {
     async fn run(mut self, mut mailbox: mpsc::Receiver<HubMessage>) {
         self.publish();
+        let mut refresh = tokio::time::interval(Duration::from_millis(250));
+        refresh.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             let deadline = self.shutdown.as_ref().map(|(_, at)| *at);
             let message = tokio::select! {
                 message = mailbox.recv() => message,
+                _ = refresh.tick(), if !self.running.is_empty() => {
+                    self.publish();
+                    continue;
+                }
                 changed = self.settings.changed() => {
                     if changed.is_err() { break; }
                     self.publish();
@@ -358,12 +372,16 @@ impl<A: Agents> Hub<A> {
                     self.start_turn(key, Turn::from_parts(&parts));
                 }
             }
-            HubMessage::Bind { key, session } => self.bind(key, session),
+            HubMessage::Bind { key, generation, session } => {
+                if generation.is_none_or(|id| {
+                    self.running.get(&key).is_some_and(|live| live.generation == id)
+                }) {
+                    self.bind(key, session);
+                }
+            }
             HubMessage::Ended { key, generation, inbox } => self.ended(key, generation, inbox),
             HubMessage::Stop(key) => {
-                if let Some(live) = self.running.get(&key) {
-                    live.cancel.cancel();
-                }
+                self.stop(key);
             }
             HubMessage::Reset(key) => {
                 // Like `/reset`: not during a turn or a snapshot of this topic.
@@ -382,6 +400,7 @@ impl<A: Agents> Hub<A> {
                 self.outbox.shutdown();
                 self.options.shutdown();
                 for live in self.running.values() {
+                    live.progress.stopping();
                     live.cancel.cancel();
                 }
                 self.shutdown = Some((done, Instant::now() + SHUTDOWN_TIMEOUT));
@@ -582,10 +601,11 @@ impl<A: Agents> Hub<A> {
                 }
             }
             Command::Backend => self.backend(key, args),
-            Command::Stop => match self.running.get(&key) {
-                Some(live) => live.cancel.cancel(),
-                None => self.say(Target::Topic(key), texts::NOTHING_TO_STOP.to_owned()),
-            },
+            Command::Stop => {
+                if !self.stop(key) {
+                    self.say(Target::Topic(key), texts::NOTHING_TO_STOP.to_owned());
+                }
+            }
             Command::Status => match self.topics.get(&key) {
                 None => self.say(Target::Topic(key), texts::NO_SESSION.to_owned()),
                 Some(session) => {
@@ -597,8 +617,9 @@ impl<A: Agents> Hub<A> {
                     self.say(
                         Target::Topic(key),
                         format!(
-                            "{}\n{}",
+                            "{}\n{}\n{}",
                             texts::describe(state, session),
+                            self.progress(key).describe(std::time::Instant::now()),
                             self.parameters(key, session)
                         ),
                     );
@@ -740,11 +761,20 @@ impl<A: Agents> Hub<A> {
         let (inbox, receiver) = reuse.unwrap_or_else(|| mpsc::channel(INBOX));
         self.generation += 1;
         let cancel = CancellationToken::new();
+        let progress = Progress::new();
+        self.last_progress.remove(&key);
         self.running.insert(
             key,
-            Live { parameters, inbox, cancel: cancel.clone(), generation: self.generation },
+            Live {
+                progress: progress.clone(),
+                parameters,
+                inbox,
+                cancel: cancel.clone(),
+                generation: self.generation,
+            },
         );
         let run = Run {
+            progress,
             key,
             session,
             first,
@@ -768,6 +798,8 @@ impl<A: Agents> Hub<A> {
             self.running.insert(key, live);
             return;
         }
+        live.progress.finish(live.cancel.is_cancelled());
+        self.last_progress.insert(key, live.progress.snapshot());
         let Some(mut inbox) = inbox else { return };
         if self.shutdown.is_some() {
             return;
@@ -783,6 +815,23 @@ impl<A: Agents> Hub<A> {
         if session.session.as_ref() != Some(&id) {
             self.put(key, session.with_session(Some(id)));
         }
+    }
+
+    fn stop(&self, key: TopicKey) -> bool {
+        if let Some(live) = self.running.get(&key) {
+            live.progress.stopping();
+            live.cancel.cancel();
+            true
+        } else {
+            false
+        }
+    }
+
+    fn progress(&self, key: TopicKey) -> TaskProgress {
+        self.running.get(&key).map_or_else(
+            || self.last_progress.get(&key).cloned().unwrap_or_default(),
+            |live| live.progress.snapshot(),
+        )
     }
 
     fn is_reserved(&self, session: &TopicSession) -> bool {
@@ -1055,10 +1104,12 @@ impl<A: Agents> Hub<A> {
             return;
         }
         self.topics = next;
+        self.last_progress.remove(&key);
         self.projects.invalidate(key);
         self.options.invalidate(key);
         self.say(Target::Topic(key), texts::restored(&name, &session));
         for holder in holders {
+            self.last_progress.remove(&holder);
             self.projects.invalidate(holder);
             self.options.invalidate(holder);
             self.say(Target::Topic(holder), texts::SESSION_MOVED.to_owned());
@@ -1078,6 +1129,9 @@ impl<A: Agents> Hub<A> {
     }
 
     fn put(&mut self, key: TopicKey, session: TopicSession) {
+        if !self.running.contains_key(&key) {
+            self.last_progress.remove(&key);
+        }
         self.projects.invalidate(key);
         self.options.invalidate(key);
         self.topics.insert(key, session);
@@ -1186,6 +1240,11 @@ impl<A: Agents> Hub<A> {
                             if self.store.save(&next).is_err() {
                                 Outgoing::plain("⚠️ Настройки не сохранены на диск. Прежние параметры и контекст темы сохранены.".to_owned())
                             } else {
+                                if self.topics.get(&key).and_then(|s| s.session.as_ref())
+                                    != session.session.as_ref()
+                                {
+                                    self.last_progress.remove(&key);
+                                }
                                 self.topics = next;
                                 self.options.invalidate(key);
                                 self.projects.invalidate(key);
@@ -1267,6 +1326,7 @@ impl<A: Agents> Hub<A> {
                     return;
                 }
                 self.topics = next;
+                self.last_progress.remove(&key);
                 self.projects.invalidate(key);
                 self.options.invalidate(key);
                 self.projects.recent.remember(ticket.project.id());
@@ -1424,6 +1484,7 @@ impl<A: Agents> Hub<A> {
             .topics
             .iter()
             .map(|(key, session)| TopicView {
+                progress: self.progress(*key),
                 parameters: self.parameters(*key, session),
                 key: *key,
                 title: self.titles.get(key).cloned(),
@@ -1435,7 +1496,14 @@ impl<A: Agents> Hub<A> {
                 },
             })
             .collect();
-        self.views.send_replace(views);
+        self.views.send_if_modified(|current| {
+            if *current == views {
+                false
+            } else {
+                *current = views;
+                true
+            }
+        });
     }
 }
 
@@ -1467,6 +1535,9 @@ mod tests {
         Say(Vec<AgentEvent>),
         UntilStopped,
         Collect(usize),
+        Stream(mpsc::Receiver<AgentEvent>),
+        Approval,
+        Crash,
     }
 
     #[derive(Default)]
@@ -1539,6 +1610,27 @@ mod tests {
                 self.scripts.lock().unwrap().pop_front().unwrap_or(Script::Say(Vec::new()));
             Box::pin(async move {
                 match script {
+                    Script::Crash => panic!("test session crash"),
+                    Script::Approval => {
+                        let requested =
+                            conversation.channel.request(hub_core::domain::ToolRequest {
+                                tool: "test".to_owned(),
+                                summary: "test".to_owned(),
+                            });
+                        tokio::select! {
+                            () = conversation.cancel.cancelled() => {},
+                            _ = requested => { conversation.events.send(finished()).await.unwrap(); }
+                        }
+                    }
+                    Script::Stream(mut source) => loop {
+                        tokio::select! {
+                            () = conversation.cancel.cancelled() => break,
+                            next = source.recv() => match next {
+                                Some(event) => { if conversation.events.send(event).await.is_err() { break; } }
+                                None => break,
+                            }
+                        }
+                    },
                     Script::Say(events) => {
                         for event in events {
                             conversation.events.send(event).await.unwrap();
@@ -1918,6 +2010,141 @@ mod tests {
         let pick = project_button(world, "Бэкенд").await;
         world.send(HubMessage::Press(pick)).await;
         project_button(world, "Выбрать и сбросить").await
+    }
+
+    #[tokio::test]
+    async fn progress_follows_background_and_next_turn_until_the_process_ends() {
+        use hub_core::progress::Phase;
+        let (events, received) = mpsc::channel(8);
+        let world = world(FakeAgents::scripted(vec![Script::Stream(received)]));
+        world.send(text(Some(7), 1, "work")).await;
+        eventually("executing", || phase(&world) == Some(Phase::Running)).await;
+        let mut completed = finished();
+        if let AgentEvent::Finished(result) = &mut completed {
+            result.background = 1;
+        }
+        events.send(completed).await.unwrap();
+        eventually("background", || phase(&world) == Some(Phase::Background)).await;
+        assert!(world.running());
+        world.send(text(Some(7), 2, "/status")).await;
+        eventually("status", || {
+            world.texts().iter().any(|t| {
+                t.contains("Фоновые задачи")
+                    && t.contains("Длительность запуска")
+                    && t.contains("Получен результат хода")
+            })
+        })
+        .await;
+        events.send(AgentEvent::TurnStarted).await.unwrap();
+        eventually("next turn before output", || phase(&world) == Some(Phase::Running)).await;
+        events.send(finished()).await.unwrap();
+        eventually("finishing", || phase(&world) == Some(Phase::Finishing)).await;
+        assert!(world.running());
+        drop(events);
+        eventually("complete", || !world.running() && phase(&world) == Some(Phase::Completed))
+            .await;
+    }
+
+    fn phase(world: &World) -> Option<hub_core::progress::Phase> {
+        world.handle.views.borrow().iter().find(|v| v.key == KEY).map(|v| v.progress.phase())
+    }
+
+    #[tokio::test]
+    async fn progress_waiting_topic_is_busy_and_stop_clears_waiting() {
+        use hub_core::progress::Phase;
+        let world = world(FakeAgents::scripted(vec![Script::Approval]));
+        world.send(text(Some(7), 1, "work")).await;
+        eventually("approval", || phase(&world) == Some(Phase::AwaitingApproval)).await;
+        assert!(world.running());
+        world.send(text(Some(7), 2, "/status")).await;
+        eventually("waiting status", || {
+            world.texts().iter().any(|t| t.contains("Ожидает разрешения"))
+        })
+        .await;
+        world.send(text(Some(7), 3, "/stop")).await;
+        eventually("stopped", || !world.running() && phase(&world) == Some(Phase::Stopped)).await;
+    }
+
+    #[tokio::test]
+    async fn progress_crash_and_preparation_failure_are_errors_and_reset_clears_them() {
+        use hub_core::progress::Phase;
+        let world = world(FakeAgents::scripted(vec![Script::Crash]));
+        world.send(text(Some(7), 1, "crash")).await;
+        eventually("crash", || !world.running() && phase(&world) == Some(Phase::Failed)).await;
+        assert!(world.store.last().unwrap()[&KEY].session.is_none());
+        world.send(text(Some(7), 2, "/reset")).await;
+        eventually("clear without session id", || phase(&world) == Some(Phase::Unknown)).await;
+        world.settings.send_modify(|settings| {
+            Arc::make_mut(settings).workspace_root = world.root.path().join("missing");
+        });
+        world.send(text(Some(7), 3, "bad root")).await;
+        eventually("preparation failed", || {
+            phase(&world) == Some(Phase::Failed) && !world.running()
+        })
+        .await;
+        assert_eq!(world.agents.prompts(), ["crash"]);
+    }
+
+    #[tokio::test]
+    async fn progress_rejects_late_ended_and_binding_from_an_old_generation() {
+        use hub_core::progress::Phase;
+        let world =
+            world(FakeAgents::scripted(vec![Script::Say(vec![finished()]), Script::UntilStopped]));
+        world.send(text(Some(7), 1, "first")).await;
+        eventually("first completed", || {
+            phase(&world) == Some(Phase::Completed) && !world.running()
+        })
+        .await;
+        world.send(text(Some(7), 2, "second")).await;
+        eventually("second running", || phase(&world) == Some(Phase::Running)).await;
+        world
+            .send(HubMessage::Bind {
+                key: KEY,
+                generation: Some(1),
+                session: SessionId::parse("stale").unwrap(),
+            })
+            .await;
+        world.send(HubMessage::Ended { key: KEY, generation: 1, inbox: None }).await;
+        world.send(text(Some(7), 3, "/status")).await;
+        eventually("barrier", || world.texts().iter().any(|t| t.starts_with(texts::RUNNING))).await;
+        assert_eq!(bound_to(&world, KEY), SessionId::parse("s-1"));
+        assert_eq!(phase(&world), Some(Phase::Running));
+        world.send(text(Some(7), 4, "/stop")).await;
+        eventually("stopped", || !world.running()).await;
+    }
+
+    #[tokio::test]
+    async fn progress_survives_rename_and_model_change_but_not_reset_or_restart() {
+        use hub_core::progress::Phase;
+        let mut world = world(FakeAgents::scripted(vec![Script::Say(vec![finished()])]));
+        world.send(text(Some(7), 1, "first")).await;
+        eventually("completed", || phase(&world) == Some(Phase::Completed) && !world.running())
+            .await;
+        world.send(inbound(Some(7), 2, Content::TopicRenamed { name: "Renamed".to_owned() })).await;
+        apply_option(&world, "/model another").await;
+        assert_eq!(phase(&world), Some(Phase::Completed));
+        world.restart().await;
+        eventually("restart clears", || phase(&world) == Some(Phase::Unknown)).await;
+        assert_eq!(bound_to(&world, KEY), SessionId::parse("s-1"));
+    }
+
+    #[tokio::test]
+    async fn progress_project_write_failure_preserves_the_previous_result() {
+        use hub_core::progress::Phase;
+        let world = world(FakeAgents::scripted(vec![Script::Say(vec![finished()])]));
+        configure_project(&world);
+        world.send(text(Some(7), 1, "first")).await;
+        eventually("completed", || phase(&world) == Some(Phase::Completed) && !world.running())
+            .await;
+        let confirm = choose_project(&world).await;
+        world.store.fail.store(true, Ordering::SeqCst);
+        world.send(HubMessage::Press(confirm)).await;
+        eventually("write failed", || said(&world, "⚠️ Проект не выбран")).await;
+        assert_eq!(phase(&world), Some(Phase::Completed));
+        world.store.fail.store(false, Ordering::SeqCst);
+        let confirm = choose_project(&world).await;
+        world.send(HubMessage::Press(confirm)).await;
+        eventually("new context", || phase(&world) == Some(Phase::Unknown)).await;
     }
 
     #[tokio::test]
@@ -3241,7 +3468,13 @@ mod tests {
     const THIRD: TopicKey = TopicKey { chat: ChatId(-100), thread: ThreadId(9) };
 
     async fn bound(world: &World, key: TopicKey, id: &str) {
-        world.send(HubMessage::Bind { key, session: SessionId::parse(id).unwrap() }).await;
+        world
+            .send(HubMessage::Bind {
+                key,
+                generation: None,
+                session: SessionId::parse(id).unwrap(),
+            })
+            .await;
         eventually("bound", || {
             world
                 .store

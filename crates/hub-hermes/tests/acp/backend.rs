@@ -133,7 +133,7 @@ async fn eof_during_prompt_reports_failure_instead_of_a_finished_turn() {
     let fixture = Fixture::new("prompt_eof");
     assert!(matches!(
         run(&fixture, None).await.as_slice(),
-        [AgentEvent::SessionStarted(_), AgentEvent::Failed(_)]
+        [AgentEvent::SessionStarted(_), AgentEvent::TurnStarted, AgentEvent::Failed(_)]
     ));
 }
 
@@ -403,6 +403,7 @@ async fn opens_new_session_and_reports_prompt_result_usage() {
         run(&fixture, None).await,
         vec![
             AgentEvent::SessionStarted(id.clone()),
+            AgentEvent::TurnStarted,
             AgentEvent::AssistantText("first ".to_owned()),
             AgentEvent::ToolCall(ToolUse {
                 tool: "execute".to_owned(),

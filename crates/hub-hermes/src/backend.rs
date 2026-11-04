@@ -220,6 +220,9 @@ async fn turn(
     tracker: &mut TurnTracker,
     conversation: &Conversation,
 ) -> Result<Option<TurnResult>, RpcError> {
+    if !conversation.cancel.is_cancelled() {
+        emit(conversation, AgentEvent::TurnStarted).await;
+    }
     let request = client.request_untimed("session/prompt", protocol::prompt_params(id, prompt));
     tokio::pin!(request);
     let mut updates_open = true;

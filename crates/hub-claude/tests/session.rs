@@ -239,6 +239,7 @@ mod tests {
         assert_eq!(
             events,
             [
+                AgentEvent::TurnStarted,
                 AgentEvent::SessionStarted(session()),
                 AgentEvent::AssistantText("Привет".to_owned()),
                 finished(0)
@@ -273,6 +274,7 @@ mod tests {
         assert_eq!(
             events,
             [
+                AgentEvent::TurnStarted,
                 AgentEvent::Quota(QuotaUpdate::new(BackendKind::Claude, None, vec![window])),
                 AgentEvent::SessionStarted(session()),
                 AgentEvent::AssistantText("Привет".to_owned()),
@@ -390,6 +392,8 @@ mod tests {
             })
             .collect();
         assert_eq!(backgrounds, [1, 0]);
+        assert!(events.contains(&AgentEvent::BackgroundChanged(1)));
+        assert!(events.contains(&AgentEvent::BackgroundChanged(0)));
         assert!(events.contains(&AgentEvent::AssistantText("BG-DONE".to_owned())));
     }
 
@@ -409,7 +413,63 @@ mod tests {
         {
             harness.cli.send(&message).await;
         }
-        harness.finish().await;
+        let (events, _, _) = harness.finish().await;
+        assert!(events.iter().filter(|event| **event == AgentEvent::TurnStarted).count() >= 2);
+    }
+
+    #[tokio::test]
+    async fn queued_turn_remains_running_after_the_previous_result() {
+        for failed in [false, true] {
+            let mut harness = Harness::start(FakeChannel::allowing(), limits());
+            harness.cli.handshake().await;
+            harness.inbox.send(prompt("second")).await.unwrap();
+            let second = harness.cli.expect().await;
+            assert_eq!(second["type"], "user");
+            let mut first_result = result(None);
+            first_result["is_error"] = failed.into();
+            harness.cli.send(&first_result).await;
+            harness.cli.accept(&second).await;
+            harness.cli.send(&result(None)).await;
+            let (events, _, _) = harness.finish().await;
+            let first_end = events
+                .iter()
+                .position(|event| matches!(event, AgentEvent::Finished(_) | AgentEvent::Failed(_)))
+                .unwrap();
+            assert_eq!(events[first_end + 1], AgentEvent::TurnStarted, "{events:?}");
+            let now = std::time::Instant::now();
+            let mut progress = hub_core::progress::TaskProgress::new(now);
+            for event in &events[..=first_end + 1] {
+                progress.observe(event, now);
+            }
+            assert_eq!(progress.phase(), hub_core::progress::Phase::Running);
+            for event in &events[first_end + 2..] {
+                progress.observe(event, now);
+            }
+            progress.finish(false, now);
+            assert_eq!(progress.phase(), hub_core::progress::Phase::Completed);
+        }
+    }
+
+    #[tokio::test]
+    async fn background_completion_without_another_result_is_observable() {
+        let mut timing = limits();
+        timing.settle = Duration::from_millis(10);
+        let mut harness = Harness::start(FakeChannel::allowing(), timing);
+        harness.cli.handshake().await;
+        for message in [started("b", "task"), result(None), notified("b")] {
+            harness.cli.send(&message).await;
+        }
+        let (events, _, _) = harness.finish().await;
+        assert!(events.contains(&finished(1)));
+        assert!(events.contains(&AgentEvent::BackgroundChanged(0)));
+        assert!(!events.contains(&finished(0)));
+        let now = std::time::Instant::now();
+        let mut progress = hub_core::progress::TaskProgress::new(now);
+        for event in events {
+            progress.observe(&event, now);
+        }
+        progress.finish(false, now);
+        assert_eq!(progress.phase(), hub_core::progress::Phase::Completed);
     }
 
     #[tokio::test]

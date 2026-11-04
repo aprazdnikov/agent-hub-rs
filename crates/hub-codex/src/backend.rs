@@ -505,6 +505,7 @@ mod tests {
             events,
             [
                 AgentEvent::SessionStarted(thread()),
+                AgentEvent::TurnStarted,
                 AgentEvent::AssistantText("Привет".to_owned()),
                 AgentEvent::Finished(Finished {
                     session: thread(),
@@ -651,6 +652,7 @@ mod tests {
             events,
             [
                 AgentEvent::SessionStarted(thread()),
+                AgentEvent::TurnStarted,
                 AgentEvent::Failed("Codex: quota exceeded".to_owned())
             ]
         );
@@ -681,6 +683,7 @@ mod tests {
             collect(received).await,
             [
                 AgentEvent::SessionStarted(thread()),
+                AgentEvent::TurnStarted,
                 AgentEvent::Failed(APP_SERVER_FAILED.to_owned())
             ]
         );

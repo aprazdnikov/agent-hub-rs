@@ -15,12 +15,14 @@ use hub_core::domain::{
     AbsolutePath, Decision, Denied, FileDelivery, OutgoingFile, Question, QuestionAnswer,
     QuestionsOutcome, ToolRequest, TopicKey,
 };
+use hub_core::progress::WaitKind;
 use hub_core::questions::{self, Answer, Button, QuestionId, QuestionRegistry};
 use tokio::sync::oneshot;
 use uuid::Uuid;
 
 use crate::messenger::{Format, Outgoing, Target};
 use crate::paths::outgoing_path;
+use crate::progress::Progress;
 use crate::sender::Sender;
 use crate::texts;
 
@@ -48,6 +50,7 @@ pub struct TelegramChannel {
     home: PathBuf,
     registries: Shared,
     timeout: Duration,
+    progress: Option<Progress>,
 }
 
 impl TelegramChannel {
@@ -60,7 +63,12 @@ impl TelegramChannel {
         registries: Shared,
         timeout: Duration,
     ) -> Self {
-        Self { sender, key, cwd, home, registries, timeout }
+        Self { sender, key, cwd, home, registries, timeout, progress: None }
+    }
+
+    pub(crate) fn with_progress(mut self, progress: Progress) -> Self {
+        self.progress = Some(progress);
+        self
     }
 
     async fn approval(&self, tool: ToolRequest) -> Decision {
@@ -81,10 +89,12 @@ impl TelegramChannel {
         let Some(message) = self.sender.one(Target::Topic(self.key), outgoing).await else {
             return Decision::Denied(Denied::new(texts::APPROVAL_UNSENT));
         };
+        let waiting = self.progress.as_ref().map(|progress| progress.wait(WaitKind::Approval));
         // Notification is only a wake-up. Even when timeout wins the future poll, a
         // button may already have committed its answer under the registry lock.
         let _ = tokio::time::timeout(self.timeout, notification).await;
         let outcome = lock(&self.registries).approvals.finish(&id);
+        drop(waiting);
         let (decision, verdict) = match outcome {
             ApprovalOutcome::Answered(verdict) => {
                 let decision = verdict.decision();
@@ -126,7 +136,10 @@ impl TelegramChannel {
         let Some(message) = self.sender.one(Target::Topic(self.key), outgoing).await else {
             return Answer::Declined(Denied::new(texts::QUESTION_UNSENT));
         };
-        match tokio::time::timeout(self.timeout, answer).await {
+        let waiting = self.progress.as_ref().map(|progress| progress.wait(WaitKind::Answer));
+        let outcome = tokio::time::timeout(self.timeout, answer).await;
+        drop(waiting);
+        match outcome {
             Ok(Ok(answer)) => {
                 let shown = format!("{text}\n\n{}", questions::answer_line(&answer));
                 self.sender.edit(self.key.chat, message, shown, Format::Html).await;
@@ -224,6 +237,7 @@ mod tests {
     const KEY: TopicKey = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
 
     struct Setup {
+        progress: crate::progress::Progress,
         channel: Arc<TelegramChannel>,
         messenger: Arc<FakeMessenger>,
         sender: Sender,
@@ -241,15 +255,20 @@ mod tests {
         let messenger = Arc::new(messenger);
         let sender = Sender::new(Arc::clone(&messenger) as Arc<dyn Messenger>);
         let registries = Shared::default();
-        let channel = Arc::new(TelegramChannel::new(
-            sender.clone(),
-            KEY,
-            cwd,
-            std::env::temp_dir(),
-            Arc::clone(&registries),
-            timeout,
-        ));
-        Setup { channel, messenger, sender, registries, dir }
+        let progress = crate::progress::Progress::new();
+        progress.executing();
+        let channel = Arc::new(
+            TelegramChannel::new(
+                sender.clone(),
+                KEY,
+                cwd,
+                std::env::temp_dir(),
+                Arc::clone(&registries),
+                timeout,
+            )
+            .with_progress(progress.clone()),
+        );
+        Setup { progress, channel, messenger, sender, registries, dir }
     }
 
     async fn keyboard(messenger: &FakeMessenger) -> (MessageId, Vec<Vec<Button>>) {
@@ -307,6 +326,48 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_closes_approval_before_a_delayed_final_edit() {
+        use hub_core::progress::Phase;
+        let setup = setup(Duration::from_secs(5));
+        let mut request = Box::pin(setup.channel.request(bash()));
+        assert!(futures::poll!(&mut request).is_pending());
+        assert_eq!(setup.progress.snapshot().phase(), Phase::AwaitingApproval);
+        let (message, rows) = setup.messenger.last_keyboard().unwrap();
+        press::handle(
+            setup.registries.clone(),
+            setup.sender.clone(),
+            press(&button(&rows, 0, 0), message),
+        )
+        .await;
+        let release = setup.messenger.delay_next_edit();
+        assert!(futures::poll!(&mut request).is_pending());
+        assert_eq!(setup.progress.snapshot().phase(), Phase::Running);
+        release.send(()).unwrap();
+        assert_eq!(request.await, Decision::Allowed);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn progress_question_timeout_and_abort_restore_execution() {
+        use hub_core::progress::Phase;
+        let setup = setup(Duration::from_secs(5));
+        let question = question(Selection::Single);
+        let mut request = Box::pin(setup.channel.question(&question));
+        assert!(futures::poll!(&mut request).is_pending());
+        assert_eq!(setup.progress.snapshot().phase(), Phase::AwaitingAnswer);
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let release = setup.messenger.delay_next_edit();
+        assert!(futures::poll!(&mut request).is_pending());
+        assert_eq!(setup.progress.snapshot().phase(), Phase::Running);
+        release.send(()).unwrap();
+        assert!(matches!(request.await, Answer::Declined(_)));
+        let mut request = Box::pin(setup.channel.question(&question));
+        assert!(futures::poll!(&mut request).is_pending());
+        assert_eq!(setup.progress.snapshot().phase(), Phase::AwaitingAnswer);
+        drop(request);
+        assert_eq!(setup.progress.snapshot().phase(), Phase::Running);
     }
 
     #[tokio::test(start_paused = true)]
@@ -500,6 +561,7 @@ mod tests {
             Decision::Denied(Denied::new("Не удалось отправить запрос подтверждения в Telegram"))
         );
         let attempted = setup.messenger.send_attempts();
+        assert_eq!(setup.progress.snapshot().phase(), hub_core::progress::Phase::Running);
         let [message] = attempted.as_slice() else { panic!("one approval send expected") };
         press::handle(
             Arc::clone(&setup.registries),
@@ -537,6 +599,7 @@ mod tests {
     async fn unanswered_approval_is_denied_after_the_timeout() {
         let setup = setup(Duration::from_millis(50));
         let decision = setup.channel.request(bash()).await;
+        assert_eq!(setup.progress.snapshot().phase(), hub_core::progress::Phase::Running);
         assert_eq!(decision, Decision::Denied(Denied::new("Нет ответа пользователя за 0 с")));
         assert!(setup.messenger.calls().iter().any(
             |call| matches!(call, Call::Edit { text, .. } if text.ends_with("⌛ Нет ответа — запрещено"))
@@ -561,6 +624,7 @@ mod tests {
         let (message, rows) = keyboard(&setup.messenger).await;
         request.abort();
         let _ = request.await;
+        assert_eq!(setup.progress.snapshot().phase(), hub_core::progress::Phase::Running);
         let pressed = press(&button(&rows, 0, 0), message);
         press::handle(Arc::clone(&setup.registries), setup.sender.clone(), pressed).await;
         assert!(setup.messenger.calls().contains(&stale("Запрос уже неактуален")));
