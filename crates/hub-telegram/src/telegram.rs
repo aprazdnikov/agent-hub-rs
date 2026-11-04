@@ -57,6 +57,9 @@ fn content(message: &Message) -> Content {
     if let Some(created) = message.forum_topic_created() {
         return Content::TopicCreated { name: created.name.clone() };
     }
+    if let Some(name) = message.forum_topic_edited().and_then(|edited| edited.name.as_ref()) {
+        return Content::TopicRenamed { name: name.clone() };
+    }
     if message.voice().is_some() || message.video_note().is_some() {
         return Content::Voice;
     }
@@ -529,6 +532,18 @@ mod tests {
             "forum_topic_created": {"name": "backend", "icon_color": 0}
         })));
         assert_eq!(created.content, Content::TopicCreated { name: "backend".to_owned() });
+    }
+
+    #[test]
+    fn topic_rename_is_recognised() {
+        let renamed = convert(&topic(&json!({
+            "forum_topic_edited": {"name": "Новое имя"}
+        })));
+        assert_eq!(renamed.content, Content::TopicRenamed { name: "Новое имя".to_owned() });
+        let icon_only = convert(&topic(&json!({
+            "forum_topic_edited": {"icon_custom_emoji_id": "123"}
+        })));
+        assert_eq!(icon_only.content, Content::Ignored);
     }
 
     #[test]

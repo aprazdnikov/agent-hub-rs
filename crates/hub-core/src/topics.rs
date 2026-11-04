@@ -12,6 +12,51 @@ use crate::domain::{
 const FORMAT_VERSION: u32 = 1;
 
 pub type Topics = BTreeMap<TopicKey, TopicSession>;
+/// Separate metadata: a rename does not change the topic's agent session.
+pub type Titles = BTreeMap<TopicKey, String>;
+
+#[derive(Serialize, Deserialize)]
+struct TitlesFile {
+    version: u32,
+    titles: Vec<TitleEntry>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct TitleEntry {
+    chat_id: i64,
+    thread_id: i32,
+    title: String,
+}
+
+/// Reads the optional `topics.titles.json` sidecar, not the session bindings file.
+pub fn parse_titles(raw: &str) -> Result<Titles, CorruptState> {
+    let file: TitlesFile = serde_json::from_str(raw)?;
+    if file.version != FORMAT_VERSION {
+        return Err(CorruptState::Version(file.version));
+    }
+    let mut titles = Titles::new();
+    for (index, TitleEntry { chat_id, thread_id, title }) in file.titles.into_iter().enumerate() {
+        let key = TopicKey { chat: ChatId(chat_id), thread: ThreadId(thread_id) };
+        if titles.insert(key, title).is_some() {
+            return Err(CorruptState::Entry {
+                index, reason: "повторяющийся ключ темы"
+            });
+        }
+    }
+    Ok(titles)
+}
+
+pub fn dump_titles(titles: &Titles) -> Result<String, serde_json::Error> {
+    let titles = titles
+        .iter()
+        .map(|(key, title)| TitleEntry {
+            chat_id: key.chat.0,
+            thread_id: key.thread.0,
+            title: title.clone(),
+        })
+        .collect();
+    serde_json::to_string_pretty(&TitlesFile { version: FORMAT_VERSION, titles })
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum CorruptState {
@@ -124,6 +169,29 @@ mod tests {
     #[test]
     fn empty_state_round_trips() {
         assert_eq!(parse_state(&dump_state(&Topics::new()).unwrap()).unwrap(), Topics::new());
+    }
+
+    #[test]
+    fn titles_round_trip_independently_of_bindings() {
+        let titles = Titles::from([
+            (TopicKey { chat: ChatId(-100), thread: ThreadId(7) }, "Тесты 🦀".to_owned()),
+            (TopicKey { chat: ChatId(-200), thread: ThreadId(7) }, "Другой чат".to_owned()),
+        ]);
+        let text = dump_titles(&titles).unwrap();
+        assert!(text.contains("Тесты 🦀"));
+        assert_eq!(parse_titles(&text).unwrap(), titles);
+        assert_eq!(parse_titles(&dump_titles(&Titles::new()).unwrap()).unwrap(), Titles::new());
+        let bindings = dump_state(&Topics::new()).unwrap();
+        assert!(!bindings.contains("titles"));
+    }
+
+    #[rstest]
+    #[case("broken")]
+    #[case(r#"{"version": 2, "titles": []}"#)]
+    #[case(r#"{"version": 1, "titles": [{"chat_id": 1, "thread_id": 7, "title": 123}]}"#)]
+    #[case(r#"{"version": 1, "titles": [{"chat_id": 1, "thread_id": 7, "title": "one"}, {"chat_id": 1, "thread_id": 7, "title": "two"}]}"#)]
+    fn invalid_titles_are_rejected(#[case] raw: &str) {
+        assert!(parse_titles(raw).is_err());
     }
 
     #[test]

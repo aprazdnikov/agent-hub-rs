@@ -23,6 +23,7 @@ pub enum Content {
     Media { caption: String, attachment: Attachment },
     Voice,
     TopicCreated { name: String },
+    TopicRenamed { name: String },
     Ignored,
 }
 
@@ -96,7 +97,10 @@ impl Turn {
                         }
                     }
                 }
-                Content::Voice | Content::TopicCreated { .. } | Content::Ignored => {}
+                Content::Voice
+                | Content::TopicCreated { .. }
+                | Content::TopicRenamed { .. }
+                | Content::Ignored => {}
             }
         }
         let text = texts.into_iter().filter(|text| !text.is_empty()).collect::<Vec<_>>().join("\n");

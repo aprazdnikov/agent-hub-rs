@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use hub_core::topics::{Topics, dump_state, parse_state};
+use hub_core::topics::{Titles, Topics, dump_state, dump_titles, parse_state, parse_titles};
 use hub_telegram::hub::TopicStore;
 
 use crate::atomic::write_atomic;
@@ -21,6 +21,17 @@ pub fn load_topics(path: &Path) -> Result<Topics, StoreError> {
     }
 }
 
+/// The sidecar is optional, so existing installations need no migration.
+pub fn load_titles(topics_path: &Path) -> Result<Titles, StoreError> {
+    let path = topics_path.with_extension("titles.json");
+    match fs::read_to_string(&path) {
+        Ok(raw) => parse_titles(&raw)
+            .map_err(|error| StoreError::Corrupt { path, reason: error.to_string() }),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Titles::new()),
+        Err(error) => Err(StoreError::Read { path, error }),
+    }
+}
+
 pub struct FileTopics {
     path: PathBuf,
 }
@@ -33,6 +44,12 @@ impl FileTopics {
 }
 
 impl TopicStore for FileTopics {
+    fn save_titles(&mut self, titles: &Titles) -> Result<(), String> {
+        let path = self.path.with_extension("titles.json");
+        let text = dump_titles(titles).map_err(|error| error.to_string())?;
+        write_atomic(&path, text.as_bytes()).map_err(|error| format!("{}: {error}", path.display()))
+    }
+
     fn save(&mut self, topics: &Topics) -> Result<(), String> {
         let text = dump_state(topics).map_err(|error| error.to_string())?;
         write_atomic(&self.path, text.as_bytes())
@@ -52,6 +69,7 @@ mod tests {
     fn missing_file_means_no_topics() {
         let dir = tempfile::tempdir().unwrap();
         assert!(load_topics(&dir.path().join("topics.json")).unwrap().is_empty());
+        assert!(load_titles(&dir.path().join("topics.json")).unwrap().is_empty());
     }
 
     #[test]
@@ -65,6 +83,21 @@ mod tests {
         )]);
         FileTopics::new(path.clone()).save(&topics).unwrap();
         assert_eq!(load_topics(&path).unwrap(), topics);
+        assert!(load_titles(&path).unwrap().is_empty(), "old installations have no title sidecar");
+        let bindings = fs::read(&path).unwrap();
+        let mut store = FileTopics::new(path.clone());
+        let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
+        for name in ["Старое имя", "Новое имя 🦀"] {
+            let titles = Titles::from([(key, name.to_owned())]);
+            store.save_titles(&titles).unwrap();
+            assert_eq!(load_titles(&path).unwrap(), titles);
+            assert_eq!(fs::read(&path).unwrap(), bindings, "rename must not rewrite session state");
+        }
+        assert_eq!(
+            fs::read_dir(dir.path()).unwrap().count(),
+            2,
+            "atomic writes leave no temporary files"
+        );
     }
 
     #[test]
@@ -76,5 +109,30 @@ mod tests {
         assert!(error.to_string().contains("topics.json"));
         assert!(error.to_string().contains("версия"));
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"version\": 9, \"topics\": []}");
+    }
+
+    #[test]
+    fn corrupt_title_sidecar_is_reported_without_overwriting_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("topics.json");
+        let sidecar = path.with_extension("titles.json");
+        for raw in ["bad json", r#"{"version": 99, "titles": []}"#] {
+            fs::write(&sidecar, raw).unwrap();
+            let error = load_titles(&path).unwrap_err();
+            assert!(error.to_string().contains("topics.titles.json"));
+            assert_eq!(fs::read_to_string(&sidecar).unwrap(), raw);
+        }
+    }
+
+    #[test]
+    fn title_write_error_does_not_damage_bindings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("topics.json");
+        let mut store = FileTopics::new(path.clone());
+        store.save(&Topics::new()).unwrap();
+        let before = fs::read(&path).unwrap();
+        fs::create_dir(path.with_extension("titles.json")).unwrap();
+        assert!(store.save_titles(&Titles::new()).is_err());
+        assert_eq!(fs::read(&path).unwrap(), before);
     }
 }

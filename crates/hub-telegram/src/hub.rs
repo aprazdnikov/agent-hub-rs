@@ -22,7 +22,7 @@ use hub_core::quota::{QuotaReport, QuotaUpdate};
 use hub_core::render::render_limits;
 use hub_core::settings::Settings;
 use hub_core::snapshot::{SnapshotName, default_name};
-use hub_core::topics::Topics;
+use hub_core::topics::{Titles, Topics};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
@@ -74,6 +74,7 @@ pub trait Agents: Send + Sync + 'static {
 
 pub trait TopicStore: Send + 'static {
     fn save(&mut self, topics: &Topics) -> Result<(), String>;
+    fn save_titles(&mut self, titles: &Titles) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -141,6 +142,7 @@ pub struct HubSetup<A> {
     pub messenger: Arc<dyn Messenger>,
     pub settings: watch::Receiver<Arc<Settings>>,
     pub topics: Topics,
+    pub titles: Titles,
     pub store: Box<dyn TopicStore>,
     pub home: PathBuf,
     /// The bot's username, to accept `/command@bot`.
@@ -172,7 +174,7 @@ struct Hub<A> {
     bot: String,
     running: HashMap<TopicKey, Live>,
     albums: HashMap<String, Vec<Inbound>>,
-    titles: HashMap<TopicKey, String>,
+    titles: Titles,
     generation: u64,
     mailbox: mpsc::Sender<HubMessage>,
     views: watch::Sender<Vec<TopicView>>,
@@ -192,7 +194,8 @@ struct Hub<A> {
 
 #[must_use]
 pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
-    let HubSetup { agents, action_runner, messenger, settings, topics, store, home, bot } = setup;
+    let HubSetup { agents, action_runner, messenger, settings, topics, titles, store, home, bot } =
+        setup;
     let (mailbox, inbox) = mpsc::channel(MAILBOX);
     let (views, watched) = watch::channel(Vec::new());
     let registries = Shared::default();
@@ -208,7 +211,7 @@ pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
         bot,
         running: HashMap::new(),
         albums: HashMap::new(),
-        titles: HashMap::new(),
+        titles,
         generation: 0,
         mailbox: mailbox.clone(),
         views,
@@ -320,7 +323,7 @@ impl<A: Agents> Hub<A> {
         }
         match &inbound.content {
             Content::TopicCreated { name } => {
-                self.titles.insert(key, name.clone());
+                self.rename(key, name.clone());
                 match self.root() {
                     Ok(root) => {
                         let default = self.settings.borrow().default_backend;
@@ -331,6 +334,7 @@ impl<A: Agents> Hub<A> {
                     Err(error) => self.say(Target::Topic(key), texts::warning(&error)),
                 }
             }
+            Content::TopicRenamed { name } => self.rename(key, name.clone()),
             Content::Text(text) => match parse_input(text, &self.bot) {
                 Input::Command { command, args } => {
                     self.command(key, inbound.chat, inbound.message, command, &args);
@@ -368,7 +372,7 @@ impl<A: Agents> Hub<A> {
             Content::Media { .. } | Content::Voice => {
                 self.say(target, texts::CREATE_TOPIC.to_owned());
             }
-            Content::TopicCreated { .. } | Content::Ignored => {}
+            Content::TopicCreated { .. } | Content::TopicRenamed { .. } | Content::Ignored => {}
         }
     }
 
@@ -933,6 +937,14 @@ impl<A: Agents> Hub<A> {
         }
     }
 
+    fn rename(&mut self, key: TopicKey, name: String) {
+        self.titles.insert(key, name);
+        if let Err(error) = self.store.save_titles(&self.titles) {
+            tracing::error!(%error, "topic titles could not be saved");
+            self.say(Target::Topic(key), "⚠️ Название темы обновлено в памяти, но не сохранено на диск. После перезапуска оно может потеряться.".to_owned());
+        }
+    }
+
     fn root(&self) -> Result<AbsolutePath, CwdError> {
         workspace_root(&self.settings.borrow().workspace_root)
     }
@@ -1180,6 +1192,7 @@ mod tests {
     #[derive(Default, Clone)]
     struct MemoryStore {
         saved: Arc<StdMutex<Vec<Topics>>>,
+        titles: Arc<StdMutex<Titles>>,
         fail: Arc<AtomicBool>,
     }
 
@@ -1191,6 +1204,14 @@ mod tests {
     }
 
     impl TopicStore for MemoryStore {
+        fn save_titles(&mut self, titles: &Titles) -> Result<(), String> {
+            if self.fail.load(Ordering::SeqCst) {
+                return Err("диск полон".to_owned());
+            }
+            *self.titles.lock().unwrap() = titles.clone();
+            Ok(())
+        }
+
         fn save(&mut self, topics: &Topics) -> Result<(), String> {
             if self.fail.load(Ordering::SeqCst) {
                 return Err("диск полон".to_owned());
@@ -1339,6 +1360,7 @@ mod tests {
             messenger: Arc::clone(&messenger) as Arc<dyn Messenger>,
             settings,
             topics: Topics::new(),
+            titles: Titles::new(),
             store: Box::new(store.clone()),
             home: std::env::temp_dir(),
             bot: "agent_hub_bot".to_owned(),
@@ -1450,6 +1472,125 @@ mod tests {
                 .borrow()
                 .first()
                 .is_some_and(|v| v.title.as_deref() == Some("backend"))
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn known_titles_are_loaded_after_restart() {
+        let mut world = world(FakeAgents::default());
+        world.send(inbound(Some(7), 1, Content::TopicCreated { name: "backend".to_owned() })).await;
+        eventually("persisted title", || {
+            world.store.titles.lock().unwrap().get(&KEY).is_some_and(|title| title == "backend")
+        })
+        .await;
+        world
+            .send(inbound(Some(7), 2, Content::TopicRenamed { name: "backend v2".to_owned() }))
+            .await;
+        eventually("persisted rename", || {
+            world.store.titles.lock().unwrap().get(&KEY).is_some_and(|title| title == "backend v2")
+        })
+        .await;
+        let (done, stopped) = oneshot::channel();
+        world.send(HubMessage::Shutdown(done)).await;
+        stopped.await.unwrap();
+        (&mut world.handle.task).await.unwrap();
+        world.handle = spawn(HubSetup {
+            action_runner: Arc::new(crate::testing::FakeActionRunner),
+            agents: Arc::clone(&world.agents),
+            messenger: world.messenger.clone(),
+            settings: world.settings.subscribe(),
+            topics: world.store.last().unwrap(),
+            titles: world.store.titles.lock().unwrap().clone(),
+            store: Box::new(world.store.clone()),
+            home: std::env::temp_dir(),
+            bot: "agent_hub_bot".to_owned(),
+        });
+        eventually("restored title", || {
+            world
+                .handle
+                .views
+                .borrow()
+                .iter()
+                .any(|view| view.key == KEY && view.title.as_deref() == Some("backend v2"))
+        })
+        .await;
+        assert!(world.agents.prompts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn rename_during_a_turn_preserves_session_and_does_not_send_a_prompt() {
+        let world = world(FakeAgents::scripted(vec![Script::UntilStopped]));
+        bound(&world, KEY, "s-1").await;
+        world.send(text(Some(7), 1, "work")).await;
+        eventually("running", || world.running()).await;
+        let before = world.handle.views.borrow().first().unwrap().session.clone();
+        world
+            .send(inbound(Some(7), 2, Content::TopicRenamed { name: "Новое имя".to_owned() }))
+            .await;
+        eventually("renamed", || {
+            world
+                .handle
+                .views
+                .borrow()
+                .first()
+                .is_some_and(|view| view.title.as_deref() == Some("Новое имя"))
+        })
+        .await;
+        let view = world.handle.views.borrow().first().unwrap().clone();
+        assert_eq!(view.session, before);
+        assert_eq!(view.state, TopicState::Running);
+        assert_eq!(world.agents.prompts(), ["work"]);
+        assert_eq!(
+            world.store.titles.lock().unwrap().get(&KEY).map(String::as_str),
+            Some("Новое имя")
+        );
+        world.send(HubMessage::Stop(KEY)).await;
+        eventually("stopped", || !world.running()).await;
+    }
+
+    #[tokio::test]
+    async fn rename_before_first_message_is_kept_until_binding() {
+        let world = world(FakeAgents::default());
+        world
+            .send(inbound(Some(7), 1, Content::TopicRenamed { name: "Известная тема".to_owned() }))
+            .await;
+        eventually("name received", || world.store.titles.lock().unwrap().contains_key(&KEY)).await;
+        assert!(world.handle.views.borrow().is_empty());
+        world.send(text(Some(7), 2, "/new")).await;
+        eventually("named binding", || {
+            world
+                .handle
+                .views
+                .borrow()
+                .first()
+                .is_some_and(|view| view.title.as_deref() == Some("Известная тема"))
+        })
+        .await;
+        assert!(world.agents.prompts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_title_save_is_visible_and_a_repeated_update_retries() {
+        let world = world(FakeAgents::default());
+        world.send(inbound(Some(7), 1, Content::TopicCreated { name: "Старое".to_owned() })).await;
+        eventually("old title persisted", || world.store.titles.lock().unwrap().contains_key(&KEY))
+            .await;
+        world.store.fail.store(true, Ordering::SeqCst);
+        world.send(inbound(Some(7), 2, Content::TopicRenamed { name: "Новое".to_owned() })).await;
+        eventually("save warning", || {
+            world.texts().iter().any(|text| text.contains("не сохранено на диск"))
+        })
+        .await;
+        assert_eq!(world.handle.views.borrow().first().unwrap().title.as_deref(), Some("Новое"));
+        assert_eq!(
+            world.store.titles.lock().unwrap().get(&KEY).map(String::as_str),
+            Some("Старое")
+        );
+        world.store.fail.store(false, Ordering::SeqCst);
+        world.send(inbound(Some(7), 3, Content::TopicRenamed { name: "Новое".to_owned() })).await;
+        eventually("new title persisted", || {
+            world.store.titles.lock().unwrap().get(&KEY).is_some_and(|title| title == "Новое")
         })
         .await;
     }
@@ -2231,13 +2372,16 @@ mod tests {
         eventually("empty", || world.texts().contains(&texts::NO_SNAPSHOTS.to_owned())).await;
 
         world
-            .send(inbound(Some(7), 2, Content::TopicCreated { name: "Починить тесты".to_owned() }))
+            .send(inbound(Some(7), 2, Content::TopicCreated { name: "Старое имя".to_owned() }))
             .await;
         bound(&world, KEY, "s-1").await;
-        world.send(text(Some(7), 3, "/save")).await;
+        world
+            .send(inbound(Some(7), 3, Content::TopicRenamed { name: "Починить тесты".to_owned() }))
+            .await;
+        world.send(text(Some(7), 4, "/save")).await;
         eventually("saved", || said(&world, "💾 Сохранено: pochinit-testy-")).await;
 
-        world.send(text(Some(7), 4, "/saves")).await;
+        world.send(text(Some(7), 5, "/saves")).await;
         eventually("listed", || said(&world, "💾 Снимки, новые сверху:\npochinit-testy-")).await;
         assert!(world.texts().iter().any(|t| t.ends_with(" · Починить тесты")));
     }
