@@ -202,6 +202,7 @@ impl HubApp {
 
 impl eframe::App for HubApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.topics.poll(ctx);
         let snapshot = self.snapshot.borrow().clone();
         self.tray_actions(ctx, &snapshot);
         if let Some((tray, _)) = &mut self.tray {

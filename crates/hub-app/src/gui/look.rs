@@ -1,7 +1,7 @@
 //! Pure presentation decisions shared by the window and the tray.
 
 use hub_codex::protocol::CodexAuth;
-use hub_core::domain::BackendKind;
+use hub_core::domain::{BackendKind, TopicKey};
 use hub_core::settings::Draft;
 use hub_qwen::backend::QwenAuth;
 use hub_telegram::hub::TopicState;
@@ -10,6 +10,17 @@ use crate::supervisor::{AgentAuth, AgentState, BotStatus, Snapshot};
 use crate::updater::UpdateState;
 
 const SHORT_SESSION: usize = 8;
+
+#[must_use]
+pub fn topic_url(key: TopicKey) -> Option<String> {
+    // Bot API supergroup IDs are -(1_000_000_000_000 + MTProto channel ID).
+    // https://core.telegram.org/api/bots/ids#supergroup-channel-ids
+    if !(-1_997_852_516_352..=-1_000_000_000_001).contains(&key.chat.0) || key.thread.0 <= 0 {
+        return None;
+    }
+    let channel = -key.chat.0 - 1_000_000_000_000;
+    Some(format!("https://t.me/c/{channel}/{}", key.thread.0))
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Health {
@@ -180,6 +191,27 @@ mod tests {
 
     use super::*;
     use crate::supervisor::{AgentAuth, AgentState};
+
+    #[rstest]
+    #[case(-1_001_234_567_890, 42, Some("https://t.me/c/1234567890/42"))]
+    #[case(-1_000_000_000_001, 1, Some("https://t.me/c/1/1"))]
+    #[case(-1_997_852_516_352, i32::MAX, Some("https://t.me/c/997852516352/2147483647"))]
+    #[case(-1_001_234_567_890, 0, None)]
+    #[case(-1_001_234_567_890, -7, None)]
+    #[case(-1_000_000_000_000, 7, None)]
+    #[case(-1_997_852_516_353, 7, None)]
+    #[case(-100, 7, None)]
+    #[case(100, 7, None)]
+    #[case(i64::MIN, 7, None)]
+    #[case(i64::MAX, 7, None)]
+    fn topic_links_use_supergroup_and_topic_ids(
+        #[case] chat: i64,
+        #[case] thread: i32,
+        #[case] expected: Option<&str>,
+    ) {
+        let key = TopicKey { chat: ChatId(chat), thread: ThreadId(thread) };
+        assert_eq!(topic_url(key).as_deref(), expected);
+    }
 
     fn view(thread: i32, state: TopicState) -> TopicView {
         let root = if cfg!(windows) { r"C:\p" } else { "/p" };
