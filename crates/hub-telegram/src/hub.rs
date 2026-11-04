@@ -18,6 +18,7 @@ use hub_core::commands::{
 use hub_core::domain::{
     AbsolutePath, BackendKind, ChatId, MessageId, Prompt, SessionId, TopicKey, TopicSession,
 };
+use hub_core::projects::RecentProjects;
 use hub_core::quota::{QuotaReport, QuotaUpdate};
 use hub_core::render::render_limits;
 use hub_core::settings::Settings;
@@ -36,6 +37,7 @@ use crate::limits::{self, Outcome, QuotaCache};
 use crate::messenger::{Format, Messenger, Outgoing, Target};
 use crate::paths::{CwdError, resolve_cwd, workspace_root};
 use crate::press;
+use crate::projects::{self, Projects, Stage};
 use crate::sender::Sender;
 use crate::session::{First, Run};
 use crate::snapshots::{SnapshotError, SnapshotStore};
@@ -75,6 +77,7 @@ pub trait Agents: Send + Sync + 'static {
 pub trait TopicStore: Send + 'static {
     fn save(&mut self, topics: &Topics) -> Result<(), String>;
     fn save_titles(&mut self, titles: &Titles) -> Result<(), String>;
+    fn save_recent_projects(&mut self, recent: &RecentProjects) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,6 +146,7 @@ pub struct HubSetup<A> {
     pub settings: watch::Receiver<Arc<Settings>>,
     pub topics: Topics,
     pub titles: Titles,
+    pub recent_projects: RecentProjects,
     pub store: Box<dyn TopicStore>,
     pub home: PathBuf,
     /// The bot's username, to accept `/command@bot`.
@@ -164,6 +168,7 @@ struct Live {
 
 struct Hub<A> {
     actions: Actions,
+    projects: Projects,
     agents: Arc<A>,
     sender: Sender,
     registries: Shared,
@@ -194,13 +199,24 @@ struct Hub<A> {
 
 #[must_use]
 pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
-    let HubSetup { agents, action_runner, messenger, settings, topics, titles, store, home, bot } =
-        setup;
+    let HubSetup {
+        agents,
+        action_runner,
+        messenger,
+        settings,
+        topics,
+        titles,
+        recent_projects,
+        store,
+        home,
+        bot,
+    } = setup;
     let (mailbox, inbox) = mpsc::channel(MAILBOX);
     let (views, watched) = watch::channel(Vec::new());
     let registries = Shared::default();
     let hub = Hub {
         actions: Actions::new(action_runner),
+        projects: Projects::new(recent_projects),
         agents,
         sender: Sender::new(messenger),
         registries: Arc::clone(&registries),
@@ -256,7 +272,11 @@ impl<A: Agents> Hub<A> {
                 }
             }
             HubMessage::Press(pressed) => {
-                if pressed.data.starts_with(actions::PREFIX) {
+                if pressed.data.starts_with(projects::PREFIX) {
+                    if self.shutdown.is_none() {
+                        self.project_press(pressed);
+                    }
+                } else if pressed.data.starts_with(actions::PREFIX) {
                     if self.shutdown.is_none() {
                         self.actions.press(
                             pressed,
@@ -399,6 +419,7 @@ impl<A: Agents> Hub<A> {
         args: &[&str],
     ) {
         match command {
+            Command::Projects => self.project_menu(key),
             Command::Actions => self.actions.menu(
                 &self.settings.borrow().actions,
                 Target::Topic(key),
@@ -525,6 +546,7 @@ impl<A: Agents> Hub<A> {
     }
 
     fn start_turn(&mut self, key: TopicKey, turn: Turn) {
+        self.projects.invalidate(key);
         if !self.running.contains_key(&key) {
             self.launch(key, First::Turn(turn), None);
             return;
@@ -912,8 +934,10 @@ impl<A: Agents> Hub<A> {
             return;
         }
         self.topics = next;
+        self.projects.invalidate(key);
         self.say(Target::Topic(key), texts::restored(&name, &session));
         for holder in holders {
+            self.projects.invalidate(holder);
             self.say(Target::Topic(holder), texts::SESSION_MOVED.to_owned());
         }
     }
@@ -931,6 +955,7 @@ impl<A: Agents> Hub<A> {
     }
 
     fn put(&mut self, key: TopicKey, session: TopicSession) {
+        self.projects.invalidate(key);
         self.topics.insert(key, session);
         if let Err(error) = self.store.save(&self.topics) {
             tracing::error!(%error, "topics could not be saved");
@@ -942,6 +967,85 @@ impl<A: Agents> Hub<A> {
         if let Err(error) = self.store.save_titles(&self.titles) {
             tracing::error!(%error, "topic titles could not be saved");
             self.say(Target::Topic(key), "⚠️ Название темы обновлено в памяти, но не сохранено на диск. После перезапуска оно может потеряться.".to_owned());
+        }
+    }
+
+    fn project_menu(&mut self, key: TopicKey) {
+        if self.refuse_if_running(key) {
+            return;
+        }
+        let message = self.projects.menu(key, &self.settings.borrow(), self.topics.get(&key));
+        let sender = self.sender.clone();
+        tokio::spawn(async move {
+            projects::send_card(sender, key, message).await;
+        });
+    }
+
+    fn project_press(&mut self, press: crate::inbound::Press) {
+        let ticket = self.projects.take(&press, &self.settings.borrow(), &self.topics);
+        let sender = self.sender.clone();
+        let answer = ticket.as_ref().err().copied();
+        tokio::spawn(async move {
+            sender.answer(press.callback, answer).await;
+        });
+        let Ok(ticket) = ticket else { return };
+        let key = ticket.key;
+        if matches!(ticket.stage, Stage::Cancel) {
+            self.projects.invalidate(key);
+            self.say(Target::Topic(key), "Выбор проекта отменён, контекст сохранён.".to_owned());
+            return;
+        }
+        if self.refuse_if_running(key) {
+            return;
+        }
+        let cwd = match self.resolve(Some(ticket.project.cwd())) {
+            Ok(cwd) => cwd,
+            Err(error) => {
+                self.say(Target::Topic(key), texts::warning(&error));
+                return;
+            }
+        };
+        match &ticket.stage {
+            Stage::Preview => {
+                let message = self.projects.confirm(ticket, cwd, &self.settings.borrow());
+                let sender = self.sender.clone();
+                tokio::spawn(async move {
+                    projects::send_card(sender, key, message).await;
+                });
+            }
+            Stage::Apply(shown) => {
+                if *shown != cwd {
+                    self.say(Target::Topic(key), projects::STALE.to_owned());
+                    return;
+                }
+                let session = TopicSession::fresh(ticket.project.backend(), cwd);
+                let mut next = self.topics.clone();
+                next.insert(key, session.clone());
+                if let Err(error) = self.store.save(&next) {
+                    tracing::error!(%error, "project selection could not be saved");
+                    self.say(Target::Topic(key), "⚠️ Проект не выбран: не удалось сохранить привязку на диск. Контекст темы сохранён.".to_owned());
+                    return;
+                }
+                self.topics = next;
+                self.projects.invalidate(key);
+                self.projects.recent.remember(ticket.project.id());
+                if let Err(error) = self.store.save_recent_projects(&self.projects.recent) {
+                    tracing::error!(%error, "recent projects could not be saved");
+                    self.say(
+                        Target::Topic(key),
+                        "⚠️ Проект выбран, но список последних проектов не сохранён на диск."
+                            .to_owned(),
+                    );
+                }
+                self.say(
+                    Target::Topic(key),
+                    texts::describe(
+                        &format!("📁 Выбран проект: {}", ticket.project.name()),
+                        &session,
+                    ),
+                );
+            }
+            Stage::Cancel => {}
         }
     }
 
@@ -1193,6 +1297,8 @@ mod tests {
     struct MemoryStore {
         saved: Arc<StdMutex<Vec<Topics>>>,
         titles: Arc<StdMutex<Titles>>,
+        recent: Arc<StdMutex<RecentProjects>>,
+        fail_recent: Arc<AtomicBool>,
         fail: Arc<AtomicBool>,
     }
 
@@ -1204,6 +1310,14 @@ mod tests {
     }
 
     impl TopicStore for MemoryStore {
+        fn save_recent_projects(&mut self, recent: &RecentProjects) -> Result<(), String> {
+            if self.fail.load(Ordering::SeqCst) || self.fail_recent.load(Ordering::SeqCst) {
+                return Err("диск полон".to_owned());
+            }
+            *self.recent.lock().unwrap() = recent.clone();
+            Ok(())
+        }
+
         fn save_titles(&mut self, titles: &Titles) -> Result<(), String> {
             if self.fail.load(Ordering::SeqCst) {
                 return Err("диск полон".to_owned());
@@ -1310,6 +1424,25 @@ mod tests {
     }
 
     impl World {
+        async fn restart(&mut self) {
+            let (done, stopped) = oneshot::channel();
+            self.send(HubMessage::Shutdown(done)).await;
+            stopped.await.unwrap();
+            (&mut self.handle.task).await.unwrap();
+            self.handle = spawn(HubSetup {
+                action_runner: Arc::new(crate::testing::FakeActionRunner),
+                agents: Arc::clone(&self.agents),
+                messenger: self.messenger.clone(),
+                settings: self.settings.subscribe(),
+                topics: self.store.last().unwrap(),
+                titles: self.store.titles.lock().unwrap().clone(),
+                recent_projects: self.store.recent.lock().unwrap().clone(),
+                store: Box::new(self.store.clone()),
+                home: std::env::temp_dir(),
+                bot: "agent_hub_bot".to_owned(),
+            });
+        }
+
         fn texts(&self) -> Vec<String> {
             self.messenger.sent_texts()
         }
@@ -1361,6 +1494,7 @@ mod tests {
             settings,
             topics: Topics::new(),
             titles: Titles::new(),
+            recent_projects: RecentProjects::default(),
             store: Box::new(store.clone()),
             home: std::env::temp_dir(),
             bot: "agent_hub_bot".to_owned(),
@@ -1476,6 +1610,197 @@ mod tests {
         .await;
     }
 
+    fn configure_project(world: &World) {
+        let mut draft = Draft::from_settings(&world.settings.borrow());
+        draft.projects = vec![hub_core::projects::ProjectDraft {
+            id: "backend".to_owned(),
+            name: "Бэкенд".to_owned(),
+            cwd: "project".to_owned(),
+            backend: "codex".to_owned(),
+            actions: Vec::new(),
+        }];
+        world.settings.send(Arc::new(draft.parse(&std::env::temp_dir()).unwrap())).unwrap();
+    }
+
+    async fn project_button(world: &World, label: &str) -> crate::inbound::Press {
+        eventually("project keyboard", || {
+            world.messenger.last_keyboard().is_some_and(|(_, rows)| {
+                rows.iter().flatten().any(|button| button.text.contains(label))
+            })
+        })
+        .await;
+        let (message, rows) = world.messenger.last_keyboard().unwrap();
+        let button = rows.into_iter().flatten().find(|button| button.text.contains(label)).unwrap();
+        crate::inbound::Press {
+            callback: uuid::Uuid::new_v4().to_string(),
+            user: UserId(1),
+            chat: Some(KEY.chat),
+            message: Some(message),
+            html: None,
+            data: button.data,
+        }
+    }
+
+    async fn choose_project(world: &World) -> crate::inbound::Press {
+        world.send(text(Some(7), 1, "/projects")).await;
+        let pick = project_button(world, "Бэкенд").await;
+        world.send(HubMessage::Press(pick)).await;
+        project_button(world, "Выбрать и сбросить").await
+    }
+
+    #[tokio::test]
+    async fn project_selection_requires_confirmation_and_persists_a_fresh_session() {
+        let world = world(FakeAgents::default());
+        configure_project(&world);
+        bound(&world, KEY, "old-session").await;
+        let confirm = choose_project(&world).await;
+        assert_eq!(bound_to(&world, KEY), SessionId::parse("old-session"));
+        world.send(HubMessage::Press(confirm.clone())).await;
+        eventually("project selected", || {
+            world.store.last().is_some_and(|saved| {
+                saved.get(&KEY).is_some_and(|session| {
+                    session.backend == BackendKind::Codex && session.session.is_none()
+                })
+            })
+        })
+        .await;
+        let saved = world.store.last().unwrap();
+        assert_eq!(
+            saved.get(&KEY).unwrap().cwd,
+            workspace_root(&world.root.path().join("project")).unwrap()
+        );
+        assert!(world.agents.prompts().is_empty());
+        assert_eq!(world.store.recent.lock().unwrap().ids(), ["backend"]);
+        bound(&world, KEY, "new-session").await;
+        world.send(HubMessage::Press(confirm)).await;
+        eventually("stale answer", || {
+            world.messenger.calls().iter().any(|call|
+            matches!(call, Call::Answer { text: Some(text), .. } if text == projects::STALE))
+        })
+        .await;
+        assert_eq!(bound_to(&world, KEY), SessionId::parse("new-session"));
+    }
+
+    #[tokio::test]
+    async fn restoring_the_same_session_invalidates_project_confirmation() {
+        let world = world(FakeAgents::default());
+        configure_project(&world);
+        saved_snap(&world).await;
+        let confirm = choose_project(&world).await;
+        world.send(text(Some(7), 2, "/restore snap")).await;
+        eventually("restored", || said(&world, "♻️ Восстановлено: snap")).await;
+        world.send(HubMessage::Press(confirm)).await;
+        eventually("stale after restore", || {
+            world.messenger.calls().iter().any(|call|
+            matches!(call, Call::Answer { text: Some(text), .. } if text == projects::STALE))
+        })
+        .await;
+        assert_eq!(bound_to(&world, KEY), SessionId::parse("s-1"));
+    }
+
+    #[tokio::test]
+    async fn project_cancel_and_disk_failure_keep_existing_context() {
+        let world = world(FakeAgents::default());
+        configure_project(&world);
+        bound(&world, KEY, "old").await;
+        let confirm = choose_project(&world).await;
+        let cancel = project_button(&world, "Отмена").await;
+        world.send(HubMessage::Press(cancel)).await;
+        eventually("cancelled", || said(&world, "Выбор проекта отменён")).await;
+        assert_eq!(bound_to(&world, KEY), SessionId::parse("old"));
+        world.send(HubMessage::Press(confirm)).await;
+        let confirm = choose_project(&world).await;
+        world.store.fail.store(true, Ordering::SeqCst);
+        world.send(HubMessage::Press(confirm)).await;
+        eventually("write failed", || said(&world, "⚠️ Проект не выбран")).await;
+        assert_eq!(
+            world.handle.views.borrow().first().unwrap().session.session,
+            SessionId::parse("old")
+        );
+        assert_eq!(bound_to(&world, KEY), SessionId::parse("old"));
+    }
+
+    #[tokio::test]
+    async fn project_choice_rechecks_a_deleted_directory() {
+        let world = world(FakeAgents::default());
+        configure_project(&world);
+        bound(&world, KEY, "old").await;
+        let confirm = choose_project(&world).await;
+        std::fs::remove_dir(world.root.path().join("project")).unwrap();
+        world.send(HubMessage::Press(confirm)).await;
+        eventually("missing directory", || {
+            world.texts().iter().any(|text| text.contains("не существует"))
+        })
+        .await;
+        assert_eq!(bound_to(&world, KEY), SessionId::parse("old"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn project_choice_rechecks_symlinks_at_confirmation() {
+        let world = world(FakeAgents::default());
+        configure_project(&world);
+        bound(&world, KEY, "old").await;
+        let confirm = choose_project(&world).await;
+        let path = world.root.path().join("project");
+        std::fs::remove_dir(&path).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(outside.path(), path).unwrap();
+        world.send(HubMessage::Press(confirm)).await;
+        eventually("outside root", || world.texts().iter().any(|text| text.contains("вне корня")))
+            .await;
+        assert_eq!(bound_to(&world, KEY), SessionId::parse("old"));
+    }
+
+    #[tokio::test]
+    async fn a_new_turn_invalidates_project_buttons_and_busy_topics_refuse_the_menu() {
+        let world = world(FakeAgents::scripted(vec![Script::UntilStopped]));
+        configure_project(&world);
+        bound(&world, KEY, "old").await;
+        let confirm = choose_project(&world).await;
+        world.send(text(Some(7), 2, "work")).await;
+        eventually("running", || world.running()).await;
+        world.send(text(Some(7), 3, "/projects")).await;
+        eventually("busy", || world.texts().contains(&texts::ALREADY_RUNNING.to_owned())).await;
+        world.send(HubMessage::Press(confirm)).await;
+        eventually("stale after turn", || {
+            world.messenger.calls().iter().any(|call|
+            matches!(call, Call::Answer { text: Some(text), .. } if text == projects::STALE))
+        })
+        .await;
+        assert!(world.running());
+        world.send(HubMessage::Stop(KEY)).await;
+        eventually("stopped", || !world.running()).await;
+    }
+
+    #[tokio::test]
+    async fn recent_project_is_shown_after_hub_restart() {
+        let mut world = world(FakeAgents::default());
+        configure_project(&world);
+        let confirm = choose_project(&world).await;
+        world.send(HubMessage::Press(confirm)).await;
+        eventually("recent saved", || world.store.recent.lock().unwrap().ids() == ["backend"])
+            .await;
+        world.restart().await;
+        world.send(text(Some(7), 2, "/projects")).await;
+        let recent = project_button(&world, "🕘 Бэкенд").await;
+        assert!(recent.data.starts_with(projects::PREFIX));
+        assert!(world.agents.prompts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_recent_history_write_does_not_hide_successful_selection() {
+        let world = world(FakeAgents::default());
+        configure_project(&world);
+        world.store.fail_recent.store(true, Ordering::SeqCst);
+        let confirm = choose_project(&world).await;
+        world.send(HubMessage::Press(confirm)).await;
+        eventually("history failure", || said(&world, "⚠️ Проект выбран, но список последних"))
+            .await;
+        assert_eq!(world.store.last().unwrap().get(&KEY).unwrap().backend, BackendKind::Codex);
+        assert!(world.store.recent.lock().unwrap().ids().is_empty());
+    }
+
     #[tokio::test]
     async fn known_titles_are_loaded_after_restart() {
         let mut world = world(FakeAgents::default());
@@ -1491,21 +1816,7 @@ mod tests {
             world.store.titles.lock().unwrap().get(&KEY).is_some_and(|title| title == "backend v2")
         })
         .await;
-        let (done, stopped) = oneshot::channel();
-        world.send(HubMessage::Shutdown(done)).await;
-        stopped.await.unwrap();
-        (&mut world.handle.task).await.unwrap();
-        world.handle = spawn(HubSetup {
-            action_runner: Arc::new(crate::testing::FakeActionRunner),
-            agents: Arc::clone(&world.agents),
-            messenger: world.messenger.clone(),
-            settings: world.settings.subscribe(),
-            topics: world.store.last().unwrap(),
-            titles: world.store.titles.lock().unwrap().clone(),
-            store: Box::new(world.store.clone()),
-            home: std::env::temp_dir(),
-            bot: "agent_hub_bot".to_owned(),
-        });
+        world.restart().await;
         eventually("restored title", || {
             world
                 .handle

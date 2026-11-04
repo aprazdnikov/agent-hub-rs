@@ -2,13 +2,38 @@
 
 use std::fs;
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-use hub_core::settings::{ApiKey, Draft, FieldError, Keys, Settings, SettingsFile};
+use hub_core::settings::{ApiKey, Draft, Field, FieldError, Keys, Settings, SettingsFile};
+use hub_telegram::paths::{resolve_cwd, workspace_root};
 
 use crate::atomic::write_atomic;
 use crate::error::StoreError;
 use crate::secrets::{Secret, Secrets};
+
+/// Validate project folders at the settings write boundary.
+#[must_use]
+pub fn project_errors(settings: &Settings, home: &Path) -> Vec<FieldError> {
+    if settings.projects.is_empty() {
+        return Vec::new();
+    }
+    let root = match workspace_root(&settings.workspace_root) {
+        Ok(root) => root,
+        Err(error) => {
+            return vec![FieldError { field: Field::Projects, message: error.to_string() }];
+        }
+    };
+    settings
+        .projects
+        .iter()
+        .filter_map(|project| {
+            resolve_cwd(&root, home, Some(project.cwd())).err().map(|error| FieldError {
+                field: Field::Projects,
+                message: format!("{}: {error}", project.name()),
+            })
+        })
+        .collect()
+}
 
 #[derive(Debug)]
 pub enum Loaded {
@@ -62,6 +87,20 @@ impl FileSettings {
 
 impl SettingsStore for FileSettings {
     fn save(&self, settings: &Settings) -> Result<(), StoreError> {
+        let errors = project_errors(settings, &self.home);
+        if !errors.is_empty() {
+            return Err(StoreError::Write {
+                path: self.path.clone(),
+                error: io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    errors
+                        .iter()
+                        .map(|error| error.message.as_str())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                ),
+            });
+        }
         let write = |error| StoreError::Write { path: self.path.clone(), error };
         let text = toml::to_string_pretty(&SettingsFile::from_settings(settings, &self.home))
             .map_err(|error| write(io::Error::other(error)))?;
@@ -101,6 +140,48 @@ mod tests {
             dir.to_path_buf(),
             Box::new(MemorySecrets::default()),
         )
+    }
+
+    #[test]
+    fn project_profiles_persist_and_a_deleted_folder_cannot_be_saved() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("Проект с пробелами");
+        fs::create_dir(&project).unwrap();
+        let mut draft = draft(dir.path());
+        draft.projects = vec![hub_core::projects::ProjectDraft {
+            id: "project".to_owned(),
+            name: "Проект".to_owned(),
+            cwd: project.display().to_string(),
+            backend: "codex".to_owned(),
+            actions: Vec::new(),
+        }];
+        let settings = draft.parse(dir.path()).unwrap();
+        let store = store(dir.path());
+        store.save(&settings).unwrap();
+        assert!(matches!(store.load().unwrap(), Loaded::Ready(loaded) if loaded == settings));
+        let before = fs::read(dir.path().join("settings.toml")).unwrap();
+        fs::remove_dir(project).unwrap();
+        assert!(store.save(&settings).is_err());
+        assert_eq!(fs::read(dir.path().join("settings.toml")).unwrap(), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_folder_cannot_escape_workspace_through_a_symlink() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let link = dir.path().join("linked");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+        let mut draft = draft(dir.path());
+        draft.projects = vec![hub_core::projects::ProjectDraft {
+            id: "project".to_owned(),
+            name: "Проект".to_owned(),
+            cwd: "linked".to_owned(),
+            backend: "codex".to_owned(),
+            actions: Vec::new(),
+        }];
+        let errors = project_errors(&draft.parse(dir.path()).unwrap(), dir.path());
+        assert!(errors.iter().any(|error| error.message.contains("вне корня")));
     }
 
     #[test]

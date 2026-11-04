@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 use eframe::egui;
 use hub_core::actions::{ActionDraft, MAX_ACTIONS};
 use hub_core::domain::BackendKind;
+use hub_core::projects::{MAX_PROJECTS, ProjectDraft};
 use hub_core::settings::{
     ApiEndpoint, Approval, CodexField, Draft, Field, FieldError, HermesField, OpencodeField,
     PermissionMode, QwenApproval, QwenField, Sandbox, Settings, UpdateCheck,
@@ -123,6 +124,8 @@ impl SettingsForm {
             ui.separator();
             self.workspace(ui, &errors);
             ui.separator();
+            self.projects(ui, &errors);
+            ui.separator();
             self.actions(ui, &errors);
             ui.separator();
             self.agent(ui, &errors);
@@ -138,6 +141,93 @@ impl SettingsForm {
             self.timeouts(ui, &errors);
         });
         self.confirm(ui.ctx(), sessions, send);
+    }
+
+    fn projects(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
+        ui.heading("Проекты");
+        ui.label("Сохраните каталог и бэкенд, затем выберите проект через /projects в Telegram.");
+        ui.label("Связанные действия запускаются вручную через /actions. Изменения профиля не меняют существующие сессии.");
+        let mut remove = None;
+        for (index, project) in self.draft.projects.iter_mut().enumerate() {
+            ui.push_id(&project.id, |ui| {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Название");
+                        ui.text_edit_singleline(&mut project.name);
+                        if ui.button("Удалить проект").clicked() {
+                            remove = Some(index);
+                        }
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Каталог");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut project.cwd)
+                                .hint_text("путь внутри корня рабочих каталогов"),
+                        );
+                        if ui.button("Выбрать…").clicked()
+                            && let Some(path) = pick_folder(&project.cwd)
+                        {
+                            project.cwd = path;
+                        }
+                    });
+                    egui::ComboBox::from_id_salt("project-backend")
+                        .selected_text(&project.backend)
+                        .show_ui(ui, |ui| {
+                            for backend in BackendKind::ALL {
+                                ui.selectable_value(
+                                    &mut project.backend,
+                                    backend.name().to_owned(),
+                                    backend.name(),
+                                );
+                            }
+                        });
+                    if !self.draft.actions.is_empty() {
+                        ui.label("Связанные действия (например, VPN)");
+                    }
+                    for action in &self.draft.actions {
+                        let mut checked = project.actions.contains(&action.id);
+                        if ui.checkbox(&mut checked, &action.name).changed() {
+                            project.actions.retain(|id| id != &action.id);
+                            if checked {
+                                project.actions.push(action.id.clone());
+                            }
+                        }
+                    }
+                    // A removed action must be explicitly unlinked, not silently assigned to a new one.
+                    let missing: Vec<_> = project
+                        .actions
+                        .iter()
+                        .filter(|id| !self.draft.actions.iter().any(|action| action.id == **id))
+                        .cloned()
+                        .collect();
+                    for id in missing {
+                        if ui.button(format!("Убрать отсутствующее действие {id}")).clicked()
+                        {
+                            project.actions.retain(|saved| saved != &id);
+                        }
+                    }
+                })
+            });
+        }
+        if let Some(index) = remove {
+            self.draft.projects.remove(index);
+        }
+        if ui
+            .add_enabled(
+                self.draft.projects.len() < MAX_PROJECTS,
+                egui::Button::new("Добавить проект"),
+            )
+            .clicked()
+        {
+            self.draft.projects.push(ProjectDraft {
+                id: uuid::Uuid::new_v4().simple().to_string(),
+                name: String::new(),
+                cwd: String::new(),
+                backend: self.draft.default_backend.name().to_owned(),
+                actions: Vec::new(),
+            });
+        }
+        messages(ui, errors, Field::Projects);
     }
 
     fn actions(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
@@ -192,12 +282,10 @@ impl SettingsForm {
             )
             .clicked()
         {
-            let id = (1..=MAX_ACTIONS + 1)
-                .map(|index| format!("action-{index}"))
-                .find(|id| !self.draft.actions.iter().any(|action| action.id == *id));
-            if let Some(id) = id {
-                self.draft.actions.push(ActionDraft { id, ..ActionDraft::default() });
-            }
+            self.draft.actions.push(ActionDraft {
+                id: uuid::Uuid::new_v4().simple().to_string(),
+                ..ActionDraft::default()
+            });
         }
         messages(ui, errors, Field::Actions);
     }
@@ -555,6 +643,82 @@ pub fn home_or_root() -> PathBuf {
 mod tests {
     use super::*;
     use rstest::rstest;
+
+    #[test]
+    fn project_rows_keep_stable_ids_and_support_linked_actions() {
+        fn frame(
+            ctx: &egui::Context,
+            form: &mut SettingsForm,
+            events: Vec<egui::Event>,
+        ) -> egui::FullOutput {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(960.0, 1200.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    form.projects(ui, &[]);
+                },
+            );
+            output.textures_delta.clear();
+            output
+        }
+        fn click(ctx: &egui::Context, form: &mut SettingsForm, label: &str) {
+            frame(ctx, form, Vec::new());
+            let output = frame(ctx, form, Vec::new());
+            let position = output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape
+                        && text.galley.text() == label
+                    {
+                        Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            for pressed in [true, false] {
+                frame(
+                    ctx,
+                    form,
+                    vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut form = SettingsForm::default();
+        form.draft.actions.push(ActionDraft {
+            id: "vpn".to_owned(),
+            name: "VPN".to_owned(),
+            command: "echo vpn".to_owned(),
+            cwd: String::new(),
+        });
+        click(&ctx, &mut form, "Добавить проект");
+        let first = form.draft.projects.first().unwrap().id.clone();
+        click(&ctx, &mut form, "VPN");
+        assert_eq!(form.draft.projects.first().unwrap().actions, ["vpn"]);
+        click(&ctx, &mut form, "Добавить проект");
+        let second = form.draft.projects.last().unwrap().id.clone();
+        assert_ne!(first, second);
+        click(&ctx, &mut form, "Удалить проект");
+        assert_eq!(form.draft.projects.first().unwrap().id, second);
+        click(&ctx, &mut form, "Добавить проект");
+        assert_ne!(form.draft.projects.last().unwrap().id, first);
+    }
 
     #[test]
     fn action_rows_can_be_added_and_removed() {

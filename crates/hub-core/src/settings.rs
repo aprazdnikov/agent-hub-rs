@@ -11,6 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::actions::{self, Action, ActionDraft};
 use crate::domain::{BackendKind, ChatId, UserId};
+use crate::projects::{self, Project, ProjectDraft};
 use crate::workspace::expand_home;
 
 pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_mins(10);
@@ -292,6 +293,7 @@ pub struct Timeouts {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
     pub actions: Vec<Action>,
+    pub projects: Vec<Project>,
     pub telegram: TelegramSettings,
     pub workspace_root: PathBuf,
     pub snapshots_dir: PathBuf,
@@ -308,6 +310,7 @@ pub struct Settings {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
     Actions,
+    Projects,
     Token,
     Chat,
     Users,
@@ -469,6 +472,7 @@ impl OpencodeDraft {
 #[derive(Clone, PartialEq, Eq)]
 pub struct Draft {
     pub actions: Vec<ActionDraft>,
+    pub projects: Vec<ProjectDraft>,
     pub token: String,
     pub chat: String,
     pub users: String,
@@ -492,6 +496,7 @@ impl Default for Draft {
     fn default() -> Self {
         Self {
             actions: Vec::new(),
+            projects: Vec::new(),
             token: String::new(),
             chat: String::new(),
             users: String::new(),
@@ -517,6 +522,7 @@ impl fmt::Debug for Draft {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
             actions,
+            projects,
             token: _token,
             chat,
             users,
@@ -537,6 +543,7 @@ impl fmt::Debug for Draft {
         } = self;
         f.debug_struct("Draft")
             .field("actions", actions)
+            .field("projects", projects)
             .field("token", &"***")
             .field("chat", chat)
             .field("users", users)
@@ -558,11 +565,31 @@ impl fmt::Debug for Draft {
     }
 }
 
+impl CodexDraft {
+    fn parse(&self, home: &Path, errors: &mut Vec<FieldError>) -> Option<CodexSettings> {
+        let cli = check(errors, Field::Codex(CodexField::Cli), parse_cli(&self.cli, home));
+        let model = check(errors, Field::Codex(CodexField::Model), parse_model(&self.model));
+        let api_key = check(errors, Field::Codex(CodexField::ApiKey), parse_api_key(&self.api_key));
+        Some(CodexSettings {
+            cli: cli?,
+            model: model?,
+            api_key: api_key?,
+            sandbox: self.sandbox,
+            approval: self.approval,
+        })
+    }
+}
+
 impl Draft {
     /// Parses every field and reports all errors at once, in form order.
     pub fn parse(&self, home: &Path) -> Result<Settings, Vec<FieldError>> {
         let mut errors = Vec::new();
         let actions = check(&mut errors, Field::Actions, actions::parse(&self.actions, home));
+        let projects = check(
+            &mut errors,
+            Field::Projects,
+            projects::parse(&self.projects, actions.as_deref().unwrap_or_default()),
+        );
         let token = check(&mut errors, Field::Token, parse_token(&self.token));
         let chat = check(&mut errors, Field::Chat, parse_chat(&self.chat));
         let users = check(&mut errors, Field::Users, parse_users(&self.users));
@@ -572,15 +599,7 @@ impl Draft {
         let cli = check(&mut errors, Field::Cli, parse_cli(&self.cli, home));
         let model = check(&mut errors, Field::Model, parse_model(&self.model));
         let budget = check(&mut errors, Field::Budget, parse_budget(&self.budget));
-        let codex_cli =
-            check(&mut errors, Field::Codex(CodexField::Cli), parse_cli(&self.codex.cli, home));
-        let codex_model =
-            check(&mut errors, Field::Codex(CodexField::Model), parse_model(&self.codex.model));
-        let api_key = check(
-            &mut errors,
-            Field::Codex(CodexField::ApiKey),
-            parse_api_key(&self.codex.api_key),
-        );
+        let codex = self.codex.parse(home, &mut errors);
         let qwen_cli =
             check(&mut errors, Field::Qwen(QwenField::Cli), parse_cli(&self.qwen.cli, home));
         let qwen_model =
@@ -603,9 +622,7 @@ impl Draft {
             Some(cli),
             Some(model),
             Some(budget),
-            Some(codex_cli),
-            Some(codex_model),
-            Some(api_key),
+            Some(codex),
             Some(qwen_cli),
             Some(qwen_model),
             Some(endpoint),
@@ -614,42 +631,24 @@ impl Draft {
             Some(approval),
             Some(background),
         ) = (
-            token,
-            chat,
-            users,
-            root,
-            snapshots,
-            cli,
-            model,
-            budget,
-            codex_cli,
-            codex_model,
-            api_key,
-            qwen_cli,
-            qwen_model,
-            endpoint,
-            hermes,
-            opencode,
-            approval,
-            background,
+            token, chat, users, root, snapshots, cli, model, budget, codex, qwen_cli, qwen_model,
+            endpoint, hermes, opencode, approval, background,
         )
         else {
             return Err(errors);
         };
+        let (Some(actions), Some(projects)) = (actions, projects) else {
+            return Err(errors);
+        };
         Ok(Settings {
-            actions: actions.ok_or(errors)?,
+            actions,
+            projects,
             telegram: TelegramSettings { token, chat, users },
             workspace_root,
             snapshots_dir,
             default_backend: self.default_backend,
             claude: ClaudeSettings { cli, model, permission_mode: self.permission_mode, budget },
-            codex: CodexSettings {
-                cli: codex_cli,
-                model: codex_model,
-                sandbox: self.codex.sandbox,
-                approval: self.codex.approval,
-                api_key,
-            },
+            codex,
             qwen: QwenSettings {
                 cli: qwen_cli,
                 model: qwen_model,
@@ -667,6 +666,7 @@ impl Draft {
     pub fn from_settings(settings: &Settings) -> Self {
         Self {
             actions: settings.actions.iter().map(Action::to_draft).collect(),
+            projects: settings.projects.iter().map(Project::to_draft).collect(),
             token: settings.telegram.token.expose().to_owned(),
             chat: settings.telegram.chat.0.to_string(),
             users: settings
@@ -906,6 +906,8 @@ fn parse_seconds(raw: &str) -> Result<Duration, String> {
 pub struct SettingsFile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<ActionDraft>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<ProjectDraft>,
     pub telegram: TelegramFile,
     pub workspace: WorkspaceFile,
     #[serde(default)]
@@ -1035,6 +1037,7 @@ impl SettingsFile {
     pub fn from_settings(settings: &Settings, home: &Path) -> Self {
         Self {
             actions: settings.actions.iter().map(Action::to_draft).collect(),
+            projects: settings.projects.iter().map(Project::to_draft).collect(),
             telegram: TelegramFile {
                 chat: settings.telegram.chat.0,
                 users: settings.telegram.users.iter().map(|user| user.0).collect(),
@@ -1130,6 +1133,7 @@ impl SettingsFile {
         let defaults = Draft::default();
         Ok(Draft {
             actions: self.actions.clone(),
+            projects: self.projects.clone(),
             token,
             chat: self.telegram.chat.to_string(),
             users: self.telegram.users.iter().map(u64::to_string).collect::<Vec<_>>().join(", "),
@@ -1231,6 +1235,41 @@ mod tests {
         assert!(!format!("{settings:?} {draft:?} {file:?}").contains("private-value"));
         let restored: SettingsFile = toml::from_str(&text).unwrap();
         assert_eq!(restored.to_draft(keys()).unwrap().parse(&home()).unwrap(), settings);
+    }
+
+    #[test]
+    fn project_profiles_round_trip_and_old_settings_have_none() {
+        let mut draft = draft();
+        assert!(draft.parse(&home()).unwrap().projects.is_empty());
+        draft.actions = vec![ActionDraft {
+            id: "vpn".to_owned(),
+            name: "VPN".to_owned(),
+            command: "echo configured".to_owned(),
+            cwd: String::new(),
+        }];
+        draft.projects = vec![ProjectDraft {
+            id: "shop".to_owned(),
+            name: "Магазин".to_owned(),
+            cwd: "shop/backend".to_owned(),
+            backend: "codex".to_owned(),
+            actions: vec!["vpn".to_owned()],
+        }];
+        let settings = draft.parse(&home()).unwrap();
+        let raw = toml::to_string(&SettingsFile::from_settings(&settings, &home())).unwrap();
+        let file: SettingsFile = toml::from_str(&raw).unwrap();
+        let restored = file
+            .to_draft(Keys {
+                token: draft.token.clone(),
+                api_key: String::new(),
+                qwen_key: String::new(),
+            })
+            .unwrap();
+        assert_eq!(restored.parse(&home()).unwrap(), settings);
+        assert_eq!(Draft::from_settings(&settings).projects, draft.projects);
+        draft.actions.clear();
+        assert!(
+            draft.parse(&home()).unwrap_err().iter().any(|error| error.field == Field::Projects)
+        );
     }
 
     #[test]

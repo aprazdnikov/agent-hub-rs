@@ -1794,6 +1794,7 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "tray-icon",
+ "uuid",
  "windows",
  "winresource",
 ]

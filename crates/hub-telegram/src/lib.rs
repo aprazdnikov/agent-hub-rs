@@ -9,6 +9,7 @@ mod menu;
 pub mod messenger;
 pub mod paths;
 pub mod press;
+mod projects;
 pub mod sender;
 mod session;
 pub mod snapshots;

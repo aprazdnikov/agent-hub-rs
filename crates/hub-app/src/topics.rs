@@ -4,6 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use hub_core::projects::RecentProjects;
 use hub_core::topics::{Titles, Topics, dump_state, dump_titles, parse_state, parse_titles};
 use hub_telegram::hub::TopicStore;
 
@@ -32,6 +33,17 @@ pub fn load_titles(topics_path: &Path) -> Result<Titles, StoreError> {
     }
 }
 
+pub fn load_recent_projects(topics_path: &Path) -> Result<RecentProjects, StoreError> {
+    let path = topics_path.with_extension("projects.json");
+    match fs::read_to_string(&path) {
+        Ok(raw) => {
+            RecentProjects::parse(&raw).map_err(|reason| StoreError::Corrupt { path, reason })
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(RecentProjects::default()),
+        Err(error) => Err(StoreError::Read { path, error }),
+    }
+}
+
 pub struct FileTopics {
     path: PathBuf,
 }
@@ -44,6 +56,12 @@ impl FileTopics {
 }
 
 impl TopicStore for FileTopics {
+    fn save_recent_projects(&mut self, recent: &RecentProjects) -> Result<(), String> {
+        let path = self.path.with_extension("projects.json");
+        let text = recent.dump().map_err(|error| error.to_string())?;
+        write_atomic(&path, text.as_bytes()).map_err(|error| format!("{}: {error}", path.display()))
+    }
+
     fn save_titles(&mut self, titles: &Titles) -> Result<(), String> {
         let path = self.path.with_extension("titles.json");
         let text = dump_titles(titles).map_err(|error| error.to_string())?;
@@ -122,6 +140,27 @@ mod tests {
             assert!(error.to_string().contains("topics.titles.json"));
             assert_eq!(fs::read_to_string(&sidecar).unwrap(), raw);
         }
+    }
+
+    #[test]
+    fn recent_projects_round_trip_without_changing_bindings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("topics.json");
+        assert!(load_recent_projects(&path).unwrap().ids().is_empty());
+        let mut store = FileTopics::new(path.clone());
+        store.save(&Topics::new()).unwrap();
+        let before = fs::read(&path).unwrap();
+        let mut recent = RecentProjects::default();
+        recent.remember("shop");
+        store.save_recent_projects(&recent).unwrap();
+        assert_eq!(load_recent_projects(&path).unwrap(), recent);
+        assert_eq!(fs::read(&path).unwrap(), before);
+        let sidecar = path.with_extension("projects.json");
+        fs::write(&sidecar, "bad json").unwrap();
+        assert!(
+            load_recent_projects(&path).unwrap_err().to_string().contains("topics.projects.json")
+        );
+        assert_eq!(fs::read_to_string(sidecar).unwrap(), "bad json");
     }
 
     #[test]

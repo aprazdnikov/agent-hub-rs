@@ -20,7 +20,7 @@ use tokio::task::JoinHandle;
 
 use crate::error::StoreError;
 use crate::supervisor::{AgentAuth, AgentState, AgentStatus, Connector, Started};
-use crate::topics::{FileTopics, load_titles, load_topics};
+use crate::topics::{FileTopics, load_recent_projects, load_titles, load_topics};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
@@ -138,6 +138,7 @@ impl Connector for TelegramConnector {
             workspace_root(&current.workspace_root)?;
             let topics = load_topics(&self.topics)?;
             let titles = load_titles(&self.topics)?;
+            let recent_projects = load_recent_projects(&self.topics)?;
             let checked = join_all(BackendKind::ALL.iter().map(|&kind| {
                 let current = &current;
                 async move { (kind, check_agent(kind, current).await) }
@@ -162,6 +163,7 @@ impl Connector for TelegramConnector {
                     settings,
                     topics,
                     titles,
+                    recent_projects,
                     store: Box::new(FileTopics::new(self.topics.clone())),
                     home: self.home.clone(),
                     bot: username.clone(),

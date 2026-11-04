@@ -6,6 +6,7 @@ use crate::snapshot::{NameError, SnapshotName};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Actions,
+    Projects,
     Help,
     New,
     Cwd,
@@ -20,7 +21,7 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Self; 12] = [
+    pub const ALL: [Self; 13] = [
         Self::New,
         Self::Backend,
         Self::Cwd,
@@ -29,6 +30,7 @@ impl Command {
         Self::Status,
         Self::Limits,
         Self::Actions,
+        Self::Projects,
         Self::Save,
         Self::Saves,
         Self::Restore,
@@ -39,6 +41,7 @@ impl Command {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Actions => "actions",
+            Self::Projects => "projects",
             Self::Help => "help",
             Self::New => "new",
             Self::Cwd => "cwd",
@@ -57,6 +60,7 @@ impl Command {
     pub const fn description(self) -> &'static str {
         match self {
             Self::Actions => "запуск и остановка пользовательских действий",
+            Self::Projects => "выбрать проект для этой темы (сброс контекста)",
             Self::Help => "эта справка",
             Self::New => "новая сессия в этой теме (сброс контекста)",
             Self::Cwd => "сменить рабочую директорию (сброс контекста)",
@@ -85,7 +89,8 @@ impl Command {
             | Self::Status
             | Self::Saves
             | Self::Limits
-            | Self::Actions => "",
+            | Self::Actions
+            | Self::Projects => "",
         }
     }
 
@@ -238,7 +243,7 @@ mod tests {
             assert!((1..=256).contains(&command.description().chars().count()));
             assert_eq!(Command::parse(name), Some(command));
         }
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 13);
     }
 
     #[test]
@@ -247,8 +252,8 @@ mod tests {
         assert_eq!(
             names,
             [
-                "new", "backend", "cwd", "reset", "stop", "status", "limits", "actions", "save",
-                "saves", "restore", "help"
+                "new", "backend", "cwd", "reset", "stop", "status", "limits", "actions",
+                "projects", "save", "saves", "restore", "help"
             ]
         );
     }

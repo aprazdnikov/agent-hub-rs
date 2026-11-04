@@ -15,7 +15,7 @@ use hub_telegram::hub::{HubMessage, TopicView};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::{Instant, sleep_until};
 
-use crate::config::{Loaded, SettingsStore};
+use crate::config::{Loaded, SettingsStore, project_errors};
 use crate::error::StoreError;
 use crate::logging::Repaint;
 
@@ -297,6 +297,14 @@ impl<C: Connector> Supervisor<C> {
                 return;
             }
         };
+        let errors = project_errors(&settings, &self.home);
+        if !errors.is_empty() {
+            self.notice(Some(format!(
+                "Настройки не сохранены: {}",
+                errors.iter().map(|error| error.message.as_str()).collect::<Vec<_>>().join("; ")
+            )));
+            return;
+        }
         if let Err(error) = self.store.save(&settings) {
             tracing::error!(%error, "settings could not be saved");
             self.notice(Some(error.to_string()));
