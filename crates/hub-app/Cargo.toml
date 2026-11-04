@@ -44,6 +44,7 @@ tracing-subscriber.workspace = true
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 
 [target.'cfg(windows)'.dependencies]
+winreg = "0.56"
 windows = { version = "0.62", features = ["Win32_System_Threading"] }
 
 [target.'cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))'.dependencies]

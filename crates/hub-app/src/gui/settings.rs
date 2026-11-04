@@ -26,6 +26,7 @@ struct Revealed {
 
 #[derive(Default)]
 pub struct SettingsForm {
+    autostart: Option<super::autostart::Control>,
     draft: Draft,
     synced: Option<Draft>,
     revealed: Revealed,
@@ -169,6 +170,17 @@ fn pick_file(start: &str) -> Option<String> {
 }
 
 impl SettingsForm {
+    pub fn with_autostart(
+        registration: Result<std::sync::Arc<dyn crate::autostart::Registration>, String>,
+    ) -> Self {
+        Self { autostart: Some(super::autostart::Control::new(registration)), ..Self::default() }
+    }
+
+    pub fn poll(&mut self, ctx: &egui::Context) {
+        if let Some(control) = &mut self.autostart {
+            control.poll(ctx);
+        }
+    }
     /// Adopts newly saved settings unless the user is in the middle of editing.
     pub fn sync(&mut self, saved: Option<&Draft>) {
         if self.synced.as_ref() == saved {
@@ -234,6 +246,10 @@ impl SettingsForm {
             });
         });
         egui::ScrollArea::vertical().show(ui, |ui| {
+            if let Some(control) = &mut self.autostart {
+                control.show(ui);
+                ui.separator();
+            }
             self.telegram(ui, &errors);
             ui.separator();
             self.workspace(ui, &errors);
@@ -756,6 +772,82 @@ pub fn home_or_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autostart_applies_without_saving_an_incomplete_telegram_form() {
+        use crate::autostart::{Action, Registration, State};
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct Fake(Arc<AtomicBool>);
+        impl Registration for Fake {
+            fn apply(&self, action: Action) -> Result<State, String> {
+                match action {
+                    Action::Enable => self.0.store(true, Ordering::SeqCst),
+                    Action::Disable => self.0.store(false, Ordering::SeqCst),
+                    Action::Inspect => {}
+                }
+                Ok(if self.0.load(Ordering::SeqCst) { State::Enabled } else { State::Disabled })
+            }
+        }
+        let enabled = Arc::new(AtomicBool::new(false));
+        let mut form = SettingsForm::with_autostart(Ok(Arc::new(Fake(enabled.clone()))));
+        let ctx = egui::Context::default();
+        let mut frame = |events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    form.show(ui, &std::env::temp_dir(), 0, &mut |_| {
+                        panic!("autostart must not save bot settings")
+                    });
+                },
+            );
+            output.textures_delta.clear();
+            output
+        };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let output = loop {
+            let output = frame(vec![]);
+            if output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(t) if t.galley.text() == "Выключен в настройках ОС")) { break output; }
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        };
+        let pos = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(t) if t.galley.text() == "Включить" => {
+                    Some(t.galley.rect.translate(t.pos.to_vec2()).center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        for pressed in [true, false] {
+            frame(vec![
+                egui::Event::PointerMoved(pos),
+                egui::Event::PointerButton {
+                    pos,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+        }
+        while !enabled.load(Ordering::SeqCst) {
+            frame(vec![]);
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(!form.check(&std::env::temp_dir()).0.is_empty());
+    }
     use rstest::rstest;
 
     #[test]

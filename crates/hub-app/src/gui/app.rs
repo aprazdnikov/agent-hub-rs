@@ -42,6 +42,8 @@ enum Confirm {
 }
 
 pub struct AppSetup {
+    pub autostart: Result<Arc<dyn crate::autostart::Registration>, String>,
+    pub initial_window: crate::autostart::Window,
     pub commands: mpsc::Sender<Command>,
     pub snapshot: watch::Receiver<Snapshot>,
     pub logs: LogBuffer,
@@ -54,6 +56,7 @@ pub struct AppSetup {
 }
 
 pub struct HubApp {
+    initial_window: Option<crate::autostart::Window>,
     commands: mpsc::Sender<Command>,
     snapshot: watch::Receiver<Snapshot>,
     logs: LogBuffer,
@@ -74,6 +77,8 @@ impl HubApp {
     #[must_use]
     pub fn new(setup: AppSetup) -> Self {
         let AppSetup {
+            autostart,
+            initial_window,
             commands,
             snapshot,
             logs,
@@ -92,6 +97,7 @@ impl HubApp {
             | BotStatus::Failed(_) => Tab::Status,
         };
         Self {
+            initial_window: Some(initial_window),
             commands,
             snapshot,
             logs,
@@ -105,7 +111,7 @@ impl HubApp {
             restart: Confirm::Hidden,
             topics: TopicsView::default(),
             log: LogView::default(),
-            form: SettingsForm::default(),
+            form: SettingsForm::with_autostart(autostart),
         }
     }
 
@@ -182,6 +188,7 @@ impl HubApp {
         for action in actions {
             match action {
                 TrayAction::Open => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
                     ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
                 }
@@ -202,6 +209,18 @@ impl HubApp {
 
 impl eframe::App for HubApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if let Some(initial) = self.initial_window.take() {
+            match initial {
+                crate::autostart::Window::Visible => {}
+                crate::autostart::Window::Minimized => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(true));
+                }
+                crate::autostart::Window::Hidden => {
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+                }
+            }
+        }
+        self.form.poll(ctx);
         self.topics.poll(ctx);
         let snapshot = self.snapshot.borrow().clone();
         self.tray_actions(ctx, &snapshot);

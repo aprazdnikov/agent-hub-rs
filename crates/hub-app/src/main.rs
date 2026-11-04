@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use anyhow::Context as _;
 use eframe::egui;
+use hub_app::autostart::{self, Launch, Window};
 use hub_app::config::FileSettings;
 use hub_app::connector::TelegramConnector;
 use hub_app::dirs::AppDirs;
@@ -45,6 +46,7 @@ fn alert(text: &str) {
 }
 
 fn run() -> anyhow::Result<()> {
+    let launch = Launch::from_args(std::env::args_os().skip(1));
     // Taken before an update can replace the file: on Linux the path of a replaced running
     // binary reads "<path> (deleted)" afterwards.
     let program = std::env::current_exe()?;
@@ -52,7 +54,9 @@ fn run() -> anyhow::Result<()> {
     let lock = match InstanceLock::acquire(&dirs.lock()) {
         Ok(lock) => lock,
         Err(InstanceError::Running) => {
-            alert("agent-hub уже запущен — его значок в трее.");
+            if launch == Launch::Manual {
+                alert("agent-hub уже запущен — откройте его окно или значок в трее.");
+            }
             return Ok(());
         }
         Err(error) => return Err(error.into()),
@@ -63,6 +67,8 @@ fn run() -> anyhow::Result<()> {
     let home = home_or_root();
     let store = FileSettings::new(dirs.settings(), home.clone(), Box::new(Keyring));
     let loaded = store.load();
+    let configured = matches!(&loaded, Ok(hub_app::config::Loaded::Ready(_)));
+    let autostart = autostart::system(&program);
     if let Err(error) = &loaded {
         tracing::error!(%error, "settings not loaded");
     }
@@ -113,6 +119,8 @@ fn run() -> anyhow::Result<()> {
                 }
             };
             Ok(Box::new(HubApp::new(AppSetup {
+                initial_window: Window::initial(launch, tray.is_some(), configured),
+                autostart,
                 commands: window,
                 snapshot: watched,
                 logs,

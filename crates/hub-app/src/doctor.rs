@@ -280,8 +280,12 @@ mod tests {
         )
         .await;
         assert_eq!(result.unwrap_err(), "Тайм-аут");
-        let port = listener.local_addr().unwrap().port();
         drop(listener);
+        // Reserve a TCP port without listening: a parallel test cannot reuse it between
+        // dropping a listener and probing, and connection attempts are still refused.
+        let closed = tokio::net::TcpSocket::new_v4().unwrap();
+        closed.bind("127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = closed.local_addr().unwrap().port();
         let drafts =
             [CheckDraft::Tcp { name: "Closed".to_owned(), host: "127.0.0.1".to_owned(), port }];
         let checks = hub_core::doctor::parse(&drafts).unwrap();

@@ -1,4 +1,5 @@
 pub mod app;
+mod autostart;
 mod folder;
 mod log;
 pub mod look;
