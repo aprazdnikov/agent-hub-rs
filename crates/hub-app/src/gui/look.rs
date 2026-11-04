@@ -216,6 +216,7 @@ mod tests {
     fn view(thread: i32, state: TopicState) -> TopicView {
         let root = if cfg!(windows) { r"C:\p" } else { "/p" };
         TopicView {
+            parameters: String::new(),
             key: TopicKey { chat: ChatId(-100), thread: ThreadId(thread) },
             title: None,
             session: TopicSession::fresh(

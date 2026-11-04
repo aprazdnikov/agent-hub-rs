@@ -86,6 +86,7 @@ impl AbsolutePath {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopicSession {
+    pub preferences: crate::options::Preferences,
     pub backend: BackendKind,
     pub cwd: AbsolutePath,
     pub session: Option<SessionId>,
@@ -94,7 +95,7 @@ pub struct TopicSession {
 impl TopicSession {
     #[must_use]
     pub fn fresh(backend: BackendKind, cwd: AbsolutePath) -> Self {
-        Self { backend, cwd, session: None }
+        Self { preferences: crate::options::Preferences::default(), backend, cwd, session: None }
     }
 
     #[must_use]

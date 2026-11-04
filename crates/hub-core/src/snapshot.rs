@@ -227,6 +227,7 @@ impl BackendData {
 /// `manifest.json` of one snapshot; the backend is `data.backend()`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Manifest {
+    pub preferences: crate::options::Preferences,
     pub name: SnapshotName,
     /// UTC `YYYY-MM-DDTHH:MM:SSZ`: sorts chronologically as text.
     pub created_at: String,
@@ -260,6 +261,8 @@ struct Versioned {
 
 #[derive(Serialize, Deserialize)]
 struct ManifestFile {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preferences: Option<crate::options::PreferencesDraft>,
     version: u32,
     name: String,
     created_at: String,
@@ -292,11 +295,12 @@ impl Manifest {
             return Err(ManifestError::TooLarge(raw.len()));
         }
         let Versioned { version } = serde_json::from_str(raw)?;
-        if version != MANIFEST_VERSION {
+        if !matches!(version, 1 | 2) {
             return Err(ManifestError::Version(version));
         }
         let ManifestFile {
             version: _version,
+            preferences,
             name,
             created_at,
             title,
@@ -327,6 +331,11 @@ impl Manifest {
         if BackendKind::parse(&backend) != Some(data.backend()) {
             return Err(bad("backend", format!("«{backend}» не совпадает с backend_data")));
         }
+        if version == 1 && preferences.is_some() {
+            return Err(bad("preferences", "нужна версия 2"));
+        }
+        let preferences = crate::options::Preferences::parse(data.backend(), preferences)
+            .map_err(|reason| bad("preferences", reason))?;
         if files.len() > FILES_LIMIT {
             return Err(bad("files", format!("больше {FILES_LIMIT} файлов")));
         }
@@ -335,18 +344,22 @@ impl Manifest {
             .map(|file| RelPath::parse(file))
             .collect::<Result<Vec<_>, _>>()
             .map_err(|error| bad("files", error.to_string()))?;
-        Ok(Self { name, created_at, title, cwd, session, agent_version, data, files })
+        Ok(Self { preferences, name, created_at, title, cwd, session, agent_version, data, files })
     }
 
     /// The same limits as `parse`, so a snapshot that is published can always be read back.
     pub fn dump(&self) -> Result<String, ManifestError> {
-        let Self { name, created_at, title, cwd, session, agent_version, data, files } = self;
+        let Self { preferences, name, created_at, title, cwd, session, agent_version, data, files } =
+            self;
         if files.len() > FILES_LIMIT {
             return Err(bad("files", format!("больше {FILES_LIMIT} файлов")));
         }
+        crate::options::Preferences::parse(data.backend(), preferences.to_draft())
+            .map_err(|reason| bad("preferences", reason))?;
         let path = cwd.as_path();
         let file = ManifestFile {
-            version: MANIFEST_VERSION,
+            version: if preferences.to_draft().is_some() { 2 } else { MANIFEST_VERSION },
+            preferences: preferences.to_draft(),
             name: name.as_str().to_owned(),
             created_at: created_at.clone(),
             title: title.clone(),
@@ -483,6 +496,7 @@ mod tests {
 
     fn manifest(data: BackendData) -> Manifest {
         Manifest {
+            preferences: crate::options::Preferences::default(),
             name: SnapshotName::parse("fix-tests-20261009-1530").unwrap(),
             created_at: "2026-10-09T15:30:12Z".to_owned(),
             title: Some("Починить тесты".to_owned()),
@@ -505,6 +519,28 @@ mod tests {
         assert_eq!(Manifest::parse(&original.dump().unwrap()).unwrap(), original);
     }
 
+    #[test]
+    fn snapshot_options_survive_v2_and_invalid_preferences_are_not_published() {
+        use crate::options::{Options, OptionsDraft, Preferences};
+        let mut snapshot = manifest(BackendData::Codex);
+        snapshot.preferences = Preferences::for_project(
+            "p",
+            "Project",
+            Options::parse(
+                BackendKind::Codex,
+                &OptionsDraft {
+                    model: "model".to_owned(),
+                    mode: "read-only/on-request".to_owned(),
+                },
+            )
+            .unwrap(),
+        );
+        let raw = snapshot.dump().unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&raw).unwrap()["version"], 2);
+        assert_eq!(Manifest::parse(&raw).unwrap(), snapshot);
+        snapshot.data = BackendData::Qwen;
+        assert!(snapshot.dump().is_err());
+    }
     #[test]
     fn manifest_shape_matches_the_spec() {
         let text = manifest(BackendData::Claude { project: RelPath::parse("-work-shop").unwrap() })
@@ -550,7 +586,7 @@ mod tests {
 
     #[test]
     fn unknown_manifest_version_is_reported_before_the_shape() {
-        assert!(matches!(Manifest::parse(r#"{"version": 2}"#), Err(ManifestError::Version(2))));
+        assert!(matches!(Manifest::parse(r#"{"version": 3}"#), Err(ManifestError::Version(3))));
     }
 
     #[rstest]

@@ -10,6 +10,8 @@ pub enum Command {
     Doctor,
     Last,
     Outbox,
+    Model,
+    Mode,
     Help,
     New,
     Cwd,
@@ -24,9 +26,11 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Self; 16] = [
+    pub const ALL: [Self; 18] = [
         Self::New,
         Self::Backend,
+        Self::Model,
+        Self::Mode,
         Self::Cwd,
         Self::Reset,
         Self::Stop,
@@ -51,6 +55,8 @@ impl Command {
             Self::Doctor => "doctor",
             Self::Last => "last",
             Self::Outbox => "outbox",
+            Self::Model => "model",
+            Self::Mode => "mode",
             Self::Help => "help",
             Self::New => "new",
             Self::Cwd => "cwd",
@@ -73,6 +79,8 @@ impl Command {
             Self::Doctor => "проверить каталог, CLI и ресурсы проекта",
             Self::Last => "повторить последний сохранённый ответ темы",
             Self::Outbox => "очередь доставки: повторить или удалить ответ",
+            Self::Model => "модель темы и источник настройки",
+            Self::Mode => "режим работы в этой теме",
             Self::Help => "эта справка",
             Self::New => "новая сессия в этой теме (сброс контекста)",
             Self::Cwd => "сменить рабочую директорию (сброс контекста)",
@@ -92,6 +100,8 @@ impl Command {
         match self {
             Self::New => " [агент] [путь]",
             Self::Backend => " [агент]",
+            Self::Model => " [ID|inherit]",
+            Self::Mode => " [режим|inherit]",
             Self::Cwd => " <путь>",
             Self::Save => " [имя]",
             Self::Restore => " <имя> [каталог]",
@@ -258,7 +268,7 @@ mod tests {
             assert!((1..=256).contains(&command.description().chars().count()));
             assert_eq!(Command::parse(name), Some(command));
         }
-        assert_eq!(names.len(), 16);
+        assert_eq!(names.len(), 18);
     }
 
     #[test]
@@ -267,8 +277,9 @@ mod tests {
         assert_eq!(
             names,
             [
-                "new", "backend", "cwd", "reset", "stop", "status", "limits", "actions",
-                "projects", "doctor", "last", "outbox", "save", "saves", "restore", "help"
+                "new", "backend", "model", "mode", "cwd", "reset", "stop", "status", "limits",
+                "actions", "projects", "doctor", "last", "outbox", "save", "saves", "restore",
+                "help"
             ]
         );
     }

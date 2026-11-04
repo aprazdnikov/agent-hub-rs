@@ -333,6 +333,7 @@ mod tests {
                 users: "1".to_owned(),
                 workspace_root: root.display().to_string(),
                 projects: vec![ProjectDraft {
+                    options: hub_core::options::OptionsDraft::default(),
                     id: "p".to_owned(),
                     name: "Project".to_owned(),
                     cwd: ".".to_owned(),

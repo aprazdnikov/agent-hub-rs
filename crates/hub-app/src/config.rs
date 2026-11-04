@@ -149,6 +149,7 @@ mod tests {
         fs::create_dir(&project).unwrap();
         let mut draft = draft(dir.path());
         draft.projects = vec![hub_core::projects::ProjectDraft {
+            options: hub_core::options::OptionsDraft::default(),
             id: "project".to_owned(),
             name: "Проект".to_owned(),
             cwd: project.display().to_string(),
@@ -175,6 +176,7 @@ mod tests {
         std::os::unix::fs::symlink(outside.path(), &link).unwrap();
         let mut draft = draft(dir.path());
         draft.projects = vec![hub_core::projects::ProjectDraft {
+            options: hub_core::options::OptionsDraft::default(),
             id: "project".to_owned(),
             name: "Проект".to_owned(),
             cwd: "linked".to_owned(),

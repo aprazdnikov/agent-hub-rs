@@ -16,8 +16,9 @@ use hub_core::commands::{
     join_path_args, parse_input, parse_new_args, parse_restore_args, parse_save_args,
 };
 use hub_core::domain::{
-    AbsolutePath, BackendKind, ChatId, MessageId, Prompt, SessionId, TopicKey, TopicSession,
+    AbsolutePath, BackendKind, ChatId, MessageId, Prompt, SessionId, TopicKey, TopicSession, UserId,
 };
+use hub_core::options::Effective;
 use hub_core::projects::RecentProjects;
 use hub_core::quota::{QuotaReport, QuotaUpdate};
 use hub_core::render::render_limits;
@@ -36,6 +37,7 @@ use crate::download::download;
 use crate::inbound::{Content, Inbound, Press, Turn};
 use crate::limits::{self, Outcome, QuotaCache};
 use crate::messenger::{Format, Messenger, Outgoing, Target};
+use crate::options;
 use crate::outbox::{self, Outbox};
 use crate::paths::{CwdError, resolve_cwd, workspace_root};
 use crate::press;
@@ -62,6 +64,7 @@ pub trait Agents: Send + Sync + 'static {
         prompt: Prompt,
         inbox: mpsc::Receiver<Prompt>,
         conversation: Conversation,
+        settings: Arc<Settings>,
     ) -> BoxFuture<'a, mpsc::Receiver<Prompt>>;
 
     /// The backend's session archive once its CLI is found and new enough; the error is the
@@ -91,6 +94,7 @@ pub enum TopicState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopicView {
+    pub parameters: String,
     pub key: TopicKey,
     pub title: Option<String>,
     pub session: TopicSession,
@@ -169,6 +173,7 @@ pub struct HubHandle {
 }
 
 struct Live {
+    parameters: Effective,
     inbox: mpsc::Sender<Prompt>,
     cancel: CancellationToken,
     generation: u64,
@@ -180,6 +185,7 @@ struct Hub<A> {
     actions: Actions,
     doctors: Doctors,
     projects: Projects,
+    options: options::Choices,
     agents: Arc<A>,
     sender: Sender,
     registries: Shared,
@@ -233,6 +239,7 @@ pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
         actions: Actions::new(action_runner),
         doctors: Doctors::new(doctor_runner),
         projects: Projects::new(recent_projects),
+        options: options::Choices::default(),
         agents,
         sender: Sender::new(messenger),
         registries: Arc::clone(&registries),
@@ -265,6 +272,11 @@ impl<A: Agents> Hub<A> {
             let deadline = self.shutdown.as_ref().map(|(_, at)| *at);
             let message = tokio::select! {
                 message = mailbox.recv() => message,
+                changed = self.settings.changed() => {
+                    if changed.is_err() { break; }
+                    self.publish();
+                    continue;
+                }
                 () = sleep_until(deadline.unwrap_or_else(Instant::now)), if deadline.is_some() => None,
             };
             let Some(message) = message else { break };
@@ -276,6 +288,47 @@ impl<A: Agents> Hub<A> {
         if let Some((done, _)) = self.shutdown.take() {
             // The caller may have given up waiting; there is nobody else to tell.
             let _ = done.send(());
+        }
+    }
+
+    fn press(&mut self, pressed: Press) {
+        if pressed.data.starts_with(options::PREFIX) {
+            if self.shutdown.is_none() {
+                self.option_press(pressed);
+            }
+        } else if pressed.data.starts_with(outbox::PREFIX) {
+            if self.shutdown.is_none() {
+                self.outbox.press(&pressed);
+            }
+        } else if pressed.data.starts_with(doctor::PREFIX) {
+            if self.shutdown.is_none() {
+                let settings = self.settings.borrow();
+                if let Some(key) = self.doctors.press(
+                    pressed,
+                    &settings,
+                    self.sender.clone(),
+                    self.mailbox.clone(),
+                ) {
+                    self.actions.menu(&settings.actions, Target::Topic(key), self.sender.clone());
+                }
+            }
+        } else if pressed.data.starts_with(projects::PREFIX) {
+            if self.shutdown.is_none() {
+                self.project_press(pressed);
+            }
+        } else if pressed.data.starts_with(actions::PREFIX) {
+            if self.shutdown.is_none() {
+                self.actions.press(
+                    pressed,
+                    &self.settings.borrow(),
+                    self.sender.clone(),
+                    self.mailbox.clone(),
+                );
+            }
+        } else if pressed.data == limits::REFRESH {
+            self.refresh(pressed);
+        } else {
+            tokio::spawn(press::handle(Arc::clone(&self.registries), self.sender.clone(), pressed));
         }
     }
 
@@ -295,50 +348,7 @@ impl<A: Agents> Hub<A> {
                     self.inbound(inbound);
                 }
             }
-            HubMessage::Press(pressed) => {
-                if pressed.data.starts_with(outbox::PREFIX) {
-                    if self.shutdown.is_none() {
-                        self.outbox.press(&pressed);
-                    }
-                } else if pressed.data.starts_with(doctor::PREFIX) {
-                    if self.shutdown.is_none() {
-                        let settings = self.settings.borrow();
-                        if let Some(key) = self.doctors.press(
-                            pressed,
-                            &settings,
-                            self.sender.clone(),
-                            self.mailbox.clone(),
-                        ) {
-                            self.actions.menu(
-                                &settings.actions,
-                                Target::Topic(key),
-                                self.sender.clone(),
-                            );
-                        }
-                    }
-                } else if pressed.data.starts_with(projects::PREFIX) {
-                    if self.shutdown.is_none() {
-                        self.project_press(pressed);
-                    }
-                } else if pressed.data.starts_with(actions::PREFIX) {
-                    if self.shutdown.is_none() {
-                        self.actions.press(
-                            pressed,
-                            &self.settings.borrow(),
-                            self.sender.clone(),
-                            self.mailbox.clone(),
-                        );
-                    }
-                } else if pressed.data == limits::REFRESH {
-                    self.refresh(pressed);
-                } else {
-                    tokio::spawn(press::handle(
-                        Arc::clone(&self.registries),
-                        self.sender.clone(),
-                        pressed,
-                    ));
-                }
-            }
+            HubMessage::Press(pressed) => self.press(pressed),
             HubMessage::Quota(update) => self.quotas.apply(update, Utc::now()),
             HubMessage::Limits(LimitsDone(polled)) => self.limits_done(polled),
             HubMessage::Deliver { key, prompt } => self.deliver(key, prompt),
@@ -370,6 +380,7 @@ impl<A: Agents> Hub<A> {
                 self.doctors.shutdown();
                 self.results.shutdown();
                 self.outbox.shutdown();
+                self.options.shutdown();
                 for live in self.running.values() {
                     live.cancel.cancel();
                 }
@@ -423,6 +434,12 @@ impl<A: Agents> Hub<A> {
             }
             Content::TopicRenamed { name } => self.rename(key, name.clone()),
             Content::Text(text) => match parse_input(text, &self.bot) {
+                Input::Command { command: Command::Model, args } => {
+                    self.option_command(key, inbound.user, options::Field::Model, &args);
+                }
+                Input::Command { command: Command::Mode, args } => {
+                    self.option_command(key, inbound.user, options::Field::Mode, &args);
+                }
                 Input::Command { command: Command::Outbox, .. } => {
                     self.outbox.menu(key, inbound.user);
                 }
@@ -498,7 +515,7 @@ impl<A: Agents> Hub<A> {
         args: &[&str],
     ) {
         match command {
-            Command::Last | Command::Outbox => {} // Handled with the live user's identity in inbound().
+            Command::Last | Command::Outbox | Command::Model | Command::Mode => {} // Handled with the live user's identity in inbound().
             Command::Projects => self.project_menu(key),
             Command::Doctor => {
                 let card = self.doctors.menu(key, &self.settings.borrow());
@@ -577,7 +594,14 @@ impl<A: Agents> Hub<A> {
                     } else {
                         texts::WAITING
                     };
-                    self.say(Target::Topic(key), texts::describe(state, session));
+                    self.say(
+                        Target::Topic(key),
+                        format!(
+                            "{}\n{}",
+                            texts::describe(state, session),
+                            self.parameters(key, session)
+                        ),
+                    );
                 }
             },
             Command::Save => self.save(key, args),
@@ -631,6 +655,7 @@ impl<A: Agents> Hub<A> {
 
     fn start_turn(&mut self, key: TopicKey, turn: Turn) {
         self.projects.invalidate(key);
+        self.options.invalidate(key);
         if !self.running.contains_key(&key) {
             self.launch(key, First::Turn(turn), None);
             return;
@@ -701,12 +726,24 @@ impl<A: Agents> Hub<A> {
                 return;
             }
         };
-        let settings = Arc::clone(&self.settings.borrow());
+        self.options.invalidate(key);
+        let mut settings = Settings::clone(&self.settings.borrow());
+        let parameters = match session.preferences.resolve(session.backend, &settings) {
+            Ok(parameters) => parameters,
+            Err(error) => {
+                self.say(Target::Topic(key), format!("⚠️ {error}"));
+                return;
+            }
+        };
+        parameters.apply(&mut settings);
+        let settings = Arc::new(settings);
         let (inbox, receiver) = reuse.unwrap_or_else(|| mpsc::channel(INBOX));
         self.generation += 1;
         let cancel = CancellationToken::new();
-        self.running
-            .insert(key, Live { inbox, cancel: cancel.clone(), generation: self.generation });
+        self.running.insert(
+            key,
+            Live { parameters, inbox, cancel: cancel.clone(), generation: self.generation },
+        );
         let run = Run {
             key,
             session,
@@ -1019,9 +1056,11 @@ impl<A: Agents> Hub<A> {
         }
         self.topics = next;
         self.projects.invalidate(key);
+        self.options.invalidate(key);
         self.say(Target::Topic(key), texts::restored(&name, &session));
         for holder in holders {
             self.projects.invalidate(holder);
+            self.options.invalidate(holder);
             self.say(Target::Topic(holder), texts::SESSION_MOVED.to_owned());
         }
     }
@@ -1040,6 +1079,7 @@ impl<A: Agents> Hub<A> {
 
     fn put(&mut self, key: TopicKey, session: TopicSession) {
         self.projects.invalidate(key);
+        self.options.invalidate(key);
         self.topics.insert(key, session);
         if let Err(error) = self.store.save(&self.topics) {
             tracing::error!(%error, "topics could not be saved");
@@ -1052,6 +1092,120 @@ impl<A: Agents> Hub<A> {
             tracing::error!(%error, "topic titles could not be saved");
             self.say(Target::Topic(key), "⚠️ Название темы обновлено в памяти, но не сохранено на диск. После перезапуска оно может потеряться.".to_owned());
         }
+    }
+
+    fn option_context(&self, key: TopicKey, user: UserId) -> Result<options::Context, String> {
+        let settings = self.settings.borrow().clone();
+        let current = self.topics.get(&key).cloned();
+        let session = match &current {
+            Some(current) => current.clone(),
+            None => TopicSession::fresh(
+                settings.default_backend,
+                self.root().map_err(|error| error.to_string())?,
+            ),
+        };
+        Ok(options::Context { key, user, current, session, settings })
+    }
+    fn option_refusal(&self, key: TopicKey, session: &TopicSession) -> Option<&'static str> {
+        if self.running.contains_key(&key) {
+            Some(texts::ALREADY_RUNNING)
+        } else if self.snapshotting.contains(&key) || self.is_reserved(session) {
+            Some(texts::SNAPSHOT_BUSY)
+        } else {
+            None
+        }
+    }
+    fn option_command(
+        &mut self,
+        key: TopicKey,
+        user: Option<UserId>,
+        field: options::Field,
+        args: &[&str],
+    ) {
+        let Some(user) = user else {
+            return;
+        };
+        if !crate::telegram::allowed(&self.settings.borrow().telegram, Some(key.chat), Some(user))
+            || !self.options.available(key)
+        {
+            return;
+        }
+        let message = match self.option_context(key, user) {
+            Err(error) => Outgoing::plain(format!("⚠️ {error}")),
+            Ok(context) => {
+                if args.is_empty() {
+                    let summary = self.parameters(key, &context.session);
+                    self.options.menu(context, field, &summary)
+                } else if let Some(refusal) = self.option_refusal(key, &context.session) {
+                    Outgoing::plain(refusal.to_owned())
+                } else {
+                    self.options
+                        .change(context, field, args)
+                        .unwrap_or_else(|error| Outgoing::plain(format!("⚠️ {error}")))
+                }
+            }
+        };
+        self.options.emit(
+            key,
+            user,
+            self.settings.clone(),
+            self.sender.clone(),
+            options::Reply { message: Some(message), ..options::Reply::default() },
+        );
+    }
+    fn option_press(&mut self, press: Press) {
+        let Some(key) = options::key(&press) else {
+            return;
+        };
+        if !crate::telegram::allowed(&self.settings.borrow().telegram, press.chat, Some(press.user))
+            || !self.options.available(key)
+        {
+            return;
+        }
+        let ticket = self.options.take(&press, &self.settings.borrow(), &self.topics);
+        let mut reply =
+            options::Reply { callback: Some(press.callback), ..options::Reply::default() };
+        match ticket {
+            Err(error) => reply.answer = Some(error.to_owned()),
+            Ok(ticket) => {
+                if let Some(refusal) = self.option_refusal(key, &ticket.context.session) {
+                    reply.answer = Some(refusal.to_owned());
+                } else {
+                    let message = match ticket.action {
+                        options::Action::Cancel => {
+                            self.options.invalidate(key);
+                            Outgoing::plain("Изменение отменено.".to_owned())
+                        }
+                        options::Action::Preview(preferences) => self
+                            .options
+                            .preview(ticket.context, preferences)
+                            .unwrap_or_else(|error| Outgoing::plain(format!("⚠️ {error}"))),
+                        options::Action::Apply(session) => {
+                            let mut next = self.topics.clone();
+                            next.insert(key, session.clone());
+                            if self.store.save(&next).is_err() {
+                                Outgoing::plain("⚠️ Настройки не сохранены на диск. Прежние параметры и контекст темы сохранены.".to_owned())
+                            } else {
+                                self.topics = next;
+                                self.options.invalidate(key);
+                                self.projects.invalidate(key);
+                                Outgoing::plain(format!(
+                                    "✅ Настройки темы сохранены. {}\n{}",
+                                    if session.session.is_some() {
+                                        "История разговора сохранена."
+                                    } else {
+                                        "Следующий запуск создаст новую сессию."
+                                    },
+                                    self.parameters(key, &session)
+                                ))
+                            }
+                        }
+                    };
+                    reply.message = Some(message);
+                }
+            }
+        }
+        self.options.emit(key, press.user, self.settings.clone(), self.sender.clone(), reply);
     }
 
     fn project_menu(&mut self, key: TopicKey) {
@@ -1076,6 +1230,7 @@ impl<A: Agents> Hub<A> {
         let key = ticket.key;
         if matches!(ticket.stage, Stage::Cancel) {
             self.projects.invalidate(key);
+            self.options.invalidate(key);
             self.say(Target::Topic(key), "Выбор проекта отменён, контекст сохранён.".to_owned());
             return;
         }
@@ -1102,7 +1257,8 @@ impl<A: Agents> Hub<A> {
                     self.say(Target::Topic(key), projects::STALE.to_owned());
                     return;
                 }
-                let session = TopicSession::fresh(ticket.project.backend(), cwd);
+                let mut session = TopicSession::fresh(ticket.project.backend(), cwd);
+                session.preferences = ticket.project.preferences();
                 let mut next = self.topics.clone();
                 next.insert(key, session.clone());
                 if let Err(error) = self.store.save(&next) {
@@ -1112,6 +1268,7 @@ impl<A: Agents> Hub<A> {
                 }
                 self.topics = next;
                 self.projects.invalidate(key);
+                self.options.invalidate(key);
                 self.projects.recent.remember(ticket.project.id());
                 if let Err(error) = self.store.save_recent_projects(&self.projects.recent) {
                     tracing::error!(%error, "recent projects could not be saved");
@@ -1243,11 +1400,31 @@ impl<A: Agents> Hub<A> {
         tokio::spawn(async move { sender.text(target, &text).await });
     }
 
+    fn parameters(&self, key: TopicKey, session: &TopicSession) -> String {
+        let next = session.preferences.resolve(session.backend, &self.settings.borrow());
+        let mut description = match (self.running.get(&key), next) {
+            (Some(live), Ok(next)) if live.parameters != next => format!(
+                "Параметры текущего запуска:\n{}\n\nСледующий запуск:\n{}",
+                live.parameters.describe(),
+                next.describe()
+            ),
+            (Some(live), _) => {
+                format!("Параметры текущего запуска:\n{}", live.parameters.describe())
+            }
+            (None, Ok(next)) => format!("Параметры следующего запуска:\n{}", next.describe()),
+            (None, Err(error)) => format!("⚠️ {error}"),
+        };
+        if session.backend == BackendKind::Qwen && session.session.is_some() {
+            description.push_str("\nQwen: показаны запрошенные параметры. Загруженная сессия может сохранить собственные модель и режим; /reset начнёт новую сессию.");
+        }
+        description
+    }
     fn publish(&self) {
         let views = self
             .topics
             .iter()
             .map(|(key, session)| TopicView {
+                parameters: self.parameters(*key, session),
                 key: *key,
                 title: self.titles.get(key).cloned(),
                 session: session.clone(),
@@ -1296,6 +1473,7 @@ mod tests {
     struct FakeAgents {
         scripts: StdMutex<VecDeque<Script>>,
         prompts: StdMutex<Vec<String>>,
+        parameters: StdMutex<Vec<Arc<Settings>>>,
         archive: Arc<FakeArchive>,
         /// The next `archive` lookup panics, as a bug in a backend would.
         crash_archive: AtomicBool,
@@ -1353,7 +1531,9 @@ mod tests {
             prompt: Prompt,
             mut inbox: mpsc::Receiver<Prompt>,
             conversation: Conversation,
+            settings: Arc<Settings>,
         ) -> BoxFuture<'a, mpsc::Receiver<Prompt>> {
+            self.parameters.lock().unwrap().push(settings);
             self.prompts.lock().unwrap().push(prompt.text().to_owned());
             let script =
                 self.scripts.lock().unwrap().pop_front().unwrap_or(Script::Say(Vec::new()));
@@ -1703,6 +1883,7 @@ mod tests {
     fn configure_project(world: &World) {
         let mut draft = Draft::from_settings(&world.settings.borrow());
         draft.projects = vec![hub_core::projects::ProjectDraft {
+            options: hub_core::options::OptionsDraft::default(),
             id: "backend".to_owned(),
             name: "Бэкенд".to_owned(),
             cwd: "project".to_owned(),
@@ -1737,6 +1918,210 @@ mod tests {
         let pick = project_button(world, "Бэкенд").await;
         world.send(HubMessage::Press(pick)).await;
         project_button(world, "Выбрать и сбросить").await
+    }
+
+    #[tokio::test]
+    async fn options_views_do_not_create_a_binding_or_start_a_model() {
+        let world = world(FakeAgents::default());
+        world.send(text(Some(7), 1, "/model")).await;
+        eventually("model help", || said(&world, "⚙️ claude")).await;
+        world.send(text(Some(7), 2, "/mode")).await;
+        project_button(&world, "acceptEdits").await;
+        assert!(world.store.last().is_none());
+        assert!(world.handle.views.borrow().is_empty());
+        assert!(world.agents.prompts().is_empty());
+    }
+
+    async fn option_preview(world: &World, command: &str) -> crate::inbound::Press {
+        let previous = world.messenger.last_keyboard().map(|(id, _)| id);
+        world.send(text(Some(7), 1, command)).await;
+        eventually("new option preview", || {
+            world.messenger.last_keyboard().is_some_and(|(id, rows)| {
+                Some(id) != previous
+                    && rows.iter().flatten().any(|b| b.text.starts_with("Применить"))
+            })
+        })
+        .await;
+        project_button(world, "Применить").await
+    }
+
+    async fn apply_option(world: &World, command: &str) {
+        let before = world.texts().iter().filter(|t| t.starts_with("✅ Настройки темы")).count();
+        let button = option_preview(world, command).await;
+        world.send(HubMessage::Press(button)).await;
+        eventually("options saved", || {
+            world.texts().iter().filter(|t| t.starts_with("✅ Настройки темы")).count() > before
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn options_preserve_history_across_restart_reset_and_snapshot_restore() {
+        let mut world = world(FakeAgents::default());
+        bound(&world, KEY, "old-session").await;
+        let preview = option_preview(&world, "/model topic-model").await;
+        assert_eq!(bound_to(&world, KEY), SessionId::parse("old-session"));
+        assert!(world.store.last().unwrap()[&KEY].preferences.to_draft().is_none());
+        world.send(HubMessage::Press(preview)).await;
+        eventually("saved", || said(&world, "✅ Настройки темы")).await;
+        let selected = world.store.last().unwrap()[&KEY].clone();
+        assert_eq!(selected.session, SessionId::parse("old-session"));
+        world.restart().await;
+        eventually("restored preferences", || {
+            world.handle.views.borrow().iter().any(|v| v.session == selected)
+        })
+        .await;
+        world.send(text(Some(7), 2, "/save options")).await;
+        eventually("snapshot", || said(&world, "💾 Сохранено: options")).await;
+        world.send(text(Some(7), 3, "/reset")).await;
+        eventually("reset", || bound_to(&world, KEY).is_none()).await;
+        assert_eq!(world.store.last().unwrap()[&KEY].preferences, selected.preferences);
+        world.send(text(Some(8), 4, "/restore options")).await;
+        eventually("restore", || said(&world, "♻️ Восстановлено: options")).await;
+        assert_eq!(world.store.last().unwrap()[&OTHER].preferences, selected.preferences);
+        assert_eq!(bound_to(&world, OTHER), selected.session);
+        world.send(text(Some(7), 5, "/new")).await;
+        eventually("new clears preferences", || {
+            world.store.last().unwrap()[&KEY].preferences.to_draft().is_none()
+        })
+        .await;
+        assert!(world.agents.prompts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn options_qwen_cancel_and_disk_failure_keep_history_until_explicit_apply() {
+        let world = world_from(FakeAgents::default(), FakeMessenger::default(), BackendKind::Qwen);
+        bound(&world, KEY, "old-qwen").await;
+        let before = world.store.last().unwrap();
+        let preview = option_preview(&world, "/model qwen-model").await;
+        assert!(world.texts().iter().any(|t| t.contains("контекст будет сброшен")));
+        let cancel = project_button(&world, "Отмена").await;
+        world.send(HubMessage::Press(cancel)).await;
+        eventually("cancel", || said(&world, "Изменение отменено")).await;
+        assert_eq!(world.store.last().unwrap(), before);
+        world.send(HubMessage::Press(preview)).await;
+        eventually("cancel invalidates apply", || {
+            world
+                .messenger
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Answer {text: Some(t), ..} if t == options::STALE))
+        })
+        .await;
+        let preview = option_preview(&world, "/model qwen-model").await;
+        world.store.fail.store(true, Ordering::SeqCst);
+        world.send(HubMessage::Press(preview)).await;
+        eventually("disk error", || said(&world, "⚠️ Настройки не сохранены")).await;
+        assert_eq!(world.store.last().unwrap(), before);
+        assert_eq!(world.handle.views.borrow()[0].session, before[&KEY]);
+        world.store.fail.store(false, Ordering::SeqCst);
+        apply_option(&world, "/model qwen-model").await;
+        assert!(bound_to(&world, KEY).is_none());
+        assert_eq!(
+            world.store.last().unwrap()[&KEY].preferences.overrides.to_draft().model,
+            "qwen-model"
+        );
+    }
+
+    #[tokio::test]
+    async fn options_start_invalidates_preview_and_busy_topic_rejects_changes() {
+        let world = world(FakeAgents::scripted(vec![Script::UntilStopped]));
+        bound(&world, KEY, "kept").await;
+        let before = world.store.last().unwrap();
+        let preview = option_preview(&world, "/model later").await;
+        world.send(text(Some(7), 2, "work")).await;
+        eventually("running", || world.running()).await;
+        world.send(HubMessage::Press(preview)).await;
+        eventually("stale", || {
+            world
+                .messenger
+                .calls()
+                .iter()
+                .any(|c| matches!(c, Call::Answer {text: Some(t), ..} if t == options::STALE))
+        })
+        .await;
+        world.send(text(Some(7), 3, "/mode plan")).await;
+        eventually("busy", || world.texts().contains(&texts::ALREADY_RUNNING.to_owned())).await;
+        assert_eq!(world.store.last().unwrap(), before);
+        world.send(text(Some(7), 4, "/stop")).await;
+        eventually("stopped", || !world.running()).await;
+    }
+
+    #[tokio::test]
+    async fn options_freeze_launch_settings_and_display_the_next_launch_separately() {
+        let world = world(FakeAgents::scripted(vec![Script::UntilStopped, Script::Say(vec![])]));
+        world.settings.send_modify(|settings| {
+            Arc::make_mut(settings).claude.model = Some("first".to_owned());
+        });
+        world.send(text(Some(7), 1, "work")).await;
+        eventually("started", || world.agents.parameters.lock().unwrap().len() == 1).await;
+        world.settings.send_modify(|settings| {
+            Arc::make_mut(settings).claude.model = Some("second".to_owned());
+        });
+        eventually("current and next parameters", || {
+            world.handle.views.borrow().iter().any(|v| {
+                v.parameters.contains("first")
+                    && v.parameters.contains("second")
+                    && v.parameters.contains("Следующий запуск")
+            })
+        })
+        .await;
+        assert_eq!(
+            world.agents.parameters.lock().unwrap()[0].claude.model.as_deref(),
+            Some("first")
+        );
+        world.send(text(Some(7), 2, "/stop")).await;
+        eventually("stopped", || !world.running()).await;
+        world.send(text(Some(7), 3, "next")).await;
+        eventually("second launch", || world.agents.parameters.lock().unwrap().len() == 2).await;
+        assert_eq!(
+            world.agents.parameters.lock().unwrap()[1].claude.model.as_deref(),
+            Some("second")
+        );
+    }
+
+    #[tokio::test]
+    async fn options_launch_resolves_each_field_from_topic_project_and_global() {
+        let world = world(FakeAgents::default());
+        configure_project(&world);
+        let mut draft = Draft::from_settings(&world.settings.borrow());
+        draft.projects[0].options.model = "project-model".to_owned();
+        draft.projects[0].options.mode = "read-only/on-request".to_owned();
+        world.settings.send(Arc::new(draft.parse(&std::env::temp_dir()).unwrap())).unwrap();
+        let confirm = choose_project(&world).await;
+        world.send(HubMessage::Press(confirm)).await;
+        eventually("project", || {
+            world.store.last().is_some_and(|topics| topics[&KEY].backend == BackendKind::Codex)
+        })
+        .await;
+        apply_option(&world, "/model topic-model").await;
+        world.send(text(Some(7), 2, "topic")).await;
+        eventually("first launch", || {
+            world.agents.parameters.lock().unwrap().len() == 1 && !world.running()
+        })
+        .await;
+        {
+            let parameters = world.agents.parameters.lock().unwrap();
+            assert_eq!(parameters[0].codex.model.as_deref(), Some("topic-model"));
+            assert_eq!(parameters[0].codex.sandbox, hub_core::settings::Sandbox::ReadOnly);
+        }
+        // Removing the saved profile does not change the copy already selected in the topic.
+        let mut draft = Draft::from_settings(&world.settings.borrow());
+        draft.projects.clear();
+        world.settings.send(Arc::new(draft.parse(&std::env::temp_dir()).unwrap())).unwrap();
+        apply_option(&world, "/model inherit").await;
+        apply_option(&world, "/mode workspace-write never").await;
+        world.send(text(Some(7), 3, "project")).await;
+        eventually("second launch", || {
+            world.agents.parameters.lock().unwrap().len() == 2 && !world.running()
+        })
+        .await;
+        {
+            let parameters = world.agents.parameters.lock().unwrap();
+            assert_eq!(parameters[1].codex.model.as_deref(), Some("project-model"));
+            assert_eq!(parameters[1].codex.sandbox, hub_core::settings::Sandbox::WorkspaceWrite);
+            assert_eq!(parameters[1].codex.approval, hub_core::settings::Approval::Never);
+        }
     }
 
     #[tokio::test]
@@ -3071,7 +3456,13 @@ mod tests {
         eventually("status", || said(&world, texts::WAITING)).await;
 
         assert_eq!(bound_to(&world, KEY), SessionId::parse("s-1"));
-        assert!(world.texts().iter().any(|t| t.starts_with(texts::WAITING) && t.ends_with("s-1")));
+        assert!(
+            world
+                .texts()
+                .iter()
+                .any(|t| t.starts_with(texts::WAITING)
+                    && t.lines().any(|line| line == "session: s-1"))
+        );
         release.send(()).unwrap();
         eventually("saved", || said(&world, "💾 Сохранено: snap")).await;
         world.send(HubMessage::Reset(KEY)).await;

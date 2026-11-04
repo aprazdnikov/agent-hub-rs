@@ -43,9 +43,9 @@ impl Agents for HubAgents {
         prompt: Prompt,
         inbox: mpsc::Receiver<Prompt>,
         conversation: Conversation,
+        settings: Arc<Settings>,
     ) -> BoxFuture<'a, mpsc::Receiver<Prompt>> {
-        // Settings are read per session, so changes apply from the next one.
-        let settings = Arc::clone(&self.settings.borrow());
+        // Hub froze and resolved these settings before downloads or process startup.
         Box::pin(async move {
             match session.backend {
                 BackendKind::Claude => {
@@ -284,6 +284,10 @@ mod tests {
 
     use super::*;
 
+    fn current(agents: &HubAgents) -> Arc<Settings> {
+        agents.settings.borrow().clone()
+    }
+
     struct Allowing;
 
     impl UserChannel for Allowing {
@@ -329,7 +333,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_topics_run_the_configured_codex() {
+    async fn codex_topics_use_the_frozen_configuration_instead_of_the_live_watch() {
         let missing = std::env::temp_dir().join("definitely-not-codex-binary");
         let settings = Draft {
             token: "1:a".to_owned(),
@@ -341,7 +345,22 @@ mod tests {
         }
         .parse(&std::env::temp_dir())
         .unwrap();
-        let agents = HubAgents::new(watch::Sender::new(Arc::new(settings)).subscribe());
+        let frozen = Arc::new(settings);
+        let mut live = (*frozen).clone();
+        live.codex.cli = Some(std::env::temp_dir().join("different-missing-cli"));
+        // A mistaken read from the watch would successfully spawn this harmless fixture
+        // and fail later during the handshake, instead of reporting the frozen spawn error.
+        #[cfg(unix)]
+        let fixture = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let cli = fixture.path().join("fake-cli");
+            std::fs::write(&cli, "#!/bin/sh\nexit 0\n").unwrap();
+            std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+            live.codex.cli = Some(cli);
+        }
+        let agents = HubAgents::new(watch::Sender::new(Arc::new(live)).subscribe());
         let cwd = AbsolutePath::new(std::env::temp_dir()).unwrap();
         let session = TopicSession::fresh(BackendKind::Codex, cwd);
         let (events, mut received) = mpsc::channel(4);
@@ -354,12 +373,16 @@ mod tests {
         let (_inbox_in, inbox) = mpsc::channel(1);
         let prompt = Prompt::new("hi".to_owned(), Vec::new()).unwrap();
 
-        let _inbox = agents.run(&session, prompt, inbox, conversation).await;
+        let _inbox = agents.run(&session, prompt, inbox, conversation, frozen).await;
 
-        assert!(matches!(
-            received.recv().await,
-            Some(AgentEvent::Failed(reason)) if reason.starts_with("Не удалось запустить Codex")
-        ));
+        let result = received.recv().await;
+        assert!(
+            matches!(
+                &result,
+                Some(AgentEvent::Failed(reason)) if reason.starts_with("Не удалось запустить Codex")
+            ),
+            "{result:?}"
+        );
     }
 
     #[tokio::test]
@@ -388,7 +411,7 @@ mod tests {
         let (_inbox_in, inbox) = mpsc::channel(1);
         let prompt = Prompt::new("hi".to_owned(), Vec::new()).unwrap();
 
-        let _inbox = agents.run(&session, prompt, inbox, conversation).await;
+        let _inbox = agents.run(&session, prompt, inbox, conversation, current(&agents)).await;
 
         assert_eq!(
             received.recv().await,
@@ -420,7 +443,13 @@ mod tests {
         let (queued, inbox) = mpsc::channel(1);
         queued.send(Prompt::new("later".to_owned(), Vec::new()).unwrap()).await.unwrap();
         let mut inbox = agents
-            .run(&session, Prompt::new("hi".to_owned(), Vec::new()).unwrap(), inbox, conversation)
+            .run(
+                &session,
+                Prompt::new("hi".to_owned(), Vec::new()).unwrap(),
+                inbox,
+                conversation,
+                current(&agents),
+            )
             .await;
         assert!(
             matches!(received.recv().await, Some(AgentEvent::Failed(reason)) if reason.contains("Hermes"))
@@ -452,7 +481,13 @@ mod tests {
         let (queued, inbox) = mpsc::channel(1);
         queued.send(Prompt::new("later".to_owned(), Vec::new()).unwrap()).await.unwrap();
         let mut inbox = agents
-            .run(&session, Prompt::new("hi".to_owned(), Vec::new()).unwrap(), inbox, conversation)
+            .run(
+                &session,
+                Prompt::new("hi".to_owned(), Vec::new()).unwrap(),
+                inbox,
+                conversation,
+                current(&agents),
+            )
             .await;
         assert!(
             matches!(received.recv().await, Some(AgentEvent::Failed(reason)) if reason.contains("OpenCode"))

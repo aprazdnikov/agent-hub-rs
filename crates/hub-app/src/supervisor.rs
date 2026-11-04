@@ -841,6 +841,7 @@ mod tests {
         let mut harness = harness(Ok(Loaded::Ready(settings("-100", ""))), &[], false);
         harness.until("running", running).await;
         let view = TopicView {
+            parameters: String::new(),
             key: TopicKey { chat: ChatId(-100), thread: ThreadId(7) },
             title: Some("backend".to_owned()),
             session: hub_core::domain::TopicSession::fresh(

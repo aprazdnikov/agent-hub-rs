@@ -207,6 +207,7 @@ mod tests {
 
     fn manifest(name: &str, created_at: &str, title: Option<&str>) -> Manifest {
         Manifest {
+            preferences: hub_core::options::Preferences::default(),
             name: SnapshotName::parse(name).unwrap(),
             created_at: created_at.to_owned(),
             title: title.map(str::to_owned),

@@ -164,6 +164,7 @@ impl<A: Agents> SaveJob<A> {
                     ));
                 }
                 Ok(Manifest {
+                    preferences: session.preferences.clone(),
                     name: name.clone(),
                     created_at,
                     title,
@@ -195,6 +196,7 @@ pub struct RestoreJob<A> {
 
 /// What phase one found: everything `present`/`import` need.
 struct Plan {
+    preferences: hub_core::options::Preferences,
     session: SessionId,
     data: BackendData,
     files: Vec<RelPath>,
@@ -260,6 +262,7 @@ async fn load(
         let Loaded { manifest, agent } =
             store.load(&wanted).map_err(|error| texts::warning(&error))?;
         let Manifest {
+            preferences,
             name: _name,
             created_at: _created_at,
             title: _title,
@@ -274,7 +277,7 @@ async fn load(
             None => resolve_cwd(&root, &home, Some(&saved.as_path().display().to_string()))
                 .map_err(|error| texts::warning(&error))?,
         };
-        Ok(Plan { session, data, files, agent, cwd })
+        Ok(Plan { preferences, session, data, files, agent, cwd })
     })
     .await
     .map_err(|error| internal(&error))?
@@ -287,7 +290,7 @@ async fn apply<A: Agents>(
     agents: &A,
     home: &Path,
 ) -> Result<Restoration, String> {
-    let Plan { session, data, files, agent, cwd } = plan;
+    let Plan { preferences, session, data, files, agent, cwd } = plan;
     let backend = data.backend();
     let archive: Arc<dyn SessionArchive> =
         agents.archive(backend, home).await.map_err(|reason| texts::warning(&reason))?;
@@ -304,7 +307,7 @@ async fn apply<A: Agents>(
     .map_err(|error| texts::warning(&error))?;
     Ok(Restoration {
         name,
-        session: TopicSession { backend, cwd, session: Some(session) },
+        session: TopicSession { preferences, backend, cwd, session: Some(session) },
         imported,
     })
 }

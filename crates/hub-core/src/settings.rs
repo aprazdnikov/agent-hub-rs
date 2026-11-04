@@ -1248,6 +1248,7 @@ mod tests {
             cwd: String::new(),
         }];
         draft.projects = vec![ProjectDraft {
+            options: crate::options::OptionsDraft::default(),
             id: "shop".to_owned(),
             name: "Магазин".to_owned(),
             cwd: "shop/backend".to_owned(),

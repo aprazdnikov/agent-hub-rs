@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use crate::actions::Action;
 use crate::doctor::{self, Check, CheckDraft};
 use crate::domain::BackendKind;
+use crate::options::{Options, OptionsDraft, Preferences};
 
 pub const MAX_PROJECTS: usize = 32;
 const MAX_RECENT: usize = 5;
@@ -14,6 +15,8 @@ const MAX_RECENT: usize = 5;
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProjectDraft {
+    #[serde(default, skip_serializing_if = "OptionsDraft::is_empty")]
+    pub options: OptionsDraft,
     pub id: String,
     pub name: String,
     pub cwd: String,
@@ -26,6 +29,7 @@ pub struct ProjectDraft {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Project {
+    options: Options,
     id: String,
     name: String,
     cwd: String,
@@ -35,6 +39,10 @@ pub struct Project {
 }
 
 impl Project {
+    #[must_use]
+    pub fn preferences(&self) -> Preferences {
+        Preferences::for_project(&self.id, &self.name, self.options.clone())
+    }
     #[must_use]
     pub fn id(&self) -> &str {
         &self.id
@@ -62,6 +70,7 @@ impl Project {
     #[must_use]
     pub fn to_draft(&self) -> ProjectDraft {
         ProjectDraft {
+            options: self.options.to_draft(),
             id: self.id.clone(),
             name: self.name.clone(),
             cwd: self.cwd.clone(),
@@ -117,8 +126,11 @@ pub fn parse(drafts: &[ProjectDraft], actions: &[Action]) -> Result<Vec<Project>
                     return Err(error("связанное действие отсутствует или указано дважды"));
                 }
             }
+            let options =
+                Options::parse(backend, &draft.options).map_err(|reason| error(&reason))?;
             let checks = doctor::parse(&draft.checks).map_err(|reason| error(&reason))?;
             Ok(Project {
+                options,
                 id: id.to_owned(),
                 name: name.to_owned(),
                 cwd: cwd.to_owned(),
@@ -173,6 +185,7 @@ mod tests {
 
     fn draft() -> ProjectDraft {
         ProjectDraft {
+            options: crate::options::OptionsDraft::default(),
             id: "project-1".to_owned(),
             name: "Бэкенд".to_owned(),
             cwd: "проект с пробелами".to_owned(),
@@ -182,6 +195,21 @@ mod tests {
         }
     }
 
+    #[test]
+    fn project_options_are_validated_and_copied_into_topic_preferences() {
+        let mut form = draft();
+        form.options = OptionsDraft {
+            model: "project-model".to_owned(),
+            mode: "read-only/on-request".to_owned(),
+        };
+        let project = parse(&[form.clone()], &[]).unwrap().remove(0);
+        assert_eq!(project.to_draft().options, form.options);
+        let copied = project.preferences();
+        form.options.model = "changed".to_owned();
+        assert_ne!(parse(&[form.clone()], &[]).unwrap()[0].preferences(), copied);
+        form.backend = "hermes".to_owned();
+        assert!(parse(&[form], &[]).is_err());
+    }
     #[test]
     fn profiles_keep_identity_and_defaults() {
         let projects = parse(&[draft()], &[]).unwrap();

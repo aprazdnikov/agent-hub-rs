@@ -15,6 +15,7 @@ fn name(raw: &str) -> SnapshotName {
 
 fn manifest(raw: &str, created_at: &str) -> Manifest {
     Manifest {
+        preferences: hub_core::options::Preferences::default(),
         name: name(raw),
         created_at: created_at.to_owned(),
         title: None,

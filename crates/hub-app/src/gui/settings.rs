@@ -32,6 +32,51 @@ pub struct SettingsForm {
     confirming: bool,
 }
 
+fn project_options(ui: &mut egui::Ui, project: &mut ProjectDraft) {
+    let previous_backend = project.backend.clone();
+    egui::ComboBox::from_id_salt("project-backend").selected_text(&project.backend).show_ui(
+        ui,
+        |ui| {
+            for backend in BackendKind::ALL {
+                ui.selectable_value(
+                    &mut project.backend,
+                    backend.name().to_owned(),
+                    backend.name(),
+                );
+            }
+        },
+    );
+    if previous_backend != project.backend {
+        project.options = hub_core::options::OptionsDraft::default();
+    }
+    ui.horizontal(|ui| {
+        ui.label("Модель");
+        ui.add(
+            egui::TextEdit::singleline(&mut project.options.model)
+                .hint_text("пусто — общие настройки"),
+        );
+    });
+    let modes =
+        BackendKind::parse(&project.backend).map(hub_core::options::Mode::all).unwrap_or_default();
+    if modes.is_empty() {
+        ui.label("Режим задаётся самим CLI.");
+    } else {
+        egui::ComboBox::from_id_salt("project-mode")
+            .selected_text(if project.options.mode.is_empty() {
+                "Режим: общие настройки"
+            } else {
+                &project.options.mode
+            })
+            .show_ui(ui, |ui| {
+                ui.selectable_value(&mut project.options.mode, String::new(), "Общие настройки");
+                for mode in modes {
+                    let wire = mode.wire();
+                    ui.selectable_value(&mut project.options.mode, wire.clone(), wire);
+                }
+            });
+    }
+}
+
 fn project_checks(ui: &mut egui::Ui, checks: &mut Vec<CheckDraft>) {
     ui.separator();
     ui.label("Проверки ресурсов через /doctor");
@@ -214,11 +259,12 @@ impl SettingsForm {
 
     fn projects(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
         ui.heading("Проекты");
-        ui.label("Сохраните каталог и бэкенд, затем выберите проект через /projects в Telegram.");
+        ui.label("Сохраните каталог, бэкенд и параметры, затем выберите проект через /projects в Telegram.");
+        ui.label("Пустые параметры наследуют общие настройки. Смена бэкенда сбрасывает модель и режим профиля.");
         ui.label("Связанные действия запускаются вручную через /actions. Изменения профиля не меняют существующие сессии.");
         let mut remove = None;
         for (index, project) in self.draft.projects.iter_mut().enumerate() {
-            ui.push_id(&project.id, |ui| {
+            ui.push_id(egui::Id::new(&project.id), |ui| {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
                         ui.label("Название");
@@ -239,17 +285,7 @@ impl SettingsForm {
                             project.cwd = path;
                         }
                     });
-                    egui::ComboBox::from_id_salt("project-backend")
-                        .selected_text(&project.backend)
-                        .show_ui(ui, |ui| {
-                            for backend in BackendKind::ALL {
-                                ui.selectable_value(
-                                    &mut project.backend,
-                                    backend.name().to_owned(),
-                                    backend.name(),
-                                );
-                            }
-                        });
+                    project_options(ui, project);
                     if !self.draft.actions.is_empty() {
                         ui.label("Связанные действия (например, VPN)");
                     }
@@ -290,6 +326,7 @@ impl SettingsForm {
             .clicked()
         {
             self.draft.projects.push(ProjectDraft {
+                options: hub_core::options::OptionsDraft::default(),
                 id: uuid::Uuid::new_v4().simple().to_string(),
                 name: String::new(),
                 cwd: String::new(),

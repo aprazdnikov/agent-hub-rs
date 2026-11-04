@@ -120,7 +120,7 @@ impl<A: Agents> Run<A> {
         };
         let background = settings.timeouts.background;
         let (inbox, ()) = tokio::join!(
-            agents.run(&session, prompt, inbox, conversation),
+            agents.run(&session, prompt, inbox, conversation, settings),
             relay(
                 received,
                 &sender,

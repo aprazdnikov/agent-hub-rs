@@ -148,7 +148,15 @@ impl TopicsView {
                 });
             })
         });
-        ui.label(topic.session.backend.name());
+        ui.push_id((topic.key, "parameters"), |ui| {
+            ui.vertical(|ui| {
+                ui.set_width(210.0);
+                ui.label(topic.session.backend.name());
+                for line in topic.parameters.lines() {
+                    ui.add(egui::Label::new(line).truncate()).on_hover_text(&topic.parameters);
+                }
+            });
+        });
         ui.push_id((topic.key, "path"), |ui| {
             ui.vertical(|ui| {
                 ui.set_width(190.0);
@@ -216,6 +224,7 @@ mod tests {
 
     fn topic(thread: i32, name: &str, backend: BackendKind, state: TopicState) -> TopicView {
         TopicView {
+            parameters: String::new(),
             key: TopicKey { chat: ChatId(-1_001_234_567_890), thread: ThreadId(thread) },
             title: Some(name.to_owned()),
             session: TopicSession::fresh(
@@ -450,10 +459,9 @@ mod tests {
     fn topic_cells_stay_under_their_grid_headers() {
         let ctx = egui::Context::default();
         let mut view = TopicsView::default();
-        let snapshot = Snapshot {
-            topics: vec![topic(42, "Alpha", BackendKind::Claude, TopicState::Waiting)],
-            ..Snapshot::default()
-        };
+        let mut configured = topic(42, "Alpha", BackendKind::Claude, TopicState::Waiting);
+        configured.parameters = "Параметры текущего запуска:\nМодель: model · тема\nРежим: plan · проект\nСледующий запуск:\nМодель: other · общие настройки".to_owned();
+        let snapshot = Snapshot { topics: vec![configured], ..Snapshot::default() };
         draw(&ctx, &mut view, &snapshot);
         let output = draw(&ctx, &mut view, &snapshot);
         let x = |label| {
@@ -473,5 +481,8 @@ mod tests {
         };
         assert!(x("claude") >= x("Бэкенд"), "backend cell is left of its header");
         assert!(x("claude") < x("Каталог"), "backend cell exceeds its column");
+        for label in ["Модель: model · тема", "Режим: plan · проект"] {
+            assert!(x(label) >= x("Бэкенд") && x(label) < x("Каталог"));
+        }
     }
 }

@@ -34,6 +34,7 @@ pub struct Ticket {
     pub stage: Stage,
     current: Option<TopicSession>,
     root: PathBuf,
+    parameters: Result<hub_core::options::Effective, String>,
     created: Instant,
 }
 
@@ -104,6 +105,7 @@ impl Projects {
                         stage: Stage::Preview,
                         current: current.cloned(),
                         root: settings.workspace_root.clone(),
+                        parameters: project.preferences().resolve(project.backend(), settings),
                         created: Instant::now(),
                     },
                 )]
@@ -131,6 +133,8 @@ impl Projects {
             || Some(ticket.key.chat) != press.chat
             || !settings.projects.contains(&ticket.project)
             || ticket.root != settings.workspace_root
+            || ticket.parameters
+                != ticket.project.preferences().resolve(ticket.project.backend(), settings)
             || topics.get(&ticket.key) != ticket.current.as_ref()
         {
             return Err(STALE);
@@ -152,6 +156,10 @@ impl Projects {
             cwd.as_path().display(),
             ticket.project.backend().name()
         );
+        if let Ok(parameters) = &ticket.parameters {
+            text.push_str("\n\n");
+            text.push_str(&parameters.describe());
+        }
         if !actions.is_empty() {
             text.push_str("\n\nСвязанные действия: ");
             text.push_str(&actions.join(", "));
@@ -198,6 +206,7 @@ mod tests {
             workspace_root: std::env::temp_dir().display().to_string(),
             projects: vec![
                 ProjectDraft {
+                    options: hub_core::options::OptionsDraft::default(),
                     id: "one".to_owned(),
                     name: "Первый".to_owned(),
                     cwd: "one".to_owned(),
@@ -206,6 +215,7 @@ mod tests {
                     checks: Vec::new(),
                 },
                 ProjectDraft {
+                    options: hub_core::options::OptionsDraft::default(),
                     id: "two".to_owned(),
                     name: "Второй".to_owned(),
                     cwd: "two".to_owned(),

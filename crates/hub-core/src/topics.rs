@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
+use crate::options::{Preferences, PreferencesDraft};
 use serde::{Deserialize, Serialize};
 
 use crate::domain::{
@@ -62,7 +63,7 @@ pub fn dump_titles(titles: &Titles) -> Result<String, serde_json::Error> {
 pub enum CorruptState {
     #[error("файл не является JSON нужной формы")]
     Json(#[from] serde_json::Error),
-    #[error("ожидалась версия формата {FORMAT_VERSION}, найдена {0}")]
+    #[error("неподдерживаемая версия формата: {0}")]
     Version(u32),
     #[error("тема №{index}: {reason}")]
     Entry { index: usize, reason: &'static str },
@@ -70,6 +71,8 @@ pub enum CorruptState {
 
 #[derive(Debug, thiserror::Error)]
 pub enum DumpError {
+    #[error("Некорректные настройки темы: {0}")]
+    Preferences(String),
     #[error("не удалось сериализовать привязки тем")]
     Json(#[from] serde_json::Error),
     #[error("путь {} не в UTF-8", .0.display())]
@@ -84,6 +87,8 @@ struct StateFile {
 
 #[derive(Serialize, Deserialize)]
 struct Entry {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    preferences: Option<PreferencesDraft>,
     #[serde(rename = "chat_id")]
     chat: i64,
     #[serde(rename = "thread_id")]
@@ -96,8 +101,13 @@ struct Entry {
 
 pub fn parse_state(raw: &str) -> Result<Topics, CorruptState> {
     let file: StateFile = serde_json::from_str(raw)?;
-    if file.version != FORMAT_VERSION {
+    if !matches!(file.version, 1 | 2) {
         return Err(CorruptState::Version(file.version));
+    }
+    if file.version == 1 && file.topics.iter().any(|entry| entry.preferences.is_some()) {
+        return Err(CorruptState::Entry {
+            index: 0, reason: "настройкам темы нужна версия 2"
+        });
     }
     file.topics
         .into_iter()
@@ -109,8 +119,10 @@ pub fn parse_state(raw: &str) -> Result<Topics, CorruptState> {
 }
 
 fn parse_entry(entry: Entry) -> Result<(TopicKey, TopicSession), &'static str> {
-    let Entry { chat, thread, backend, cwd, session } = entry;
+    let Entry { chat, thread, backend, cwd, session, preferences } = entry;
     let backend = BackendKind::parse(&backend).ok_or("неизвестный бэкенд")?;
+    let preferences =
+        Preferences::parse(backend, preferences).map_err(|_| "некорректные настройки темы")?;
     let cwd = AbsolutePath::new(PathBuf::from(cwd)).ok_or("cwd должен быть абсолютным путём")?;
     let session = match session {
         None => None,
@@ -118,7 +130,7 @@ fn parse_entry(entry: Entry) -> Result<(TopicKey, TopicSession), &'static str> {
     };
     Ok((
         TopicKey { chat: ChatId(chat), thread: ThreadId(thread) },
-        TopicSession { backend, cwd, session },
+        TopicSession { preferences, backend, cwd, session },
     ))
 }
 
@@ -126,8 +138,11 @@ pub fn dump_state(topics: &Topics) -> Result<String, DumpError> {
     let entries = topics
         .iter()
         .map(|(key, session)| {
+            Preferences::parse(session.backend, session.preferences.to_draft())
+                .map_err(DumpError::Preferences)?;
             let cwd = session.cwd.as_path();
             Ok(Entry {
+                preferences: session.preferences.to_draft(),
                 chat: key.chat.0,
                 thread: key.thread.0,
                 backend: session.backend.name().to_owned(),
@@ -139,7 +154,9 @@ pub fn dump_state(topics: &Topics) -> Result<String, DumpError> {
             })
         })
         .collect::<Result<Vec<_>, DumpError>>()?;
-    Ok(serde_json::to_string_pretty(&StateFile { version: FORMAT_VERSION, topics: entries })?)
+    let version =
+        if entries.iter().any(|entry| entry.preferences.is_some()) { 2 } else { FORMAT_VERSION };
+    Ok(serde_json::to_string_pretty(&StateFile { version, topics: entries })?)
 }
 
 #[cfg(test)]
@@ -156,6 +173,7 @@ mod tests {
 
     fn session(name: &str, id: Option<&str>) -> TopicSession {
         TopicSession {
+            preferences: crate::options::Preferences::default(),
             backend: BackendKind::Claude,
             cwd: AbsolutePath::new(absolute(name)).unwrap(),
             session: id.and_then(SessionId::parse),
@@ -166,6 +184,29 @@ mod tests {
         serde_json::to_string(&absolute(name).display().to_string()).unwrap()
     }
 
+    #[test]
+    fn topic_options_use_v2_only_when_present_and_survive_restart() {
+        use crate::options::{Options, OptionsDraft, Preferences};
+        let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
+        let mut topic = session("project", Some("saved"));
+        let old = dump_state(&Topics::from([(key, topic.clone())])).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&old).unwrap()["version"], 1);
+        let options = Options::parse(
+            topic.backend,
+            &OptionsDraft { model: "model".to_owned(), mode: "plan".to_owned() },
+        )
+        .unwrap();
+        topic.preferences = Preferences::for_project("p", "Project", options);
+        let topics = Topics::from([(key, topic)]);
+        let raw = dump_state(&topics).unwrap();
+        assert_eq!(serde_json::from_str::<serde_json::Value>(&raw).unwrap()["version"], 2);
+        assert_eq!(parse_state(&raw).unwrap(), topics);
+        let mut invalid: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        invalid["topics"][0]["backend"] = "codex".into();
+        assert!(parse_state(&invalid.to_string()).is_err());
+        invalid["version"] = 1.into();
+        assert!(parse_state(&invalid.to_string()).is_err());
+    }
     #[test]
     fn empty_state_round_trips() {
         assert_eq!(parse_state(&dump_state(&Topics::new()).unwrap()).unwrap(), Topics::new());
