@@ -31,17 +31,15 @@ const PLIST_SUFFIX: &str = "</string><string>--autostart</string></array>\n</dic
 
 // The script is constant. The plist path is an argv value, never executable source.
 // statusForLegacyURL: takes the plist URL, not the executable or application URL.
+// Detect the API directly: JXA cannot reliably expose NSOperatingSystemVersion fields.
 const AUTHORIZATION_SCRIPT: &str = r"function run(argv) {
     ObjC.import('Foundation');
-    var major = $.NSProcessInfo.processInfo.operatingSystemVersion.majorVersion;
-    if (typeof major !== 'number' || !isFinite(major) || major < 10) {
-        throw new Error('Unknown macOS version');
-    }
-    if (major < 13) {
+    ObjC.import('ServiceManagement');
+    var service = $.NSClassFromString('SMAppService');
+    if (service.isNil()) {
         return 'legacy';
     }
-    ObjC.import('ServiceManagement');
-    var status = $.SMAppService.statusForLegacyURL($.NSURL.fileURLWithPath(argv[0]));
+    var status = service.statusForLegacyURL($.NSURL.fileURLWithPath(argv[0]));
     if (typeof status !== 'number') throw new Error('Invalid Service Management response');
     if (status === $.SMAppServiceStatusEnabled) return 'enabled';
     if (status === $.SMAppServiceStatusRequiresApproval) return 'requires-approval';

@@ -107,3 +107,17 @@ TCP-порт мог занять параллельный тест. Исправ
 - [Windows Run](https://learn.microsoft.com/windows/win32/setupapi/run-and-runonce-registry-keys)
 - [Apple launchd](https://developer.apple.com/library/archive/documentation/MacOSX/Conceptual/BPSystemStartup/Chapters/CreatingLaunchdJobs.html)
 - [Apple legacy authorization](https://developer.apple.com/documentation/servicemanagement/smappservice/statusforlegacyplist%28at%3A%29?language=objc)
+
+## Проверка перед v0.8.0, 2026-11-05
+
+В [CI на macOS](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/41883363188)
+нативный тест `native_authorization_bridge_queries_only_a_fixture_path` завершился
+ошибкой `Unknown macOS version`: проверка полей `NSOperatingSystemVersion` через JXA
+не дала ожидаемую версию. Проверка доступности `SMAppService` через `NSClassFromString`
+заменяет разбор структуры версии. Отсутствие класса сохраняет режим legacy; неизвестный
+ответ Service Management по-прежнему отклоняется. Основание для проверки nil —
+[документация моста JXA](https://developer.apple.com/library/archive/releasenotes/InterapplicationCommunication/RN-JavaScriptForAutomation/Articles/OSX10-10.html).
+
+Семь сценариев на поддельном мосте прошли после исправления (до него пять завершались
+ошибкой), как и 21 локальный тест адаптера. Нативный тест оставлен включённым; его
+повторный результат перед тегом фиксируется в [журнале выпуска](../releases/README.md).

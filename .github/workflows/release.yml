@@ -31,6 +31,7 @@ jobs:
         run: |
           version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)
           test "v${version}" = "${GITHUB_REF_NAME}" || { echo "tag ${GITHUB_REF_NAME} != v${version}"; exit 1; }
+          test -s "docs/releases/${GITHUB_REF_NAME}.md" || { echo "release notes missing for ${GITHUB_REF_NAME}"; exit 1; }
       - name: Toolchain
         run: |
           rustup toolchain install
@@ -79,6 +80,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
           path: dist
@@ -86,4 +88,5 @@ jobs:
       - uses: softprops/action-gh-release@v2
         with:
           files: dist/*
-          generate_release_notes: true
+          body_path: docs/releases/${{ github.ref_name }}.md
+          generate_release_notes: false
