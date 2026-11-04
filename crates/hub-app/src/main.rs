@@ -79,7 +79,7 @@ fn run() -> anyhow::Result<()> {
     let window_exit = Arc::clone(&exit);
     let core = runtime.handle().clone();
     let window = commands.clone();
-    let connector = TelegramConnector { home: home.clone(), topics: dirs.topics() };
+    let connector = TelegramConnector::new(home.clone(), dirs.topics());
     let logs_dir = dirs.logs();
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()

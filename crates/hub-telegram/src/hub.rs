@@ -39,6 +39,7 @@ use crate::messenger::{Format, Messenger, Outgoing, Target};
 use crate::paths::{CwdError, resolve_cwd, workspace_root};
 use crate::press;
 use crate::projects::{self, Projects, Stage};
+use crate::results::{LastResults, ResultStore, SaveResult};
 use crate::sender::Sender;
 use crate::session::{First, Run};
 use crate::snapshots::{SnapshotError, SnapshotStore};
@@ -96,6 +97,8 @@ pub struct TopicView {
 }
 
 pub enum HubMessage {
+    SaveResult(SaveResult),
+    LastDone(TopicKey),
     ActionDone(actions::Done),
     DoctorDone(crate::doctor::Done),
     Inbound(Inbound),
@@ -142,6 +145,7 @@ struct Polled {
 }
 
 pub struct HubSetup<A> {
+    pub results: Arc<dyn ResultStore>,
     pub action_runner: Arc<dyn ActionRunner>,
     pub doctor_runner: Arc<dyn DoctorRunner>,
     pub agents: Arc<A>,
@@ -170,6 +174,7 @@ struct Live {
 }
 
 struct Hub<A> {
+    results: LastResults,
     actions: Actions,
     doctors: Doctors,
     projects: Projects,
@@ -204,6 +209,7 @@ struct Hub<A> {
 #[must_use]
 pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
     let HubSetup {
+        results,
         agents,
         action_runner,
         doctor_runner,
@@ -220,6 +226,7 @@ pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
     let (views, watched) = watch::channel(Vec::new());
     let registries = Shared::default();
     let hub = Hub {
+        results: LastResults::new(results),
         actions: Actions::new(action_runner),
         doctors: Doctors::new(doctor_runner),
         projects: Projects::new(recent_projects),
@@ -271,6 +278,8 @@ impl<A: Agents> Hub<A> {
 
     fn handle(&mut self, message: HubMessage) {
         match message {
+            HubMessage::LastDone(key) => self.results.complete(key),
+            HubMessage::SaveResult(saved) => self.save_result(saved),
             HubMessage::DoctorDone(done) => self.doctors.complete(
                 &done,
                 &self.settings.borrow(),
@@ -352,6 +361,7 @@ impl<A: Agents> Hub<A> {
             HubMessage::Shutdown(done) => {
                 self.actions.shutdown();
                 self.doctors.shutdown();
+                self.results.shutdown();
                 for live in self.running.values() {
                     live.cancel.cancel();
                 }
@@ -359,6 +369,23 @@ impl<A: Agents> Hub<A> {
             }
         }
         self.publish();
+    }
+
+    fn save_result(&self, saved: SaveResult) {
+        let SaveResult { key, generation, record, reply } = saved;
+        if record.key() == key
+            && self
+                .running
+                .get(&key)
+                .is_some_and(|live| live.generation == generation && !live.cancel.is_cancelled())
+        {
+            let saving = self.results.store.save(record);
+            tokio::spawn(async move {
+                let _ = reply.send(saving.await);
+            });
+        } else {
+            let _ = reply.send(Err("Результат прежнего запуска не сохранён".to_owned()));
+        }
     }
 
     fn inbound(&mut self, inbound: Inbound) {
@@ -385,6 +412,15 @@ impl<A: Agents> Hub<A> {
             }
             Content::TopicRenamed { name } => self.rename(key, name.clone()),
             Content::Text(text) => match parse_input(text, &self.bot) {
+                Input::Command { command: Command::Last, .. } => {
+                    self.results.read(
+                        key,
+                        inbound.user,
+                        self.settings.clone(),
+                        self.sender.clone(),
+                        self.mailbox.clone(),
+                    );
+                }
                 Input::Command { command, args } => {
                     self.command(key, inbound.chat, inbound.message, command, &args);
                 }
@@ -448,6 +484,7 @@ impl<A: Agents> Hub<A> {
         args: &[&str],
     ) {
         match command {
+            Command::Last => {} // Handled with the live user's identity in inbound().
             Command::Projects => self.project_menu(key),
             Command::Doctor => {
                 let card = self.doctors.menu(key, &self.settings.borrow());
@@ -1452,6 +1489,7 @@ mod tests {
         messenger: Arc<FakeMessenger>,
         agents: Arc<FakeAgents>,
         store: MemoryStore,
+        results: Arc<crate::testing::MemoryResults>,
         settings: watch::Sender<Arc<Settings>>,
         root: tempfile::TempDir,
     }
@@ -1463,6 +1501,7 @@ mod tests {
             stopped.await.unwrap();
             (&mut self.handle.task).await.unwrap();
             self.handle = spawn(HubSetup {
+                results: self.results.clone(),
                 action_runner: Arc::new(crate::testing::FakeActionRunner),
                 doctor_runner: Arc::new(crate::testing::FakeDoctorRunner),
                 agents: Arc::clone(&self.agents),
@@ -1521,7 +1560,9 @@ mod tests {
         let messenger = Arc::new(messenger);
         let agents = Arc::new(agents);
         let store = MemoryStore::default();
+        let results = Arc::new(crate::testing::MemoryResults::default());
         let handle = spawn(HubSetup {
+            results: results.clone(),
             action_runner: Arc::new(crate::testing::FakeActionRunner),
             doctor_runner: Arc::new(crate::testing::FakeDoctorRunner),
             agents: Arc::clone(&agents),
@@ -1534,7 +1575,7 @@ mod tests {
             home: std::env::temp_dir(),
             bot: "agent_hub_bot".to_owned(),
         });
-        World { handle, messenger, agents, store, settings: settings_tx, root }
+        World { handle, messenger, agents, store, results, settings: settings_tx, root }
     }
 
     fn inbound(thread: Option<i32>, message: i32, content: Content) -> HubMessage {
@@ -1682,6 +1723,284 @@ mod tests {
         let pick = project_button(world, "Бэкенд").await;
         world.send(HubMessage::Press(pick)).await;
         project_button(world, "Выбрать и сбросить").await
+    }
+
+    #[tokio::test]
+    async fn last_result_survives_failed_delivery_and_hub_restart() {
+        let mut world = world_with(
+            FakeAgents::scripted(vec![Script::Say(vec![
+                AgentEvent::AssistantText("**saved answer**".to_owned()),
+                finished(),
+            ])]),
+            FakeMessenger::with_sends(vec![Err(crate::messenger::SendError::Failed(
+                "offline".to_owned(),
+            ))]),
+        );
+        world.send(text(Some(7), 1, "task")).await;
+        eventually("saved last answer", || {
+            world.results.records.lock().unwrap().contains_key(&KEY)
+        })
+        .await;
+        eventually("turn ended", || !world.running()).await;
+        world.restart().await;
+        world.send(text(Some(7), 2, "/last")).await;
+        eventually("recovered answer", || {
+            world.texts().iter().any(|t| t.contains("Последний сохранённый ответ"))
+        })
+        .await;
+        eventually("recovered markdown", || {
+            world.texts().iter().any(|t| t.contains("<b>saved answer</b>"))
+        })
+        .await;
+        assert_eq!(world.agents.prompts(), ["task"]);
+    }
+
+    #[tokio::test]
+    async fn last_result_is_saved_while_tool_message_delivery_is_stalled() {
+        let world = world(FakeAgents::scripted(vec![Script::Say(vec![
+            AgentEvent::ToolCall(hub_core::domain::ToolUse {
+                tool: "test".to_owned(),
+                summary: "working".to_owned(),
+            }),
+            AgentEvent::AssistantText("ready despite network".to_owned()),
+            finished(),
+        ])]));
+        let release = world.messenger.delay_next_send();
+        world.send(text(Some(7), 1, "task")).await;
+        eventually("pending network send", || !world.messenger.send_attempts().is_empty()).await;
+        eventually("saved before network release", || {
+            world.results.records.lock().unwrap().contains_key(&KEY)
+        })
+        .await;
+        assert!(world.texts().is_empty());
+        release.send(()).unwrap();
+        eventually("final delivered", || {
+            world.texts().iter().any(|t| t == "ready despite network")
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn last_result_keeps_the_final_group_and_survives_errors_empty_turns_and_reset() {
+        let world = world(FakeAgents::scripted(vec![Script::Say(vec![
+            AgentEvent::AssistantText("progress".to_owned()),
+            AgentEvent::ToolCall(hub_core::domain::ToolUse {
+                tool: "test".to_owned(),
+                summary: String::new(),
+            }),
+            AgentEvent::AssistantText("first".to_owned()),
+            AgentEvent::AssistantText("second".to_owned()),
+            finished(),
+            AgentEvent::AssistantText("incomplete".to_owned()),
+            AgentEvent::Failed("failed".to_owned()),
+            finished(),
+        ])]));
+        world.send(text(Some(7), 1, "task")).await;
+        eventually("success saved", || world.results.records.lock().unwrap().contains_key(&KEY))
+            .await;
+        eventually("failure shown", || world.texts().iter().any(|t| t.contains("failed"))).await;
+        eventually("idle", || !world.running()).await;
+        assert_eq!(
+            world.results.records.lock().unwrap().get(&KEY).unwrap().text(),
+            "first\n\nsecond"
+        );
+        world.send(text(Some(7), 2, "/reset")).await;
+        world.send(text(Some(7), 3, "/last")).await;
+        eventually("last after reset", || {
+            world.texts().iter().any(|t| t.contains("Последний сохранённый ответ"))
+        })
+        .await;
+        assert_eq!(world.agents.prompts(), ["task"]);
+    }
+
+    #[tokio::test]
+    async fn last_result_disk_failure_is_visible_and_does_not_suppress_the_answer() {
+        let world = world(FakeAgents::scripted(vec![Script::Say(vec![
+            AgentEvent::AssistantText("answer".to_owned()),
+            finished(),
+        ])]));
+        world.results.fail.store(true, Ordering::SeqCst);
+        world.send(text(Some(7), 1, "task")).await;
+        eventually("save failure", || {
+            world.texts().iter().any(|t| t.contains("не сохранён для /last: диск полон"))
+        })
+        .await;
+        eventually("answer delivered", || world.texts().iter().any(|t| t == "answer")).await;
+        assert!(world.results.records.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn last_result_rejects_stale_generation_and_unauthorized_reads() {
+        let world = world(FakeAgents::scripted(vec![Script::UntilStopped]));
+        world.send(text(Some(7), 1, "task")).await;
+        eventually("running", || world.running()).await;
+        let record = hub_core::results::SavedResult::new(
+            KEY,
+            "b".repeat(32),
+            1,
+            &TopicSession::fresh(
+                BackendKind::Claude,
+                AbsolutePath::new(world.root.path().to_path_buf()).unwrap(),
+            )
+            .with_session(SessionId::parse("s")),
+            "wrong".to_owned(),
+        )
+        .unwrap();
+        let (reply, rejected) = oneshot::channel();
+        world
+            .send(HubMessage::SaveResult(SaveResult { key: KEY, generation: 0, record, reply }))
+            .await;
+        assert!(rejected.await.unwrap().is_err());
+        assert!(world.results.records.lock().unwrap().is_empty());
+        let HubMessage::Inbound(mut incoming) = text(Some(7), 2, "/last") else {
+            panic!("inbound")
+        };
+        incoming.user = Some(UserId(999));
+        world.send(HubMessage::Inbound(incoming)).await;
+        world.send(text(Some(7), 3, "/status")).await;
+        eventually("status barrier", || !world.texts().is_empty()).await;
+        assert!(!world.texts().iter().any(|t| t.contains("Сохранённого ответа")));
+        world.send(HubMessage::Stop(KEY)).await;
+    }
+
+    #[tokio::test]
+    async fn last_result_reports_absence_without_starting_a_session() {
+        let world = world(FakeAgents::default());
+        world.send(text(Some(7), 1, "/last")).await;
+        eventually("empty last", || {
+            world.texts().iter().any(|t| t.contains("Сохранённого ответа в этой теме нет"))
+        })
+        .await;
+        assert!(world.agents.prompts().is_empty());
+        assert!(world.store.last().is_none());
+    }
+
+    #[tokio::test]
+    async fn last_result_oversize_and_stop_keep_the_previous_success() {
+        let huge = "x".repeat(hub_core::results::MAX_TEXT_BYTES + 1);
+        let world = world(FakeAgents::scripted(vec![
+            Script::Say(vec![
+                AgentEvent::AssistantText("kept".to_owned()),
+                finished(),
+                AgentEvent::AssistantText(huge),
+                finished(),
+            ]),
+            Script::UntilStopped,
+        ]));
+        world.send(text(Some(7), 1, "first task")).await;
+        eventually("oversize warning", || {
+            world.texts().iter().any(|t| t.contains("превышает 64 КиБ"))
+        })
+        .await;
+        eventually("idle", || !world.running()).await;
+        world.send(text(Some(7), 2, "second task")).await;
+        eventually("busy", || world.running()).await;
+        world.send(HubMessage::Stop(KEY)).await;
+        eventually("stopped", || world.texts().iter().any(|t| t == texts::STOPPED)).await;
+        assert_eq!(world.results.records.lock().unwrap().get(&KEY).unwrap().text(), "kept");
+    }
+
+    #[tokio::test]
+    async fn last_result_does_not_depend_on_delivery_queue_capacity() {
+        let mut events = (0..100)
+            .map(|n| {
+                AgentEvent::ToolCall(hub_core::domain::ToolUse {
+                    tool: "test".to_owned(),
+                    summary: n.to_string(),
+                })
+            })
+            .collect::<Vec<_>>();
+        events.extend([AgentEvent::AssistantText("stored after burst".to_owned()), finished()]);
+        let world = world(FakeAgents::scripted(vec![Script::Say(events)]));
+        let release = world.messenger.delay_next_send();
+        world.send(text(Some(7), 1, "task")).await;
+        eventually("saved despite burst", || {
+            world.results.records.lock().unwrap().contains_key(&KEY)
+        })
+        .await;
+        release.send(()).unwrap();
+        eventually("lost output warning", || {
+            world.texts().iter().any(|t| t.contains("переполнения очереди"))
+        })
+        .await;
+        assert_eq!(
+            world.results.records.lock().unwrap().get(&KEY).unwrap().text(),
+            "stored after burst"
+        );
+    }
+
+    #[tokio::test]
+    async fn last_result_oversize_answer_is_delivered_in_full_on_a_healthy_connection() {
+        let huge = "x".repeat(200_000);
+        let world = world(FakeAgents::scripted(vec![Script::Say(vec![
+            AgentEvent::AssistantText(huge.clone()),
+            finished(),
+        ])]));
+        world.send(text(Some(7), 1, "task")).await;
+        eventually("started", || !world.agents.prompts().is_empty()).await;
+        eventually("ended", || !world.running()).await;
+        let delivered: String = world
+            .texts()
+            .into_iter()
+            .filter(|text| text.bytes().all(|byte| byte == b'x'))
+            .collect();
+        assert_eq!(delivered.len(), huge.len());
+        assert!(world.results.records.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn last_result_large_output_keeps_markdown_formatting() {
+        let huge = format!("```rust\n{}\n```", "let x = 1;\n".repeat(20_000));
+        let expected = hub_core::markdown::markdown_to_html_chunks(
+            &huge,
+            hub_core::render::TELEGRAM_TEXT_LIMIT,
+        );
+        let world = world(FakeAgents::scripted(vec![Script::Say(vec![
+            AgentEvent::AssistantText(huge),
+            finished(),
+        ])]));
+        world.send(text(Some(7), 1, "task")).await;
+        eventually("started", || !world.agents.prompts().is_empty()).await;
+        eventually("ended", || !world.running()).await;
+        let actual: Vec<_> = world
+            .messenger
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::Send { message, .. } if message.format == Format::Html => Some(message.text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(actual, expected);
+        assert!(world.texts().iter().any(|text| text.contains("превышает 64 КиБ")));
+    }
+
+    #[tokio::test]
+    async fn last_result_is_rejected_when_stop_was_already_processed() {
+        let world = world(FakeAgents::scripted(vec![Script::UntilStopped]));
+        world.send(text(Some(7), 1, "task")).await;
+        eventually("busy", || world.running()).await;
+        let record = hub_core::results::SavedResult::new(
+            KEY,
+            "b".repeat(32),
+            1,
+            &TopicSession::fresh(
+                BackendKind::Claude,
+                AbsolutePath::new(world.root.path().to_path_buf()).unwrap(),
+            )
+            .with_session(SessionId::parse("s")),
+            "cancelled".to_owned(),
+        )
+        .unwrap();
+        let (reply, rejected) = oneshot::channel();
+        world.handle.mailbox.try_send(HubMessage::Stop(KEY)).unwrap();
+        world
+            .handle
+            .mailbox
+            .try_send(HubMessage::SaveResult(SaveResult { key: KEY, generation: 1, record, reply }))
+            .unwrap();
+        assert!(rejected.await.unwrap().is_err());
+        assert!(world.results.records.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -112,8 +112,17 @@ pub fn statuses(
 }
 
 pub struct TelegramConnector {
-    pub home: PathBuf,
-    pub topics: PathBuf,
+    home: PathBuf,
+    topics: PathBuf,
+    results: Arc<crate::results::FileResults>,
+}
+
+impl TelegramConnector {
+    #[must_use]
+    pub fn new(home: PathBuf, topics: PathBuf) -> Self {
+        let results = Arc::new(crate::results::FileResults::new(&topics));
+        Self { home, topics, results }
+    }
 }
 
 impl Connector for TelegramConnector {
@@ -158,6 +167,7 @@ impl Connector for TelegramConnector {
             let HubHandle { mailbox, views, registries: _registries, task } =
                 hub::spawn(HubSetup {
                     action_runner: Arc::new(LocalActionRunner),
+                    results: self.results.clone(),
                     doctor_runner: Arc::new(crate::doctor::LocalDoctor::new(self.home.clone())),
                     agents: Arc::new(HubAgents::new(settings.clone())),
                     messenger,
@@ -258,10 +268,8 @@ mod tests {
     #[tokio::test]
     async fn missing_workspace_root_stops_the_start() {
         let dir = tempfile::tempdir().unwrap();
-        let connector = TelegramConnector {
-            home: dir.path().to_path_buf(),
-            topics: dir.path().join("topics.json"),
-        };
+        let connector =
+            TelegramConnector::new(dir.path().to_path_buf(), dir.path().join("topics.json"));
         let error = connector.connect(settings(&dir.path().join("нет"))).await.err().unwrap();
         assert!(matches!(error, StartError::Workspace(_)));
     }
@@ -271,8 +279,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let topics = dir.path().join("topics.json");
         std::fs::write(&topics, "не json").unwrap();
-        let connector =
-            TelegramConnector { home: dir.path().to_path_buf(), topics: topics.clone() };
+        let connector = TelegramConnector::new(dir.path().to_path_buf(), topics.clone());
         let error = connector.connect(settings(dir.path())).await.err().unwrap();
         assert!(matches!(error, StartError::Topics(StoreError::Corrupt { .. })));
         assert!(error.to_string().contains("topics.json"));
@@ -383,10 +390,8 @@ mod tests {
     #[tokio::test]
     async fn a_missing_default_agent_stops_the_start() {
         let dir = tempfile::tempdir().unwrap();
-        let connector = TelegramConnector {
-            home: dir.path().to_path_buf(),
-            topics: dir.path().join("topics.json"),
-        };
+        let connector =
+            TelegramConnector::new(dir.path().to_path_buf(), dir.path().join("topics.json"));
         let settings = Draft {
             token: "1:a".to_owned(),
             chat: "-100".to_owned(),
@@ -427,10 +432,8 @@ mod tests {
     #[tokio::test]
     async fn a_missing_default_qwen_stops_the_start() {
         let dir = tempfile::tempdir().unwrap();
-        let connector = TelegramConnector {
-            home: dir.path().to_path_buf(),
-            topics: dir.path().join("topics.json"),
-        };
+        let connector =
+            TelegramConnector::new(dir.path().to_path_buf(), dir.path().join("topics.json"));
         let settings = Draft {
             token: "1:a".to_owned(),
             chat: "-100".to_owned(),

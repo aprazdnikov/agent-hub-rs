@@ -46,6 +46,7 @@ pub(crate) struct FakeMessenger {
     sends: Mutex<VecDeque<Result<(), SendError>>>,
     edits: Mutex<VecDeque<Result<(), SendError>>>,
     edit_delay: Mutex<Option<oneshot::Receiver<()>>>,
+    send_delay: Mutex<Option<oneshot::Receiver<()>>>,
     pub(crate) files: HashMap<String, Vec<u8>>,
     next: AtomicI32,
 }
@@ -74,6 +75,12 @@ impl FakeMessenger {
     pub(crate) fn delay_next_edit(&self) -> oneshot::Sender<()> {
         let (release, wait) = oneshot::channel();
         *self.edit_delay.lock().unwrap() = Some(wait);
+        release
+    }
+
+    pub fn delay_next_send(&self) -> oneshot::Sender<()> {
+        let (release, wait) = oneshot::channel();
+        *self.send_delay.lock().unwrap() = Some(wait);
         release
     }
 
@@ -111,12 +118,17 @@ impl Messenger for FakeMessenger {
     ) -> BoxFuture<'_, Result<MessageId, SendError>> {
         self.send_attempts.lock().unwrap().push(message.clone());
         let scripted = self.sends.lock().unwrap().pop_front().unwrap_or(Ok(()));
-        let result = scripted.map(|()| {
-            let id = MessageId(self.next.fetch_add(1, Ordering::SeqCst) + 1);
-            self.record(Call::Send { target, message, id });
-            id
-        });
-        Box::pin(async move { result })
+        let delay = self.send_delay.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some(delay) = delay {
+                let _ = delay.await;
+            }
+            scripted.map(|()| {
+                let id = MessageId(self.next.fetch_add(1, Ordering::SeqCst) + 1);
+                self.record(Call::Send { target, message, id });
+                id
+            })
+        })
     }
 
     fn edit(
@@ -204,5 +216,35 @@ impl crate::doctor::DoctorRunner for FakeDoctorRunner {
                 resources: vec![],
             })
         })
+    }
+}
+
+#[derive(Default)]
+pub struct MemoryResults {
+    pub records: std::sync::Mutex<
+        std::collections::HashMap<hub_core::domain::TopicKey, hub_core::results::SavedResult>,
+    >,
+    pub fail: std::sync::atomic::AtomicBool,
+}
+impl crate::results::ResultStore for MemoryResults {
+    fn save(
+        &self,
+        record: hub_core::results::SavedResult,
+    ) -> futures::future::BoxFuture<'static, Result<(), String>> {
+        let result = if self.fail.load(std::sync::atomic::Ordering::SeqCst) {
+            Err("диск полон".to_owned())
+        } else {
+            self.records.lock().unwrap().insert(record.key(), record);
+            Ok(())
+        };
+        Box::pin(std::future::ready(result))
+    }
+    fn load(
+        &self,
+        key: hub_core::domain::TopicKey,
+    ) -> futures::future::BoxFuture<'static, Result<Option<hub_core::results::SavedResult>, String>>
+    {
+        let record = self.records.lock().unwrap().get(&key).cloned();
+        Box::pin(std::future::ready(Ok(record)))
     }
 }
