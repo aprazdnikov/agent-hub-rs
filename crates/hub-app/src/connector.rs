@@ -155,6 +155,7 @@ impl Connector for TelegramConnector {
             }
             let HubHandle { mailbox, views, registries: _registries, task } =
                 hub::spawn(HubSetup {
+                    action_runner: Arc::new(LocalActionRunner),
                     agents: Arc::new(HubAgents::new(settings.clone())),
                     messenger,
                     settings,
@@ -172,6 +173,34 @@ impl Connector for TelegramConnector {
                 views,
                 stop: Box::new(move || Box::pin(shutdown(hub, listener, task))),
             })
+        })
+    }
+}
+
+struct LocalActionRunner;
+
+impl hub_telegram::actions::ActionRunner for LocalActionRunner {
+    fn run(
+        &self,
+        action: hub_core::actions::Action,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> BoxFuture<'static, String> {
+        Box::pin(async move {
+            let result = crate::actions::run(action.command(), action.cwd(), cancel).await;
+            let status = match result.status {
+                crate::actions::ProcessStatus::Completed(Some(0)) => {
+                    "✅ Команда завершена".to_owned()
+                }
+                crate::actions::ProcessStatus::Completed(Some(code)) => {
+                    format!("❌ Команда завершилась с кодом {code}")
+                }
+                crate::actions::ProcessStatus::Completed(None) => {
+                    "❌ Процесс завершён сигналом".to_owned()
+                }
+                crate::actions::ProcessStatus::Stopped => "⏹ Действие остановлено".to_owned(),
+                crate::actions::ProcessStatus::Failed(reason) => format!("❌ {reason}"),
+            };
+            format!("{status}\n\n{}\n{}", result.stdout, result.stderr).trim_end().to_owned()
         })
     }
 }

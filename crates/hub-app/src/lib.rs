@@ -1,3 +1,4 @@
+pub mod actions;
 pub mod atomic;
 pub mod config;
 pub mod connector;

@@ -9,6 +9,7 @@ use std::time::Duration;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+use crate::actions::{self, Action, ActionDraft};
 use crate::domain::{BackendKind, ChatId, UserId};
 use crate::workspace::expand_home;
 
@@ -290,6 +291,7 @@ pub struct Timeouts {
 /// Parsed settings. `workspace_root` is absolute; whether it exists is checked by the shell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
+    pub actions: Vec<Action>,
     pub telegram: TelegramSettings,
     pub workspace_root: PathBuf,
     pub snapshots_dir: PathBuf,
@@ -305,6 +307,7 @@ pub struct Settings {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
+    Actions,
     Token,
     Chat,
     Users,
@@ -465,6 +468,7 @@ impl OpencodeDraft {
 /// The settings form as typed by the user.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Draft {
+    pub actions: Vec<ActionDraft>,
     pub token: String,
     pub chat: String,
     pub users: String,
@@ -487,6 +491,7 @@ pub struct Draft {
 impl Default for Draft {
     fn default() -> Self {
         Self {
+            actions: Vec::new(),
             token: String::new(),
             chat: String::new(),
             users: String::new(),
@@ -511,6 +516,7 @@ impl Default for Draft {
 impl fmt::Debug for Draft {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
+            actions,
             token: _token,
             chat,
             users,
@@ -530,6 +536,7 @@ impl fmt::Debug for Draft {
             updates,
         } = self;
         f.debug_struct("Draft")
+            .field("actions", actions)
             .field("token", &"***")
             .field("chat", chat)
             .field("users", users)
@@ -555,6 +562,7 @@ impl Draft {
     /// Parses every field and reports all errors at once, in form order.
     pub fn parse(&self, home: &Path) -> Result<Settings, Vec<FieldError>> {
         let mut errors = Vec::new();
+        let actions = check(&mut errors, Field::Actions, actions::parse(&self.actions, home));
         let token = check(&mut errors, Field::Token, parse_token(&self.token));
         let chat = check(&mut errors, Field::Chat, parse_chat(&self.chat));
         let users = check(&mut errors, Field::Users, parse_users(&self.users));
@@ -629,6 +637,7 @@ impl Draft {
             return Err(errors);
         };
         Ok(Settings {
+            actions: actions.ok_or(errors)?,
             telegram: TelegramSettings { token, chat, users },
             workspace_root,
             snapshots_dir,
@@ -657,6 +666,7 @@ impl Draft {
     #[must_use]
     pub fn from_settings(settings: &Settings) -> Self {
         Self {
+            actions: settings.actions.iter().map(Action::to_draft).collect(),
             token: settings.telegram.token.expose().to_owned(),
             chat: settings.telegram.chat.0.to_string(),
             users: settings
@@ -894,6 +904,8 @@ fn parse_seconds(raw: &str) -> Result<Duration, String> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsFile {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub actions: Vec<ActionDraft>,
     pub telegram: TelegramFile,
     pub workspace: WorkspaceFile,
     #[serde(default)]
@@ -1022,6 +1034,7 @@ impl SettingsFile {
     /// readable by versions that do not know `[snapshots]`.
     pub fn from_settings(settings: &Settings, home: &Path) -> Self {
         Self {
+            actions: settings.actions.iter().map(Action::to_draft).collect(),
             telegram: TelegramFile {
                 chat: settings.telegram.chat.0,
                 users: settings.telegram.users.iter().map(|user| user.0).collect(),
@@ -1116,6 +1129,7 @@ impl SettingsFile {
         )?;
         let defaults = Draft::default();
         Ok(Draft {
+            actions: self.actions.clone(),
             token,
             chat: self.telegram.chat.to_string(),
             users: self.telegram.users.iter().map(u64::to_string).collect::<Vec<_>>().join(", "),
@@ -1204,6 +1218,22 @@ mod tests {
     }
 
     #[test]
+    fn custom_actions_round_trip_without_exposing_commands_in_debug() {
+        let raw = "[telegram]\nchat = -100\nusers = [1]\n[workspace]\nroot = \"~/Projects\"\n\
+                   [[actions]]\nid = \"vpn\"\nname = \"Рабочий VPN\"\ncommand = \"echo private-value\"\ncwd = \"~/vpn\"\n";
+        let file: SettingsFile = toml::from_str(raw).unwrap();
+        let keys =
+            || Keys { token: "1:a".to_owned(), api_key: String::new(), qwen_key: String::new() };
+        let draft = file.to_draft(keys()).unwrap();
+        let settings = draft.parse(&home()).unwrap();
+        let text = toml::to_string(&SettingsFile::from_settings(&settings, &home())).unwrap();
+        assert!(text.contains("private-value"));
+        assert!(!format!("{settings:?} {draft:?} {file:?}").contains("private-value"));
+        let restored: SettingsFile = toml::from_str(&text).unwrap();
+        assert_eq!(restored.to_draft(keys()).unwrap().parse(&home()).unwrap(), settings);
+    }
+
+    #[test]
     fn snapshots_live_in_agent_hub_under_home_by_default() {
         assert_eq!(draft().parse(&home()).unwrap().snapshots_dir, home().join(".agent-hub"));
     }
@@ -1244,6 +1274,7 @@ mod tests {
         let settings = draft().parse(&home()).unwrap();
         let text = toml::to_string(&SettingsFile::from_settings(&settings, &home())).unwrap();
         assert!(!text.contains("snapshots"), "{text}");
+        assert!(!text.contains("actions"), "empty actions should preserve old file shape: {text}");
         let file: SettingsFile = toml::from_str(&text).unwrap();
         let keys =
             Keys { token: "123:abc".to_owned(), api_key: String::new(), qwen_key: String::new() };

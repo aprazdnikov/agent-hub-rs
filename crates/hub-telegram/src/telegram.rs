@@ -198,10 +198,12 @@ impl Messenger for TelegramMessenger {
                     .bot
                     .send_message(tg::ChatId(key.chat.0), text)
                     .message_thread_id(thread(key)),
-                Target::Reply { chat, message } => self
-                    .bot
-                    .send_message(tg::ChatId(chat.0), text)
-                    .reply_parameters(ReplyParameters::new(tg::MessageId(message.0))),
+                Target::Reply { chat, message } => {
+                    self.bot.send_message(tg::ChatId(chat.0), text).reply_parameters(
+                        ReplyParameters::new(tg::MessageId(message.0))
+                            .allow_sending_without_reply(),
+                    )
+                }
             };
             let request = match format {
                 Format::Html => request.parse_mode(ParseMode::Html),
@@ -393,6 +395,52 @@ mod tests {
     use serde_json::json;
 
     use super::*;
+
+    #[tokio::test]
+    async fn result_can_be_sent_after_original_command_message_is_deleted() {
+        use http_body_util::{BodyExt, Full};
+        use hyper::body::Bytes;
+        use hyper_util::rt::TokioIo;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(
+                |request: hyper::Request<hyper::body::Incoming>| async move {
+                    let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                    let params: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    let allowed = params
+                        .get("reply_parameters")
+                        .and_then(|p| p.get("allow_sending_without_reply"))
+                        .and_then(serde_json::Value::as_bool)
+                        == Some(true);
+                    let body = if allowed {
+                        json!({"ok": true, "result": {"message_id": 2, "date": 0, "chat": {"id": -100, "type": "supergroup"}, "text": "done"}})
+                    } else {
+                        json!({"ok": false, "error_code": 400, "description": "Bad Request: message to be replied not found"})
+                    };
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(Bytes::from(
+                        body.to_string(),
+                    ))))
+                },
+            );
+            hyper::server::conn::http1::Builder::new()
+                .keep_alive(false)
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        });
+        let bot = Bot::new("1:test").set_api_url(format!("http://{address}/").parse().unwrap());
+        let messenger = TelegramMessenger { files: bot.clone(), bot };
+        let result = messenger
+            .send(
+                Target::Reply { chat: ChatId(-100), message: MessageId(1) },
+                Outgoing::plain("done".to_owned()),
+            )
+            .await;
+        assert_eq!(result, Ok(MessageId(2)));
+        server.await.unwrap();
+    }
 
     fn message(extra: &serde_json::Value) -> Message {
         let mut base = json!({

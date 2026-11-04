@@ -5,6 +5,7 @@ use crate::snapshot::{NameError, SnapshotName};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
+    Actions,
     Help,
     New,
     Cwd,
@@ -19,7 +20,7 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::New,
         Self::Backend,
         Self::Cwd,
@@ -27,6 +28,7 @@ impl Command {
         Self::Stop,
         Self::Status,
         Self::Limits,
+        Self::Actions,
         Self::Save,
         Self::Saves,
         Self::Restore,
@@ -36,6 +38,7 @@ impl Command {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Actions => "actions",
             Self::Help => "help",
             Self::New => "new",
             Self::Cwd => "cwd",
@@ -53,6 +56,7 @@ impl Command {
     #[must_use]
     pub const fn description(self) -> &'static str {
         match self {
+            Self::Actions => "запуск и остановка пользовательских действий",
             Self::Help => "эта справка",
             Self::New => "новая сессия в этой теме (сброс контекста)",
             Self::Cwd => "сменить рабочую директорию (сброс контекста)",
@@ -75,7 +79,13 @@ impl Command {
             Self::Cwd => " <путь>",
             Self::Save => " [имя]",
             Self::Restore => " <имя> [каталог]",
-            Self::Help | Self::Reset | Self::Stop | Self::Status | Self::Saves | Self::Limits => "",
+            Self::Help
+            | Self::Reset
+            | Self::Stop
+            | Self::Status
+            | Self::Saves
+            | Self::Limits
+            | Self::Actions => "",
         }
     }
 
@@ -212,6 +222,12 @@ mod tests {
     use crate::snapshot::{NameError, SnapshotName};
 
     #[test]
+    fn actions_are_registered_in_the_command_menu() {
+        assert!(matches!(parse_input("/actions", "bot"), Input::Command { .. }));
+        assert!(Command::ALL.iter().any(|command| command.name() == "actions"));
+    }
+
+    #[test]
     fn menu_registry_is_unique_valid_and_parsed() {
         let mut names = std::collections::HashSet::new();
         for command in Command::ALL {
@@ -222,7 +238,7 @@ mod tests {
             assert!((1..=256).contains(&command.description().chars().count()));
             assert_eq!(Command::parse(name), Some(command));
         }
-        assert_eq!(names.len(), 11);
+        assert_eq!(names.len(), 12);
     }
 
     #[test]
@@ -231,8 +247,8 @@ mod tests {
         assert_eq!(
             names,
             [
-                "new", "backend", "cwd", "reset", "stop", "status", "limits", "save", "saves",
-                "restore", "help"
+                "new", "backend", "cwd", "reset", "stop", "status", "limits", "actions", "save",
+                "saves", "restore", "help"
             ]
         );
     }

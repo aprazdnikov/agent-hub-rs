@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
+use hub_core::actions::{ActionDraft, MAX_ACTIONS};
 use hub_core::domain::BackendKind;
 use hub_core::settings::{
     ApiEndpoint, Approval, CodexField, Draft, Field, FieldError, HermesField, OpencodeField,
@@ -122,6 +123,8 @@ impl SettingsForm {
             ui.separator();
             self.workspace(ui, &errors);
             ui.separator();
+            self.actions(ui, &errors);
+            ui.separator();
             self.agent(ui, &errors);
             ui.separator();
             self.codex(ui, &errors);
@@ -137,9 +140,71 @@ impl SettingsForm {
         self.confirm(ui.ctx(), sessions, send);
     }
 
+    fn actions(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
+        ui.heading("Действия");
+        ui.label("Назовите команду и запускайте её кнопкой через /actions в Telegram.");
+        ui.label("Команды выполняются от вашего пользователя. Без ввода пароля и терминала; вывод отправляется в группу.");
+        ui.label("Постоянные команды работают до остановки. Остановка бота или выход из приложения останавливает их.");
+        ui.label(if cfg!(windows) {
+            "Оболочка: cmd.exe /D /S /C"
+        } else {
+            "Оболочка: /bin/sh -c"
+        });
+        let mut remove = None;
+        for (index, action) in self.draft.actions.iter_mut().enumerate() {
+            ui.push_id(index, |ui| {
+                ui.group(|ui| {
+                    ui.horizontal(|ui| {
+                        ui.label("Название");
+                        ui.text_edit_singleline(&mut action.name);
+                        if ui.button("Удалить").clicked() {
+                            remove = Some(index);
+                        }
+                    });
+                    ui.label("Команда");
+                    ui.add(
+                        egui::TextEdit::multiline(&mut action.command)
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY),
+                    );
+                    ui.horizontal(|ui| {
+                        ui.label("Каталог");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut action.cwd)
+                                .hint_text("пусто — домашний каталог"),
+                        );
+                        if ui.button("Выбрать…").clicked()
+                            && let Some(path) = pick_folder(&action.cwd)
+                        {
+                            action.cwd = path;
+                        }
+                    });
+                });
+            });
+        }
+        if let Some(index) = remove {
+            self.draft.actions.remove(index);
+        }
+        if ui
+            .add_enabled(
+                self.draft.actions.len() < MAX_ACTIONS,
+                egui::Button::new("Добавить действие"),
+            )
+            .clicked()
+        {
+            let id = (1..=MAX_ACTIONS + 1)
+                .map(|index| format!("action-{index}"))
+                .find(|id| !self.draft.actions.iter().any(|action| action.id == *id));
+            if let Some(id) = id {
+                self.draft.actions.push(ActionDraft { id, ..ActionDraft::default() });
+            }
+        }
+        messages(ui, errors, Field::Actions);
+    }
+
     fn telegram(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
         ui.heading("Telegram");
-        ui.label("Изменение этих полей перезапускает бота и прерывает работающие сессии.");
+        ui.label("Изменение этих полей перезапускает бота и останавливает сессии и пользовательские действия.");
         ui.horizontal(|ui| {
             ui.label("Токен бота");
             ui.add(
@@ -492,6 +557,76 @@ mod tests {
     use rstest::rstest;
 
     #[test]
+    fn action_rows_can_be_added_and_removed() {
+        fn draw(
+            ctx: &egui::Context,
+            form: &mut SettingsForm,
+            events: Vec<egui::Event>,
+        ) -> egui::FullOutput {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(960.0, 1200.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    egui::CentralPanel::default().show(ui, |ui| form.actions(ui, &[]));
+                },
+            );
+            output.textures_delta.clear();
+            output
+        }
+        fn click(ctx: &egui::Context, form: &mut SettingsForm, label: &str) {
+            let output = draw(ctx, form, Vec::new());
+            let position = output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape
+                        && text.galley.text() == label
+                    {
+                        Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            for pressed in [true, false] {
+                draw(
+                    ctx,
+                    form,
+                    vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                );
+            }
+        }
+        let ctx = egui::Context::default();
+        let mut form = SettingsForm::default();
+        click(&ctx, &mut form, "Добавить действие");
+        click(&ctx, &mut form, "Добавить действие");
+        assert_eq!(form.draft.actions.len(), 2);
+        let ids = form
+            .draft
+            .actions
+            .iter()
+            .map(|action| &action.id)
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(ids.len(), 2);
+        click(&ctx, &mut form, "Удалить");
+        assert_eq!(form.draft.actions.len(), 1);
+    }
+
+    #[test]
     fn snapshots_directory_is_visible() {
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 4000.0));
@@ -546,6 +681,12 @@ mod tests {
             chat: "0".to_owned(),
             users: "1".to_owned(),
             workspace_root: home.display().to_string(),
+            actions: vec![ActionDraft {
+                id: "vpn".to_owned(),
+                name: "Рабочий VPN".to_owned(),
+                command: "echo test".to_owned(),
+                cwd: String::new(),
+            }],
             ..Draft::default()
         };
         let mut form = SettingsForm::default();
@@ -592,7 +733,9 @@ mod tests {
                 },
             ]);
         }
-        assert!(matches!(commands.as_slice(), [Command::Save(saved)] if saved.chat == "-100"));
+        assert!(
+            matches!(commands.as_slice(), [Command::Save(saved)] if saved.chat == "-100" && saved.actions == draft.actions)
+        );
     }
 
     #[rstest]

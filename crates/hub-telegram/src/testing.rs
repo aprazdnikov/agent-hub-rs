@@ -13,6 +13,22 @@ use tokio::sync::oneshot;
 
 use crate::messenger::{Format, Messenger, Outgoing, SendError, Target};
 
+#[derive(Default)]
+pub(crate) struct FakeActionRunner;
+
+impl crate::actions::ActionRunner for FakeActionRunner {
+    fn run(
+        &self,
+        _action: hub_core::actions::Action,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> BoxFuture<'static, String> {
+        Box::pin(async move {
+            cancel.cancelled().await;
+            "⏹ Остановлено".to_owned()
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Call {
     Send { target: Target, message: Outgoing, id: MessageId },

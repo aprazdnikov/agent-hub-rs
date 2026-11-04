@@ -28,6 +28,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
 use tokio_util::sync::CancellationToken;
 
+use crate::actions::{self, ActionRunner, Actions};
 use crate::channel::{Shared, lock};
 use crate::download::download;
 use crate::inbound::{Content, Inbound, Press, Turn};
@@ -90,6 +91,7 @@ pub struct TopicView {
 }
 
 pub enum HubMessage {
+    ActionDone(actions::Done),
     Inbound(Inbound),
     Press(Press),
     /// A prompt whose attachments finished downloading.
@@ -134,6 +136,7 @@ struct Polled {
 }
 
 pub struct HubSetup<A> {
+    pub action_runner: Arc<dyn ActionRunner>,
     pub agents: Arc<A>,
     pub messenger: Arc<dyn Messenger>,
     pub settings: watch::Receiver<Arc<Settings>>,
@@ -158,6 +161,7 @@ struct Live {
 }
 
 struct Hub<A> {
+    actions: Actions,
     agents: Arc<A>,
     sender: Sender,
     registries: Shared,
@@ -188,11 +192,12 @@ struct Hub<A> {
 
 #[must_use]
 pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
-    let HubSetup { agents, messenger, settings, topics, store, home, bot } = setup;
+    let HubSetup { agents, action_runner, messenger, settings, topics, store, home, bot } = setup;
     let (mailbox, inbox) = mpsc::channel(MAILBOX);
     let (views, watched) = watch::channel(Vec::new());
     let registries = Shared::default();
     let hub = Hub {
+        actions: Actions::new(action_runner),
         agents,
         sender: Sender::new(messenger),
         registries: Arc::clone(&registries),
@@ -229,7 +234,7 @@ impl<A: Agents> Hub<A> {
             };
             let Some(message) = message else { break };
             self.handle(message);
-            if self.shutdown.is_some() && self.running.is_empty() {
+            if self.shutdown.is_some() && self.running.is_empty() && self.actions.is_idle() {
                 break;
             }
         }
@@ -241,13 +246,23 @@ impl<A: Agents> Hub<A> {
 
     fn handle(&mut self, message: HubMessage) {
         match message {
+            HubMessage::ActionDone(done) => self.actions.complete(done, self.sender.clone()),
             HubMessage::Inbound(inbound) => {
                 if self.shutdown.is_none() {
                     self.inbound(inbound);
                 }
             }
             HubMessage::Press(pressed) => {
-                if pressed.data == limits::REFRESH {
+                if pressed.data.starts_with(actions::PREFIX) {
+                    if self.shutdown.is_none() {
+                        self.actions.press(
+                            pressed,
+                            &self.settings.borrow(),
+                            self.sender.clone(),
+                            self.mailbox.clone(),
+                        );
+                    }
+                } else if pressed.data == limits::REFRESH {
                     self.refresh(pressed);
                 } else {
                     tokio::spawn(press::handle(
@@ -284,6 +299,7 @@ impl<A: Agents> Hub<A> {
             }
             HubMessage::Snapshot(SnapshotDone(done)) => self.snapshot_done(done),
             HubMessage::Shutdown(done) => {
+                self.actions.shutdown();
                 for live in self.running.values() {
                     live.cancel.cancel();
                 }
@@ -341,6 +357,9 @@ impl<A: Agents> Hub<A> {
                 Input::Command { command: Command::Limits, .. } => {
                     self.limits(target, inbound.chat);
                 }
+                Input::Command { command: Command::Actions, .. } => {
+                    self.actions.menu(&self.settings.borrow().actions, target, self.sender.clone());
+                }
                 Input::Command { .. } | Input::Text => {
                     self.say(target, texts::CREATE_TOPIC.to_owned());
                 }
@@ -376,6 +395,11 @@ impl<A: Agents> Hub<A> {
         args: &[&str],
     ) {
         match command {
+            Command::Actions => self.actions.menu(
+                &self.settings.borrow().actions,
+                Target::Topic(key),
+                self.sender.clone(),
+            ),
             Command::Help => {
                 let root = self.settings.borrow().workspace_root.clone();
                 self.say(Target::Reply { chat, message }, texts::help(&root));
@@ -1310,6 +1334,7 @@ mod tests {
         let agents = Arc::new(agents);
         let store = MemoryStore::default();
         let handle = spawn(HubSetup {
+            action_runner: Arc::new(crate::testing::FakeActionRunner),
             agents: Arc::clone(&agents),
             messenger: Arc::clone(&messenger) as Arc<dyn Messenger>,
             settings,
@@ -1352,6 +1377,62 @@ mod tests {
             usage: Usage::Claude { turns: 1, cost: None },
             background: 0,
         })
+    }
+
+    #[tokio::test]
+    async fn actions_work_in_general_and_topic_without_starting_an_agent() {
+        let world = world(FakeAgents::default());
+        let mut settings = (**world.settings.borrow()).clone();
+        settings.actions = hub_core::actions::parse(
+            &[hub_core::actions::ActionDraft {
+                id: "vpn".to_owned(),
+                name: "Рабочий VPN".to_owned(),
+                command: "echo test".to_owned(),
+                cwd: String::new(),
+            }],
+            world.root.path(),
+        )
+        .unwrap();
+        world.settings.send_replace(Arc::new(settings));
+        world.send(text(None, 1, "/actions")).await;
+        eventually("general actions", || world.messenger.last_keyboard().is_some()).await;
+        let data = world
+            .messenger
+            .last_keyboard()
+            .unwrap()
+            .1
+            .first()
+            .unwrap()
+            .first()
+            .unwrap()
+            .data
+            .clone();
+        world
+            .send(HubMessage::Press(Press {
+                callback: "start-action".to_owned(),
+                user: UserId(1),
+                chat: Some(ChatId(-100)),
+                message: Some(MessageId(1)),
+                html: None,
+                data,
+            }))
+            .await;
+        eventually("started action", || {
+            world.texts().iter().any(|text| text.contains("запуск команды"))
+        })
+        .await;
+        world.send(text(Some(7), 2, "/actions")).await;
+        eventually("topic action can stop", || {
+            world.messenger.last_keyboard().is_some_and(|(_, rows)| {
+                rows.iter().flatten().any(|button| button.text.starts_with('⏹'))
+            })
+        })
+        .await;
+        assert!(world.agents.prompts().is_empty());
+        let (done, stopped) = oneshot::channel();
+        world.send(HubMessage::Shutdown(done)).await;
+        tokio::time::timeout(Duration::from_secs(2), stopped).await.unwrap().unwrap();
+        world.handle.task.await.unwrap();
     }
 
     #[tokio::test]

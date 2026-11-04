@@ -482,7 +482,8 @@ mod tests {
                             HubMessage::Reset(key) => {
                                 format!("reset {}/{}", key.chat.0, key.thread.0)
                             }
-                            HubMessage::Inbound(_)
+                            HubMessage::ActionDone(_)
+                            | HubMessage::Inbound(_)
                             | HubMessage::Press(_)
                             | HubMessage::Deliver { .. }
                             | HubMessage::FlushAlbum(_)

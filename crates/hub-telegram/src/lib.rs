@@ -1,3 +1,4 @@
+pub mod actions;
 pub mod agents;
 pub mod channel;
 pub mod download;
