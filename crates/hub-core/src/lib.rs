@@ -14,6 +14,7 @@ pub mod quota;
 pub mod render;
 pub mod settings;
 pub mod snapshot;
+pub mod speech;
 pub mod topics;
 pub mod workspace;
 

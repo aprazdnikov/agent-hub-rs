@@ -24,7 +24,7 @@ hub-core.workspace = true
 hub-telegram.workspace = true
 keyring.workspace = true
 process-wrap = { version = "10.0.1", default-features = false, features = ["tokio1", "process-group", "job-object", "kill-on-drop", "creation-flags"] }
-reqwest.workspace = true
+reqwest = { workspace = true, features = ["multipart"] }
 rfd.workspace = true
 self-replace.workspace = true
 serde.workspace = true

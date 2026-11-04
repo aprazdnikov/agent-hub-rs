@@ -105,6 +105,7 @@ pub struct TopicView {
 }
 
 pub enum HubMessage {
+    VoiceDone(crate::voice::Done),
     SaveResult(SaveResult),
     LastDone(TopicKey),
     ActionDone(actions::Done),
@@ -155,6 +156,7 @@ struct Polled {
 }
 
 pub struct HubSetup<A> {
+    pub transcriber: Arc<dyn crate::transcription::Transcriber>,
     pub results: Arc<dyn ResultStore>,
     pub action_runner: Arc<dyn ActionRunner>,
     pub doctor_runner: Arc<dyn DoctorRunner>,
@@ -187,6 +189,7 @@ struct Live {
 }
 
 struct Hub<A> {
+    voices: crate::voice::Voices,
     cards: crate::progress_card::Cards,
     results: LastResults,
     outbox: Outbox,
@@ -226,6 +229,7 @@ struct Hub<A> {
 #[must_use]
 pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
     let HubSetup {
+        transcriber,
         results,
         agents,
         action_runner,
@@ -243,6 +247,11 @@ pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
     let (views, watched) = watch::channel(Vec::new());
     let registries = Shared::default();
     let hub = Hub {
+        voices: crate::voice::Voices::new(
+            transcriber,
+            Sender::new(messenger.clone()),
+            mailbox.clone(),
+        ),
         cards: crate::progress_card::Cards::default(),
         outbox: Outbox::new(results.clone(), Sender::new(messenger.clone()), settings.clone()),
         results: LastResults::new(results),
@@ -285,12 +294,14 @@ impl<A: Agents> Hub<A> {
             let deadline = self.shutdown.as_ref().map(|(_, at)| *at);
             let message = tokio::select! {
                 message = mailbox.recv() => message,
-                _ = refresh.tick(), if !self.running.is_empty() => {
+                _ = refresh.tick(), if !self.running.is_empty() || !self.voices.is_empty() => {
+                    self.voices.refresh(&self.settings.borrow(), &self.topics);
                     self.publish();
                     continue;
                 }
                 changed = self.settings.changed() => {
                     if changed.is_err() { break; }
+                    self.voices.refresh(&self.settings.borrow(), &self.topics);
                     self.publish();
                     continue;
                 }
@@ -309,7 +320,14 @@ impl<A: Agents> Hub<A> {
     }
 
     fn press(&mut self, pressed: Press) {
-        if pressed.data.starts_with(crate::progress_card::PREFIX) {
+        if pressed.data.starts_with(crate::voice::PREFIX) {
+            if self.shutdown.is_none() {
+                let confirmed = self.voices.press(pressed, &self.settings.borrow(), &self.topics);
+                if let Some((key, text)) = confirmed {
+                    self.start_turn(key, Turn::text(text));
+                }
+            }
+        } else if pressed.data.starts_with(crate::progress_card::PREFIX) {
             if self.shutdown.is_none() {
                 let key = crate::progress_card::target(&pressed, &self.settings.borrow().telegram);
                 let stopped = key.is_some_and(|key| {
@@ -368,6 +386,9 @@ impl<A: Agents> Hub<A> {
 
     fn handle(&mut self, message: HubMessage) {
         match message {
+            HubMessage::VoiceDone(done) => {
+                self.voices.complete(done, &self.settings.borrow(), &self.topics);
+            }
             HubMessage::LastDone(key) => self.results.complete(key),
             HubMessage::SaveResult(saved) => self.save_result(saved),
             HubMessage::DoctorDone(done) => self.doctors.complete(
@@ -414,6 +435,7 @@ impl<A: Agents> Hub<A> {
             }
             HubMessage::Snapshot(SnapshotDone(done)) => self.snapshot_done(done),
             HubMessage::Shutdown(done) => {
+                self.voices.shutdown();
                 self.cards.shutdown();
                 self.actions.shutdown();
                 self.doctors.shutdown();
@@ -451,6 +473,10 @@ impl<A: Agents> Hub<A> {
     }
 
     fn inbound(&mut self, inbound: Inbound) {
+        self.voices.refresh(&self.settings.borrow(), &self.topics);
+        if self.voices.correction(&inbound) {
+            return;
+        }
         let Some(key) = inbound.key() else {
             self.outside_topic(inbound);
             return;
@@ -501,7 +527,20 @@ impl<A: Agents> Hub<A> {
             Content::Media { .. } => {
                 self.start_turn(key, Turn::from_parts(std::slice::from_ref(&inbound)));
             }
-            Content::Voice => self.say(Target::Topic(key), texts::VOICE_UNSUPPORTED.to_owned()),
+            Content::Voice { .. } => {
+                if self.snapshotting.contains(&key)
+                    || self.topics.get(&key).is_some_and(|session| self.is_reserved(session))
+                {
+                    self.say(Target::Topic(key), texts::SNAPSHOT_BUSY.to_owned());
+                } else {
+                    self.voices.start(
+                        &inbound,
+                        self.settings.borrow().clone(),
+                        self.topics.get(&key).cloned(),
+                    );
+                }
+            }
+            Content::VideoNote => self.say(Target::Topic(key), texts::VIDEO_UNSUPPORTED.to_owned()),
             Content::Ignored => {}
         }
     }
@@ -525,7 +564,7 @@ impl<A: Agents> Hub<A> {
                 }
                 Input::Unknown => {}
             },
-            Content::Media { .. } | Content::Voice => {
+            Content::Media { .. } | Content::Voice { .. } | Content::VideoNote => {
                 self.say(target, texts::CREATE_TOPIC.to_owned());
             }
             Content::TopicCreated { .. } | Content::TopicRenamed { .. } | Content::Ignored => {}
@@ -1083,6 +1122,16 @@ impl<A: Agents> Hub<A> {
         }
         // The hub handles one message at a time: nothing else sees the session in between.
         if reply.send(true).is_ok() {
+            // Import can change history without changing the session identity, and can
+            // fail after touching files. Discard drafts before granting that write.
+            self.voices.invalidate(key);
+            for (topic, session) in &self.topics {
+                if session.backend == reservation.0
+                    && session.session.as_ref() == Some(&reservation.1)
+                {
+                    self.voices.invalidate(*topic);
+                }
+            }
             self.reserved.insert(reservation, key);
         } else {
             // The job vanished (runtime shutting down): it will not report back.
@@ -1093,6 +1142,7 @@ impl<A: Agents> Hub<A> {
     /// One session, one topic: every other holder is reset and `key` bound, persisted as one
     /// save; only a successful save changes the hub's bindings and tells the topics.
     fn rebind(&mut self, key: TopicKey, restoration: Restoration) {
+        self.voices.invalidate(key);
         let Restoration { name, session, imported } = restoration;
         let holders = holders(&self.topics, key, &session);
         let involved = || std::iter::once(&key).chain(&holders);
@@ -1134,6 +1184,7 @@ impl<A: Agents> Hub<A> {
         self.options.invalidate(key);
         self.say(Target::Topic(key), texts::restored(&name, &session));
         for holder in holders {
+            self.voices.invalidate(holder);
             self.last_progress.remove(&holder);
             self.projects.invalidate(holder);
             self.options.invalidate(holder);
@@ -1154,6 +1205,7 @@ impl<A: Agents> Hub<A> {
     }
 
     fn put(&mut self, key: TopicKey, session: TopicSession) {
+        self.voices.invalidate(key);
         if !self.running.contains_key(&key) {
             self.last_progress.remove(&key);
         }
@@ -1819,6 +1871,36 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TestTranscriber {
+        calls: AtomicUsize,
+        hanging: AtomicBool,
+        result: StdMutex<Option<Result<String, crate::transcription::SpeechError>>>,
+    }
+
+    impl crate::transcription::Transcriber for TestTranscriber {
+        fn transcribe(
+            &self,
+            _settings: hub_core::speech::SpeechSettings,
+            _audio: Vec<u8>,
+            cancel: CancellationToken,
+        ) -> futures::future::BoxFuture<'_, Result<String, crate::transcription::SpeechError>>
+        {
+            Box::pin(async move {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                if self.hanging.load(Ordering::SeqCst) {
+                    cancel.cancelled().await;
+                    return Err(crate::transcription::SpeechError::Cancelled);
+                }
+                self.result
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .unwrap_or_else(|| Ok("Проверь сборку проекта".to_owned()))
+            })
+        }
+    }
+
     struct World {
         handle: HubHandle,
         messenger: Arc<FakeMessenger>,
@@ -1826,6 +1908,7 @@ mod tests {
         store: MemoryStore,
         results: Arc<crate::testing::MemoryResults>,
         settings: watch::Sender<Arc<Settings>>,
+        transcriber: Arc<TestTranscriber>,
         root: tempfile::TempDir,
     }
 
@@ -1839,6 +1922,7 @@ mod tests {
                 results: self.results.clone(),
                 action_runner: Arc::new(crate::testing::FakeActionRunner),
                 doctor_runner: Arc::new(crate::testing::FakeDoctorRunner),
+                transcriber: self.transcriber.clone(),
                 agents: Arc::clone(&self.agents),
                 messenger: self.messenger.clone(),
                 settings: self.settings.subscribe(),
@@ -1897,7 +1981,9 @@ mod tests {
         let agents = Arc::new(agents);
         let store = MemoryStore::default();
         let results = Arc::new(crate::testing::MemoryResults::default());
+        let transcriber = Arc::new(TestTranscriber::default());
         let handle = spawn(HubSetup {
+            transcriber: transcriber.clone(),
             results: results.clone(),
             action_runner: Arc::new(crate::testing::FakeActionRunner),
             doctor_runner: Arc::new(crate::testing::FakeDoctorRunner),
@@ -1911,7 +1997,16 @@ mod tests {
             home: std::env::temp_dir(),
             bot: "agent_hub_bot".to_owned(),
         });
-        World { handle, messenger, agents, store, results, settings: settings_tx, root }
+        World {
+            handle,
+            messenger,
+            agents,
+            store,
+            results,
+            settings: settings_tx,
+            root,
+            transcriber,
+        }
     }
 
     fn inbound(thread: Option<i32>, message: i32, content: Content) -> HubMessage {
@@ -1921,6 +2016,8 @@ mod tests {
             user: Some(UserId(1)),
             message: MessageId(message),
             album: None,
+            reply_to: None,
+            voice_reply: false,
             content,
         })
     }
@@ -3648,8 +3745,355 @@ mod tests {
     #[tokio::test]
     async fn voice_gets_a_hint() {
         let world = world(FakeAgents::default());
-        world.send(inbound(Some(7), 1, Content::Voice)).await;
-        eventually("hint", || world.texts().contains(&texts::VOICE_UNSUPPORTED.to_owned())).await;
+        world.send(inbound(Some(7), 1, Content::VideoNote)).await;
+        eventually("hint", || world.texts().contains(&texts::VIDEO_UNSUPPORTED.to_owned())).await;
+    }
+
+    fn voice_world() -> World {
+        let mut messenger = FakeMessenger::default();
+        messenger.files.insert("voice".to_owned(), vec![1, 2, 3]);
+        let world = world_with(FakeAgents::default(), messenger);
+        world.settings.send_modify(|settings| {
+            Arc::make_mut(settings).speech.provider = hub_core::speech::SpeechProvider::Local;
+        });
+        world
+    }
+
+    fn voice_message(thread: i32) -> HubMessage {
+        inbound(
+            Some(thread),
+            21,
+            Content::Voice {
+                file: FileRef { id: "voice".to_owned(), name: None, size: Some(3) },
+                duration: Duration::from_secs(10),
+            },
+        )
+    }
+
+    fn voice_button(world: &World, label: &str) -> Option<(MessageId, String)> {
+        world.messenger.calls().into_iter().rev().find_map(|call| {
+            let (id, card) = match call {
+                Call::Send { message, id, .. } => (id, message),
+                Call::EditCard { message, card, .. } => (message, card),
+                _ => return None,
+            };
+            card.keyboard
+                .into_iter()
+                .flatten()
+                .find(|button| button.text == label)
+                .map(|button| (id, button.data))
+        })
+    }
+
+    async fn voice_preview(world: &World) -> (MessageId, String) {
+        eventually("voice preview", || voice_button(world, "Отправить").is_some()).await;
+        voice_button(world, "Отправить").unwrap()
+    }
+
+    async fn voice_click(world: &World, label: &str) {
+        let (message, data) = voice_button(world, label).unwrap();
+        world.send(press(label, message.0, &data)).await;
+    }
+
+    fn correction(prompt: MessageId, user: u64, text: &str) -> HubMessage {
+        HubMessage::Inbound(Inbound {
+            chat: KEY.chat,
+            thread: Some(KEY.thread),
+            user: Some(UserId(user)),
+            message: MessageId(55),
+            album: None,
+            reply_to: Some(prompt),
+            voice_reply: true,
+            content: Content::Text(text.to_owned()),
+        })
+    }
+
+    #[tokio::test]
+    async fn voice_only_starts_after_author_confirmation_and_only_once() {
+        let world = voice_world();
+        world.send(voice_message(7)).await;
+        let (message, data) = voice_preview(&world).await;
+        assert!(world.agents.prompts().is_empty());
+        assert!(world.store.last().unwrap_or_default().is_empty());
+        let forged = Press {
+            callback: "wrong-user".to_owned(),
+            user: UserId(2),
+            chat: Some(KEY.chat),
+            message: Some(message),
+            html: None,
+            data: data.clone(),
+        };
+        world.send(HubMessage::Press(forged)).await;
+        eventually("author check", || {
+            world.messenger.calls().iter().any(
+                |call| matches!(call, Call::Answer { callback, .. } if callback == "wrong-user"),
+            )
+        })
+        .await;
+        assert!(world.agents.prompts().is_empty());
+        for _ in 0..2 {
+            world.send(press("send", message.0, &data)).await;
+        }
+        eventually("confirmed prompt", || world.agents.prompts() == ["Проверь сборку проекта"])
+            .await;
+        eventually("duplicate answered", || {
+            world
+                .messenger
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, Call::Answer { callback, .. } if callback == "send"))
+                .count()
+                == 2
+        })
+        .await;
+        assert_eq!(world.agents.prompts(), ["Проверь сборку проекта"]);
+    }
+
+    #[tokio::test]
+    async fn voice_confirmation_checks_chat_and_message() {
+        let world = voice_world();
+        world.send(voice_message(7)).await;
+        let (message, data) = voice_preview(&world).await;
+        for (chat, message) in [(ChatId(-101), message), (KEY.chat, MessageId(10000))] {
+            world
+                .send(HubMessage::Press(Press {
+                    callback: "forged".to_owned(),
+                    user: UserId(1),
+                    chat: Some(chat),
+                    message: Some(message),
+                    html: None,
+                    data: data.clone(),
+                }))
+                .await;
+        }
+        eventually("forged checks", || {
+            world
+                .messenger
+                .calls()
+                .iter()
+                .filter(
+                    |call| matches!(call, Call::Answer { callback, .. } if callback == "forged"),
+                )
+                .count()
+                == 2
+        })
+        .await;
+        assert!(world.agents.prompts().is_empty());
+        voice_click(&world, "Отправить").await;
+        eventually("valid confirmation", || world.agents.prompts().len() == 1).await;
+    }
+
+    #[tokio::test]
+    async fn voice_cancel_discards_draft_and_old_send() {
+        let world = voice_world();
+        world.send(voice_message(7)).await;
+        let (message, data) = voice_preview(&world).await;
+        voice_click(&world, "Отмена").await;
+        world.send(press("old", message.0, &data)).await;
+        eventually("old button answered", || {
+            world
+                .messenger
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::Answer { callback, .. } if callback == "old"))
+        })
+        .await;
+        assert!(world.agents.prompts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn voice_edit_requires_reply_and_new_confirmation_and_treats_commands_as_text() {
+        let world = voice_world();
+        world.send(voice_message(7)).await;
+        let (_, old_data) = voice_preview(&world).await;
+        voice_click(&world, "Исправить").await;
+        eventually("correction prompt", || {
+            world
+                .messenger
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::Send { message, .. } if message.force_reply))
+        })
+        .await;
+        let prompt = world
+            .messenger
+            .calls()
+            .into_iter()
+            .find_map(|call| match call {
+                Call::Send { message, id, .. } if message.force_reply => {
+                    assert_eq!(message.reply_to, Some(MessageId(21)));
+                    Some(id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        world.send(correction(prompt, 2, "чужое исправление")).await;
+        world.send(correction(MessageId(prompt.0 + 1000), 1, "не тот ответ")).await;
+        world.send(correction(prompt, 1, "/reset это текст задачи")).await;
+        eventually("revised preview", || {
+            voice_button(&world, "Отправить").is_some_and(|(_, data)| data != old_data)
+        })
+        .await;
+        assert!(world.agents.prompts().is_empty());
+        voice_click(&world, "Отправить").await;
+        eventually("literal task", || world.agents.prompts() == ["/reset это текст задачи"]).await;
+        world.send(correction(prompt, 1, "повторный ответ")).await;
+        eventually("stale correction", || {
+            world.texts().iter().any(|text| text.contains("Черновик устарел"))
+        })
+        .await;
+        assert_eq!(world.agents.prompts(), ["/reset это текст задачи"]);
+    }
+
+    #[tokio::test]
+    async fn voice_edit_does_not_consume_unrelated_text() {
+        let world = voice_world();
+        world.send(voice_message(7)).await;
+        voice_preview(&world).await;
+        voice_click(&world, "Исправить").await;
+        world.send(text(Some(7), 33, "обычная задача")).await;
+        eventually("ordinary task", || world.agents.prompts() == ["обычная задача"]).await;
+    }
+
+    #[tokio::test]
+    async fn voice_old_correction_after_restart_does_not_start_task() {
+        let mut world = voice_world();
+        world.send(voice_message(7)).await;
+        voice_preview(&world).await;
+        voice_click(&world, "Исправить").await;
+        eventually("edit prompt", || {
+            world
+                .messenger
+                .calls()
+                .iter()
+                .any(|call| matches!(call, Call::Send { message, .. } if message.force_reply))
+        })
+        .await;
+        world.restart().await;
+        world.send(correction(MessageId(100), 1, "старый ответ")).await;
+        eventually("stale after restart", || {
+            world.texts().iter().any(|text| text.contains("Черновик устарел"))
+        })
+        .await;
+        assert!(world.agents.prompts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn voice_settings_and_context_changes_invalidate_confirmation() {
+        for change_settings in [false, true] {
+            let world = voice_world();
+            world.send(voice_message(7)).await;
+            let (message, data) = voice_preview(&world).await;
+            if change_settings {
+                world.settings.send_modify(|settings| {
+                    Arc::make_mut(settings).speech.provider =
+                        hub_core::speech::SpeechProvider::Disabled;
+                });
+            } else {
+                world.send(text(Some(7), 30, "/new")).await;
+            }
+            world.send(press("stale", message.0, &data)).await;
+            eventually("invalidated preview", || world.messenger.calls().iter().any(|call| matches!(call, Call::Answer { callback, text: Some(text) } if callback == "stale" && text.contains("устарел")))).await;
+            assert!(world.agents.prompts().is_empty());
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn voice_preview_expires() {
+        let world = voice_world();
+        world.send(voice_message(7)).await;
+        let (message, data) = voice_preview(&world).await;
+        tokio::time::advance(Duration::from_mins(11)).await;
+        world.send(press("expired", message.0, &data)).await;
+        eventually("expired preview", || world.messenger.calls().iter().any(|call| matches!(call, Call::Answer { callback, text: Some(text) } if callback == "expired" && text.contains("устарел")))).await;
+        assert!(world.agents.prompts().is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn voice_timeout_keeps_ordinary_text_available() {
+        let world = voice_world();
+        world.transcriber.hanging.store(true, Ordering::SeqCst);
+        world.send(voice_message(7)).await;
+        eventually("recognition starts", || world.transcriber.calls.load(Ordering::SeqCst) == 1)
+            .await;
+        world.send(text(Some(8), 30, "пока работай")).await;
+        eventually("independent task", || world.agents.prompts() == ["пока работай"]).await;
+        tokio::time::advance(Duration::from_secs(181)).await;
+        eventually("timeout hint", || {
+            world.texts().iter().any(|text| text.contains("больше 3 минут"))
+        })
+        .await;
+        assert!(voice_button(&world, "Отправить").is_none());
+    }
+
+    #[tokio::test]
+    async fn voice_metadata_limits_disabled_and_failures_do_not_launch() {
+        for duration in [Duration::from_secs(181), Duration::from_secs(10)] {
+            let world = voice_world();
+            let size = if duration.as_secs() == 10 { 11 * 1024 * 1024 } else { 3 };
+            world
+                .send(inbound(
+                    Some(7),
+                    21,
+                    Content::Voice {
+                        file: FileRef { id: "voice".to_owned(), name: None, size: Some(size) },
+                        duration,
+                    },
+                ))
+                .await;
+            eventually("limit hint", || {
+                world.texts().iter().any(|text| text.contains("не длиннее 3 минут"))
+            })
+            .await;
+            assert_eq!(world.transcriber.calls.load(Ordering::SeqCst), 0);
+            assert!(world.agents.prompts().is_empty());
+        }
+        let world = voice_world();
+        world.settings.send_modify(|settings| {
+            Arc::make_mut(settings).speech.provider = hub_core::speech::SpeechProvider::Disabled;
+        });
+        world.send(voice_message(7)).await;
+        eventually("disabled hint", || world.texts().iter().any(|text| text.contains("выключено")))
+            .await;
+        assert_eq!(world.transcriber.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn voice_errors_and_empty_or_oversized_transcripts_offer_fallback() {
+        for result in [
+            Err(crate::transcription::SpeechError::Failed("Нет модели".to_owned())),
+            Ok("   ".to_owned()),
+            Ok("😀".repeat(1501)),
+        ] {
+            let world = voice_world();
+            *world.transcriber.result.lock().unwrap() = Some(result);
+            world.send(voice_message(7)).await;
+            eventually("fallback hint", || {
+                world
+                    .texts()
+                    .iter()
+                    .any(|text| text.contains("Можно отправить задачу обычным текстом"))
+            })
+            .await;
+            assert!(voice_button(&world, "Отправить").is_none());
+            world.send(text(Some(7), 30, "текст вместо голоса")).await;
+            eventually("fallback task", || world.agents.prompts() == ["текст вместо голоса"]).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn voice_parallel_recognition_is_bounded() {
+        let world = voice_world();
+        world.transcriber.hanging.store(true, Ordering::SeqCst);
+        for thread in [7, 8, 9] {
+            world.send(voice_message(thread)).await;
+        }
+        eventually("concurrency hint", || {
+            world.texts().iter().any(|text| text.contains("два сообщения"))
+        })
+        .await;
+        assert_eq!(world.transcriber.calls.load(Ordering::SeqCst), 2);
+        assert!(world.agents.prompts().is_empty());
     }
 
     #[tokio::test]
@@ -3666,6 +4110,8 @@ mod tests {
                     user: Some(UserId(1)),
                     message: MessageId(message),
                     album: Some("g".to_owned()),
+                    reply_to: None,
+                    voice_reply: false,
                     content: Content::Media {
                         caption: caption.to_owned(),
                         attachment: Attachment::Photo(FileRef {
@@ -3758,6 +4204,21 @@ mod tests {
         assert_eq!(topics.get(&OTHER).and_then(|s| s.session.clone()), SessionId::parse("s-1"));
         assert_eq!(topics.get(&KEY).map(|s| s.session.is_none()), Some(true));
         assert!(world.agents.archive.imports().is_empty(), "the agent still had it");
+    }
+
+    #[tokio::test]
+    async fn voice_restore_same_session_invalidates_old_preview() {
+        let world = voice_world();
+        saved_snap(&world).await;
+        world.agents.archive.forget();
+        world.send(voice_message(7)).await;
+        let (message, data) = voice_preview(&world).await;
+        world.send(text(Some(7), 30, "/restore snap")).await;
+        eventually("restored same session", || said(&world, "♻️ Восстановлено: snap")).await;
+        assert_eq!(bound_to(&world, KEY), SessionId::parse("s-1"));
+        world.send(press("after-restore", message.0, &data)).await;
+        eventually("restore invalidates voice", || world.messenger.calls().iter().any(|call| matches!(call, Call::Answer { callback, text: Some(text) } if callback == "after-restore" && text.contains("устарел")))).await;
+        assert!(world.agents.prompts().is_empty());
     }
 
     #[tokio::test]

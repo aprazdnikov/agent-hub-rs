@@ -166,6 +166,7 @@ impl Connector for TelegramConnector {
             }
             let HubHandle { mailbox, views, registries: _registries, task } =
                 hub::spawn(HubSetup {
+                    transcriber: Arc::new(crate::speech::SpeechTranscriber),
                     action_runner: Arc::new(LocalActionRunner),
                     results: self.results.clone(),
                     doctor_runner: Arc::new(crate::doctor::LocalDoctor::new(self.home.clone())),

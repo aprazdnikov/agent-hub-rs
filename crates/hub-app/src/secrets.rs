@@ -7,6 +7,7 @@ pub enum Secret {
     TelegramToken,
     OpenAiKey,
     QwenKey,
+    SpeechKey,
 }
 
 impl Secret {
@@ -15,6 +16,7 @@ impl Secret {
             Self::TelegramToken => "telegram-token",
             Self::OpenAiKey => "openai-api-key",
             Self::QwenKey => "qwen-api-key",
+            Self::SpeechKey => "speech-api-key",
         }
     }
 }

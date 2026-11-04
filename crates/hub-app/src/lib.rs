@@ -11,6 +11,7 @@ pub mod gui;
 pub mod instance;
 pub mod logging;
 pub mod secrets;
+pub mod speech;
 pub mod supervisor;
 pub mod topics;
 pub mod updater;

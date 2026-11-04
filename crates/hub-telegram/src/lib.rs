@@ -20,7 +20,9 @@ pub mod telegram;
 #[cfg(test)]
 mod testing;
 pub mod texts;
+pub mod transcription;
 mod transfer;
+mod voice;
 
 pub mod results;
 

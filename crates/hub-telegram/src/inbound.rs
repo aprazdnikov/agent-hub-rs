@@ -1,6 +1,10 @@
 //! Telegram updates reduced to what the hub acts on, independent of the Bot API library.
 
+use std::time::Duration;
+
 use hub_core::domain::{ChatId, MessageId, ThreadId, TopicKey, UserId};
+
+pub const VOICE_EDIT_PROMPT: &str = "🎤 Исправление голосовой задачи\nОтветьте на это сообщение полным исправленным текстом. Затем подтвердите отправку.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRef {
@@ -21,7 +25,8 @@ pub enum Attachment {
 pub enum Content {
     Text(String),
     Media { caption: String, attachment: Attachment },
-    Voice,
+    Voice { file: FileRef, duration: Duration },
+    VideoNote,
     TopicCreated { name: String },
     TopicRenamed { name: String },
     Ignored,
@@ -34,6 +39,9 @@ pub struct Inbound {
     pub thread: Option<ThreadId>,
     pub user: Option<UserId>,
     pub message: MessageId,
+    pub reply_to: Option<MessageId>,
+    /// A reply to the bot's voice-correction prompt, including an expired prompt.
+    pub voice_reply: bool,
     pub album: Option<String>,
     pub content: Content,
 }
@@ -97,7 +105,8 @@ impl Turn {
                         }
                     }
                 }
-                Content::Voice
+                Content::Voice { .. }
+                | Content::VideoNote
                 | Content::TopicCreated { .. }
                 | Content::TopicRenamed { .. }
                 | Content::Ignored => {}
@@ -123,6 +132,8 @@ mod tests {
             thread: Some(ThreadId(7)),
             user: Some(UserId(1)),
             message: MessageId(message),
+            reply_to: None,
+            voice_reply: false,
             album: Some("g".to_owned()),
             content: Content::Media { caption: caption.to_owned(), attachment },
         }
@@ -159,5 +170,14 @@ mod tests {
         );
         assert!(turn.has_attachments());
         assert!(!Turn::text("hi".to_owned()).has_attachments());
+    }
+
+    #[test]
+    fn voice_and_video_notes_do_not_become_ordinary_turns() {
+        let mut voice = part(1, "", Attachment::Photo(file("p", None)));
+        voice.content = Content::Voice { file: file("v", None), duration: Duration::from_secs(2) };
+        let mut video = voice.clone();
+        video.content = Content::VideoNote;
+        assert_eq!(Turn::from_parts(&[voice, video]), Turn::text(String::new()));
     }
 }

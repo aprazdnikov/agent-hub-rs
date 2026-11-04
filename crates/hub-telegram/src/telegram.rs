@@ -6,6 +6,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
+use futures::{Stream, StreamExt};
 use hub_core::domain::{ChatId, MessageId, ThreadId, TopicKey, UserId};
 use hub_core::questions::Button;
 use hub_core::settings::{TelegramSettings, Token};
@@ -27,7 +28,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::hub::HubMessage;
-use crate::inbound::{Attachment, Content, FileRef, Inbound, Press};
+use crate::inbound::{Attachment, Content, FileRef, Inbound, Press, VOICE_EDIT_PROMPT};
 pub use crate::menu::{MenuError, synchronize_commands};
 use crate::messenger::{Format, Messenger, Outgoing, SendError, Target};
 
@@ -44,6 +45,11 @@ pub fn convert(message: &Message) -> Inbound {
         thread,
         user: message.from.as_ref().map(|user| UserId(user.id.0)),
         message: MessageId(message.id.0),
+        reply_to: message.reply_to_message().map(|reply| MessageId(reply.id.0)),
+        voice_reply: message.reply_to_message().is_some_and(|reply| {
+            reply.from.as_ref().is_some_and(|author| author.is_bot)
+                && reply.text().is_some_and(|text| text.starts_with(VOICE_EDIT_PROMPT))
+        }),
         album: message.media_group_id().map(|group| group.0.clone()),
         content: content(message),
     }
@@ -60,8 +66,14 @@ fn content(message: &Message) -> Content {
     if let Some(name) = message.forum_topic_edited().and_then(|edited| edited.name.as_ref()) {
         return Content::TopicRenamed { name: name.clone() };
     }
-    if message.voice().is_some() || message.video_note().is_some() {
-        return Content::Voice;
+    if let Some(voice) = message.voice() {
+        return Content::Voice {
+            file: reference(&voice.file, None),
+            duration: voice.duration.duration(),
+        };
+    }
+    if message.video_note().is_some() {
+        return Content::VideoNote;
     }
     if let Some(photo) = message.photo().and_then(<[tg::PhotoSize]>::last) {
         return media(Attachment::Photo(reference(&photo.file, None)));
@@ -176,6 +188,28 @@ fn failed(error: impl std::fmt::Display) -> SendError {
     SendError::Failed(error.to_string())
 }
 
+fn download_too_large() -> SendError {
+    SendError::Rejected("Файл превышает допустимый размер".to_owned())
+}
+
+async fn collect_limited<B: AsRef<[u8]>, E>(
+    chunks: impl Stream<Item = Result<B, E>>,
+    limit: usize,
+) -> Result<Vec<u8>, SendError> {
+    let mut chunks = std::pin::pin!(chunks);
+    let mut bytes = Vec::new();
+    while let Some(chunk) = chunks.next().await {
+        // Download errors can contain the file URL, including the bot token.
+        let chunk = chunk.map_err(|_| SendError::Failed("Не удалось скачать файл".to_owned()))?;
+        let chunk = chunk.as_ref();
+        if chunk.len() > limit.saturating_sub(bytes.len()) {
+            return Err(download_too_large());
+        }
+        bytes.extend_from_slice(chunk);
+    }
+    Ok(bytes)
+}
+
 fn markup(keyboard: Vec<Vec<Button>>) -> InlineKeyboardMarkup {
     InlineKeyboardMarkup::new(keyboard.into_iter().map(|row| {
         row.into_iter()
@@ -196,6 +230,11 @@ impl Messenger for TelegramMessenger {
         card: Outgoing,
     ) -> BoxFuture<'_, Result<(), SendError>> {
         Box::pin(async move {
+            if card.force_reply || card.reply_to.is_some() {
+                return Err(SendError::Rejected(
+                    "Запрос ответа можно добавить только к новому сообщению".to_owned(),
+                ));
+            }
             let request = self
                 .bot
                 .edit_message_text(tg::ChatId(chat.0), tg::MessageId(message.0), card.text)
@@ -216,12 +255,26 @@ impl Messenger for TelegramMessenger {
         message: Outgoing,
     ) -> BoxFuture<'_, Result<MessageId, SendError>> {
         Box::pin(async move {
-            let Outgoing { text, format, keyboard } = message;
+            let Outgoing { text, format, keyboard, force_reply, reply_to } = message;
+            if force_reply && !keyboard.is_empty() {
+                return Err(SendError::Rejected(
+                    "Запрос ответа несовместим с кнопками сообщения".to_owned(),
+                ));
+            }
             let request = match target {
-                Target::Topic(key) => self
-                    .bot
-                    .send_message(tg::ChatId(key.chat.0), text)
-                    .message_thread_id(thread(key)),
+                Target::Topic(key) => {
+                    let request = self
+                        .bot
+                        .send_message(tg::ChatId(key.chat.0), text)
+                        .message_thread_id(thread(key));
+                    match reply_to {
+                        Some(message) => request.reply_parameters(
+                            ReplyParameters::new(tg::MessageId(message.0))
+                                .allow_sending_without_reply(),
+                        ),
+                        None => request,
+                    }
+                }
                 Target::Reply { chat, message } => {
                     self.bot.send_message(tg::ChatId(chat.0), text).reply_parameters(
                         ReplyParameters::new(tg::MessageId(message.0))
@@ -233,8 +286,13 @@ impl Messenger for TelegramMessenger {
                 Format::Html => request.parse_mode(ParseMode::Html),
                 Format::Plain => request,
             };
-            let request =
-                if keyboard.is_empty() { request } else { request.reply_markup(markup(keyboard)) };
+            let request = if force_reply {
+                request.reply_markup(tg::ForceReply::new().selective())
+            } else if keyboard.is_empty() {
+                request
+            } else {
+                request.reply_markup(markup(keyboard))
+            };
             request.await.map(|sent| MessageId(sent.id.0)).map_err(sent)
         })
     }
@@ -321,6 +379,23 @@ impl Messenger for TelegramMessenger {
             let mut bytes = Vec::new();
             self.files.download_file(&file.path, &mut bytes).await.map_err(failed)?;
             Ok(bytes)
+        })
+    }
+
+    fn fetch_limited(
+        &self,
+        file: String,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<u8>, SendError>> {
+        Box::pin(async move {
+            let file = self.files.get_file(FileId(file)).await.map_err(|error| match error {
+                RequestError::RetryAfter(seconds) => SendError::RetryAfter(seconds.duration()),
+                _ => SendError::Failed("Не удалось получить файл".to_owned()),
+            })?;
+            if usize::try_from(file.size).map_or(true, |size| size > limit) {
+                return Err(download_too_large());
+            }
+            collect_limited(self.files.download_file_stream(&file.path), limit).await
         })
     }
 
@@ -523,6 +598,172 @@ mod tests {
         server.await.unwrap();
     }
 
+    #[tokio::test]
+    async fn correction_prompt_sends_selective_force_reply_in_its_topic() {
+        use http_body_util::{BodyExt, Full};
+        use hyper::body::Bytes;
+        use hyper_util::rt::TokioIo;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let service = hyper::service::service_fn(
+                |request: hyper::Request<hyper::body::Incoming>| async move {
+                    let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                    let params: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                    assert_eq!(
+                        params,
+                        json!({
+                            "chat_id": -100,
+                            "message_thread_id": 7,
+                            "text": VOICE_EDIT_PROMPT,
+                            "reply_parameters": {"message_id": 8, "allow_sending_without_reply": true},
+                            "reply_markup": {"force_reply": true, "selective": true}
+                        })
+                    );
+                    let body = json!({"ok": true, "result": {"message_id": 9, "date": 0, "chat": {"id": -100, "type": "supergroup"}, "text": VOICE_EDIT_PROMPT}});
+                    Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(Bytes::from(
+                        body.to_string(),
+                    ))))
+                },
+            );
+            hyper::server::conn::http1::Builder::new()
+                .keep_alive(false)
+                .serve_connection(TokioIo::new(stream), service)
+                .await
+                .unwrap();
+        });
+        let bot = Bot::new("1:test").set_api_url(format!("http://{address}/").parse().unwrap());
+        let messenger = TelegramMessenger { files: bot.clone(), bot };
+        assert!(
+            messenger
+                .send(
+                    Target::Topic(TopicKey { chat: ChatId(-100), thread: ThreadId(7) }),
+                    Outgoing::plain(VOICE_EDIT_PROMPT.to_owned())
+                        .with_force_reply()
+                        .replying_to(MessageId(8)),
+                )
+                .await
+                .is_ok()
+        );
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn force_reply_cannot_be_combined_with_an_inline_keyboard() {
+        // An unreachable local endpoint ensures rejected requests have no network effects.
+        let bot = Bot::new("1:test").set_api_url("http://127.0.0.1:1/".parse().unwrap());
+        let messenger = TelegramMessenger { files: bot.clone(), bot };
+        let outgoing = Outgoing::plain("reply".to_owned())
+            .with_force_reply()
+            .with_keyboard(vec![vec![Button { text: "Confirm".into(), data: "confirm".into() }]]);
+        assert!(matches!(
+            messenger
+                .send(Target::Reply { chat: ChatId(-100), message: MessageId(1) }, outgoing)
+                .await,
+            Err(SendError::Rejected(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn force_reply_cannot_be_added_to_an_existing_card() {
+        let bot = Bot::new("1:test").set_api_url("http://127.0.0.1:1/".parse().unwrap());
+        let messenger = TelegramMessenger { files: bot.clone(), bot };
+        assert!(matches!(
+            messenger
+                .edit_card(
+                    ChatId(-100),
+                    MessageId(1),
+                    Outgoing::plain("reply".to_owned()).with_force_reply()
+                )
+                .await,
+            Err(SendError::Rejected(_))
+        ));
+    }
+
+    #[rstest::rstest]
+    #[case::empty(vec![], 0, Ok(vec![]))]
+    #[case::exact(vec![vec![1, 2], vec![3]], 3, Ok(vec![1, 2, 3]))]
+    #[case::overflow(vec![vec![1, 2], vec![3, 4]], 3, Err(download_too_large()))]
+    #[case::zero(vec![vec![1]], 0, Err(download_too_large()))]
+    #[tokio::test]
+    async fn download_stream_enforces_actual_byte_limit(
+        #[case] chunks: Vec<Vec<u8>>,
+        #[case] limit: usize,
+        #[case] expected: Result<Vec<u8>, SendError>,
+    ) {
+        let stream = futures::stream::iter(chunks.into_iter().map(Ok::<_, &str>));
+        assert_eq!(collect_limited(stream, limit).await, expected);
+    }
+
+    #[tokio::test]
+    async fn download_stops_polling_as_soon_as_limit_is_exceeded() {
+        let polled = std::sync::atomic::AtomicUsize::new(0);
+        let stream =
+            futures::stream::iter([Ok::<_, &str>(vec![1, 2]), Ok(vec![3])]).inspect(|_| {
+                polled.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            });
+        assert!(collect_limited(stream, 1).await.is_err());
+        assert_eq!(polled.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn download_errors_do_not_expose_file_urls_or_bot_tokens() {
+        let stream = futures::stream::iter([Err::<Vec<u8>, _>(
+            "request failed at https://api.telegram.org/file/bot1:secret/voice.ogg",
+        )]);
+        assert_eq!(
+            collect_limited(stream, 10).await,
+            Err(SendError::Failed("Не удалось скачать файл".to_owned()))
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::exact(3, Some(vec![1, 2, 3]), Ok(vec![1, 2, 3]))]
+    #[case::lying_metadata(1, Some(vec![1, 2, 3, 4]), Err(download_too_large()))]
+    #[case::oversized_metadata(4, None, Err(download_too_large()))]
+    #[tokio::test]
+    async fn limited_fetch_checks_metadata_and_downloaded_bytes(
+        #[case] size: u32,
+        #[case] download: Option<Vec<u8>>,
+        #[case] expected: Result<Vec<u8>, SendError>,
+    ) {
+        use http_body_util::Full;
+        use hyper::body::Bytes;
+        use hyper_util::rt::TokioIo;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let metadata = json!({"ok": true, "result": {"file_id": "voice", "file_unique_id": "v", "file_size": size, "file_path": "voice.ogg"}});
+            let responses =
+                std::iter::once(("/bot1:test/GetFile", metadata.to_string().into_bytes()))
+                    .chain(download.map(|bytes| ("/file/bot1:test/voice.ogg", bytes)));
+            for (path, body) in responses {
+                let (stream, _) = listener.accept().await.unwrap();
+                let service = hyper::service::service_fn(
+                    move |request: hyper::Request<hyper::body::Incoming>| {
+                        assert!(request.uri().path().eq_ignore_ascii_case(path));
+                        let body = body.clone();
+                        async move {
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                                Bytes::from(body),
+                            )))
+                        }
+                    },
+                );
+                hyper::server::conn::http1::Builder::new()
+                    .keep_alive(false)
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await
+                    .unwrap();
+            }
+        });
+        let bot = Bot::new("1:test").set_api_url(format!("http://{address}/").parse().unwrap());
+        let messenger = TelegramMessenger { files: bot.clone(), bot };
+        assert_eq!(messenger.fetch_limited("voice".to_owned(), 3).await, expected);
+        server.await.unwrap();
+    }
+
     fn message(extra: &serde_json::Value) -> Message {
         let mut base = json!({
             "message_id": 5,
@@ -601,7 +842,46 @@ mod tests {
         let voice = convert(&topic(&json!({
             "voice": {"file_id": "v", "file_unique_id": "vu", "duration": 1, "mime_type": "audio/ogg", "file_size": 3}
         })));
-        assert_eq!(voice.content, Content::Voice);
+        assert_eq!(
+            voice.content,
+            Content::Voice {
+                file: FileRef { id: "v".to_owned(), name: None, size: Some(3) },
+                duration: Duration::from_secs(1),
+            }
+        );
+    }
+
+    #[test]
+    fn video_note_is_distinct_from_voice() {
+        let video_note = convert(&topic(&json!({
+            "video_note": {"file_id": "v", "file_unique_id": "vu", "duration": 2, "length": 320, "file_size": 3}
+        })));
+        assert_eq!(video_note.content, Content::VideoNote);
+    }
+
+    #[test]
+    fn reply_message_id_is_preserved() {
+        let reply = convert(&topic(&json!({
+            "text": "corrected",
+            "reply_to_message": {"message_id": 4, "date": 0, "chat": {"id": -100, "type": "supergroup"}, "text": "prompt"}
+        })));
+        assert_eq!(reply.reply_to, Some(MessageId(4)));
+    }
+
+    #[rstest::rstest]
+    #[case::bot_prompt(true, VOICE_EDIT_PROMPT, true)]
+    #[case::human_forgery(false, VOICE_EDIT_PROMPT, false)]
+    #[case::ordinary_bot_message(true, "ordinary message", false)]
+    fn voice_correction_reply_is_recognised_only_for_a_bot_prompt(
+        #[case] is_bot: bool,
+        #[case] text: &str,
+        #[case] expected: bool,
+    ) {
+        let reply = convert(&topic(&json!({
+            "text": "corrected",
+            "reply_to_message": {"message_id": 4, "date": 0, "chat": {"id": -100, "type": "supergroup"}, "from": {"id": 2, "is_bot": is_bot, "first_name": "bot"}, "text": text}
+        })));
+        assert_eq!(reply.voice_reply, expected);
     }
 
     #[test]

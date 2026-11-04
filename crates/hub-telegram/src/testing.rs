@@ -210,6 +210,25 @@ impl Messenger for FakeMessenger {
         Box::pin(async move { found })
     }
 
+    fn fetch_limited(
+        &self,
+        file: String,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<u8>, SendError>> {
+        let found = self
+            .files
+            .get(&file)
+            .ok_or_else(|| SendError::Failed("Не удалось получить файл".to_owned()))
+            .and_then(|bytes| {
+                if bytes.len() > limit {
+                    Err(SendError::Rejected("Файл превышает допустимый размер".to_owned()))
+                } else {
+                    Ok(bytes.clone())
+                }
+            });
+        Box::pin(async move { found })
+    }
+
     fn save(
         &self,
         file: String,
@@ -221,6 +240,36 @@ impl Messenger for FakeMessenger {
             target.write_all(&bytes).await.map_err(|error| SendError::Failed(error.to_string()))?;
             target.flush().await.map_err(|error| SendError::Failed(error.to_string()))
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[rstest::rstest]
+    #[case::exact(3, Ok(vec![1, 2, 3]))]
+    #[case::overflow(2, Err(SendError::Rejected("Файл превышает допустимый размер".to_owned())))]
+    #[case::zero(0, Err(SendError::Rejected("Файл превышает допустимый размер".to_owned())))]
+    #[tokio::test]
+    async fn limited_fetch_checks_before_cloning_and_has_no_message_effects(
+        #[case] limit: usize,
+        #[case] expected: Result<Vec<u8>, SendError>,
+    ) {
+        let mut messenger = FakeMessenger::default();
+        messenger.files.insert("voice".to_owned(), vec![1, 2, 3]);
+        assert_eq!(messenger.fetch_limited("voice".to_owned(), limit).await, expected);
+        assert!(messenger.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn limited_fetch_missing_file_is_safe_and_has_no_message_effects() {
+        let messenger = FakeMessenger::default();
+        assert_eq!(
+            messenger.fetch_limited("https://invalid/secret".to_owned(), 3).await,
+            Err(SendError::Failed("Не удалось получить файл".to_owned()))
+        );
+        assert!(messenger.calls().is_empty());
     }
 }
 

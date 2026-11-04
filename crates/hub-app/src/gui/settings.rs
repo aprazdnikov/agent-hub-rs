@@ -11,6 +11,7 @@ use hub_core::settings::{
     ApiEndpoint, Approval, CodexField, Draft, Field, FieldError, HermesField, OpencodeField,
     PermissionMode, ProgressMode, QwenApproval, QwenField, Sandbox, Settings, UpdateCheck,
 };
+use hub_core::speech::SpeechProvider;
 
 use crate::gui::log::LogAction;
 use crate::gui::look::{add_user, telegram_changed, use_chat};
@@ -18,10 +19,15 @@ use crate::supervisor::Command;
 
 /// Which secret fields are shown in clear text.
 #[derive(Default)]
+#[expect(
+    clippy::struct_excessive_bools,
+    reason = "Each secret has an independent visibility toggle"
+)]
 struct Revealed {
     token: bool,
     codex_key: bool,
     qwen_key: bool,
+    speech_key: bool,
 }
 
 #[derive(Default)]
@@ -252,6 +258,8 @@ impl SettingsForm {
             }
             self.telegram(ui, &errors);
             ui.separator();
+            self.speech(ui, &errors);
+            ui.separator();
             self.workspace(ui, &errors);
             ui.separator();
             self.projects(ui, &errors);
@@ -271,6 +279,75 @@ impl SettingsForm {
             self.timeouts(ui, &errors);
         });
         self.confirm(ui.ctx(), sessions, send);
+    }
+
+    fn speech(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
+        ui.heading("Голосовые сообщения");
+        egui::ComboBox::from_id_salt("speech_provider")
+            .selected_text(self.draft.speech.provider.label())
+            .show_ui(ui, |ui| {
+                for provider in SpeechProvider::ALL {
+                    ui.selectable_value(
+                        &mut self.draft.speech.provider,
+                        provider,
+                        provider.label(),
+                    );
+                }
+            });
+        ui.label("Смена способа распознавания сохраняет настройки обоих провайдеров.");
+        match self.draft.speech.provider {
+            SpeechProvider::Disabled => {
+                ui.label("Распознавание голосовых сообщений выключено.");
+            }
+            SpeechProvider::Local => {
+                ui.label("Установите Whisper.cpp и ffmpeg самостоятельно и скачайте модель. Аудио распознаётся на этом компьютере.");
+                for (id, label, path) in [
+                    ("speech_whisper", "Путь к whisper-cli", &mut self.draft.speech.whisper_path),
+                    ("speech_model", "Файл модели Whisper.cpp", &mut self.draft.speech.model_path),
+                    ("speech_ffmpeg", "Путь к ffmpeg", &mut self.draft.speech.ffmpeg_path),
+                ] {
+                    ui.push_id(id, |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            ui.text_edit_singleline(path);
+                            if ui.button("Выбрать…").clicked()
+                                && let Some(selected) = pick_file(path)
+                            {
+                                *path = selected;
+                            }
+                        });
+                    });
+                }
+                ui.small("Для команд допустимо имя из PATH или полный путь; для модели нужен полный путь.");
+            }
+            SpeechProvider::Api => {
+                ui.label("Аудио отправляется на указанный API-адрес. Провайдер может взимать плату за распознавание.");
+                ui.horizontal(|ui| {
+                    ui.label("API URL");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.draft.speech.api_url)
+                            .hint_text("https://api.openai.com/v1"),
+                    );
+                });
+                ui.small("Базовый URL без /audio/transcriptions. HTTPS; HTTP — только localhost или loopback IP.");
+                ui.horizontal(|ui| {
+                    ui.label("Модель распознавания");
+                    ui.text_edit_singleline(&mut self.draft.speech.api_model);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("API-ключ распознавания");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut self.draft.speech.api_key)
+                            .password(!self.revealed.speech_key),
+                    );
+                    ui.checkbox(&mut self.revealed.speech_key, "показать");
+                });
+                ui.small("Отдельный ключ хранится в системном хранилище ключей.");
+            }
+        }
+        for error in errors.iter().filter(|error| matches!(error.field, Field::Speech(_))) {
+            ui.colored_label(ui.visuals().error_fg_color, &error.message);
+        }
     }
 
     fn projects(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
@@ -772,6 +849,38 @@ pub fn home_or_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speech_settings_show_provider_specific_configuration_without_losing_it() {
+        let ctx = egui::Context::default();
+        let mut form = SettingsForm::default();
+        form.draft.speech.api_key = "sk-hidden-speech".to_owned();
+        form.draft.speech.model_path = "/models/whisper.bin".to_owned();
+        for (provider, expected) in [
+            (SpeechProvider::Disabled, "Распознавание голосовых сообщений выключено."),
+            (SpeechProvider::Local, "Файл модели Whisper.cpp"),
+            (SpeechProvider::Api, "API-ключ распознавания"),
+        ] {
+            form.draft.speech.provider = provider;
+            let before = form.draft.speech.clone();
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 1000.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| form.speech(ui, &[]),
+            );
+            output.textures_delta.clear();
+            assert!(output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == expected)));
+            assert!(!output.shapes.iter().any(|shape| matches!(&shape.shape,
+                egui::Shape::Text(text) if text.galley.text().contains("sk-hidden-speech"))));
+            assert_eq!(form.draft.speech, before);
+        }
+    }
 
     #[test]
     fn autostart_applies_without_saving_an_incomplete_telegram_form() {

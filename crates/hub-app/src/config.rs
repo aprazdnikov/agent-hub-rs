@@ -76,6 +76,7 @@ impl FileSettings {
             token: self.secrets.read(Secret::TelegramToken)?.unwrap_or_default(),
             api_key: self.secrets.read(Secret::OpenAiKey)?.unwrap_or_default(),
             qwen_key: self.secrets.read(Secret::QwenKey)?.unwrap_or_default(),
+            speech_key: self.secrets.read(Secret::SpeechKey)?.unwrap_or_default(),
         };
         let draft = file.to_draft(keys).map_err(|error| corrupt(error.message))?;
         Ok(match draft.parse(&self.home) {
@@ -110,6 +111,8 @@ impl SettingsStore for FileSettings {
             .write(Secret::OpenAiKey, settings.codex.api_key.as_ref().map(ApiKey::expose))?;
         let qwen_key = settings.qwen.endpoint.as_ref().map(|endpoint| endpoint.key().expose());
         self.secrets.write(Secret::QwenKey, qwen_key)?;
+        self.secrets
+            .write(Secret::SpeechKey, settings.speech.api_key.as_ref().map(ApiKey::expose))?;
         write_atomic(&self.path, text.as_bytes()).map_err(write)
     }
 }
@@ -204,6 +207,42 @@ mod tests {
             Loaded::Ready(loaded) => assert_eq!(loaded, settings),
             other => panic!("expected Ready, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn speech_key_round_trips_separately_across_provider_switches() {
+        use hub_core::speech::SpeechProvider;
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        let mut form = draft(dir.path());
+        form.codex.api_key = "sk-codex-separate".to_owned();
+        form.speech.api_key = "sk-speech-private".to_owned();
+        form.speech.model_path = dir.path().join("model.bin").display().to_string();
+        for provider in [SpeechProvider::Api, SpeechProvider::Local, SpeechProvider::Disabled] {
+            form.speech.provider = provider;
+            let settings = form.parse(dir.path()).unwrap();
+            store.save(&settings).unwrap();
+            let text = fs::read_to_string(dir.path().join("settings.toml")).unwrap();
+            assert!(!text.contains("sk-speech-private") && !text.contains("sk-codex-separate"));
+            assert!(matches!(store.load().unwrap(), Loaded::Ready(loaded) if loaded == settings));
+        }
+        form.speech.api_key.clear();
+        store.save(&form.parse(dir.path()).unwrap()).unwrap();
+        assert!(matches!(store.load().unwrap(), Loaded::Ready(loaded)
+            if loaded.speech.api_key.is_none()
+                && loaded.codex.api_key.as_ref().map(ApiKey::expose) == Some("sk-codex-separate")));
+    }
+
+    #[test]
+    fn default_speech_is_disabled_and_omitted_from_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store(dir.path());
+        store.save(&draft(dir.path()).parse(dir.path()).unwrap()).unwrap();
+        let text = fs::read_to_string(dir.path().join("settings.toml")).unwrap();
+        assert!(!text.contains("[speech]"));
+        assert!(matches!(store.load().unwrap(), Loaded::Ready(loaded)
+            if loaded.speech == hub_core::speech::SpeechSettings::default()));
     }
 
     #[test]

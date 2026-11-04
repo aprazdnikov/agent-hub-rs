@@ -19,22 +19,48 @@ pub struct Outgoing {
     pub format: Format,
     /// Inline keyboard rows; empty means none.
     pub keyboard: Vec<Vec<Button>>,
+    /// Ask for a reply to this message; incompatible with an inline keyboard.
+    pub force_reply: bool,
+    /// Reply within a topic; `Target::Reply` already supplies its own message id.
+    pub reply_to: Option<MessageId>,
 }
 
 impl Outgoing {
     #[must_use]
     pub fn plain(text: String) -> Self {
-        Self { text, format: Format::Plain, keyboard: Vec::new() }
+        Self {
+            text,
+            format: Format::Plain,
+            keyboard: Vec::new(),
+            force_reply: false,
+            reply_to: None,
+        }
     }
 
     #[must_use]
     pub fn html(text: String) -> Self {
-        Self { text, format: Format::Html, keyboard: Vec::new() }
+        Self {
+            text,
+            format: Format::Html,
+            keyboard: Vec::new(),
+            force_reply: false,
+            reply_to: None,
+        }
     }
 
     #[must_use]
     pub fn with_keyboard(self, keyboard: Vec<Vec<Button>>) -> Self {
         Self { keyboard, ..self }
+    }
+
+    #[must_use]
+    pub fn with_force_reply(self) -> Self {
+        Self { force_reply: true, ..self }
+    }
+
+    #[must_use]
+    pub fn replying_to(self, message: MessageId) -> Self {
+        Self { reply_to: Some(message), ..self }
     }
 }
 
@@ -98,5 +124,11 @@ pub trait Messenger: Send + Sync {
     ) -> BoxFuture<'_, Result<(), SendError>>;
     fn typing(&self, key: TopicKey) -> BoxFuture<'_, Result<(), SendError>>;
     fn fetch(&self, file: String) -> BoxFuture<'_, Result<Vec<u8>, SendError>>;
+    /// Reject oversized metadata and stop downloading before buffering more than `limit` bytes.
+    fn fetch_limited(
+        &self,
+        file: String,
+        limit: usize,
+    ) -> BoxFuture<'_, Result<Vec<u8>, SendError>>;
     fn save(&self, file: String, target: tokio::fs::File) -> BoxFuture<'_, Result<(), SendError>>;
 }

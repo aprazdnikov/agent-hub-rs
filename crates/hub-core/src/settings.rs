@@ -12,6 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::actions::{self, Action, ActionDraft};
 use crate::domain::{BackendKind, ChatId, UserId};
 use crate::projects::{self, Project, ProjectDraft};
+use crate::speech::{SpeechDraft, SpeechFile, SpeechSettings};
 use crate::workspace::expand_home;
 
 pub const DEFAULT_APPROVAL_TIMEOUT: Duration = Duration::from_mins(10);
@@ -304,6 +305,7 @@ pub struct Timeouts {
 /// Parsed settings. `workspace_root` is absolute; whether it exists is checked by the shell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
+    pub speech: SpeechSettings,
     pub progress_mode: ProgressMode,
     pub actions: Vec<Action>,
     pub projects: Vec<Project>,
@@ -322,6 +324,7 @@ pub struct Settings {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Field {
+    Speech(SpeechField),
     Actions,
     Projects,
     Token,
@@ -340,6 +343,16 @@ pub enum Field {
     Qwen(QwenField),
     Hermes(HermesField),
     Opencode(OpencodeField),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpeechField {
+    WhisperPath,
+    ModelPath,
+    FfmpegPath,
+    ApiUrl,
+    ApiModel,
+    ApiKey,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -484,6 +497,7 @@ impl OpencodeDraft {
 /// The settings form as typed by the user.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Draft {
+    pub speech: SpeechDraft,
     pub progress_mode: ProgressMode,
     pub actions: Vec<ActionDraft>,
     pub projects: Vec<ProjectDraft>,
@@ -509,6 +523,7 @@ pub struct Draft {
 impl Default for Draft {
     fn default() -> Self {
         Self {
+            speech: SpeechDraft::default(),
             progress_mode: ProgressMode::default(),
             actions: Vec::new(),
             projects: Vec::new(),
@@ -536,6 +551,7 @@ impl Default for Draft {
 impl fmt::Debug for Draft {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
+            speech,
             progress_mode,
             actions,
             projects,
@@ -558,6 +574,7 @@ impl fmt::Debug for Draft {
             updates,
         } = self;
         f.debug_struct("Draft")
+            .field("speech", speech)
             .field("progress_mode", progress_mode)
             .field("actions", actions)
             .field("projects", projects)
@@ -626,6 +643,8 @@ impl Draft {
             .ok();
         let hermes = self.hermes.parse(home, &mut errors);
         let opencode = self.opencode.parse(home, &mut errors);
+        let speech =
+            self.speech.parse(home).map_err(|speech_errors| errors.extend(speech_errors)).ok();
         let approval =
             check(&mut errors, Field::ApprovalTimeout, parse_seconds(&self.approval_timeout));
         let background =
@@ -654,10 +673,11 @@ impl Draft {
         else {
             return Err(errors);
         };
-        let (Some(actions), Some(projects)) = (actions, projects) else {
+        let (Some(actions), Some(projects), Some(speech)) = (actions, projects, speech) else {
             return Err(errors);
         };
         Ok(Settings {
+            speech,
             progress_mode: self.progress_mode,
             actions,
             projects,
@@ -683,6 +703,7 @@ impl Draft {
     #[must_use]
     pub fn from_settings(settings: &Settings) -> Self {
         Self {
+            speech: SpeechDraft::from(&settings.speech),
             progress_mode: settings.progress_mode,
             actions: settings.actions.iter().map(Action::to_draft).collect(),
             projects: settings.projects.iter().map(Project::to_draft).collect(),
@@ -923,6 +944,8 @@ fn parse_seconds(raw: &str) -> Result<Duration, String> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SettingsFile {
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub speech: SpeechFile,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<ActionDraft>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1033,6 +1056,7 @@ impl SnapshotsFile {
 
 /// Secrets the file does not hold, read from the keyring by the caller.
 pub struct Keys {
+    pub speech_key: String,
     pub token: String,
     pub api_key: String,
     pub qwen_key: String,
@@ -1057,6 +1081,7 @@ impl SettingsFile {
     /// readable by versions that do not know `[snapshots]`.
     pub fn from_settings(settings: &Settings, home: &Path) -> Self {
         Self {
+            speech: SpeechFile::from(&settings.speech),
             actions: settings.actions.iter().map(Action::to_draft).collect(),
             projects: settings.projects.iter().map(Project::to_draft).collect(),
             telegram: TelegramFile {
@@ -1116,7 +1141,7 @@ impl SettingsFile {
 
     /// The file as a form draft, so file and form share one parser.
     pub fn to_draft(&self, keys: Keys) -> Result<Draft, FieldError> {
-        let Keys { token, api_key, qwen_key } = keys;
+        let Keys { token, api_key, qwen_key, speech_key } = keys;
         let permission_mode = choice(
             self.claude.permission_mode.as_deref(),
             PermissionMode::Default,
@@ -1154,6 +1179,7 @@ impl SettingsFile {
         )?;
         let defaults = Draft::default();
         Ok(Draft {
+            speech: self.speech.to_draft(speech_key),
             progress_mode: self.telegram.progress,
             actions: self.actions.clone(),
             projects: self.projects.clone(),
@@ -1245,6 +1271,28 @@ mod tests {
     }
 
     #[test]
+    fn speech_section_is_accepted_in_settings_file() {
+        let raw = "[telegram]\nchat = -100\nusers = [1]\n[workspace]\nroot = \"~/Projects\"\n[speech]\nprovider = \"disabled\"\n";
+        assert!(toml::from_str::<SettingsFile>(raw).is_ok());
+    }
+
+    #[test]
+    fn old_settings_default_speech_to_disabled_without_writing_a_section() {
+        let raw = "[telegram]\nchat = -100\nusers = [1]\n[workspace]\nroot = \"~/Projects\"\n";
+        let file: SettingsFile = toml::from_str(raw).unwrap();
+        let keys = Keys {
+            token: "1:a".to_owned(),
+            api_key: String::new(),
+            qwen_key: String::new(),
+            speech_key: String::new(),
+        };
+        let settings = file.to_draft(keys).unwrap().parse(&home()).unwrap();
+        assert_eq!(settings.speech, SpeechSettings::default());
+        let encoded = toml::to_string(&SettingsFile::from_settings(&settings, &home())).unwrap();
+        assert!(!encoded.contains("[speech]"));
+    }
+
+    #[test]
     fn progress_mode_defaults_and_round_trips_without_changing_telegram_identity() {
         let raw = "[telegram]\nchat = -100\nusers = [1]\n[workspace]\nroot = \"~/Projects\"\n";
         let old: SettingsFile = toml::from_str(raw).unwrap();
@@ -1266,6 +1314,7 @@ mod tests {
                     .to_draft(Keys {
                         token: "1:a".to_owned(),
                         api_key: String::new(),
+                        speech_key: String::new(),
                         qwen_key: String::new()
                     })
                     .unwrap()
@@ -1284,8 +1333,12 @@ mod tests {
         let raw = "[telegram]\nchat = -100\nusers = [1]\n[workspace]\nroot = \"~/Projects\"\n\
                    [[actions]]\nid = \"vpn\"\nname = \"Рабочий VPN\"\ncommand = \"echo private-value\"\ncwd = \"~/vpn\"\n";
         let file: SettingsFile = toml::from_str(raw).unwrap();
-        let keys =
-            || Keys { token: "1:a".to_owned(), api_key: String::new(), qwen_key: String::new() };
+        let keys = || Keys {
+            token: "1:a".to_owned(),
+            api_key: String::new(),
+            speech_key: String::new(),
+            qwen_key: String::new(),
+        };
         let draft = file.to_draft(keys()).unwrap();
         let settings = draft.parse(&home()).unwrap();
         let text = toml::to_string(&SettingsFile::from_settings(&settings, &home())).unwrap();
@@ -1321,6 +1374,7 @@ mod tests {
             .to_draft(Keys {
                 token: draft.token.clone(),
                 api_key: String::new(),
+                speech_key: String::new(),
                 qwen_key: String::new(),
             })
             .unwrap();
@@ -1359,7 +1413,12 @@ backend = "codex"
         let raw = toml::to_string(&SettingsFile::from_settings(&settings, &home())).unwrap();
         assert!(raw.contains("[[projects.checks]]"));
         let restored: SettingsFile = toml::from_str(&raw).unwrap();
-        let keys = Keys { token: draft.token, api_key: String::new(), qwen_key: String::new() };
+        let keys = Keys {
+            token: draft.token,
+            api_key: String::new(),
+            speech_key: String::new(),
+            qwen_key: String::new(),
+        };
         assert_eq!(restored.to_draft(keys).unwrap().parse(&home()).unwrap(), settings);
     }
 
@@ -1393,8 +1452,12 @@ backend = "codex"
             "[telegram]\nchat = -100\nusers = [1]\n[workspace]\nroot = \"~/Projects\"\n",
         )
         .unwrap();
-        let keys =
-            Keys { token: "1:a".to_owned(), api_key: String::new(), qwen_key: String::new() };
+        let keys = Keys {
+            token: "1:a".to_owned(),
+            api_key: String::new(),
+            speech_key: String::new(),
+            qwen_key: String::new(),
+        };
         let settings = file.to_draft(keys).unwrap().parse(&home()).unwrap();
         assert_eq!(settings.snapshots_dir, home().join(".agent-hub"));
     }
@@ -1406,8 +1469,12 @@ backend = "codex"
         assert!(!text.contains("snapshots"), "{text}");
         assert!(!text.contains("actions"), "empty actions should preserve old file shape: {text}");
         let file: SettingsFile = toml::from_str(&text).unwrap();
-        let keys =
-            Keys { token: "123:abc".to_owned(), api_key: String::new(), qwen_key: String::new() };
+        let keys = Keys {
+            token: "123:abc".to_owned(),
+            api_key: String::new(),
+            speech_key: String::new(),
+            qwen_key: String::new(),
+        };
         assert_eq!(file.to_draft(keys).unwrap().parse(&home()).unwrap(), settings);
     }
 
@@ -1416,8 +1483,12 @@ backend = "codex"
         let settings =
             Draft { snapshots_dir: "~/snaps".to_owned(), ..draft() }.parse(&home()).unwrap();
         let file = SettingsFile::from_settings(&settings, &home());
-        let keys =
-            Keys { token: "123:abc".to_owned(), api_key: String::new(), qwen_key: String::new() };
+        let keys = Keys {
+            token: "123:abc".to_owned(),
+            api_key: String::new(),
+            speech_key: String::new(),
+            qwen_key: String::new(),
+        };
         assert_eq!(file.to_draft(keys).unwrap().parse(&home()).unwrap(), settings);
     }
 
@@ -1521,6 +1592,7 @@ backend = "codex"
         let keys = Keys {
             token: settings.telegram.token.expose().to_owned(),
             api_key: String::new(),
+            speech_key: String::new(),
             qwen_key: String::new(),
         };
         let restored = file.to_draft(keys).unwrap();
@@ -1531,7 +1603,12 @@ backend = "codex"
     fn file_with_unknown_permission_mode_is_rejected() {
         let mut file = SettingsFile::from_settings(&draft().parse(&home()).unwrap(), &home());
         file.claude.permission_mode = Some("yolo".to_owned());
-        let keys = Keys { token: String::new(), api_key: String::new(), qwen_key: String::new() };
+        let keys = Keys {
+            token: String::new(),
+            api_key: String::new(),
+            speech_key: String::new(),
+            qwen_key: String::new(),
+        };
         assert_eq!(file.to_draft(keys).unwrap_err().field, Field::PermissionMode);
     }
 
@@ -1542,8 +1619,12 @@ backend = "codex"
                     [agents]\ndefault = \"hermes\"\n\
                     [hermes]\ncli = \"~/bin/hermes\"\nprofile = \"work\"\nmodel = \"test-model\"\n";
         let file: SettingsFile = toml::from_str(text).unwrap();
-        let keys =
-            Keys { token: "1:a".to_owned(), api_key: String::new(), qwen_key: String::new() };
+        let keys = Keys {
+            token: "1:a".to_owned(),
+            api_key: String::new(),
+            speech_key: String::new(),
+            qwen_key: String::new(),
+        };
         let settings = file.to_draft(keys).unwrap().parse(&home()).unwrap();
         assert_eq!(
             (settings.default_backend.name(), settings.hermes),
@@ -1564,8 +1645,12 @@ backend = "codex"
                     [workspace]\nroot = \"~/w\"\n\
                     [hermes]\nprofile = \"bad profile\"\n";
         let file: SettingsFile = toml::from_str(text).unwrap();
-        let keys =
-            Keys { token: "1:a".to_owned(), api_key: String::new(), qwen_key: String::new() };
+        let keys = Keys {
+            token: "1:a".to_owned(),
+            api_key: String::new(),
+            speech_key: String::new(),
+            qwen_key: String::new(),
+        };
         assert_eq!(
             file.to_draft(keys).unwrap().parse(&home()).unwrap_err(),
             [FieldError {
@@ -1597,7 +1682,12 @@ backend = "codex"
         let settings = input.parse(&home()).unwrap();
         let text = toml::to_string(&SettingsFile::from_settings(&settings, &home())).unwrap();
         let file: SettingsFile = toml::from_str(&text).unwrap();
-        let keys = Keys { token: input.token, api_key: String::new(), qwen_key: String::new() };
+        let keys = Keys {
+            token: input.token,
+            api_key: String::new(),
+            speech_key: String::new(),
+            qwen_key: String::new(),
+        };
         assert_eq!(
             (
                 Draft::from_settings(&settings).parse(&home()).unwrap(),
@@ -1661,8 +1751,12 @@ backend = "codex"
                     [agents]\ndefault = \"opencode\"\n\
                     [opencode]\ncli = \"~/bin/opencode\"\nmodel = \"opencode/big-pickle\"\n";
         let file: SettingsFile = toml::from_str(text).unwrap();
-        let keys =
-            Keys { token: "1:a".to_owned(), api_key: String::new(), qwen_key: String::new() };
+        let keys = Keys {
+            token: "1:a".to_owned(),
+            api_key: String::new(),
+            speech_key: String::new(),
+            qwen_key: String::new(),
+        };
         let settings = file.to_draft(keys).unwrap().parse(&home()).unwrap();
         assert_eq!(
             (settings.default_backend.name(), settings.opencode),
@@ -1697,7 +1791,12 @@ backend = "codex"
         let settings = input.parse(&home()).unwrap();
         let text = toml::to_string(&SettingsFile::from_settings(&settings, &home())).unwrap();
         let file: SettingsFile = toml::from_str(&text).unwrap();
-        let keys = Keys { token: input.token, api_key: String::new(), qwen_key: String::new() };
+        let keys = Keys {
+            token: input.token,
+            api_key: String::new(),
+            speech_key: String::new(),
+            qwen_key: String::new(),
+        };
         assert_eq!(
             (
                 Draft::from_settings(&settings).parse(&home()).unwrap(),
@@ -1791,6 +1890,7 @@ backend = "codex"
         let keys = Keys {
             token: settings.telegram.token.expose().to_owned(),
             api_key: "sk-test".to_owned(),
+            speech_key: String::new(),
             qwen_key: String::new(),
         };
         assert_eq!(file.to_draft(keys).unwrap().parse(&home()).unwrap(), settings);
@@ -1809,8 +1909,12 @@ root = \"~/w\"
 ",
         )
         .unwrap();
-        let keys =
-            Keys { token: "1:a".to_owned(), api_key: String::new(), qwen_key: String::new() };
+        let keys = Keys {
+            token: "1:a".to_owned(),
+            api_key: String::new(),
+            speech_key: String::new(),
+            qwen_key: String::new(),
+        };
         let draft = file.to_draft(keys).unwrap();
         assert_eq!(draft.default_backend, BackendKind::Claude);
         assert_eq!(draft.codex, CodexDraft::default());
@@ -1856,7 +1960,12 @@ root = \"~/w\"
 {extra}"
         );
         let file: SettingsFile = toml::from_str(&text).unwrap();
-        let keys = Keys { token: String::new(), api_key: String::new(), qwen_key: String::new() };
+        let keys = Keys {
+            token: String::new(),
+            api_key: String::new(),
+            speech_key: String::new(),
+            qwen_key: String::new(),
+        };
         assert_eq!(file.to_draft(keys).unwrap_err().field, field);
     }
 
@@ -1925,6 +2034,7 @@ root = \"~/w\"
         let keys = Keys {
             token: settings.telegram.token.expose().to_owned(),
             api_key: String::new(),
+            speech_key: String::new(),
             qwen_key: "sk-qwen".to_owned(),
         };
         assert_eq!(file.to_draft(keys).unwrap().parse(&home()).unwrap(), settings);
