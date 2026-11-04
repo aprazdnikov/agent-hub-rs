@@ -1,0 +1,3 @@
+#!/bin/sh
+# Source fixture data while retaining the invoked symlink's $0 and arguments.
+. "$0.script"

@@ -57,7 +57,7 @@ pub(crate) const INBOX: usize = 32;
 const MAILBOX: usize = 256;
 // Telegram delivers album parts as separate updates sharing a media group id.
 const ALBUM_WAIT: Duration = Duration::from_secs(1);
-const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
+const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(14);
 
 pub trait Agents: Send + Sync + 'static {
     fn run<'a>(
@@ -105,6 +105,7 @@ pub struct TopicView {
 }
 
 pub enum HubMessage {
+    HandoffDone(crate::handoff::Done),
     VoiceDone(crate::voice::Done),
     SaveResult(SaveResult),
     LastDone(TopicKey),
@@ -189,6 +190,10 @@ struct Live {
 }
 
 struct Hub<A> {
+    handoffs: crate::handoff::Handoffs<A>,
+    /// Fresh service-event bindings observed during a pending topic creation.
+    /// Any user activity consumes the marker before handoff can claim the topic.
+    handoff_topics: HashMap<TopicKey, TopicSession>,
     voices: crate::voice::Voices,
     cards: crate::progress_card::Cards,
     results: LastResults,
@@ -247,6 +252,12 @@ pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
     let (views, watched) = watch::channel(Vec::new());
     let registries = Shared::default();
     let hub = Hub {
+        handoffs: crate::handoff::Handoffs::new(
+            agents.clone(),
+            Sender::new(messenger.clone()),
+            mailbox.clone(),
+        ),
+        handoff_topics: HashMap::new(),
         voices: crate::voice::Voices::new(
             transcriber,
             Sender::new(messenger.clone()),
@@ -294,13 +305,16 @@ impl<A: Agents> Hub<A> {
             let deadline = self.shutdown.as_ref().map(|(_, at)| *at);
             let message = tokio::select! {
                 message = mailbox.recv() => message,
-                _ = refresh.tick(), if !self.running.is_empty() || !self.voices.is_empty() => {
+                _ = refresh.tick(), if !self.running.is_empty() || !self.voices.is_empty() || !self.handoffs.is_empty() => {
+                    self.handoffs.refresh(&self.settings.borrow(), &self.topics);
+                    if !self.handoffs.creating() { self.handoff_topics.clear(); }
                     self.voices.refresh(&self.settings.borrow(), &self.topics);
                     self.publish();
                     continue;
                 }
                 changed = self.settings.changed() => {
                     if changed.is_err() { break; }
+                    self.handoffs.refresh(&self.settings.borrow(), &self.topics);
                     self.voices.refresh(&self.settings.borrow(), &self.topics);
                     self.publish();
                     continue;
@@ -309,7 +323,11 @@ impl<A: Agents> Hub<A> {
             };
             let Some(message) = message else { break };
             self.handle(message);
-            if self.shutdown.is_some() && self.running.is_empty() && self.actions.is_idle() {
+            if self.shutdown.is_some()
+                && self.running.is_empty()
+                && self.actions.is_idle()
+                && self.handoffs.is_idle()
+            {
                 break;
             }
         }
@@ -320,7 +338,13 @@ impl<A: Agents> Hub<A> {
     }
 
     fn press(&mut self, pressed: Press) {
-        if pressed.data.starts_with(crate::voice::PREFIX) {
+        if pressed.data.starts_with(crate::handoff::PREFIX) {
+            if self.shutdown.is_none() {
+                let refusal =
+                    self.handoffs.source(&pressed).and_then(|key| self.handoff_refusal(key));
+                self.handoffs.press(pressed, &self.settings.borrow(), &self.topics, refusal);
+            }
+        } else if pressed.data.starts_with(crate::voice::PREFIX) {
             if self.shutdown.is_none() {
                 let confirmed = self.voices.press(pressed, &self.settings.borrow(), &self.topics);
                 if let Some((key, text)) = confirmed {
@@ -386,6 +410,15 @@ impl<A: Agents> Hub<A> {
 
     fn handle(&mut self, message: HubMessage) {
         match message {
+            HubMessage::HandoffDone(done) => {
+                let transfer = self.handoffs.complete(done, &self.settings.borrow(), &self.topics);
+                if let Some(transfer) = transfer {
+                    self.handoff_launch(transfer);
+                }
+                if !self.handoffs.creating() {
+                    self.handoff_topics.clear();
+                }
+            }
             HubMessage::VoiceDone(done) => {
                 self.voices.complete(done, &self.settings.borrow(), &self.topics);
             }
@@ -427,6 +460,7 @@ impl<A: Agents> Hub<A> {
             HubMessage::Reset(key) => {
                 // Like `/reset`: not during a turn or a snapshot of this topic.
                 if !self.running.contains_key(&key)
+                    && !self.handoff_busy(key)
                     && !self.snapshotting.contains(&key)
                     && let Some(session) = self.topics.get(&key).cloned()
                 {
@@ -435,6 +469,7 @@ impl<A: Agents> Hub<A> {
             }
             HubMessage::Snapshot(SnapshotDone(done)) => self.snapshot_done(done),
             HubMessage::Shutdown(done) => {
+                self.handoffs.shutdown();
                 self.voices.shutdown();
                 self.cards.shutdown();
                 self.actions.shutdown();
@@ -473,6 +508,18 @@ impl<A: Agents> Hub<A> {
     }
 
     fn inbound(&mut self, inbound: Inbound) {
+        self.handoffs.refresh(&self.settings.borrow(), &self.topics);
+        if let Some(key) = inbound.key()
+            && !matches!(
+                inbound.content,
+                Content::TopicCreated { .. } | Content::TopicRenamed { .. }
+            )
+        {
+            self.handoff_topics.remove(&key);
+        }
+        if self.handoffs.correction(&inbound) {
+            return;
+        }
         self.voices.refresh(&self.settings.borrow(), &self.topics);
         if self.voices.correction(&inbound) {
             return;
@@ -487,12 +534,22 @@ impl<A: Agents> Hub<A> {
         }
         match &inbound.content {
             Content::TopicCreated { name } => {
+                // Delayed service events must not reset a session or undo a later rename.
+                if self.topics.contains_key(&key) {
+                    if !self.titles.contains_key(&key) {
+                        self.rename(key, name.clone());
+                    }
+                    return;
+                }
                 self.rename(key, name.clone());
                 match self.root() {
                     Ok(root) => {
                         let default = self.settings.borrow().default_backend;
                         let session = TopicSession::fresh(default, root);
                         self.put(key, session.clone());
+                        if self.handoffs.creating() && self.handoff_topics.len() < 128 {
+                            self.handoff_topics.insert(key, session.clone());
+                        }
                         self.say(Target::Topic(key), texts::describe(texts::NEW_SESSION, &session));
                     }
                     Err(error) => self.say(Target::Topic(key), texts::warning(&error)),
@@ -500,6 +557,9 @@ impl<A: Agents> Hub<A> {
             }
             Content::TopicRenamed { name } => self.rename(key, name.clone()),
             Content::Text(text) => match parse_input(text, &self.bot) {
+                Input::Command { command: Command::Handoff, args } => {
+                    self.handoff_command(&inbound, &args);
+                }
                 Input::Command { command: Command::Model, args } => {
                     self.option_command(key, inbound.user, options::Field::Model, &args);
                 }
@@ -594,7 +654,8 @@ impl<A: Agents> Hub<A> {
         args: &[&str],
     ) {
         match command {
-            Command::Last | Command::Outbox | Command::Model | Command::Mode => {} // Handled with the live user's identity in inbound().
+            Command::Handoff | Command::Last | Command::Outbox | Command::Model | Command::Mode => {
+            } // Handled with the live user's identity in inbound().
             Command::Projects => self.project_menu(key),
             Command::Doctor => {
                 let card = self.doctors.menu(key, &self.settings.borrow());
@@ -669,7 +730,7 @@ impl<A: Agents> Hub<A> {
             Command::Status => match self.topics.get(&key) {
                 None => self.say(Target::Topic(key), texts::NO_SESSION.to_owned()),
                 Some(session) => {
-                    let state = if self.running.contains_key(&key) {
+                    let state = if self.running.contains_key(&key) || self.handoffs.busy(key) {
                         texts::RUNNING
                     } else {
                         texts::WAITING
@@ -723,6 +784,98 @@ impl<A: Agents> Hub<A> {
         }
     }
 
+    fn handoff_refusal(&self, key: TopicKey) -> Option<&'static str> {
+        if self.running.contains_key(&key) || self.handoffs.busy(key) {
+            return Some(texts::ALREADY_RUNNING);
+        }
+        if self.snapshotting.contains(&key) {
+            return Some(texts::SNAPSHOT_BUSY);
+        }
+        if let Some(session) = self.topics.get(&key) {
+            if let Some(id) = &session.session
+                && let Some(refusal) = self.session_refusal(&(session.backend, id.clone()))
+            {
+                return Some(refusal);
+            }
+            if !self.root().is_ok_and(|root| crate::paths::inside(&root, &session.cwd)) {
+                return Some("Каталог исходной сессии недоступен или вне корня проектов.");
+            }
+        }
+        None
+    }
+
+    fn handoff_command(&mut self, inbound: &Inbound, args: &[&str]) {
+        let (Some(key), Some(user)) = (inbound.key(), inbound.user) else { return };
+        if !crate::telegram::allowed(&self.settings.borrow().telegram, Some(key.chat), Some(user)) {
+            return;
+        }
+        if let Some(refusal) = self.handoff_refusal(key) {
+            self.say(Target::Topic(key), refusal.to_owned());
+            return;
+        }
+        let Some(session) = self.topics.get(&key).cloned() else {
+            self.say(Target::Topic(key), "Сначала обсудите задачу в этой теме: у текущего агента ещё нет истории для сводки.".to_owned());
+            return;
+        };
+        let recipient = match args {
+            [] => None,
+            [name] if BackendKind::parse(name).is_some() => BackendKind::parse(name),
+            _ => {
+                self.say(
+                    Target::Topic(key),
+                    "Используйте /handoff или /handoff <агент>.".to_owned(),
+                );
+                return;
+            }
+        };
+        self.handoffs.open(inbound, session, self.settings.borrow().clone(), recipient);
+    }
+
+    fn handoff_launch(&mut self, transfer: crate::handoff::Transfer) {
+        let crate::handoff::Transfer { source, destination, original, recipient, summary } =
+            transfer;
+        let service_binding = self.handoff_topics.remove(&destination);
+        let claimed = self
+            .topics
+            .get(&destination)
+            .is_some_and(|existing| service_binding.as_ref() != Some(existing));
+        if self.shutdown.is_some()
+            || self.topics.get(&source) != Some(&original)
+            || self.handoff_refusal(source).is_some()
+            || claimed
+            || self.running.contains_key(&destination)
+            || destination == source
+            || destination.thread.0 <= 0
+        {
+            self.handoffs.notice(source, format!("Передача не запущена: контекст изменился или новая тема уже используется. Исходная сессия сохранена. Создана {}.", crate::handoff::topic_reference(destination)));
+            return;
+        }
+        let session = TopicSession::fresh(recipient, original.cwd.clone());
+        let mut next = self.topics.clone();
+        next.insert(destination, session);
+        if self.store.save(&next).is_err() {
+            self.handoffs.notice(source, format!("Новая {} создана, но привязка не сохранена. Задача не запущена; исходная сессия сохранена. Повторите /handoff после устранения ошибки хранения.", crate::handoff::topic_reference(destination)));
+            return;
+        }
+        self.topics = next;
+        self.rename(destination, format!("Передача в {}", recipient.name()));
+        self.handoffs.notice(source, format!("Сводка передана в {}. Исходная тема сохранена. Обе темы используют общие файлы проекта.", crate::handoff::topic_reference(destination)));
+        self.start_turn(destination, Turn::text(summary.receiver_text(original.backend)));
+    }
+
+    fn handoff_busy(&self, key: TopicKey) -> bool {
+        self.handoffs.busy(key)
+            || self.topics.get(&key).is_some_and(|session| self.handoffs.session_busy(session))
+    }
+
+    fn invalidate_handoff(&mut self, key: TopicKey) {
+        self.handoff_topics.remove(&key);
+        self.handoffs.invalidate(key);
+        if let Some(session) = self.topics.get(&key) {
+            self.handoffs.invalidate_session(session);
+        }
+    }
+
     fn text(&mut self, key: TopicKey, text: String) {
         // While the agent waits on a question, the next message in the topic is its answer.
         let pending = lock(&self.registries).questions.reply(key, &text);
@@ -735,6 +888,11 @@ impl<A: Agents> Hub<A> {
     }
 
     fn start_turn(&mut self, key: TopicKey, turn: Turn) {
+        if self.handoff_busy(key) {
+            self.say(Target::Topic(key), "Готовится передача задачи. Дождитесь завершения или отмените подготовку через /stop.".to_owned());
+            return;
+        }
+        self.invalidate_handoff(key);
         self.projects.invalidate(key);
         self.options.invalidate(key);
         if !self.running.contains_key(&key) {
@@ -761,6 +919,15 @@ impl<A: Agents> Hub<A> {
     }
 
     fn deliver(&mut self, key: TopicKey, prompt: Prompt) {
+        if self.handoff_busy(key) {
+            self.say(
+                Target::Topic(key),
+                "Готовится передача задачи. Повторите сообщение после завершения или отмены."
+                    .to_owned(),
+            );
+            return;
+        }
+        self.invalidate_handoff(key);
         let Some(live) = self.running.get(&key) else {
             self.launch(key, First::Prompt(prompt), None);
             return;
@@ -783,6 +950,15 @@ impl<A: Agents> Hub<A> {
         first: First,
         reuse: Option<(mpsc::Sender<Prompt>, mpsc::Receiver<Prompt>)>,
     ) {
+        if self.handoff_busy(key) {
+            self.say(
+                Target::Topic(key),
+                "Готовится передача задачи. Повторите сообщение после завершения или отмены."
+                    .to_owned(),
+            );
+            return;
+        }
+        self.invalidate_handoff(key);
         // Album flushes and finished downloads still arrive while the hub winds down.
         if self.shutdown.is_some() {
             tracing::info!(
@@ -881,7 +1057,10 @@ impl<A: Agents> Hub<A> {
         }
     }
 
-    fn stop(&self, key: TopicKey) -> bool {
+    fn stop(&mut self, key: TopicKey) -> bool {
+        if self.handoffs.stop(key) {
+            return true;
+        }
         if let Some(live) = self.running.get(&key) {
             live.progress.stopping();
             live.cancel.cancel();
@@ -892,6 +1071,9 @@ impl<A: Agents> Hub<A> {
     }
 
     fn progress(&self, key: TopicKey) -> TaskProgress {
+        if let Some(progress) = self.handoffs.progress(key) {
+            return progress;
+        }
         self.running.get(&key).map_or_else(
             || self.last_progress.get(&key).cloned().unwrap_or_default(),
             |live| live.progress.snapshot(),
@@ -912,7 +1094,7 @@ impl<A: Agents> Hub<A> {
         let running = self.topics.iter().any(|(topic, session)| {
             session.backend == *backend
                 && session.session.as_ref() == Some(id)
-                && self.running.contains_key(topic)
+                && (self.running.contains_key(topic) || self.handoff_busy(*topic))
         });
         if self.reserved.contains_key(reservation) {
             Some(texts::SESSION_RESERVED)
@@ -925,7 +1107,7 @@ impl<A: Agents> Hub<A> {
 
     /// `/save` and `/restore` refuse during a turn and while another snapshot job runs here.
     fn refuse_snapshot(&self, key: TopicKey) -> bool {
-        let text = if self.running.contains_key(&key) {
+        let text = if self.running.contains_key(&key) || self.handoff_busy(key) {
             texts::FINISH_TURN_FIRST
         } else if self.snapshotting.contains(&key) {
             texts::SNAPSHOT_BUSY
@@ -1122,6 +1304,7 @@ impl<A: Agents> Hub<A> {
         }
         // The hub handles one message at a time: nothing else sees the session in between.
         if reply.send(true).is_ok() {
+            self.invalidate_handoff(key);
             // Import can change history without changing the session identity, and can
             // fail after touching files. Discard drafts before granting that write.
             self.voices.invalidate(key);
@@ -1130,6 +1313,7 @@ impl<A: Agents> Hub<A> {
                     && session.session.as_ref() == Some(&reservation.1)
                 {
                     self.voices.invalidate(*topic);
+                    self.handoffs.invalidate(*topic);
                 }
             }
             self.reserved.insert(reservation, key);
@@ -1142,6 +1326,7 @@ impl<A: Agents> Hub<A> {
     /// One session, one topic: every other holder is reset and `key` bound, persisted as one
     /// save; only a successful save changes the hub's bindings and tells the topics.
     fn rebind(&mut self, key: TopicKey, restoration: Restoration) {
+        self.invalidate_handoff(key);
         self.voices.invalidate(key);
         let Restoration { name, session, imported } = restoration;
         let holders = holders(&self.topics, key, &session);
@@ -1184,6 +1369,7 @@ impl<A: Agents> Hub<A> {
         self.options.invalidate(key);
         self.say(Target::Topic(key), texts::restored(&name, &session));
         for holder in holders {
+            self.invalidate_handoff(holder);
             self.voices.invalidate(holder);
             self.last_progress.remove(&holder);
             self.projects.invalidate(holder);
@@ -1205,6 +1391,7 @@ impl<A: Agents> Hub<A> {
     }
 
     fn put(&mut self, key: TopicKey, session: TopicSession) {
+        self.invalidate_handoff(key);
         self.voices.invalidate(key);
         if !self.running.contains_key(&key) {
             self.last_progress.remove(&key);
@@ -1238,7 +1425,7 @@ impl<A: Agents> Hub<A> {
         Ok(options::Context { key, user, current, session, settings })
     }
     fn option_refusal(&self, key: TopicKey, session: &TopicSession) -> Option<&'static str> {
-        if self.running.contains_key(&key) {
+        if self.running.contains_key(&key) || self.handoff_busy(key) {
             Some(texts::ALREADY_RUNNING)
         } else if self.snapshotting.contains(&key) || self.is_reserved(session) {
             Some(texts::SNAPSHOT_BUSY)
@@ -1322,6 +1509,7 @@ impl<A: Agents> Hub<A> {
                                 {
                                     self.last_progress.remove(&key);
                                 }
+                                self.invalidate_handoff(key);
                                 self.topics = next;
                                 self.options.invalidate(key);
                                 self.projects.invalidate(key);
@@ -1402,6 +1590,7 @@ impl<A: Agents> Hub<A> {
                     self.say(Target::Topic(key), "⚠️ Проект не выбран: не удалось сохранить привязку на диск. Контекст темы сохранён.".to_owned());
                     return;
                 }
+                self.invalidate_handoff(key);
                 self.topics = next;
                 self.last_progress.remove(&key);
                 self.projects.invalidate(key);
@@ -1440,7 +1629,7 @@ impl<A: Agents> Hub<A> {
             self.say(Target::Topic(key), texts::SNAPSHOT_BUSY.to_owned());
             return true;
         }
-        let running = self.running.contains_key(&key);
+        let running = self.running.contains_key(&key) || self.handoff_busy(key);
         if running {
             self.say(Target::Topic(key), texts::ALREADY_RUNNING.to_owned());
         }
@@ -1566,7 +1755,7 @@ impl<A: Agents> Hub<A> {
                 key: *key,
                 title: self.titles.get(key).cloned(),
                 session: session.clone(),
-                state: if self.running.contains_key(key) {
+                state: if self.running.contains_key(key) || self.handoffs.busy(*key) {
                     TopicState::Running
                 } else {
                     TopicState::Waiting
@@ -1611,6 +1800,7 @@ mod tests {
     enum Script {
         Say(Vec<AgentEvent>),
         UntilStopped,
+        Cleanup { stopped: oneshot::Sender<()>, release: oneshot::Receiver<()> },
         Collect(usize),
         Stream(mpsc::Receiver<AgentEvent>),
         Approval,
@@ -1622,6 +1812,7 @@ mod tests {
     struct FakeAgents {
         scripts: StdMutex<VecDeque<Script>>,
         prompts: StdMutex<Vec<String>>,
+        sessions: StdMutex<Vec<TopicSession>>,
         parameters: StdMutex<Vec<Arc<Settings>>>,
         archive: Arc<FakeArchive>,
         /// The next `archive` lookup panics, as a bug in a backend would.
@@ -1676,12 +1867,13 @@ mod tests {
 
         fn run<'a>(
             &'a self,
-            _session: &'a TopicSession,
+            session: &'a TopicSession,
             prompt: Prompt,
             mut inbox: mpsc::Receiver<Prompt>,
             conversation: Conversation,
             settings: Arc<Settings>,
         ) -> BoxFuture<'a, mpsc::Receiver<Prompt>> {
+            self.sessions.lock().unwrap().push(session.clone());
             self.parameters.lock().unwrap().push(settings);
             self.prompts.lock().unwrap().push(prompt.text().to_owned());
             let script =
@@ -1738,6 +1930,11 @@ mod tests {
                         }
                     }
                     Script::UntilStopped => conversation.cancel.cancelled().await,
+                    Script::Cleanup { stopped, release } => {
+                        conversation.cancel.cancelled().await;
+                        let _ = stopped.send(());
+                        let _ = release.await;
+                    }
                     Script::Collect(count) => {
                         for _ in 0..count {
                             let next = inbox.recv().await.unwrap();
@@ -2018,6 +2215,7 @@ mod tests {
             album: None,
             reply_to: None,
             voice_reply: false,
+            handoff_reply: false,
             content,
         })
     }
@@ -3743,6 +3941,401 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handoff_lists_receivers_without_starting_model() {
+        let world = world(FakeAgents::default());
+        bound(&world, KEY, "s-1").await;
+        world.send(text(Some(7), 20, "/handoff")).await;
+        eventually("handoff menu", || world.messenger.calls().iter().any(|call| matches!(call, Call::Send { message, .. } if message.keyboard.iter().flatten().any(|button| button.data.starts_with("handoff:"))))).await;
+        assert!(world.agents.prompts().is_empty());
+        assert_eq!(bound_to(&world, KEY), SessionId::parse("s-1"));
+    }
+
+    fn handoff_events() -> Vec<AgentEvent> {
+        vec![
+            AgentEvent::AssistantText("Цель: закончить задачу\nСделано: основа\nРешения: сохранить API\nФайлы: src/lib.rs\nДалее: проверить тесты".to_owned()),
+            AgentEvent::Finished(Finished { session: SessionId::parse("s-1").unwrap(), usage: Usage::Claude { turns: 1, cost: None }, background: 0 }),
+        ]
+    }
+
+    fn handoff_button(world: &World, label: &str) -> Option<(MessageId, String)> {
+        world.messenger.calls().into_iter().rev().find_map(|call| {
+            let (id, message) = match call {
+                Call::Send { id, message, .. } => (id, message),
+                Call::EditCard { message, card, .. } => (message, card),
+                _ => return None,
+            };
+            message
+                .keyboard
+                .iter()
+                .flatten()
+                .find(|button| button.text == label && button.data.starts_with("handoff:"))
+                .map(|button| (id, button.data.clone()))
+        })
+    }
+
+    async fn handoff_click(world: &World, label: &str) {
+        eventually("handoff button", || handoff_button(world, label).is_some()).await;
+        let (message, data) = handoff_button(world, label).unwrap();
+        world.send(press(label, message.0, &data)).await;
+    }
+
+    async fn handoff_generate(world: &World) {
+        bound(world, KEY, "s-1").await;
+        world.send(text(Some(7), 20, "/handoff codex")).await;
+        handoff_click(world, "Сформировать сводку").await;
+    }
+
+    async fn handoff_preview(world: &World) {
+        handoff_generate(world).await;
+        eventually("handoff preview", || handoff_button(world, "Передать и продолжить").is_some())
+            .await;
+    }
+
+    #[tokio::test]
+    async fn handoff_only_confirmed_summary_starts_fresh_recipient_once_and_preserves_source() {
+        let world = world(FakeAgents::scripted(vec![Script::Say(handoff_events())]));
+        handoff_preview(&world).await;
+        assert_eq!(world.agents.prompts(), [hub_core::handoff::SUMMARY_REQUEST]);
+        assert!(world.results.records.lock().unwrap().is_empty());
+        assert!(world.messenger.topic_attempts().is_empty());
+        let (message, data) = handoff_button(&world, "Передать и продолжить").unwrap();
+        world.send(press("send1", message.0, &data)).await;
+        world.send(press("send2", message.0, &data)).await;
+        eventually("recipient", || world.agents.prompts().len() == 2).await;
+        assert_eq!(world.messenger.topic_attempts().len(), 1);
+        assert_eq!(bound_to(&world, KEY), SessionId::parse("s-1"));
+        let calls = world.agents.sessions.lock().unwrap();
+        assert_eq!(calls[0].session, SessionId::parse("s-1"));
+        assert_eq!(calls[1].backend, BackendKind::Codex);
+        assert_eq!(calls[1].session, None);
+        assert_eq!(calls[1].cwd, calls[0].cwd);
+        assert!(world.agents.prompts()[1].contains("Далее: проверить тесты"));
+    }
+
+    #[tokio::test]
+    async fn handoff_failures_keep_source_available() {
+        for recipient_fails in [false, true] {
+            let events = if recipient_fails {
+                handoff_events()
+            } else {
+                vec![AgentEvent::Failed("private diagnostic".to_owned())]
+            };
+            let world = world(FakeAgents::scripted(vec![
+                Script::Say(events),
+                Script::Say(vec![AgentEvent::Failed("missing recipient".to_owned())]),
+            ]));
+            handoff_generate(&world).await;
+            if recipient_fails {
+                handoff_click(&world, "Передать и продолжить").await;
+                eventually("recipient failure", || {
+                    world.texts().iter().any(|text| text.contains("missing recipient"))
+                })
+                .await;
+            } else {
+                eventually("summary failure", || {
+                    world.texts().iter().any(|text| text.contains("не завершил подготовку"))
+                })
+                .await;
+                assert!(!world.texts().iter().any(|text| text.contains("private diagnostic")));
+                assert!(world.messenger.topic_attempts().is_empty());
+            }
+            assert_eq!(bound_to(&world, KEY), SessionId::parse("s-1"));
+            world.send(text(Some(7), 50, "продолжи здесь")).await;
+            eventually("source still works", || {
+                world.agents.prompts().contains(&"продолжи здесь".to_owned())
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn handoff_topic_or_storage_failure_never_starts_recipient() {
+        for storage in [false, true] {
+            let world = world(FakeAgents::scripted(vec![Script::Say(handoff_events())]));
+            handoff_preview(&world).await;
+            if storage {
+                world.store.fail.store(true, Ordering::SeqCst);
+            } else {
+                world
+                    .messenger
+                    .topic_result(Err(SendError::Failed("token-must-not-appear".to_owned())));
+            }
+            handoff_click(&world, "Передать и продолжить").await;
+            eventually("handoff failure", || {
+                world.texts().iter().any(|text| {
+                    text.contains(if storage {
+                        "привязка не сохранена"
+                    } else {
+                        "Не удалось подтвердить создание"
+                    })
+                })
+            })
+            .await;
+            assert!(!world.texts().iter().any(|text| text.contains("token-must-not-appear")));
+            assert_eq!(world.agents.prompts().len(), 1);
+            assert_eq!(world.messenger.topic_attempts().len(), 1);
+            assert_eq!(bound_to(&world, KEY), SessionId::parse("s-1"));
+            assert!(
+                !world.handle.views.borrow().iter().any(|view| view.key.thread == ThreadId(10000))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handoff_early_and_late_topic_events_do_not_reset_recipient_binding() {
+        for early in [false, true] {
+            let world = world(FakeAgents::scripted(vec![Script::Say(handoff_events())]));
+            handoff_preview(&world).await;
+            let (release, held) = oneshot::channel();
+            world.messenger.hold_topic(held);
+            handoff_click(&world, "Передать и продолжить").await;
+            eventually("creation pending", || world.messenger.topic_attempts().len() == 1).await;
+            let event = || {
+                inbound(
+                    Some(10000),
+                    51,
+                    Content::TopicCreated { name: "Передача в codex".to_owned() },
+                )
+            };
+            if early {
+                world.send(event()).await;
+                eventually("early service binding", || {
+                    world.store.last().is_some_and(|topics| {
+                        topics.contains_key(&TopicKey { thread: ThreadId(10000), ..KEY })
+                    })
+                })
+                .await;
+            }
+            release.send(()).unwrap();
+            eventually("recipient started", || world.agents.prompts().len() == 2).await;
+            world
+                .send(inbound(
+                    Some(10000),
+                    53,
+                    Content::TopicRenamed { name: "новое имя".to_owned() },
+                ))
+                .await;
+            world.send(event()).await;
+            world.send(text(Some(10000), 54, "/status")).await;
+            eventually("recipient status", || {
+                world.texts().iter().any(|text| text.contains("codex") && text.contains("session:"))
+            })
+            .await;
+            assert_eq!(
+                world.store.last().unwrap()[&TopicKey { thread: ThreadId(10000), ..KEY }].backend,
+                BackendKind::Codex
+            );
+            assert_eq!(
+                world
+                    .store
+                    .titles
+                    .lock()
+                    .unwrap()
+                    .get(&TopicKey { thread: ThreadId(10000), ..KEY })
+                    .map(String::as_str),
+                Some("новое имя")
+            );
+            assert_eq!(bound_to(&world, KEY), SessionId::parse("s-1"));
+        }
+    }
+
+    #[tokio::test]
+    async fn handoff_does_not_overwrite_topic_claimed_before_creation_response() {
+        let world = world(FakeAgents::scripted(vec![Script::Say(handoff_events())]));
+        handoff_preview(&world).await;
+        let (release, held) = oneshot::channel();
+        world.messenger.hold_topic(held);
+        handoff_click(&world, "Передать и продолжить").await;
+        eventually("creation pending", || world.messenger.topic_attempts().len() == 1).await;
+        world
+            .send(inbound(Some(10000), 51, Content::TopicCreated { name: "new".to_owned() }))
+            .await;
+        world.send(text(Some(10000), 52, "/new qwen")).await;
+        eventually("user claimed topic", || {
+            world.store.last().is_some_and(|topics| {
+                topics
+                    .get(&TopicKey { thread: ThreadId(10000), ..KEY })
+                    .is_some_and(|session| session.backend == BackendKind::Qwen)
+            })
+        })
+        .await;
+        release.send(()).unwrap();
+        eventually("claim preserved", || {
+            world.texts().iter().any(|text| text.contains("новая тема уже используется"))
+        })
+        .await;
+        assert_eq!(world.agents.prompts().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn handoff_edits_require_author_exact_reply_and_new_confirmation() {
+        let world = world(FakeAgents::scripted(vec![Script::Say(handoff_events())]));
+        handoff_preview(&world).await;
+        let (message, old) = handoff_button(&world, "Передать и продолжить").unwrap();
+        for (chat, user, message) in [
+            (KEY.chat, UserId(2), message),
+            (ChatId(-101), UserId(1), message),
+            (KEY.chat, UserId(1), MessageId(99999)),
+        ] {
+            world
+                .send(HubMessage::Press(Press {
+                    callback: "foreign".to_owned(),
+                    chat: Some(chat),
+                    user,
+                    message: Some(message),
+                    html: None,
+                    data: old.clone(),
+                }))
+                .await;
+        }
+        handoff_click(&world, "Исправить").await;
+        eventually("handoff edit prompt", || world.messenger.calls().iter().any(|call| matches!(call, Call::Send { message, .. } if message.force_reply && message.text == crate::inbound::HANDOFF_EDIT_PROMPT))).await;
+        let prompt = world
+            .messenger
+            .calls()
+            .iter()
+            .find_map(|call| match call {
+                Call::Send { message, id, .. }
+                    if message.text == crate::inbound::HANDOFF_EDIT_PROMPT =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        let reply = |user, reply_to, text: &str| {
+            HubMessage::Inbound(Inbound {
+                chat: KEY.chat,
+                thread: Some(KEY.thread),
+                user: Some(UserId(user)),
+                message: MessageId(55),
+                reply_to: Some(reply_to),
+                voice_reply: false,
+                handoff_reply: true,
+                album: None,
+                content: Content::Text(text.to_owned()),
+            })
+        };
+        world.send(reply(2, prompt, "чужая сводка")).await;
+        world.send(reply(1, MessageId(99999), "не тот ответ")).await;
+        world.send(reply(1, prompt, "/reset — это исправленная задача")).await;
+        eventually("corrected preview", || {
+            handoff_button(&world, "Передать и продолжить").is_some_and(|(_, data)| data != old)
+        })
+        .await;
+        world.send(press("old", message.0, &old)).await;
+        assert!(world.messenger.topic_attempts().is_empty());
+        handoff_click(&world, "Передать и продолжить").await;
+        eventually("corrected task sent", || world.agents.prompts().len() == 2).await;
+        assert!(world.agents.prompts()[1].contains("/reset — это исправленная задача"));
+        assert_eq!(bound_to(&world, KEY), SessionId::parse("s-1"));
+    }
+
+    #[tokio::test]
+    async fn handoff_old_reply_after_restart_is_not_a_task() {
+        let mut world = world(FakeAgents::default());
+        world.restart().await;
+        world
+            .send(HubMessage::Inbound(Inbound {
+                chat: KEY.chat,
+                thread: Some(KEY.thread),
+                user: Some(UserId(1)),
+                message: MessageId(55),
+                reply_to: Some(MessageId(44)),
+                voice_reply: false,
+                handoff_reply: true,
+                album: None,
+                content: Content::Text("старый ответ".to_owned()),
+            }))
+            .await;
+        eventually("old reply ignored", || {
+            world.texts().iter().any(|text| text.contains("Сводка устарела"))
+        })
+        .await;
+        assert!(world.agents.prompts().is_empty());
+    }
+
+    #[tokio::test]
+    async fn handoff_normal_turn_settings_and_restore_invalidate_summary() {
+        for action in ["normal", "settings", "restore"] {
+            let world = world(FakeAgents::scripted(vec![Script::Say(handoff_events())]));
+            if action == "restore" {
+                saved_snap(&world).await;
+            }
+            handoff_preview(&world).await;
+            let (message, data) = handoff_button(&world, "Передать и продолжить").unwrap();
+            match action {
+                "normal" => world.send(text(Some(7), 30, "новая работа")).await,
+                "settings" => world.settings.send_modify(|settings| {
+                    Arc::make_mut(settings).claude.model = Some("changed".to_owned());
+                }),
+                _ => {
+                    world.agents.archive.forget();
+                    world.send(text(Some(7), 30, "/restore snap")).await;
+                }
+            }
+            if action == "restore" {
+                eventually("restored", || said(&world, "♻️ Восстановлено: snap")).await;
+            }
+            world.send(press("stale", message.0, &data)).await;
+            eventually("stale handoff", || world.messenger.calls().iter().any(|call| matches!(call, Call::Answer { callback, text: Some(text) } if callback == "stale" && text.contains("устарел")))).await;
+            assert!(world.messenger.topic_attempts().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn handoff_cancel_keeps_source_lease_until_cleanup_including_aliases() {
+        let (stopped, cancelled) = oneshot::channel();
+        let (release, cleanup) = oneshot::channel();
+        let world =
+            world(FakeAgents::scripted(vec![Script::Cleanup { stopped, release: cleanup }]));
+        bound(&world, OTHER, "s-1").await;
+        handoff_generate(&world).await;
+        eventually("summary running", || world.agents.prompts().len() == 1).await;
+        world.send(HubMessage::Reset(KEY)).await;
+        world.send(text(Some(8), 30, "/save during-summary")).await;
+        world.send(text(Some(8), 31, "alias while generating")).await;
+        world.send(HubMessage::Stop(KEY)).await;
+        cancelled.await.unwrap();
+        world.send(text(Some(8), 32, "alias during cleanup")).await;
+        world.send(text(Some(7), 33, "/status")).await;
+        eventually("cleanup lease refusal", || {
+            world.texts().iter().filter(|text| text.contains("Готовится передача задачи")).count()
+                >= 2
+        })
+        .await;
+        assert_eq!(world.agents.prompts().len(), 1);
+        assert_eq!(bound_to(&world, KEY), SessionId::parse("s-1"));
+        release.send(()).unwrap();
+        eventually("cleanup complete", || {
+            world.texts().iter().any(|text| text.contains("Подготовка сводки отменена"))
+        })
+        .await;
+        world.send(text(Some(8), 34, "alias after cleanup")).await;
+        eventually("source released", || {
+            world.agents.prompts().contains(&"alias after cleanup".to_owned())
+        })
+        .await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn handoff_expired_and_cancelled_summaries_cannot_create_topics() {
+        for expired in [false, true] {
+            let world = world(FakeAgents::scripted(vec![Script::Say(handoff_events())]));
+            handoff_preview(&world).await;
+            let (message, data) = handoff_button(&world, "Передать и продолжить").unwrap();
+            if expired {
+                tokio::time::advance(Duration::from_mins(16)).await;
+            } else {
+                handoff_click(&world, "Отмена").await;
+            }
+            world.send(press("old", message.0, &data)).await;
+            eventually("old button ignored", || world.messenger.calls().iter().any(|call| matches!(call, Call::Answer { callback, text: Some(text) } if callback == "old" && text.contains("устарел")))).await;
+            assert!(world.messenger.topic_attempts().is_empty());
+        }
+    }
+
+    #[tokio::test]
     async fn voice_gets_a_hint() {
         let world = world(FakeAgents::default());
         world.send(inbound(Some(7), 1, Content::VideoNote)).await;
@@ -3804,6 +4397,7 @@ mod tests {
             album: None,
             reply_to: Some(prompt),
             voice_reply: true,
+            handoff_reply: false,
             content: Content::Text(text.to_owned()),
         })
     }
@@ -4112,6 +4706,7 @@ mod tests {
                     album: Some("g".to_owned()),
                     reply_to: None,
                     voice_reply: false,
+                    handoff_reply: false,
                     content: Content::Media {
                         caption: caption.to_owned(),
                         attachment: Attachment::Photo(FileRef {

@@ -457,8 +457,15 @@ mod tests {
     type TestResult = Result<(), Box<dyn Error>>;
 
     fn executable(path: &Path, script: &str) -> TestResult {
-        fs::write(path, script)?;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+        // Parallel fork/exec may briefly inherit another test's writable script
+        // descriptor (ETXTBSY). Execute a checked-in launcher; write only its input.
+        fs::write(path.with_extension("script"), script)?;
+        if !path.exists() {
+            symlink(
+                Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/autostart-command"),
+                path,
+            )?;
+        }
         Ok(())
     }
 
@@ -467,7 +474,9 @@ mod tests {
         let home = directory.path().join("home space & '中文'");
         fs::create_dir(&home)?;
         let program = home.join("agent-hub");
-        executable(&program, "#!/bin/sh\nexit 0\n")?;
+        // This placeholder is inspected and chmod'ed, never executed.
+        fs::write(&program, b"application fixture")?;
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700))?;
         let launchctl = directory.path().join("launchctl-fixture");
         executable(
             &launchctl,

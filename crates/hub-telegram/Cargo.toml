@@ -17,6 +17,7 @@ hub-qwen.workspace = true
 hub-hermes.workspace = true
 hub-opencode.workspace = true
 hub-core.workspace = true
+reqwest.workspace = true
 teloxide.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "rt", "sync", "time"] }

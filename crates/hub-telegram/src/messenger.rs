@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
-use hub_core::domain::{ChatId, MessageId, TopicKey};
+use hub_core::domain::{ChatId, MessageId, ThreadId, TopicKey};
 use hub_core::questions::Button;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -85,6 +85,12 @@ pub enum SendError {
 }
 
 pub trait Messenger: Send + Sync {
+    /// Creates one forum topic without automatic retries. An uncertain result may leave a topic.
+    fn create_topic(
+        &self,
+        chat: ChatId,
+        name: String,
+    ) -> BoxFuture<'_, Result<ThreadId, SendError>>;
     fn send(
         &self,
         target: Target,

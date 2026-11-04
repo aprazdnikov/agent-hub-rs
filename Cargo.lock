@@ -1926,6 +1926,7 @@ dependencies = [
  "hub-qwen",
  "hyper",
  "hyper-util",
+ "reqwest",
  "rstest",
  "serde_json",
  "teloxide",

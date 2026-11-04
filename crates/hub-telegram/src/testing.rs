@@ -6,7 +6,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use futures::future::BoxFuture;
-use hub_core::domain::{ChatId, MessageId, TopicKey};
+use hub_core::domain::{ChatId, MessageId, ThreadId, TopicKey};
 use hub_core::questions::Button;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::oneshot;
@@ -31,6 +31,7 @@ impl crate::actions::ActionRunner for FakeActionRunner {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Call {
+    CreateTopic { chat: ChatId, name: String, thread: ThreadId },
     Send { target: Target, message: Outgoing, id: MessageId },
     Edit { chat: ChatId, message: MessageId, text: String, format: Format },
     EditCard { chat: ChatId, message: MessageId, card: Outgoing },
@@ -45,15 +46,33 @@ pub(crate) struct FakeMessenger {
     calls: Mutex<Vec<Call>>,
     send_attempts: Mutex<Vec<Outgoing>>,
     card_attempts: Mutex<Vec<Outgoing>>,
+    topic_attempts: Mutex<Vec<(ChatId, String)>>,
+    topics: Mutex<VecDeque<Result<ThreadId, SendError>>>,
     sends: Mutex<VecDeque<Result<(), SendError>>>,
     edits: Mutex<VecDeque<Result<(), SendError>>>,
     edit_delay: Mutex<Option<oneshot::Receiver<()>>>,
     send_delay: Mutex<Option<oneshot::Receiver<()>>>,
+    topic_delay: Mutex<Option<oneshot::Receiver<()>>>,
     pub(crate) files: HashMap<String, Vec<u8>>,
     next: AtomicI32,
+    next_topic: AtomicI32,
 }
 
 impl FakeMessenger {
+    /// Queue a result for the next creation; unscripted topics get unique IDs from 10000.
+    pub fn topic_result(&self, result: Result<ThreadId, SendError>) {
+        self.topics.lock().unwrap().push_back(result);
+    }
+
+    /// Hold the next creation, while still recording its attempt immediately.
+    pub fn hold_topic(&self, release: oneshot::Receiver<()>) {
+        *self.topic_delay.lock().unwrap() = Some(release);
+    }
+
+    pub fn topic_attempts(&self) -> Vec<(ChatId, String)> {
+        self.topic_attempts.lock().unwrap().clone()
+    }
+
     /// Outcomes of the next sends, in order; afterwards every send succeeds.
     pub(crate) fn with_sends(sends: Vec<Result<(), SendError>>) -> Self {
         Self { sends: Mutex::new(sends.into()), ..Self::default() }
@@ -117,6 +136,26 @@ impl FakeMessenger {
 }
 
 impl Messenger for FakeMessenger {
+    fn create_topic(
+        &self,
+        chat: ChatId,
+        name: String,
+    ) -> BoxFuture<'_, Result<ThreadId, SendError>> {
+        self.topic_attempts.lock().unwrap().push((chat, name.clone()));
+        let scripted = self.topics.lock().unwrap().pop_front();
+        let delay = self.topic_delay.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some(delay) = delay {
+                let _ = delay.await;
+            }
+            let thread = scripted.unwrap_or_else(|| {
+                Ok(ThreadId(self.next_topic.fetch_add(1, Ordering::SeqCst) + 10_000))
+            })?;
+            self.record(Call::CreateTopic { chat, name, thread });
+            Ok(thread)
+        })
+    }
+
     fn edit_card(
         &self,
         chat: ChatId,

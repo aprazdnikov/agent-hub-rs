@@ -5,6 +5,7 @@ pub mod commands;
 pub mod doctor;
 pub mod domain;
 pub mod escape;
+pub mod handoff;
 mod ids;
 pub mod markdown;
 pub mod progress;

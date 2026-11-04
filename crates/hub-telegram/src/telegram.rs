@@ -28,7 +28,9 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::hub::HubMessage;
-use crate::inbound::{Attachment, Content, FileRef, Inbound, Press, VOICE_EDIT_PROMPT};
+use crate::inbound::{
+    Attachment, Content, FileRef, HANDOFF_EDIT_PROMPT, Inbound, Press, VOICE_EDIT_PROMPT,
+};
 pub use crate::menu::{MenuError, synchronize_commands};
 use crate::messenger::{Format, Messenger, Outgoing, SendError, Target};
 
@@ -49,6 +51,10 @@ pub fn convert(message: &Message) -> Inbound {
         voice_reply: message.reply_to_message().is_some_and(|reply| {
             reply.from.as_ref().is_some_and(|author| author.is_bot)
                 && reply.text().is_some_and(|text| text.starts_with(VOICE_EDIT_PROMPT))
+        }),
+        handoff_reply: message.reply_to_message().is_some_and(|reply| {
+            reply.from.as_ref().is_some_and(|author| author.is_bot)
+                && reply.text().is_some_and(|text| text.starts_with(HANDOFF_EDIT_PROMPT))
         }),
         album: message.media_group_id().map(|group| group.0.clone()),
         content: content(message),
@@ -166,7 +172,8 @@ pub async fn connect(token: &Token, chat: ChatId) -> Result<Connection, StartErr
         }
     }
     let username = me.user.username.clone().unwrap_or_default();
-    let messenger = Arc::new(TelegramMessenger { bot: bot.clone(), files });
+    let topics = topic_bot(token.expose())?;
+    let messenger = Arc::new(TelegramMessenger { bot: bot.clone(), files, topics });
     Ok(Connection { bot, messenger, username })
 }
 
@@ -174,6 +181,18 @@ pub struct TelegramMessenger {
     bot: Bot,
     /// The same bot with a longer timeout for file transfers.
     files: Bot,
+    /// Topic creation cannot be safely repeated after an uncertain response.
+    topics: Bot,
+}
+
+fn topic_bot(token: &str) -> Result<Bot, StartError> {
+    let client = teloxide::net::default_reqwest_settings()
+        .timeout(Duration::from_secs(15))
+        .retry(reqwest::retry::never())
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|_| StartError::Network("Не удалось настроить создание тем".to_owned()))?;
+    Ok(Bot::with_client(token, client))
 }
 
 fn sent(error: RequestError) -> SendError {
@@ -223,6 +242,30 @@ fn thread(key: TopicKey) -> tg::ThreadId {
 }
 
 impl Messenger for TelegramMessenger {
+    fn create_topic(
+        &self,
+        chat: ChatId,
+        name: String,
+    ) -> BoxFuture<'_, Result<ThreadId, SendError>> {
+        Box::pin(async move {
+            let topic = self.topics.create_forum_topic(tg::ChatId(chat.0), name).await.map_err(
+                |error| match error {
+                    RequestError::RetryAfter(seconds) => SendError::RetryAfter(seconds.duration()),
+                    RequestError::Api(_) => SendError::Rejected(
+                        "Не удалось создать тему; проверьте право бота управлять темами".to_owned(),
+                    ),
+                    // Transport and parse errors can expose the token URL or response body.
+                    _ => SendError::Failed("Не удалось получить ответ о создании темы".to_owned()),
+                },
+            )?;
+            let id = topic.thread_id.0.0;
+            if id <= 0 {
+                return Err(SendError::Failed("Telegram вернул некорректный ID темы".to_owned()));
+            }
+            Ok(ThreadId(id))
+        })
+    }
+
     fn edit_card(
         &self,
         chat: ChatId,
@@ -496,6 +539,107 @@ mod tests {
     use super::*;
 
     #[rstest::rstest]
+    #[case::created(
+        json!({"ok": true, "result": {"message_thread_id": 41, "name": "Передача → Codex", "icon_color": 7_322_096}}),
+        Ok(ThreadId(41))
+    )]
+    #[case::zero_thread(
+        json!({"ok": true, "result": {"message_thread_id": 0, "name": "topic", "icon_color": 7_322_096}}),
+        Err(SendError::Failed("Telegram вернул некорректный ID темы".to_owned()))
+    )]
+    #[case::negative_thread(
+        json!({"ok": true, "result": {"message_thread_id": -7, "name": "topic", "icon_color": 7_322_096}}),
+        Err(SendError::Failed("Telegram вернул некорректный ID темы".to_owned()))
+    )]
+    #[case::rejected(
+        json!({"ok": false, "error_code": 400, "description": "secret https://api.telegram.org/bot1:secret/createForumTopic"}),
+        Err(SendError::Rejected("Не удалось создать тему; проверьте право бота управлять темами".to_owned()))
+    )]
+    #[case::rate_limited(
+        json!({"ok": false, "error_code": 429, "description": "Too Many Requests: retry after 2", "parameters": {"retry_after": 2}}),
+        Err(SendError::RetryAfter(Duration::from_secs(2)))
+    )]
+    #[case::malformed(
+        json!({"ok": true, "result": "secret https://api.telegram.org/bot1:secret/createForumTopic"}),
+        Err(SendError::Failed("Не удалось получить ответ о создании темы".to_owned()))
+    )]
+    #[tokio::test]
+    async fn topic_creation_sends_one_request_and_returns_a_safe_result(
+        #[case] response: serde_json::Value,
+        #[case] expected: Result<ThreadId, SendError>,
+    ) {
+        use http_body_util::{BodyExt, Full};
+        use hyper::body::Bytes;
+        use hyper_util::rt::TokioIo;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&requests);
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let recorded = Arc::clone(&recorded);
+                let response = response.clone();
+                let service = hyper::service::service_fn(
+                    move |request: hyper::Request<hyper::body::Incoming>| {
+                        let recorded = Arc::clone(&recorded);
+                        let response = response.clone();
+                        async move {
+                            let path = request.uri().path().to_ascii_lowercase();
+                            let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                            let params: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+                            recorded.lock().unwrap().push((path, params));
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                                Bytes::from(response.to_string()),
+                            )))
+                        }
+                    },
+                );
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .keep_alive(false)
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            }
+        });
+        let bot =
+            topic_bot("1:test").unwrap().set_api_url(format!("http://{address}/").parse().unwrap());
+        let messenger = TelegramMessenger { files: bot.clone(), topics: bot.clone(), bot };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            messenger.create_topic(ChatId(-100), "Передача → Codex".to_owned()),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        assert_eq!(
+            (result, requests.lock().unwrap().clone()),
+            (
+                expected,
+                vec![(
+                    "/bot1:test/createforumtopic".to_owned(),
+                    json!({
+                        "chat_id": -100, "name": "Передача → Codex"
+                    })
+                )]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn topic_creation_transport_failure_does_not_expose_the_token_or_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let bot = topic_bot("1:secret")
+            .unwrap()
+            .set_api_url(format!("http://{address}/").parse().unwrap());
+        let messenger = TelegramMessenger { files: bot.clone(), topics: bot.clone(), bot };
+        assert_eq!(
+            messenger.create_topic(ChatId(-100), "topic".to_owned()).await,
+            Err(SendError::Failed("Не удалось получить ответ о создании темы".to_owned()))
+        );
+    }
+
+    #[rstest::rstest]
     #[case(true)]
     #[case(false)]
     #[tokio::test]
@@ -538,7 +682,7 @@ mod tests {
                 .unwrap();
         });
         let bot = Bot::new("1:test").set_api_url(format!("http://{address}/").parse().unwrap());
-        let messenger = TelegramMessenger { files: bot.clone(), bot };
+        let messenger = TelegramMessenger { files: bot.clone(), topics: bot.clone(), bot };
         assert_eq!(
             messenger
                 .edit_card(
@@ -587,7 +731,7 @@ mod tests {
                 .unwrap();
         });
         let bot = Bot::new("1:test").set_api_url(format!("http://{address}/").parse().unwrap());
-        let messenger = TelegramMessenger { files: bot.clone(), bot };
+        let messenger = TelegramMessenger { files: bot.clone(), topics: bot.clone(), bot };
         let result = messenger
             .send(
                 Target::Reply { chat: ChatId(-100), message: MessageId(1) },
@@ -634,7 +778,7 @@ mod tests {
                 .unwrap();
         });
         let bot = Bot::new("1:test").set_api_url(format!("http://{address}/").parse().unwrap());
-        let messenger = TelegramMessenger { files: bot.clone(), bot };
+        let messenger = TelegramMessenger { files: bot.clone(), topics: bot.clone(), bot };
         assert!(
             messenger
                 .send(
@@ -653,7 +797,7 @@ mod tests {
     async fn force_reply_cannot_be_combined_with_an_inline_keyboard() {
         // An unreachable local endpoint ensures rejected requests have no network effects.
         let bot = Bot::new("1:test").set_api_url("http://127.0.0.1:1/".parse().unwrap());
-        let messenger = TelegramMessenger { files: bot.clone(), bot };
+        let messenger = TelegramMessenger { files: bot.clone(), topics: bot.clone(), bot };
         let outgoing = Outgoing::plain("reply".to_owned())
             .with_force_reply()
             .with_keyboard(vec![vec![Button { text: "Confirm".into(), data: "confirm".into() }]]);
@@ -668,7 +812,7 @@ mod tests {
     #[tokio::test]
     async fn force_reply_cannot_be_added_to_an_existing_card() {
         let bot = Bot::new("1:test").set_api_url("http://127.0.0.1:1/".parse().unwrap());
-        let messenger = TelegramMessenger { files: bot.clone(), bot };
+        let messenger = TelegramMessenger { files: bot.clone(), topics: bot.clone(), bot };
         assert!(matches!(
             messenger
                 .edit_card(
@@ -759,7 +903,7 @@ mod tests {
             }
         });
         let bot = Bot::new("1:test").set_api_url(format!("http://{address}/").parse().unwrap());
-        let messenger = TelegramMessenger { files: bot.clone(), bot };
+        let messenger = TelegramMessenger { files: bot.clone(), topics: bot.clone(), bot };
         assert_eq!(messenger.fetch_limited("voice".to_owned(), 3).await, expected);
         server.await.unwrap();
     }
@@ -882,6 +1026,36 @@ mod tests {
             "reply_to_message": {"message_id": 4, "date": 0, "chat": {"id": -100, "type": "supergroup"}, "from": {"id": 2, "is_bot": is_bot, "first_name": "bot"}, "text": text}
         })));
         assert_eq!(reply.voice_reply, expected);
+    }
+
+    #[rstest::rstest]
+    #[case::bot_prompt(
+        true,
+        "📋 Исправление сводки\nОтветьте на это сообщение полным исправленным текстом. Затем подтвердите передачу.",
+        true
+    )]
+    #[case::human_forgery(
+        false,
+        "📋 Исправление сводки\nОтветьте на это сообщение полным исправленным текстом. Затем подтвердите передачу.",
+        false
+    )]
+    #[case::ordinary_bot_message(true, "ordinary message", false)]
+    #[case::voice_prompt(true, VOICE_EDIT_PROMPT, false)]
+    #[case::bot_prompt_with_context(
+        true,
+        "📋 Исправление сводки\nОтветьте на это сообщение полным исправленным текстом. Затем подтвердите передачу.\nЧерновик #1",
+        true
+    )]
+    fn handoff_correction_reply_is_recognised_only_for_its_bot_prompt(
+        #[case] is_bot: bool,
+        #[case] text: &str,
+        #[case] expected: bool,
+    ) {
+        let reply = convert(&topic(&json!({
+            "text": "corrected",
+            "reply_to_message": {"message_id": 4, "date": 0, "chat": {"id": -100, "type": "supergroup"}, "from": {"id": 2, "is_bot": is_bot, "first_name": "bot"}, "text": text}
+        })));
+        assert_eq!(reply.handoff_reply, expected);
     }
 
     #[test]

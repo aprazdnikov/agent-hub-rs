@@ -5,6 +5,7 @@ use std::time::Duration;
 use hub_core::domain::{ChatId, MessageId, ThreadId, TopicKey, UserId};
 
 pub const VOICE_EDIT_PROMPT: &str = "🎤 Исправление голосовой задачи\nОтветьте на это сообщение полным исправленным текстом. Затем подтвердите отправку.";
+pub const HANDOFF_EDIT_PROMPT: &str = "📋 Исправление сводки\nОтветьте на это сообщение полным исправленным текстом. Затем подтвердите передачу.";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileRef {
@@ -42,6 +43,8 @@ pub struct Inbound {
     pub reply_to: Option<MessageId>,
     /// A reply to the bot's voice-correction prompt, including an expired prompt.
     pub voice_reply: bool,
+    /// A reply to the bot's handoff-correction prompt, including an expired prompt.
+    pub handoff_reply: bool,
     pub album: Option<String>,
     pub content: Content,
 }
@@ -134,6 +137,7 @@ mod tests {
             message: MessageId(message),
             reply_to: None,
             voice_reply: false,
+            handoff_reply: false,
             album: Some("g".to_owned()),
             content: Content::Media { caption: caption.to_owned(), attachment },
         }

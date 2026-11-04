@@ -490,7 +490,8 @@ mod tests {
                             HubMessage::Reset(key) => {
                                 format!("reset {}/{}", key.chat.0, key.thread.0)
                             }
-                            HubMessage::VoiceDone(_)
+                            HubMessage::HandoffDone(_)
+                            | HubMessage::VoiceDone(_)
                             | HubMessage::SaveResult(_)
                             | HubMessage::LastDone(_)
                             | HubMessage::DoctorDone(_)

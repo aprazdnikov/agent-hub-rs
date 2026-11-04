@@ -23,10 +23,11 @@ pub enum Command {
     Save,
     Saves,
     Restore,
+    Handoff,
 }
 
 impl Command {
-    pub const ALL: [Self; 18] = [
+    pub const ALL: [Self; 19] = [
         Self::New,
         Self::Backend,
         Self::Model,
@@ -44,6 +45,7 @@ impl Command {
         Self::Save,
         Self::Saves,
         Self::Restore,
+        Self::Handoff,
         Self::Help,
     ];
 
@@ -68,6 +70,7 @@ impl Command {
             Self::Save => "save",
             Self::Saves => "saves",
             Self::Restore => "restore",
+            Self::Handoff => "handoff",
         }
     }
 
@@ -92,6 +95,7 @@ impl Command {
             Self::Save => "сохранить снимок сессии этой темы",
             Self::Saves => "список снимков",
             Self::Restore => "продолжить сессию из снимка в этой теме",
+            Self::Handoff => "передать задачу со сводкой в новую тему",
         }
     }
 
@@ -99,7 +103,7 @@ impl Command {
     pub const fn arguments(self) -> &'static str {
         match self {
             Self::New => " [агент] [путь]",
-            Self::Backend => " [агент]",
+            Self::Backend | Self::Handoff => " [агент]",
             Self::Model => " [ID|inherit]",
             Self::Mode => " [режим|inherit]",
             Self::Cwd => " <путь>",
@@ -257,6 +261,23 @@ mod tests {
         assert!(Command::ALL.iter().any(|command| command.name() == "actions"));
     }
 
+    #[rstest]
+    #[case::choose_recipient("/handoff", vec![])]
+    #[case::named_recipient("/handoff@bot codex", vec!["codex"])]
+    fn handoff_accepts_an_optional_recipient_and_is_registered_for_help(
+        #[case] text: &str,
+        #[case] expected_args: Vec<&str>,
+    ) {
+        let input = parse_input(text, "bot");
+        let Input::Command { command, args } = input else {
+            panic!("handoff must be a recognised command");
+        };
+        assert_eq!(
+            (command.name(), command.arguments(), command.description(), args),
+            ("handoff", " [агент]", "передать задачу со сводкой в новую тему", expected_args)
+        );
+    }
+
     #[test]
     fn menu_registry_is_unique_valid_and_parsed() {
         let mut names = std::collections::HashSet::new();
@@ -268,7 +289,7 @@ mod tests {
             assert!((1..=256).contains(&command.description().chars().count()));
             assert_eq!(Command::parse(name), Some(command));
         }
-        assert_eq!(names.len(), 18);
+        assert_eq!(names.len(), 19);
     }
 
     #[test]
@@ -279,7 +300,7 @@ mod tests {
             [
                 "new", "backend", "model", "mode", "cwd", "reset", "stop", "status", "limits",
                 "actions", "projects", "doctor", "last", "outbox", "save", "saves", "restore",
-                "help"
+                "handoff", "help"
             ]
         );
     }
