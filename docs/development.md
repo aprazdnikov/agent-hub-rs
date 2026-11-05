@@ -15,8 +15,12 @@ cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all --check
 cargo deny check
+node --test scripts/test-macos-authorization.mjs
 cargo run -p hub-app --bin agent-hub
 ```
+
+Проверка скрипта авторизации macOS требует Node.js 18+ и работает на любой ОС.
+Она дополняет нативный тест Service Management, который запускается только на macOS.
 
 Живой тест с настоящим `claude` (тратит токены): `cargo test -p hub-claude -- --ignored`.
 Пробы лимитов (не тратят токены): `AGENT_HUB_LIVE_CLI=1 cargo test -p hub-claude --test live -- --ignored live_usage` и `AGENT_HUB_LIVE_CODEX=1 cargo test -p hub-codex --test live -- --ignored live_usage`.
@@ -41,8 +45,8 @@ cargo run -p hub-app --bin agent-hub
 
 ```bash
 cargo build --release --locked -p hub-app
-bash scripts/test-macos-package.sh target/release/agent-hub 0.8.0
-bash scripts/package-macos.sh target/release/agent-hub 0.8.0 dist/agent-hub.app
+bash scripts/test-macos-package.sh target/release/agent-hub 0.9.0
+bash scripts/package-macos.sh target/release/agent-hub 0.9.0 dist/agent-hub.app
 open dist/agent-hub.app
 ```
 

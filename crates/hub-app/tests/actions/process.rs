@@ -101,7 +101,9 @@ async fn cancellation_allows_term_cleanup_before_force_stopping() -> anyhow::Res
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
     let task = tokio::spawn(async move {
-        run("trap 'echo cleaned > cleaned; exit 0' TERM; echo ready > ready; while :; do sleep 30; done", &path, task_cancel).await
+        // wait is interrupted by TERM; a synchronous sleep can defer the trap
+        // past the grace period if it is forked while the group is signalled.
+        run(r#"trap 'echo cleaned > cleaned; exit 0' TERM; sleep 30 & sleeper=$!; echo ready > ready; wait "$sleeper""#, &path, task_cancel).await
     });
     wait_for_file(&cwd.path().join("ready")).await?;
     cancel.cancel();
@@ -137,7 +139,9 @@ async fn cancellation_allows_descendant_cleanup_after_the_shell_exits() -> anyho
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
     let task = tokio::spawn(async move {
-        run("sh -c 'trap \"sleep 0.1; echo cleaned > cleaned; exit 0\" TERM; echo ready > ready; while :; do sleep 30; done' & wait", &path, task_cancel).await
+        // Start the child before publishing readiness, then use an interruptible
+        // wait so the descendant can run its delayed trap after the shell exits.
+        run(r#"sh -c 'trap "sleep 0.1; echo cleaned > cleaned; exit 0" TERM; sleep 30 & sleeper=$!; echo ready > ready; wait "$sleeper"' & wait"#, &path, task_cancel).await
     });
     wait_for_file(&cwd.path().join("ready")).await?;
     cancel.cancel();

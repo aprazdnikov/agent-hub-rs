@@ -73,3 +73,39 @@ cargo test --workspace --locked
 ```
 
 Тесты с настоящими агентами или VPN в этот набор не входят.
+
+## Исправление остановки на macOS перед v0.9.0, 2026-11-05
+
+После исправления JXA полный macOS-прогон дошёл до runner и выявил три ошибки:
+`cancellation_allows_term_cleanup_before_force_stopping`,
+`cancellation_allows_descendant_cleanup_after_the_shell_exits` и
+`command_has_no_runtime_deadline`. Команды завершались, но результат остановки был
+`Failed(PermissionDenied)` вместо `Stopped`.
+
+Причина подтверждена [нативной диагностикой](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/42049632667):
+собственная завершённая shell оставалась zombie, `killpg` возвращал EPERM; после `wait`
+для той же группы возвращался ESRCH. Это соответствует фильтрации zombie-процессов
+в [Apple XNU, `killpg1`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sig.c).
+
+При EPERM runner теперь делает неблокирующий `try_wait` своей shell и повторяет сигнал
+группе только если shell завершилась. ESRCH означает отсутствие группы; повторный EPERM
+и другие ошибки не скрываются. Сигнал по-прежнему адресован всей группе, поэтому
+оставшиеся потомки завершаются. Одинаковая обработка применяется к TERM и KILL;
+двухсекундный период для cleanup hooks и границы ожиданий сохраняются.
+
+Три существующих интеграционных теста воспроизводят ошибку без моков и остаются
+включёнными. Повторный macOS-прогон подтвердил устранение EPERM, но обнаружил
+нестабильность проверки дочернего cleanup: результат `Stopped` уже верный,
+а файл `cleaned` иногда отсутствует. В двух cleanup-fixture обычный `sleep` заменён
+фоновым `sleep` с прерываемым `wait`; готовность публикуется после запуска потомка.
+Так сигнал не откладывает trap до конца синхронного ожидания — см.
+[Bash: Signals](https://www.gnu.org/software/bash/manual/html_node/Signals.html).
+Проверки `Stopped`, выполнения cleanup и задержки обработчика потомка сохранены.
+[Сравнение на macOS](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/42050955371)
+воспроизвело отсутствие cleanup у старой fixture в одном из десяти запусков
+(shell оставалась на `sleep 30`); вариант с `wait` выполнил cleanup во всех десяти.
+
+Локально все 13 тестов runner прошли. [Финальный CI](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/42051535340)
+прошёл на macOS, Windows и Linux: в частности, нативный тест Service Management,
+все три ранее падавших сценария остановки и весь workspace. Проверки не требуют
+повышенных прав, не запускают пользовательские команды и не меняют регистрацию автозапуска.

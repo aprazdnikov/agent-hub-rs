@@ -150,10 +150,10 @@ impl ProcessTree {
         if !self.armed {
             return Ok(());
         }
-        let result = self.process.start_kill();
-        // A normally completed shell may have no remaining process group.
         #[cfg(unix)]
-        let result = result.or_else(ignore_exited_group);
+        let result = self.signal_group(nix::sys::signal::Signal::SIGKILL);
+        #[cfg(windows)]
+        let result = self.process.start_kill();
         if result.is_ok() {
             self.armed = false;
         }
@@ -181,10 +181,26 @@ impl ProcessTree {
     }
 
     #[cfg(unix)]
+    fn signal_group(&mut self, signal: nix::sys::signal::Signal) -> io::Result<()> {
+        let result = self.process.signal(signal as i32);
+        // Darwin can return EPERM when the group's only member is a zombie.
+        // Reap our exited shell and retry the group (descendants may remain).
+        // Never ignore EPERM: a second denial is still a real cleanup failure.
+        let result = match result {
+            Err(error)
+                if error.raw_os_error() == Some(nix::errno::Errno::EPERM as i32)
+                    && self.process.inner_mut().try_wait()?.is_some() =>
+            {
+                self.process.signal(signal as i32)
+            }
+            result => result,
+        };
+        result.or_else(ignore_exited_group)
+    }
+
+    #[cfg(unix)]
     async fn terminate(&mut self) -> io::Result<()> {
-        self.process
-            .signal(nix::sys::signal::Signal::SIGTERM as i32)
-            .or_else(ignore_exited_group)?;
+        self.signal_group(nix::sys::signal::Signal::SIGTERM)?;
         // The shell can exit before a VPN child finishes its cleanup hooks.
         // Preserve the whole grace period for descendants too; waiting only
         // for the shell would immediately kill a still-cleaning-up child.

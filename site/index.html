@@ -4,10 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>agent-hub — агенты Claude, Codex, Qwen, Hermes и OpenCode в Telegram</title>
-<meta name="description" content="Каждая тема Telegram-группы — отдельная сессия Claude Code, Codex, Qwen, Hermes или OpenCode на вашем компьютере. Задачи с телефона, разрешения кнопками.">
+<meta name="description" content="Пять AI-агентов на вашем компьютере под управлением Telegram. Проекты, голосовые задачи, передача работы между агентами. В 0.9.0 — новые настройки и системные темы.">
 <meta property="og:type" content="website">
 <meta property="og:title" content="agent-hub — агенты работают, пока вы в дороге">
-<meta property="og:description" content="Каждая тема Telegram-группы — отдельная сессия Claude Code, Codex, Qwen, Hermes или OpenCode на вашем компьютере.">
+<meta property="og:description" content="Задачи с телефона, проекты, голос и передача между пятью AI-агентами. В 0.9.0 — настройки по разделам и светлая и тёмная темы вслед за системой.">
 <meta property="og:url" content="https://aprazdnikov.github.io/agent-hub-rs/">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232b7de9'/%3E%3Cpath d='M8 16h16M16 8v16' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
@@ -65,6 +65,7 @@ h1 { font: 700 clamp(30px, 5vw, 50px)/1.08 var(--display); letter-spacing: -.02e
 .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
 .btn:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
 .fine { margin-top: 16px; font-size: 14px; color: var(--muted); }
+.version { display: inline-block; margin-bottom: 16px; font: 500 14px var(--mono); text-underline-offset: 4px; }
 
 /* phone with a Telegram forum */
 .phone { background: var(--chat); border: 1px solid var(--line); border-radius: 28px; padding: 14px; max-width: 380px; width: 100%; justify-self: center; box-shadow: 0 24px 60px -30px rgba(20, 32, 51, .45); }
@@ -93,6 +94,9 @@ h2 { font: 700 clamp(22px, 3vw, 30px)/1.2 var(--display); letter-spacing: -.01em
 .feature h3 { font: 600 18px var(--body); margin: 0 0 6px; }
 .feature p { margin: 0; color: var(--muted); }
 .feature code { font: 14px var(--mono); color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; }
+.release { background: var(--surface); border: 1px solid var(--line); border-radius: 18px; padding: 28px 32px; margin-bottom: 56px; }
+.release .features { margin-bottom: 24px; gap: 24px 40px; }
+.release > p { margin: 0; color: var(--muted); }
 
 .flow { overflow-x: auto; margin-bottom: 64px; }
 .flow ol { display: flex; gap: 12px; list-style: none; padding: 0; margin: 0; min-width: 640px; }
@@ -102,7 +106,8 @@ h2 { font: 700 clamp(22px, 3vw, 30px)/1.2 var(--display); letter-spacing: -.01em
 .flow li + li::before { content: "→"; position: absolute; left: -12px; top: 50%; transform: translate(-50%, -50%); color: var(--muted); }
 .flow p { color: var(--muted); font-size: 15px; margin: 14px 0 0; }
 
-.steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; counter-reset: s; margin-bottom: 64px; }
+#agents, #start { margin-bottom: 64px; }
+.steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; counter-reset: s; margin-bottom: 24px; }
 .steps div { counter-increment: s; }
 .steps div::before { content: counter(s); display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%; background: var(--accent); color: var(--accent-ink); font: 700 15px var(--display); margin-bottom: 10px; }
 .steps b { display: block; margin-bottom: 4px; }
@@ -118,6 +123,7 @@ h2 { font: 700 clamp(22px, 3vw, 30px)/1.2 var(--display); letter-spacing: -.01em
   .hero { grid-template-columns: 1fr; gap: 36px; padding-block: 32px 24px; }
   .features, .steps { grid-template-columns: 1fr; }
   .story { grid-template-columns: 1fr; padding: 22px; gap: 12px; }
+  .release { padding: 22px; }
   nav .links { display: none; }
 }
 </style>
@@ -127,11 +133,12 @@ h2 { font: 700 clamp(22px, 3vw, 30px)/1.2 var(--display); letter-spacing: -.01em
 <div class="wrap">
   <nav>
     <div class="logo">agent<span>-</span>hub</div>
-    <div class="links"><a href="#agents">Агенты</a><a href="#how">Как устроено</a><a href="#start">Начать</a><a href="https://github.com/aprazdnikov/agent-hub-rs">GitHub</a></div>
+    <div class="links"><a href="#whats-new">В 0.9.0</a><a href="#agents">Агенты</a><a href="#start">Начать</a><a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/README.md">Документация</a><a href="https://github.com/aprazdnikov/agent-hub-rs">GitHub</a></div>
   </nav>
 
   <section class="hero">
     <div>
+      <a class="version" href="#whats-new">0.9.0 · настройки и системные темы</a>
       <h1>Агенты работают, пока вы в дороге</h1>
       <p class="lead">Каждая тема Telegram-группы — отдельная сессия <b>Claude Code, Codex, Qwen, Hermes или OpenCode</b> на вашем компьютере. Ставите задачу с телефона, разрешаете команды кнопкой, получаете результат.</p>
       <div class="cta">
@@ -142,7 +149,7 @@ h2 { font: 700 clamp(22px, 3vw, 30px)/1.2 var(--display); letter-spacing: -.01em
     </div>
 
     <div class="phone" aria-label="Пример форум-группы в Telegram">
-      <header>Мои агенты <small>4 темы</small></header>
+      <header>Мои агенты <small>3 темы</small></header>
       <div class="topics">
         <div class="topic"><b>backend: тесты</b><span class="st ok">✅ готово</span><span class="who">Claude · ~/shop/backend</span></div>
         <div class="topic"><b>agent-hub: релиз</b><span class="st run">⏳ работает</span><span class="who">Codex · ~/agent-hub</span></div>
@@ -160,13 +167,32 @@ h2 { font: 700 clamp(22px, 3vw, 30px)/1.2 var(--display); letter-spacing: -.01em
     <p>Пришлось срочно уехать, а задач было много. Пока ездил, в шести темах шли шесть сессий: я ставил задачи, отвечал на вопросы и подтверждал команды с телефона. Вернулся к готовым результатам.</p>
   </section>
 
+  <section id="whats-new" class="release">
+    <h2>В 0.9.0 — настройки по разделам</h2>
+    <div class="features">
+      <div class="feature"><h3>У каждого параметра своё место</h3><p>Telegram и доступ, рабочие каталоги, агенты, проекты, действия, голосовые сообщения, запуск и обновления — семь разделов вместо длинной формы. У каждого агента своя страница.</p></div>
+      <div class="feature"><h3>Светлая и тёмная темы</h3><p>Окно следует теме системы и переключается во время работы. На Linux для этого нужна поддержка XDG Desktop Portal в окружении рабочего стола.</p></div>
+      <div class="feature"><h3>Правки остаются при переходах</h3><p>Можно настроить несколько разделов и сохранить всё вместе. Кнопки сохранения и отмены закреплены внизу, а ошибки отмечены рядом с разделами и агентами.</p></div>
+      <div class="feature"><h3>Удобно и в небольшом окне</h3><p>В узком окне боковое меню заменяется списком разделов. Кнопка «Исправить ошибки» открывает страницу с первым неверно заполненным полем.</p></div>
+    </div>
+    <p>Подробности — в <a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/guide/settings.md">руководстве по настройкам</a>. Установка, агенты, проекты и работа в Telegram собраны в <a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/README.md">документации</a>.</p>
+  </section>
+
   <section>
-    <h2>Что умеет</h2>
+    <h2>Управляйте задачами с телефона</h2>
     <div class="features">
       <div class="feature"><h3>Тема — это сессия</h3><p>Создали тему — получили агента в своей рабочей директории. Темы работают параллельно, контекст переживает перезапуски.</p></div>
       <div class="feature"><h3>Разрешения кнопками</h3><p>Команды и правки файлов агент спрашивает кнопками прямо в теме. Вопросы с вариантами ответа тоже.</p></div>
+      <div class="feature"><h3>Проекты, модели и режимы</h3><p><code>/projects</code> выбирает сохранённый каталог и агента. <code>/model</code> и <code>/mode</code> задают параметры для темы; необходимый сброс контекста требует подтверждения.</p></div>
+      <div class="feature"><h3>Голосовые задачи</h3><p>Надиктуйте задачу, проверьте распознанный текст, исправьте и подтвердите запуск. Распознавание настраивается отдельно: локально через Whisper.cpp и FFmpeg или через внешний API.</p></div>
+      <div class="feature"><h3>Передача другому агенту</h3><p><code>/handoff</code> готовит сводку для проверки. Получатель продолжает работу в новой теме с теми же файлами проекта; исходная тема сохраняется.</p></div>
+      <div class="feature"><h3>Прогресс и последний ответ</h3><p>Карточка прогресса показывает этап, инструменты и кнопку остановки. <code>/status</code> уточняет состояние, <code>/last</code> возвращает сохранённый ответ без нового запроса к модели.</p></div>
+      <div class="feature"><h3>Доставка после сбоя связи</h3><p>Финальный текст сохраняется в очереди, которая переживает перезапуск. <code>/outbox</code> позволяет проверить, повторить или удалить доставку.</p></div>
+      <div class="feature"><h3>Команды и проверки проекта</h3><p><code>/actions</code> запускает и останавливает заранее заданные команды на компьютере. <code>/doctor</code> проверяет каталог, CLI и настроенные HTTP/TCP-ресурсы.</p></div>
       <div class="feature"><h3>Снимки сессий</h3><p><code>/save</code> сохраняет сессию, <code>/restore</code> продолжает её в новой теме.</p></div>
       <div class="feature"><h3>Лимиты подписок</h3><p><code>/limits</code> показывает, сколько осталось в окнах Claude и Codex и когда сброс.</p></div>
+      <div class="feature"><h3>Темы легко найти</h3><p>Названия сохраняются между перезапусками. В приложении есть поиск, фильтры, переход в Telegram и открытие каталога проекта.</p></div>
+      <div class="feature"><h3>Запуск вместе с системой</h3><p>Автозапуск при входе включается отдельно в настройках Windows, macOS и Linux. Приложение показывает состояние регистрации в ОС.</p></div>
     </div>
   </section>
 
@@ -177,7 +203,7 @@ h2 { font: 700 clamp(22px, 3vw, 30px)/1.2 var(--display); letter-spacing: -.01em
       <div class="feature"><h3>Codex</h3><p>Подписка ChatGPT или API-ключ OpenAI, песочница и одобрения, снимки сессий.</p></div>
       <div class="feature"><h3>Qwen Code</h3><p>Бесплатный вход или любой OpenAI-совместимый адрес; досылка сообщений посреди хода.</p></div>
       <div class="feature"><h3>Hermes</h3><p>Профили, память и скиллы Hermes; хаб запускает <code>hermes acp</code> и не трогает его ключи.</p></div>
-      <div class="feature"><h3>OpenCode — новый в 0.7.0</h3><p>Открытый агент с бесплатным провайдером: <code>npm i -g opencode-ai</code>, и тема уже работает через <code>opencode acp</code>. Модель в формате <code>провайдер/модель</code> задаётся в настройках; вход и разрешения инструментов — в самом OpenCode.</p></div>
+      <div class="feature"><h3>OpenCode</h3><p>Подключается через <code>opencode acp</code>. Модель в формате <code>провайдер/модель</code> задаётся в настройках; вход и разрешения инструментов — в самом OpenCode.</p></div>
     </div>
     <p>Агент выбирается на уровне темы: <code>/new opencode ~/shop</code> или <code>/backend opencode</code>. Один и тот же бот ведёт темы разных агентов параллельно.</p>
   </section>
@@ -190,16 +216,17 @@ h2 { font: 700 clamp(22px, 3vw, 30px)/1.2 var(--display); letter-spacing: -.01em
       <li><b>agent-hub</b><span>приложение в трее на вашем компьютере</span></li>
       <li><b>CLI агентов</b><span>claude, codex, qwen, hermes, opencode</span></li>
     </ol>
-    <p>Код и ключи остаются на вашем компьютере. Пишут боту только пользователи из вашего списка.</p>
+    <p>Агенты работают на вашем компьютере от вашего пользователя. Сообщения проходят через Telegram, а данные для модели — через выбранного провайдера. Доступ к боту ограничен списком user_id. Подробнее — <a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/guide/security.md">о безопасности и границах доступа</a>.</p>
   </section>
 
   <section id="start">
-    <h2>Начать за 5 минут</h2>
+    <h2>Начать работу</h2>
     <div class="steps">
-      <div><b>Скачайте</b><span>архив своей платформы со страницы релизов</span></div>
+      <div><b>Подготовьте приложение и агента</b><span>Установите CLI нужного агента и войдите в него. Скачайте сборку agent-hub для своей ОС; для macOS — .app.zip.</span></div>
       <div><b>Создайте бота и группу</b><span>включите темы, сделайте бота администратором</span></div>
-      <div><b>Вставьте токен</b><span>в окно настроек — и создайте первую тему</span></div>
+      <div><b>Заполните настройки</b><span>Укажите токен, ID группы, разрешённые user_id и рабочий каталог. В «Агенты → Общие» выберите агента, сохраните и создайте первую тему.</span></div>
     </div>
+    <p class="fine">Права бота, установка и получение ID — в <a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/guide/getting-started.md">пошаговой инструкции</a>.</p>
   </section>
 
   <section class="final">
