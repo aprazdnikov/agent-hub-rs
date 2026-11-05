@@ -67,17 +67,15 @@
    совпадает: сборки не подписаны Developer ID и не нотарифицированы, а Gatekeeper блокирует
    загрузку, скачанную браузером (на файле стоит пометка карантина). Два способа запустить:
 
-   - **Скачать в терминале** — `curl`, в отличие от браузера, не навешивает карантин:
+   - **Установить скриптом** — `curl`, в отличие от браузера, не навешивает карантин:
 
      ```bash
-     tag=v0.9.0                              # версия нужного релиза
-     name=agent-hub-aarch64-apple-darwin     # для Intel: agent-hub-x86_64-apple-darwin
-     curl -LO "https://github.com/aprazdnikov/agent-hub-rs/releases/download/${tag}/${name}.app.zip"
-     curl -LO "https://github.com/aprazdnikov/agent-hub-rs/releases/download/${tag}/${name}.app.zip.sha256"
-     shasum -a 256 -c "${name}.app.zip.sha256"
-     mkdir -p ~/Applications
-     ditto -x -k "${name}.app.zip" ~/Applications/
+     curl -fsSL https://raw.githubusercontent.com/aprazdnikov/agent-hub-rs/main/scripts/install-macos.sh | bash
      ```
+
+     Скрипт проверяет sha256, скачивает сборку под архитектуру машины и ставит `agent-hub.app`
+     в `~/Applications`. Нужную версию можно передать первым аргументом или `TAG=v0.9.0`,
+     папку установки — `APPS_DIR=`.
 
    - **Снять пометку** — если приложение уже установлено из браузерной загрузки:
 
