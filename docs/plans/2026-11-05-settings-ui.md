@@ -1,8 +1,8 @@
 # Settings UI Implementation Plan
 
 **Status:** Implemented locally; build and automated checks passed. The user reviewed
-the local UI and accepted the result. Included with this plan in the local UI and
-documentation commit; not yet released.
+the local UI and accepted the result. Included with this plan in UI/documentation
+commit `8cb9415` and released in [v0.9.0](../releases/v0.9.0.md).
 
 [Documentation](../README.md) · [User guide](../guide/settings.md) · [History](../history.md#обновление-интерфейса)
 

@@ -8,7 +8,7 @@
 
 | Версия | Текст | Подготовка | Результат публикации |
 |---|---|---|---|
-| v0.9.0 | [Новые настройки и системные темы](v0.9.0.md) | 2026-11-05: пользователь согласовал текст и поручил отправить изменения и создать тег; версия workspace — 0.9.0 | Публикация после CI: [страница релиза](https://github.com/aprazdnikov/agent-hub-rs/releases/tag/v0.9.0), [запуски Release](https://github.com/aprazdnikov/agent-hub-rs/actions/workflows/release.yml) |
+| v0.9.0 | [Новые настройки и системные темы](v0.9.0.md) | 2026-11-05: текст согласован; коммит `347f333`, аннотированный тег `v0.9.0` | [Опубликован](https://github.com/aprazdnikov/agent-hub-rs/releases/tag/v0.9.0): 20 файлов; [Release — PASS](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/42054464691) |
 | v0.8.0 | [Удобнее управлять задачами с телефона](v0.8.0.md) | 2026-11-05: пользователь поручил создать тег с подготовленным текстом; версия workspace обновлена до 0.8.0 | [Страница релиза](https://github.com/aprazdnikov/agent-hub-rs/releases/tag/v0.8.0), [запуски Release](https://github.com/aprazdnikov/agent-hub-rs/actions/workflows/release.yml) |
 
 Пока workflow не завершился успешно и на странице нет файлов, выпуск не считается
@@ -70,6 +70,24 @@
   Релизный коммит: `chore: подготовить релиз v0.9.0 и обновить сайт`.
   Push в `main`, тег и публикация разрешены пользователем; перед тегом проверяется CI
   релизного коммита, после тега — сборки и опубликованный текст.
+
+### Результат публикации v0.9.0
+
+- Коммит `347f33314e385ce5a492c64c30a27664d60cb37b` отправлен в `main`;
+  аннотированный тег `v0.9.0` на origin указывает на этот же коммит.
+- [CI релизного коммита](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/42053324866)
+  — PASS на macOS, Windows и Linux, включая cargo-deny.
+- [Release](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/42054464691)
+  — PASS: собраны Windows x86_64, Linux x86_64, macOS Apple Silicon и Intel.
+  Обе проверки упаковки macOS прошли; опубликованы 10 бинарников/архивов и 10 `.sha256`.
+- GitHub Release не является черновиком или prerelease, `releases/latest` возвращает
+  v0.9.0. Описание совпадает с согласованным Markdown (без учёта завершающего перевода
+  строки). Все десять опубликованных контрольных сумм совпадают с SHA-256 digest
+  соответствующих загруженных файлов в GitHub API.
+- [Pages](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/42053324822) — PASS;
+  HTML публичного сайта побайтно совпадает с `site/index.html` релизного коммита.
+- Ручные проверки реального входа в ОС, голосовых задач и передачи между агентами
+  остаются в roadmap; успешная публикация не заменяет эти сценарии.
 
 ## Подготовка v0.8.0
 
