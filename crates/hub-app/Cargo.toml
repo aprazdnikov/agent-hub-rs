@@ -43,6 +43,9 @@ tracing-subscriber.workspace = true
 [target.'cfg(unix)'.dependencies]
 nix = { version = "0.31", default-features = false, features = ["signal"] }
 
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus = { version = "5.19", default-features = false, features = ["async-io"] }
+
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"
 windows = { version = "0.62", features = ["Win32_System_Threading"] }

@@ -1,5 +1,9 @@
 //! The «Настройки» tab: a draft of every setting, saved only when it parses.
 
+mod navigation;
+
+use navigation::{AgentPage, Section};
+
 use std::path::{Path, PathBuf};
 
 use eframe::egui;
@@ -32,6 +36,8 @@ struct Revealed {
 
 #[derive(Default)]
 pub struct SettingsForm {
+    section: Section,
+    agent_page: AgentPage,
     autostart: Option<super::autostart::Control>,
     draft: Draft,
     synced: Option<Draft>,
@@ -58,10 +64,7 @@ fn project_options(ui: &mut egui::Ui, project: &mut ProjectDraft) {
     }
     ui.horizontal(|ui| {
         ui.label("Модель");
-        ui.add(
-            egui::TextEdit::singleline(&mut project.options.model)
-                .hint_text("пусто — общие настройки"),
-        );
+        ui.add(input(&mut project.options.model).hint_text("пусто — общие настройки"));
     });
     let modes =
         BackendKind::parse(&project.backend).map(hub_core::options::Mode::all).unwrap_or_default();
@@ -97,7 +100,7 @@ fn project_checks(ui: &mut egui::Ui, checks: &mut Vec<CheckDraft>) {
                 };
                 ui.horizontal(|ui| {
                     ui.label("Название проверки");
-                    ui.text_edit_singleline(name);
+                    ui.add(input(name));
                     if ui.button("Удалить проверку").clicked() {
                         remove = Some(index);
                     }
@@ -106,9 +109,7 @@ fn project_checks(ui: &mut egui::Ui, checks: &mut Vec<CheckDraft>) {
                     CheckDraft::Http { url, expected, .. } => {
                         ui.horizontal(|ui| {
                             ui.label("URL");
-                            ui.add(
-                                egui::TextEdit::singleline(url).hint_text("https://service/health"),
-                            );
+                            ui.add(input(url).hint_text("https://service/health"));
                         });
                         ui.horizontal(|ui| {
                             ui.label("Ожидаемый HTTP-статус");
@@ -121,7 +122,7 @@ fn project_checks(ui: &mut egui::Ui, checks: &mut Vec<CheckDraft>) {
                     CheckDraft::Tcp { host, port, .. } => {
                         ui.horizontal(|ui| {
                             ui.label("Хост или IP");
-                            ui.text_edit_singleline(host);
+                            ui.add(input(host));
                         });
                         ui.horizontal(|ui| {
                             ui.label("TCP-порт");
@@ -159,6 +160,31 @@ fn errors_for(errors: &[FieldError], field: Field) -> impl Iterator<Item = &str>
 fn messages(ui: &mut egui::Ui, errors: &[FieldError], field: Field) {
     for message in errors_for(errors, field) {
         ui.colored_label(ui.visuals().error_fg_color, message);
+    }
+}
+
+fn input(value: &mut String) -> egui::TextEdit<'_> {
+    egui::TextEdit::singleline(value).margin(egui::vec2(10.0, 7.0))
+}
+
+fn field_row(ui: &mut egui::Ui, label: &str, contents: impl FnOnce(&mut egui::Ui)) {
+    if ui.available_width() < 560.0 {
+        ui.vertical(|ui| {
+            ui.label(label);
+            ui.horizontal_wrapped(contents);
+        });
+    } else {
+        ui.horizontal(|ui| {
+            ui.allocate_ui_with_layout(
+                egui::vec2(180.0, 32.0),
+                egui::Layout::left_to_right(egui::Align::Center),
+                |ui| {
+                    ui.set_min_width(180.0);
+                    ui.label(label);
+                },
+            );
+            contents(ui);
+        });
     }
 }
 
@@ -203,6 +229,7 @@ impl SettingsForm {
     }
 
     pub fn apply(&mut self, action: LogAction) {
+        self.section = Section::Telegram;
         match action {
             LogAction::UseChat(chat) => use_chat(&mut self.draft, chat),
             LogAction::AddUser(user) => add_user(&mut self.draft, user),
@@ -232,57 +259,121 @@ impl SettingsForm {
         send: &mut impl FnMut(Command),
     ) {
         let (errors, parsed) = self.check(home);
-        let endpoint = parsed.as_ref().and_then(|settings| settings.qwen.endpoint.as_ref());
-        let changed = self.synced.as_ref().is_none_or(|synced| *synced != self.draft);
-        egui::Panel::bottom("settings_actions").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                let save =
-                    ui.add_enabled(errors.is_empty() && changed, egui::Button::new("Сохранить"));
-                if save.clicked() {
-                    if telegram_changed(self.synced.as_ref(), &self.draft) && sessions > 0 {
-                        self.confirming = true;
-                    } else {
-                        send(Command::Save(Box::new(self.draft.clone())));
-                    }
-                }
-                if ui.add_enabled(changed, egui::Button::new("Отменить изменения")).clicked()
-                {
-                    self.draft = self.synced.clone().unwrap_or_default();
-                }
+        self.save_bar(ui, &errors, sessions, send);
+        navigation::show(ui, &mut self.section, &errors);
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(24, 16)))
+            .show(ui, |ui| {
+                let content_width = (ui.available_width() - 12.0).min(800.0);
+                egui::ScrollArea::both()
+                    .id_salt(("settings_content", self.section, self.agent_page))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.set_width(content_width);
+                        ui.heading(self.section.title()).on_hover_text(self.section.description());
+                        if content_width >= 600.0 {
+                            ui.label(egui::RichText::new(self.section.description()).weak());
+                            ui.add_space(20.0);
+                        } else {
+                            ui.add_space(8.0);
+                        }
+                        if self.section == Section::Agents {
+                            self.agent_page.show(ui, &errors);
+                            ui.add_space(16.0);
+                        }
+                        super::theme::surface(ui).show(ui, |ui| {
+                            ui.set_width((ui.available_width()).max(280.0));
+                            ui.spacing_mut().text_edit_width =
+                                (ui.available_width() - 260.0).clamp(140.0, 320.0);
+                            ui.push_id((self.section, self.agent_page), |ui| {
+                                self.page(ui, &errors, parsed.as_ref());
+                            });
+                        });
+                    });
             });
-        });
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            if let Some(control) = &mut self.autostart {
-                control.show(ui);
-                ui.separator();
-            }
-            self.telegram(ui, &errors);
-            ui.separator();
-            self.speech(ui, &errors);
-            ui.separator();
-            self.workspace(ui, &errors);
-            ui.separator();
-            self.projects(ui, &errors);
-            ui.separator();
-            self.actions(ui, &errors);
-            ui.separator();
-            self.agent(ui, &errors);
-            ui.separator();
-            self.codex(ui, &errors);
-            ui.separator();
-            self.qwen(ui, &errors, endpoint);
-            ui.separator();
-            self.hermes(ui, &errors);
-            ui.separator();
-            self.opencode(ui, &errors);
-            ui.separator();
-            self.timeouts(ui, &errors);
-        });
         self.confirm(ui.ctx(), sessions, send);
     }
 
+    fn page(&mut self, ui: &mut egui::Ui, errors: &[FieldError], parsed: Option<&Settings>) {
+        match self.section {
+            Section::Telegram => self.telegram(ui, errors),
+            Section::Workspace => self.workspace(ui, errors),
+            Section::Projects => self.projects(ui, errors),
+            Section::Actions => self.actions(ui, errors),
+            Section::Speech => self.speech(ui, errors),
+            Section::Application => self.application(ui),
+            Section::Agents => match self.agent_page {
+                AgentPage::General => {
+                    self.agent(ui);
+                    ui.add_space(16.0);
+                    self.timeouts(ui, errors);
+                }
+                AgentPage::Backend(BackendKind::Claude) => self.claude(ui, errors),
+                AgentPage::Backend(BackendKind::Codex) => self.codex(ui, errors),
+                AgentPage::Backend(BackendKind::Qwen) => self.qwen(
+                    ui,
+                    errors,
+                    parsed.and_then(|settings| settings.qwen.endpoint.as_ref()),
+                ),
+                AgentPage::Backend(BackendKind::Hermes) => self.hermes(ui, errors),
+                AgentPage::Backend(BackendKind::Opencode) => self.opencode(ui, errors),
+            },
+        }
+    }
+
+    fn save_bar(
+        &mut self,
+        ui: &mut egui::Ui,
+        errors: &[FieldError],
+        sessions: usize,
+        send: &mut impl FnMut(Command),
+    ) {
+        let changed = self.synced.as_ref().is_none_or(|synced| *synced != self.draft);
+        egui::Panel::bottom("settings_actions")
+            .frame(
+                egui::Frame::new()
+                    .fill(ui.visuals().panel_fill)
+                    .inner_margin(egui::Margin::symmetric(20, 12)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    let save = ui.add_enabled(
+                        errors.is_empty() && changed,
+                        egui::Button::new("Сохранить").fill(ui.visuals().selection.bg_fill),
+                    );
+                    if save.clicked() {
+                        if telegram_changed(self.synced.as_ref(), &self.draft) && sessions > 0 {
+                            self.confirming = true;
+                        } else {
+                            send(Command::Save(Box::new(self.draft.clone())));
+                        }
+                    }
+                    if ui.add_enabled(changed, egui::Button::new("Отменить изменения")).clicked()
+                    {
+                        self.draft = self.synced.clone().unwrap_or_default();
+                        self.confirming = false;
+                    }
+                    ui.add_space(8.0);
+                    ui.weak(if changed {
+                        "Есть несохранённые изменения"
+                    } else {
+                        "Нет несохранённых изменений"
+                    });
+                });
+                if !errors.is_empty()
+                    && ui.button(format!("Исправить ошибки ({})", errors.len())).clicked()
+                    && let Some(error) = errors.first()
+                {
+                    self.section = Section::for_field(error.field);
+                    if let Some(page) = AgentPage::for_field(error.field) {
+                        self.agent_page = page;
+                    }
+                }
+            });
+    }
+
     fn speech(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
-        ui.heading("Голосовые сообщения");
+        ui.strong("Способ распознавания");
         egui::ComboBox::from_id_salt("speech_provider")
             .selected_text(self.draft.speech.provider.label())
             .show_ui(ui, |ui| {
@@ -309,7 +400,7 @@ impl SettingsForm {
                     ui.push_id(id, |ui| {
                         ui.horizontal(|ui| {
                             ui.label(label);
-                            ui.text_edit_singleline(path);
+                            ui.add(input(path));
                             if ui.button("Выбрать…").clicked()
                                 && let Some(selected) = pick_file(path)
                             {
@@ -322,23 +413,19 @@ impl SettingsForm {
             }
             SpeechProvider::Api => {
                 ui.label("Аудио отправляется на указанный API-адрес. Провайдер может взимать плату за распознавание.");
-                ui.horizontal(|ui| {
-                    ui.label("API URL");
+                field_row(ui, "API URL", |ui| {
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.draft.speech.api_url)
+                        input(&mut self.draft.speech.api_url)
                             .hint_text("https://api.openai.com/v1"),
                     );
                 });
                 ui.small("Базовый URL без /audio/transcriptions. HTTPS; HTTP — только localhost или loopback IP.");
-                ui.horizontal(|ui| {
-                    ui.label("Модель распознавания");
-                    ui.text_edit_singleline(&mut self.draft.speech.api_model);
+                field_row(ui, "Модель распознавания", |ui| {
+                    ui.add(input(&mut self.draft.speech.api_model));
                 });
-                ui.horizontal(|ui| {
-                    ui.label("API-ключ распознавания");
+                field_row(ui, "API-ключ распознавания", |ui| {
                     ui.add(
-                        egui::TextEdit::singleline(&mut self.draft.speech.api_key)
-                            .password(!self.revealed.speech_key),
+                        input(&mut self.draft.speech.api_key).password(!self.revealed.speech_key),
                     );
                     ui.checkbox(&mut self.revealed.speech_key, "показать");
                 });
@@ -351,7 +438,7 @@ impl SettingsForm {
     }
 
     fn projects(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
-        ui.heading("Проекты");
+        ui.strong("Профили проектов");
         ui.label("Сохраните каталог, бэкенд и параметры, затем выберите проект через /projects в Telegram.");
         ui.label("Пустые параметры наследуют общие настройки. Смена бэкенда сбрасывает модель и режим профиля.");
         ui.label("Связанные действия запускаются вручную через /actions. Изменения профиля не меняют существующие сессии.");
@@ -361,7 +448,7 @@ impl SettingsForm {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
                         ui.label("Название");
-                        ui.text_edit_singleline(&mut project.name);
+                        ui.add(input(&mut project.name));
                         if ui.button("Удалить проект").clicked() {
                             remove = Some(index);
                         }
@@ -369,7 +456,7 @@ impl SettingsForm {
                     ui.horizontal(|ui| {
                         ui.label("Каталог");
                         ui.add(
-                            egui::TextEdit::singleline(&mut project.cwd)
+                            input(&mut project.cwd)
                                 .hint_text("путь внутри корня рабочих каталогов"),
                         );
                         if ui.button("Выбрать…").clicked()
@@ -432,7 +519,7 @@ impl SettingsForm {
     }
 
     fn actions(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
-        ui.heading("Действия");
+        ui.strong("Пользовательские команды");
         ui.label("Назовите команду и запускайте её кнопкой через /actions в Telegram.");
         ui.label("Команды выполняются от вашего пользователя. Без ввода пароля и терминала; вывод отправляется в группу.");
         ui.label("Постоянные команды работают до остановки. Остановка бота или выход из приложения останавливает их.");
@@ -447,7 +534,7 @@ impl SettingsForm {
                 ui.group(|ui| {
                     ui.horizontal(|ui| {
                         ui.label("Название");
-                        ui.text_edit_singleline(&mut action.name);
+                        ui.add(input(&mut action.name));
                         if ui.button("Удалить").clicked() {
                             remove = Some(index);
                         }
@@ -460,10 +547,7 @@ impl SettingsForm {
                     );
                     ui.horizontal(|ui| {
                         ui.label("Каталог");
-                        ui.add(
-                            egui::TextEdit::singleline(&mut action.cwd)
-                                .hint_text("пусто — домашний каталог"),
-                        );
+                        ui.add(input(&mut action.cwd).hint_text("пусто — домашний каталог"));
                         if ui.button("Выбрать…").clicked()
                             && let Some(path) = pick_folder(&action.cwd)
                         {
@@ -492,28 +576,22 @@ impl SettingsForm {
     }
 
     fn telegram(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
-        ui.heading("Telegram");
-        ui.label("Изменение токена, chat_id или user_id перезапускает бота и останавливает сессии и пользовательские действия.");
-        ui.horizontal(|ui| {
-            ui.label("Токен бота");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.draft.token).password(!self.revealed.token),
-            );
+        ui.strong("Подключение");
+        field_row(ui, "Токен бота", |ui| {
+            ui.add(input(&mut self.draft.token).password(!self.revealed.token));
             ui.checkbox(&mut self.revealed.token, "показать");
         });
         messages(ui, errors, Field::Token);
-        ui.horizontal(|ui| {
-            ui.label("chat_id группы");
-            ui.text_edit_singleline(&mut self.draft.chat);
+        field_row(ui, "chat_id группы", |ui| {
+            ui.add(input(&mut self.draft.chat));
         });
         messages(ui, errors, Field::Chat);
-        ui.horizontal(|ui| {
-            ui.label("Разрешённые user_id");
-            ui.add(egui::TextEdit::singleline(&mut self.draft.users).hint_text("111, 222"));
+        field_row(ui, "Разрешённые user_id", |ui| {
+            ui.add(input(&mut self.draft.users).hint_text("111, 222"));
         });
         messages(ui, errors, Field::Users);
-        ui.horizontal(|ui| {
-            ui.label("Прогресс задач");
+        ui.small("Изменение токена, chat_id или user_id перезапускает бота и останавливает сессии и пользовательские действия.");
+        field_row(ui, "Прогресс задач", |ui| {
             ui.selectable_value(&mut self.draft.progress_mode, ProgressMode::Compact, "Компактный");
             ui.selectable_value(&mut self.draft.progress_mode, ProgressMode::Detailed, "Подробный");
         });
@@ -521,10 +599,9 @@ impl SettingsForm {
     }
 
     fn workspace(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
-        ui.heading("Рабочие каталоги");
-        ui.horizontal(|ui| {
-            ui.label("Корень");
-            ui.text_edit_singleline(&mut self.draft.workspace_root);
+        ui.strong("Каталоги");
+        field_row(ui, "Корень", |ui| {
+            ui.add(input(&mut self.draft.workspace_root));
             if ui.button("Выбрать…").clicked()
                 && let Some(path) = pick_folder(&self.draft.workspace_root)
             {
@@ -532,11 +609,8 @@ impl SettingsForm {
             }
         });
         messages(ui, errors, Field::WorkspaceRoot);
-        ui.horizontal(|ui| {
-            ui.label("Каталог снимков");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.draft.snapshots_dir).hint_text("~/.agent-hub"),
-            );
+        field_row(ui, "Каталог снимков", |ui| {
+            ui.add(input(&mut self.draft.snapshots_dir).hint_text("~/.agent-hub"));
             if ui.button("Выбрать…").clicked()
                 && let Some(path) = pick_folder(&self.draft.snapshots_dir)
             {
@@ -546,10 +620,9 @@ impl SettingsForm {
         messages(ui, errors, Field::SnapshotsDir);
     }
 
-    fn agent(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
-        ui.heading("Агенты");
-        ui.horizontal(|ui| {
-            ui.label("Агент по умолчанию");
+    fn agent(&mut self, ui: &mut egui::Ui) {
+        ui.strong("Новые темы");
+        field_row(ui, "Агент по умолчанию", |ui| {
             egui::ComboBox::from_id_salt("default_backend")
                 .selected_text(self.draft.default_backend.name())
                 .show_ui(ui, |ui| {
@@ -559,11 +632,12 @@ impl SettingsForm {
                 });
         });
         ui.label("Используется в /new без имени агента; /backend меняет агента в теме.");
-        ui.separator();
+    }
+
+    fn claude(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
         ui.heading("Claude Code");
-        ui.horizontal(|ui| {
-            ui.label("Путь к claude");
-            ui.add(egui::TextEdit::singleline(&mut self.draft.cli).hint_text("из PATH"));
+        field_row(ui, "Путь к claude", |ui| {
+            ui.add(input(&mut self.draft.cli).hint_text("из PATH"));
             if ui.button("Выбрать…").clicked()
                 && let Some(path) = pick_file(&self.draft.cli)
             {
@@ -571,16 +645,11 @@ impl SettingsForm {
             }
         });
         messages(ui, errors, Field::Cli);
-        ui.horizontal(|ui| {
-            ui.label("Модель");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.draft.model)
-                    .hint_text("из настроек Claude Code"),
-            );
+        field_row(ui, "Модель", |ui| {
+            ui.add(input(&mut self.draft.model).hint_text("из настроек Claude Code"));
         });
         messages(ui, errors, Field::Model);
-        ui.horizontal(|ui| {
-            ui.label("Режим разрешений");
+        field_row(ui, "Режим разрешений", |ui| {
             egui::ComboBox::from_id_salt("permission_mode")
                 .selected_text(self.draft.permission_mode.wire())
                 .show_ui(ui, |ui| {
@@ -595,18 +664,16 @@ impl SettingsForm {
                 "bypassPermissions: агент выполняет любые инструменты без подтверждения.",
             );
         }
-        ui.horizontal(|ui| {
-            ui.label("Лимит на задачу, $");
-            ui.add(egui::TextEdit::singleline(&mut self.draft.budget).hint_text("без лимита"));
+        field_row(ui, "Лимит на задачу, $", |ui| {
+            ui.add(input(&mut self.draft.budget).hint_text("без лимита"));
         });
         messages(ui, errors, Field::Budget);
     }
 
     fn codex(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
         ui.heading("Codex");
-        ui.horizontal(|ui| {
-            ui.label("Путь к codex");
-            ui.add(egui::TextEdit::singleline(&mut self.draft.codex.cli).hint_text("из PATH"));
+        field_row(ui, "Путь к codex", |ui| {
+            ui.add(input(&mut self.draft.codex.cli).hint_text("из PATH"));
             if ui.button("Выбрать…").clicked()
                 && let Some(path) = pick_file(&self.draft.codex.cli)
             {
@@ -614,16 +681,11 @@ impl SettingsForm {
             }
         });
         messages(ui, errors, Field::Codex(CodexField::Cli));
-        ui.horizontal(|ui| {
-            ui.label("Модель");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.draft.codex.model)
-                    .hint_text("из настроек Codex"),
-            );
+        field_row(ui, "Модель", |ui| {
+            ui.add(input(&mut self.draft.codex.model).hint_text("из настроек Codex"));
         });
         messages(ui, errors, Field::Codex(CodexField::Model));
-        ui.horizontal(|ui| {
-            ui.label("Песочница");
+        field_row(ui, "Песочница", |ui| {
             egui::ComboBox::from_id_salt("codex_sandbox")
                 .selected_text(self.draft.codex.sandbox.wire())
                 .show_ui(ui, |ui| {
@@ -638,8 +700,7 @@ impl SettingsForm {
                 "danger-full-access: команды Codex выполняются без песочницы ОС.",
             );
         }
-        ui.horizontal(|ui| {
-            ui.label("Одобрения");
+        field_row(ui, "Одобрения", |ui| {
             egui::ComboBox::from_id_salt("codex_approval")
                 .selected_text(self.draft.codex.approval.wire())
                 .show_ui(ui, |ui| {
@@ -658,10 +719,9 @@ impl SettingsForm {
                 "never: Codex ничего не спрашивает перед действиями.",
             );
         }
-        ui.horizontal(|ui| {
-            ui.label("API-ключ OpenAI");
+        field_row(ui, "API-ключ OpenAI", |ui| {
             ui.add(
-                egui::TextEdit::singleline(&mut self.draft.codex.api_key)
+                input(&mut self.draft.codex.api_key)
                     .password(!self.revealed.codex_key)
                     .hint_text("вход через codex login"),
             );
@@ -676,9 +736,8 @@ impl SettingsForm {
 
     fn qwen(&mut self, ui: &mut egui::Ui, errors: &[FieldError], endpoint: Option<&ApiEndpoint>) {
         ui.heading("Qwen");
-        ui.horizontal(|ui| {
-            ui.label("Путь к qwen");
-            ui.add(egui::TextEdit::singleline(&mut self.draft.qwen.cli).hint_text("из PATH"));
+        field_row(ui, "Путь к qwen", |ui| {
+            ui.add(input(&mut self.draft.qwen.cli).hint_text("из PATH"));
             if ui.button("Выбрать…").clicked()
                 && let Some(path) = pick_file(&self.draft.qwen.cli)
             {
@@ -686,16 +745,11 @@ impl SettingsForm {
             }
         });
         messages(ui, errors, Field::Qwen(QwenField::Cli));
-        ui.horizontal(|ui| {
-            ui.label("Модель");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.draft.qwen.model)
-                    .hint_text("из настроек Qwen"),
-            );
+        field_row(ui, "Модель", |ui| {
+            ui.add(input(&mut self.draft.qwen.model).hint_text("из настроек Qwen"));
         });
         messages(ui, errors, Field::Qwen(QwenField::Model));
-        ui.horizontal(|ui| {
-            ui.label("Одобрения");
+        field_row(ui, "Одобрения", |ui| {
             egui::ComboBox::from_id_salt("qwen_approval")
                 .selected_text(self.draft.qwen.approval.wire())
                 .show_ui(ui, |ui| {
@@ -714,18 +768,13 @@ impl SettingsForm {
                 "yolo: Qwen выполняет любые инструменты без подтверждения.",
             );
         }
-        ui.horizontal(|ui| {
-            ui.label("Base URL");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.draft.qwen.base_url)
-                    .hint_text("собственная настройка qwen"),
-            );
+        field_row(ui, "Base URL", |ui| {
+            ui.add(input(&mut self.draft.qwen.base_url).hint_text("собственная настройка qwen"));
         });
         messages(ui, errors, Field::Qwen(QwenField::BaseUrl));
-        ui.horizontal(|ui| {
-            ui.label("API-ключ");
+        field_row(ui, "API-ключ", |ui| {
             ui.add(
-                egui::TextEdit::singleline(&mut self.draft.qwen.api_key)
+                input(&mut self.draft.qwen.api_key)
                     .password(!self.revealed.qwen_key)
                     .hint_text("собственная настройка qwen"),
             );
@@ -747,9 +796,8 @@ impl SettingsForm {
 
     fn hermes(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
         ui.heading("Hermes");
-        ui.horizontal(|ui| {
-            ui.label("Путь к hermes");
-            ui.add(egui::TextEdit::singleline(&mut self.draft.hermes.cli).hint_text("из PATH"));
+        field_row(ui, "Путь к hermes", |ui| {
+            ui.add(input(&mut self.draft.hermes.cli).hint_text("из PATH"));
             if ui.button("Выбрать…").clicked()
                 && let Some(path) = pick_file(&self.draft.hermes.cli)
             {
@@ -757,20 +805,12 @@ impl SettingsForm {
             }
         });
         messages(ui, errors, Field::Hermes(HermesField::Cli));
-        ui.horizontal(|ui| {
-            ui.label("Профиль");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.draft.hermes.profile)
-                    .hint_text("активный профиль Hermes"),
-            );
+        field_row(ui, "Профиль", |ui| {
+            ui.add(input(&mut self.draft.hermes.profile).hint_text("активный профиль Hermes"));
         });
         messages(ui, errors, Field::Hermes(HermesField::Profile));
-        ui.horizontal(|ui| {
-            ui.label("Модель");
-            ui.add(
-                egui::TextEdit::singleline(&mut self.draft.hermes.model)
-                    .hint_text("из настроек Hermes"),
-            );
+        field_row(ui, "Модель", |ui| {
+            ui.add(input(&mut self.draft.hermes.model).hint_text("из настроек Hermes"));
         });
         messages(ui, errors, Field::Hermes(HermesField::Model));
         ui.label("Вход и провайдер настраиваются в Hermes (`hermes setup`). Хаб запускает `hermes acp`, не меняя профиль и его секреты. Новые сообщения во время работы ждут следующего хода.");
@@ -778,9 +818,8 @@ impl SettingsForm {
 
     fn opencode(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
         ui.heading("OpenCode");
-        ui.horizontal(|ui| {
-            ui.label("Путь к opencode");
-            ui.add(egui::TextEdit::singleline(&mut self.draft.opencode.cli).hint_text("из PATH"));
+        field_row(ui, "Путь к opencode", |ui| {
+            ui.add(input(&mut self.draft.opencode.cli).hint_text("из PATH"));
             if ui.button("Выбрать…").clicked()
                 && let Some(path) = pick_file(&self.draft.opencode.cli)
             {
@@ -788,10 +827,9 @@ impl SettingsForm {
             }
         });
         messages(ui, errors, Field::Opencode(OpencodeField::Cli));
-        ui.horizontal(|ui| {
-            ui.label("Модель");
+        field_row(ui, "Модель", |ui| {
             ui.add(
-                egui::TextEdit::singleline(&mut self.draft.opencode.model)
+                input(&mut self.draft.opencode.model)
                     .hint_text("провайдер/модель из настроек OpenCode"),
             );
         });
@@ -800,17 +838,31 @@ impl SettingsForm {
     }
 
     fn timeouts(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
-        ui.heading("Таймауты и обновления");
-        ui.horizontal(|ui| {
-            ui.label("Ожидание подтверждения, с");
-            ui.text_edit_singleline(&mut self.draft.approval_timeout);
+        ui.strong("Таймауты");
+        field_row(ui, "Ожидание подтверждения, с", |ui| {
+            ui.add(input(&mut self.draft.approval_timeout));
         });
         messages(ui, errors, Field::ApprovalTimeout);
-        ui.horizontal(|ui| {
-            ui.label("Фоновые задачи, с");
-            ui.text_edit_singleline(&mut self.draft.background_timeout);
+        field_row(ui, "Фоновые задачи, с", |ui| {
+            ui.add(input(&mut self.draft.background_timeout));
         });
         messages(ui, errors, Field::BackgroundTimeout);
+    }
+
+    fn application(&mut self, ui: &mut egui::Ui) {
+        ui.strong("Оформление");
+        ui.label("Тема меняется автоматически вслед за настройками системы.");
+        ui.weak(if ui.visuals().dark_mode {
+            "Сейчас используется тёмная тема"
+        } else {
+            "Сейчас используется светлая тема"
+        });
+        ui.add_space(20.0);
+        if let Some(control) = &mut self.autostart {
+            control.show(ui);
+            ui.add_space(20.0);
+        }
+        ui.strong("Обновления");
         let mut check = self.draft.updates == UpdateCheck::Enabled;
         if ui.checkbox(&mut check, "Проверять обновления").changed() {
             self.draft.updates = if check { UpdateCheck::Enabled } else { UpdateCheck::Disabled };
@@ -849,6 +901,203 @@ pub fn home_or_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn render(
+        ctx: &egui::Context,
+        form: &mut SettingsForm,
+        size: egui::Vec2,
+        events: Vec<egui::Event>,
+        commands: &mut Vec<Command>,
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
+                    form.show(ui, &home_or_root(), 0, &mut |command| commands.push(command));
+                });
+            },
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    fn has_label(output: &egui::FullOutput, label: &str) -> bool {
+        output.shapes.iter().any(|shape| {
+            matches!(&shape.shape,
+            egui::Shape::Text(text) if text.galley.text() == label)
+        })
+    }
+
+    fn click_label(
+        ctx: &egui::Context,
+        form: &mut SettingsForm,
+        label: &str,
+        commands: &mut Vec<Command>,
+    ) {
+        let size = egui::vec2(960.0, 900.0);
+        render(ctx, form, size, Vec::new(), commands);
+        let output = render(ctx, form, size, Vec::new(), commands);
+        let position = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing label: {label}"));
+        for pressed in [true, false] {
+            render(
+                ctx,
+                form,
+                size,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+                commands,
+            );
+        }
+    }
+
+    fn configured_form() -> SettingsForm {
+        let mut form = SettingsForm::default();
+        form.sync(Some(&Draft {
+            token: "123:test-token".to_owned(),
+            chat: "0".to_owned(),
+            users: "1".to_owned(),
+            workspace_root: home_or_root().display().to_string(),
+            ..Draft::default()
+        }));
+        form
+    }
+
+    #[test]
+    fn undo_history_does_not_cross_agent_editors() {
+        let ctx = egui::Context::default();
+        super::super::theme::configure(&ctx);
+        let mut form = configured_form();
+        form.draft.model = "claude-original".into();
+        form.draft.codex.model = "codex-original".into();
+        let mut commands = Vec::new();
+        click_label(&ctx, &mut form, "Агенты", &mut commands);
+        click_label(&ctx, &mut form, "Claude Code", &mut commands);
+        click_label(&ctx, &mut form, "claude-original", &mut commands);
+        let command = egui::Modifiers { ctrl: true, command: true, ..Default::default() };
+        let key = |key| egui::Event::Key {
+            key,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: command,
+        };
+        render(
+            &ctx,
+            &mut form,
+            egui::vec2(960.0, 900.0),
+            vec![key(egui::Key::A), egui::Event::Text("claude-edited".into())],
+            &mut commands,
+        );
+        assert_eq!(form.draft.model, "claude-edited");
+        click_label(&ctx, &mut form, "Codex", &mut commands);
+        click_label(&ctx, &mut form, "codex-original", &mut commands);
+        render(&ctx, &mut form, egui::vec2(960.0, 900.0), vec![key(egui::Key::Z)], &mut commands);
+        assert_eq!(form.draft.codex.model, "codex-original");
+    }
+
+    #[test]
+    fn navigation_preserves_edits_and_save_includes_hidden_pages() {
+        let ctx = egui::Context::default();
+        super::super::theme::configure(&ctx);
+        let mut form = configured_form();
+        let mut commands = Vec::new();
+        form.apply(LogAction::UseChat(-100));
+        click_label(&ctx, &mut form, "Агенты", &mut commands);
+        click_label(&ctx, &mut form, "Codex", &mut commands);
+        form.draft.codex.model = "custom-model".into();
+        click_label(&ctx, &mut form, "Рабочие каталоги", &mut commands);
+        let output = render(&ctx, &mut form, egui::vec2(960.0, 900.0), vec![], &mut commands);
+        assert!(has_label(&output, "Каталог снимков"));
+        assert!(!has_label(&output, "Токен бота"));
+        click_label(&ctx, &mut form, "Сохранить", &mut commands);
+        assert!(
+            matches!(commands.as_slice(), [Command::Save(saved)] if saved.chat == "-100" && saved.codex.model == "custom-model")
+        );
+    }
+
+    #[test]
+    fn hidden_agent_error_blocks_save_and_opens_the_right_editor() {
+        let ctx = egui::Context::default();
+        super::super::theme::configure(&ctx);
+        let mut form = configured_form();
+        form.draft.qwen.base_url = "not-a-url".into();
+        let mut commands = Vec::new();
+        let count = form.check(&home_or_root()).0.len();
+        assert!(count > 0);
+        click_label(&ctx, &mut form, "Сохранить", &mut commands);
+        assert!(commands.is_empty());
+        click_label(&ctx, &mut form, &format!("Исправить ошибки ({count})"), &mut commands);
+        let output = render(&ctx, &mut form, egui::vec2(960.0, 900.0), vec![], &mut commands);
+        assert!(has_label(&output, "Путь к qwen"));
+        assert!(!has_label(&output, "Путь к claude"));
+    }
+
+    #[test]
+    fn cancel_reverts_edits_across_sections_and_log_action_returns_to_telegram() {
+        let ctx = egui::Context::default();
+        super::super::theme::configure(&ctx);
+        let mut form = configured_form();
+        let mut commands = Vec::new();
+        form.draft.codex.model = "edited".into();
+        click_label(&ctx, &mut form, "Проекты", &mut commands);
+        form.apply(LogAction::UseChat(-100));
+        let output = render(&ctx, &mut form, egui::vec2(960.0, 900.0), vec![], &mut commands);
+        assert!(has_label(&output, "Токен бота"));
+        click_label(&ctx, &mut form, "Отменить изменения", &mut commands);
+        click_label(&ctx, &mut form, "Сохранить", &mut commands);
+        assert!(commands.is_empty());
+        let output = render(&ctx, &mut form, egui::vec2(960.0, 900.0), vec![], &mut commands);
+        assert!(has_label(&output, "Нет несохранённых изменений"));
+        assert_eq!(form.draft, form.synced.unwrap());
+    }
+
+    #[test]
+    fn initial_page_only_shows_telegram_fields() {
+        let ctx = egui::Context::default();
+        let mut form = SettingsForm::default();
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(960.0, 4000.0),
+                )),
+                ..Default::default()
+            },
+            |ui| form.show(ui, Path::new("/"), 0, &mut |_| {}),
+        );
+        output.textures_delta.clear();
+        let labels: Vec<_> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect();
+        assert!(labels.contains(&"Токен бота"));
+        assert!(!labels.contains(&"Каталог снимков"), "unrelated workspace editor is visible");
+        assert!(!labels.contains(&"Путь к claude"), "unrelated agent editor is visible");
+    }
 
     #[test]
     fn speech_settings_show_provider_specific_configuration_without_losing_it() {
@@ -902,6 +1151,7 @@ mod tests {
         }
         let enabled = Arc::new(AtomicBool::new(false));
         let mut form = SettingsForm::with_autostart(Ok(Arc::new(Fake(enabled.clone()))));
+        form.section = Section::Application;
         let ctx = egui::Context::default();
         let mut frame = |events| {
             let mut output = ctx.run_ui(
@@ -1123,7 +1373,7 @@ mod tests {
     fn snapshots_directory_is_visible() {
         let ctx = egui::Context::default();
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 4000.0));
-        let mut form = SettingsForm::default();
+        let mut form = SettingsForm { section: Section::Workspace, ..SettingsForm::default() };
         let mut output =
             ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
                 egui::CentralPanel::default().show(ui, |ui| {
@@ -1137,33 +1387,25 @@ mod tests {
         )));
     }
 
-    #[test]
-    fn hermes_settings_are_visible() {
+    #[rstest]
+    #[case(BackendKind::Claude, "Путь к claude")]
+    #[case(BackendKind::Codex, "Путь к codex")]
+    #[case(BackendKind::Qwen, "Путь к qwen")]
+    #[case(BackendKind::Hermes, "Профиль")]
+    #[case(BackendKind::Opencode, "Путь к opencode")]
+    fn selected_agent_settings_are_visible(#[case] backend: BackendKind, #[case] expected: &str) {
         let ctx = egui::Context::default();
-        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(960.0, 4000.0));
-        let mut form = SettingsForm::default();
-        let mut output =
-            ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
-                egui::CentralPanel::default().show(ui, |ui| {
-                    form.show(ui, Path::new("/"), 0, &mut |_| {});
-                });
-            });
-        output.textures_delta.clear();
-        let labels: Vec<_> = output
-            .shapes
-            .iter()
-            .filter_map(|clipped| {
-                if let egui::Shape::Text(text) = &clipped.shape {
-                    Some(text.galley.text().to_owned())
-                } else {
-                    None
-                }
-            })
-            .collect();
-        assert!(labels.iter().any(|label| label == "Hermes"), "Hermes section missing");
-        assert!(labels.iter().any(|label| label == "Профиль"), "Hermes profile missing");
-        assert!(labels.iter().any(|label| label == "OpenCode"), "OpenCode section missing");
-        assert!(labels.iter().any(|label| label == "Путь к opencode"), "OpenCode cli missing");
+        super::super::theme::configure(&ctx);
+        let mut form = SettingsForm {
+            section: Section::Agents,
+            agent_page: AgentPage::Backend(backend),
+            ..SettingsForm::default()
+        };
+        let output = render(&ctx, &mut form, egui::vec2(960.0, 900.0), Vec::new(), &mut Vec::new());
+        assert!(has_label(&output, expected), "missing editor: {expected}");
+        if backend != BackendKind::Claude {
+            assert!(!has_label(&output, "Путь к claude"));
+        }
     }
 
     #[test]
@@ -1186,6 +1428,7 @@ mod tests {
         form.sync(Some(&draft));
         form.apply(LogAction::UseChat(-100));
         let ctx = egui::Context::default();
+        super::super::theme::configure(&ctx);
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 360.0));
         let mut commands = Vec::new();
         let mut frame = |events| {
@@ -1236,6 +1479,7 @@ mod tests {
     #[case(egui::vec2(640.0, 360.0))]
     fn settings_actions_remain_visible(#[case] size: egui::Vec2) {
         let ctx = egui::Context::default();
+        super::super::theme::configure(&ctx);
         let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, size);
         let mut form = SettingsForm::default();
         for _ in 0..2 {

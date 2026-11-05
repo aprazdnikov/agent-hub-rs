@@ -246,30 +246,41 @@ impl eframe::App for HubApp {
         let snapshot = self.snapshot.borrow().clone();
         let commands = self.commands.clone();
         let mut send = |command| Self::send(&commands, command);
-        egui::Panel::top("tabs").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Status, "Статус");
-                ui.selectable_value(&mut self.tab, Tab::Topics, "Темы");
-                ui.selectable_value(&mut self.tab, Tab::Log, "Лог");
-                ui.selectable_value(&mut self.tab, Tab::Settings, "Настройки");
-            });
-            // Store failures matter most on «Настройки», where the app opens in exactly those cases.
-            if let Some(notice) = &snapshot.notice {
-                ui.colored_label(ui.visuals().error_fg_color, notice);
-            }
-            self.update_banner(ui, active(&snapshot));
-        });
-        self.confirm_restart(ui.ctx(), active(&snapshot));
-        egui::CentralPanel::default().show(ui, |ui| match self.tab {
-            Tab::Status => status::show(ui, &snapshot, &mut send),
-            Tab::Topics => self.topics.show(ui, &snapshot, &mut send),
-            Tab::Log => {
-                if let Some(action) = self.log.show(ui, &self.logs.lines(), &self.logs_dir) {
-                    self.form.apply(action);
-                    self.tab = Tab::Settings;
+        egui::Panel::top("tabs")
+            .frame(
+                egui::Frame::new()
+                    .fill(ui.visuals().panel_fill)
+                    .inner_margin(egui::Margin::symmetric(20, 12)),
+            )
+            .show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new("agent-hub").size(20.0).strong());
+                    ui.add_space(20.0);
+                    ui.selectable_value(&mut self.tab, Tab::Status, "Статус");
+                    ui.selectable_value(&mut self.tab, Tab::Topics, "Темы");
+                    ui.selectable_value(&mut self.tab, Tab::Log, "Лог");
+                    ui.selectable_value(&mut self.tab, Tab::Settings, "Настройки");
+                });
+                // Store failures matter most on «Настройки», where the app opens in exactly those cases.
+                if let Some(notice) = &snapshot.notice {
+                    ui.colored_label(ui.visuals().error_fg_color, notice);
                 }
-            }
-            Tab::Settings => self.form.show(ui, &self.home, active(&snapshot), &mut send),
-        });
+                self.update_banner(ui, active(&snapshot));
+            });
+        self.confirm_restart(ui.ctx(), active(&snapshot));
+        let margin = if self.tab == Tab::Settings { 0 } else { 24 };
+        egui::CentralPanel::default()
+            .frame(egui::Frame::new().fill(ui.visuals().extreme_bg_color).inner_margin(margin))
+            .show(ui, |ui| match self.tab {
+                Tab::Status => status::show(ui, &snapshot, &mut send),
+                Tab::Topics => self.topics.show(ui, &snapshot, &mut send),
+                Tab::Log => {
+                    if let Some(action) = self.log.show(ui, &self.logs.lines(), &self.logs_dir) {
+                        self.form.apply(action);
+                        self.tab = Tab::Settings;
+                    }
+                }
+                Tab::Settings => self.form.show(ui, &self.home, active(&snapshot), &mut send),
+            });
     }
 }

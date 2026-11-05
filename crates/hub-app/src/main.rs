@@ -91,6 +91,7 @@ fn run() -> anyhow::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("agent-hub")
             .with_inner_size([960.0, 640.0])
+            .with_min_inner_size([640.0, 360.0])
             .with_icon(Arc::new(window_icon())),
         ..eframe::NativeOptions::default()
     };
@@ -98,6 +99,9 @@ fn run() -> anyhow::Result<()> {
         "agent-hub",
         options,
         Box::new(move |creation| {
+            hub_app::gui::configure_theme(&creation.egui_ctx);
+            #[cfg(target_os = "linux")]
+            hub_app::gui::follow_system_theme(&core, creation.egui_ctx.clone());
             let context = creation.egui_ctx.clone();
             let repaint: Repaint = Arc::new(move || context.request_repaint());
             logs.on_change(Arc::clone(&repaint));

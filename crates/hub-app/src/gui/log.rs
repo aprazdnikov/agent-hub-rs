@@ -34,7 +34,8 @@ impl LogView {
         lines: &[LogLine],
         folder_path: &Path,
     ) -> Option<LogAction> {
-        ui.horizontal(|ui| {
+        super::theme::page_heading(ui, "Лог", "События приложения и диагностика подключения.");
+        ui.horizontal_wrapped(|ui| {
             egui::ComboBox::from_id_salt("level").selected_text(self.level.as_str()).show_ui(
                 ui,
                 |ui| {

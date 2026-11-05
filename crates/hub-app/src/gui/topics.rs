@@ -52,6 +52,7 @@ impl TopicsView {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot, send: &mut impl FnMut(Command)) {
+        super::theme::page_heading(ui, "Темы", "Сессии агентов в вашей Telegram-группе.");
         if !snapshot.topics.is_empty() {
             ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
         }

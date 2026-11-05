@@ -1798,6 +1798,7 @@ dependencies = [
  "windows",
  "winreg",
  "winresource",
+ "zbus",
 ]
 
 [[package]]
