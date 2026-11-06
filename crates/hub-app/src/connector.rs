@@ -15,7 +15,7 @@ use hub_telegram::agents::HubAgents;
 use hub_telegram::hub::{self, HubHandle, HubMessage, HubSetup};
 use hub_telegram::paths::{CwdError, workspace_root};
 use hub_telegram::telegram::{self, Connection, Listener};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 
 use crate::error::StoreError;
@@ -24,6 +24,12 @@ use crate::topics::{FileTopics, load_recent_projects, load_titles, load_topics};
 
 #[derive(Debug, thiserror::Error)]
 pub enum AgentError {
+    #[error("Не удалось выполнить проверку CLI")]
+    LocalCheck,
+    #[error("Проверка CLI превысила 10 с; проверьте доступ к диску и повторите запуск")]
+    LocalTimeout,
+    #[error("Проверка дополнительного CLI превысила допустимое время")]
+    OptionalTimeout,
     #[error(transparent)]
     Claude(#[from] hub_claude::version::CliError),
     #[error(transparent)]
@@ -40,6 +46,12 @@ pub enum AgentError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
+    #[error("Не удалось проверить локальные файлы")]
+    LocalCheck,
+    #[error(
+        "Проверка локальных файлов превысила 10 с; проверьте доступ к диску и повторите запуск"
+    )]
+    LocalTimeout,
     #[error(transparent)]
     Workspace(#[from] CwdError),
     #[error(transparent)]
@@ -50,15 +62,90 @@ pub enum StartError {
     Telegram(#[from] telegram::StartError),
 }
 
+static LOCAL_WORKER: Semaphore = Semaphore::const_new(1);
+static DEFAULT_AGENT_WORKER: Semaphore = Semaphore::const_new(1);
+static OPTIONAL_AGENT_WORKER: Semaphore = Semaphore::const_new(1);
+const LOCAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const OPTIONAL_AGENT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LocalCheckError {
+    Worker,
+    Timeout,
+}
+
+async fn local_check<T: Send + 'static>(
+    check: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, LocalCheckError> {
+    local_check_with_limit(&LOCAL_WORKER, LOCAL_TIMEOUT, check).await
+}
+
+async fn local_check_with_limit<T: Send + 'static>(
+    slot: &'static Semaphore,
+    limit: std::time::Duration,
+    check: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, LocalCheckError> {
+    tokio::time::timeout(limit, async {
+        let permit = slot.acquire().await.map_err(|_| LocalCheckError::Worker)?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            check()
+        })
+        .await
+        .map_err(|_| LocalCheckError::Worker)
+    })
+    .await
+    .map_err(|_| LocalCheckError::Timeout)?
+}
+
+fn agent_slot(kind: BackendKind, default: BackendKind) -> &'static Semaphore {
+    if kind == default { &DEFAULT_AGENT_WORKER } else { &OPTIONAL_AGENT_WORKER }
+}
+
+async fn locate_agent(
+    kind: BackendKind,
+    default: BackendKind,
+    configured: Option<PathBuf>,
+) -> Result<PathBuf, AgentError> {
+    local_check_with_limit(agent_slot(kind, default), LOCAL_TIMEOUT, move || match kind {
+        BackendKind::Claude => {
+            hub_claude::version::locate(configured.as_deref()).map_err(AgentError::from)
+        }
+        BackendKind::Codex => {
+            hub_codex::version::locate(configured.as_deref()).map_err(AgentError::from)
+        }
+        BackendKind::Hermes => {
+            hub_hermes::version::locate(configured.as_deref()).map_err(AgentError::from)
+        }
+        BackendKind::Opencode => {
+            hub_opencode::version::locate(configured.as_deref()).map_err(AgentError::from)
+        }
+        BackendKind::Qwen => {
+            hub_qwen::version::locate(configured.as_deref()).map_err(AgentError::from)
+        }
+    })
+    .await
+    .map_err(|error| match error {
+        LocalCheckError::Worker => AgentError::LocalCheck,
+        LocalCheckError::Timeout => AgentError::LocalTimeout,
+    })?
+}
+
 async fn check_agent(kind: BackendKind, settings: &Settings) -> Result<AgentState, AgentError> {
+    let configured = match kind {
+        BackendKind::Claude => settings.claude.cli.clone(),
+        BackendKind::Codex => settings.codex.cli.clone(),
+        BackendKind::Hermes => settings.hermes.cli.clone(),
+        BackendKind::Opencode => settings.opencode.cli.clone(),
+        BackendKind::Qwen => settings.qwen.cli.clone(),
+    };
+    let cli = locate_agent(kind, settings.default_backend, configured).await?;
     match kind {
         BackendKind::Claude => {
-            let cli = hub_claude::version::locate(settings.claude.cli.as_deref())?;
             let version = hub_claude::version::check(&cli).await?;
             Ok(AgentState::Ready { version: version.to_string(), auth: None })
         }
         BackendKind::Codex => {
-            let cli = hub_codex::version::locate(settings.codex.cli.as_deref())?;
             let version = hub_codex::version::check(&cli).await?;
             let auth = probe_auth(&cli, &settings.codex).await?;
             if auth == CodexAuth::Missing {
@@ -72,25 +159,36 @@ async fn check_agent(kind: BackendKind, settings: &Settings) -> Result<AgentStat
             })
         }
         BackendKind::Hermes => {
-            let cli = hub_hermes::version::locate(settings.hermes.cli.as_deref())?;
             let version = hub_hermes::version::check(&cli).await?;
             // No trial session: Hermes owns its profiles, credentials and session database.
             Ok(AgentState::Ready { version: version.to_string(), auth: Some(AgentAuth::Hermes) })
         }
         BackendKind::Opencode => {
-            let cli = hub_opencode::version::locate(settings.opencode.cli.as_deref())?;
             let version = hub_opencode::version::check(&cli).await?;
             // No trial session: OpenCode owns its providers, credentials and session database.
             Ok(AgentState::Ready { version: version.to_string(), auth: Some(AgentAuth::Opencode) })
         }
         BackendKind::Qwen => {
-            let cli = hub_qwen::version::locate(settings.qwen.cli.as_deref())?;
             let version = hub_qwen::version::check(&cli).await?;
             // Sign-in is not probed: qwen reports it only on session/new, and a trial session
             // would leave a file in ~/.qwen.
             let auth = AgentAuth::Qwen(QwenAuth::of(&settings.qwen));
             Ok(AgentState::Ready { version: version.to_string(), auth: Some(auth) })
         }
+    }
+}
+
+async fn check_for_start(
+    kind: BackendKind,
+    settings: &Settings,
+    limit: std::time::Duration,
+) -> Result<AgentState, AgentError> {
+    if kind == settings.default_backend {
+        check_agent(kind, settings).await
+    } else {
+        tokio::time::timeout(limit, check_agent(kind, settings))
+            .await
+            .map_err(|_| AgentError::OptionalTimeout)?
     }
 }
 
@@ -128,10 +226,20 @@ impl TelegramConnector {
 impl Connector for TelegramConnector {
     type Error = StartError;
 
+    fn outbox_count(
+        &self,
+        chat: hub_core::domain::ChatId,
+    ) -> BoxFuture<'static, Result<usize, String>> {
+        self.results.count(chat)
+    }
+
     fn transient(error: &StartError) -> bool {
         match error {
-            StartError::Telegram(telegram::StartError::Network(_)) => true,
+            StartError::Telegram(telegram::StartError::Network(_))
+            | StartError::LocalTimeout
+            | StartError::Agent(AgentError::LocalTimeout) => true,
             StartError::Telegram(telegram::StartError::InvalidToken)
+            | StartError::LocalCheck
             | StartError::Workspace(_)
             | StartError::Topics(_)
             | StartError::Agent(_) => false,
@@ -141,25 +249,44 @@ impl Connector for TelegramConnector {
     fn connect(
         &self,
         settings: watch::Receiver<Arc<Settings>>,
-    ) -> BoxFuture<'_, Result<Started, StartError>> {
+    ) -> BoxFuture<'static, Result<Started, StartError>> {
+        let home = self.home.clone();
+        let topic_path = self.topics.clone();
+        let results = Arc::clone(&self.results);
         Box::pin(async move {
             let current = Arc::clone(&settings.borrow());
-            workspace_root(&current.workspace_root)?;
-            let topics = load_topics(&self.topics)?;
-            let titles = load_titles(&self.topics)?;
-            let recent_projects = load_recent_projects(&self.topics)?;
-            let checked = join_all(BackendKind::ALL.iter().map(|&kind| {
-                let current = &current;
-                async move { (kind, check_agent(kind, current).await) }
-            }))
-            .await;
+            let root = current.workspace_root.clone();
+            let source = topic_path.clone();
+            let (topics, titles, recent_projects) = local_check(move || {
+                workspace_root(&root)?;
+                Ok::<_, StartError>((
+                    load_topics(&source)?,
+                    load_titles(&source)?,
+                    load_recent_projects(&source)?,
+                ))
+            })
+            .await
+            .map_err(|error| match error {
+                LocalCheckError::Worker => StartError::LocalCheck,
+                LocalCheckError::Timeout => StartError::LocalTimeout,
+            })??;
+            let checked =
+                join_all(
+                    BackendKind::ALL.iter().map(|&kind| {
+                        let current = &current;
+                        async move {
+                            (kind, check_for_start(kind, current, OPTIONAL_AGENT_TIMEOUT).await)
+                        }
+                    }),
+                )
+                .await;
             let agents = statuses(current.default_backend, checked)?;
             for agent in &agents {
                 if let AgentState::Unavailable(reason) = &agent.state {
                     tracing::warn!(backend = agent.kind.name(), %reason, "agent unavailable");
                 }
             }
-            let Connection { bot, messenger, username } =
+            let Connection { bot, messenger, username, chat_access } =
                 telegram::connect(&current.telegram.token, current.telegram.chat).await?;
             if let Err(error) = telegram::synchronize_commands(&bot, &current.telegram).await {
                 tracing::warn!(%error, "command menu not synchronized; bot will keep running");
@@ -168,22 +295,23 @@ impl Connector for TelegramConnector {
                 hub::spawn(HubSetup {
                     transcriber: Arc::new(crate::speech::SpeechTranscriber),
                     action_runner: Arc::new(LocalActionRunner),
-                    results: self.results.clone(),
-                    doctor_runner: Arc::new(crate::doctor::LocalDoctor::new(self.home.clone())),
+                    results,
+                    doctor_runner: Arc::new(crate::doctor::LocalDoctor::new(home.clone())),
                     agents: Arc::new(HubAgents::new(settings.clone())),
                     messenger,
                     settings,
                     topics,
                     titles,
                     recent_projects,
-                    store: Box::new(FileTopics::new(self.topics.clone())),
-                    home: self.home.clone(),
+                    store: Box::new(FileTopics::new(topic_path)),
+                    home,
                     bot: username.clone(),
                 });
             let listener = telegram::listen(bot, current.telegram.clone(), mailbox.clone());
             let hub = mailbox.clone();
             Ok(Started {
                 username,
+                chat_access,
                 agents,
                 mailbox,
                 views,
@@ -256,6 +384,183 @@ mod tests {
         watch::Sender::new(Arc::new(settings)).subscribe()
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stalled_optional_agent_version_check_is_bounded() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("slow-claude");
+        std::fs::write(&cli, "#!/bin/sh\nexec sleep 60\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let settings = Draft {
+            token: "1:a".into(),
+            chat: "-100".into(),
+            users: "1".into(),
+            workspace_root: dir.path().display().to_string(),
+            default_backend: BackendKind::Codex,
+            cli: cli.display().to_string(),
+            ..Draft::default()
+        }
+        .parse(dir.path())
+        .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            check_for_start(BackendKind::Claude, &settings, std::time::Duration::from_millis(50)),
+        )
+        .await;
+        assert!(matches!(result, Ok(Err(AgentError::OptionalTimeout))));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stalled_optional_lookup_does_not_block_selected_codex() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("codex");
+        std::fs::write(&cli, "#!/bin/sh\nprintf 'codex-cli 0.160.0\\n'\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let (started, ready) = oneshot::channel();
+        let (release, waiting) = std::sync::mpsc::channel::<()>();
+        let optional = tokio::spawn(local_check_with_limit(
+            agent_slot(BackendKind::Claude, BackendKind::Codex),
+            std::time::Duration::from_secs(5),
+            move || {
+                let _ = started.send(());
+                let _ = waiting.recv();
+            },
+        ));
+        ready.await.unwrap();
+        let selected = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            let path =
+                locate_agent(BackendKind::Codex, BackendKind::Codex, Some(cli)).await.unwrap();
+            hub_codex::version::check(&path).await.unwrap().to_string()
+        })
+        .await;
+        release.send(()).unwrap();
+        optional.await.unwrap().unwrap();
+        assert_eq!(selected.unwrap(), "0.160.0");
+    }
+
+    #[tokio::test]
+    async fn cancelled_selected_lookup_keeps_its_slot_and_retry_times_out() {
+        let slot = agent_slot(BackendKind::Codex, BackendKind::Codex);
+        let (started, ready) = oneshot::channel();
+        let (release, waiting) = std::sync::mpsc::channel::<()>();
+        let first = tokio::spawn(local_check_with_limit(
+            slot,
+            std::time::Duration::from_secs(5),
+            move || {
+                let _ = started.send(());
+                let _ = waiting.recv();
+            },
+        ));
+        ready.await.unwrap();
+        first.abort();
+        let retry = local_check_with_limit(slot, std::time::Duration::from_millis(50), || 1).await;
+        release.send(()).unwrap();
+        assert_eq!(retry, Err(LocalCheckError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn stalled_worker_and_retry_both_timeout_without_starting_another_worker() {
+        static SLOT: Semaphore = Semaphore::const_new(1);
+        let (started, ready) = oneshot::channel();
+        let (release, waiting) = std::sync::mpsc::channel::<()>();
+        let first = tokio::spawn(local_check_with_limit(
+            &SLOT,
+            std::time::Duration::from_millis(50),
+            move || {
+                let _ = started.send(());
+                let _ = waiting.recv();
+            },
+        ));
+        ready.await.unwrap();
+        let first_result = tokio::time::timeout(std::time::Duration::from_secs(1), first).await;
+        let retry_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = Arc::clone(&retry_started);
+        let retry_result = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            local_check_with_limit(&SLOT, std::time::Duration::from_millis(50), move || {
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                123
+            }),
+        )
+        .await;
+        assert!(matches!(first_result, Ok(Ok(Err(LocalCheckError::Timeout)))));
+        assert!(matches!(retry_result, Ok(Err(LocalCheckError::Timeout))));
+        assert!(!retry_started.load(std::sync::atomic::Ordering::SeqCst));
+        release.send(()).unwrap();
+        let recovered =
+            local_check_with_limit(&SLOT, std::time::Duration::from_secs(1), || 123).await;
+        assert_eq!(recovered, Ok(123));
+    }
+
+    #[tokio::test]
+    async fn cancelled_local_check_keeps_worker_slot_until_blocking_work_finishes() {
+        let (started, ready) = oneshot::channel();
+        let (release, waiting) = std::sync::mpsc::channel::<()>();
+        let task = tokio::spawn(local_check(move || {
+            let _ = started.send(());
+            let _ = waiting.recv();
+        }));
+        ready.await.unwrap();
+        task.abort();
+        assert!(LOCAL_WORKER.try_acquire().is_err());
+        release.send(()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_startup_cli_check_terminates_its_child() {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let executable = dir.path().join("slow-cli");
+        let pid_file = dir.path().join("pid");
+        std::fs::write(
+            &executable,
+            format!("#!/bin/sh\nprintf '%s' \"$$\" > '{}'\nexec sleep 60\n", pid_file.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let settings = Draft {
+            token: "1:a".into(),
+            chat: "-100".into(),
+            users: "1".into(),
+            workspace_root: dir.path().display().to_string(),
+            cli: executable.display().to_string(),
+            ..Draft::default()
+        }
+        .parse(dir.path())
+        .unwrap();
+        let task = tokio::spawn(async move { check_agent(BackendKind::Claude, &settings).await });
+        let pid = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&pid_file)
+                    && let Ok(pid) = text.parse::<i32>()
+                {
+                    break Pid::from_raw(pid);
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        task.abort();
+        let exited = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while kill(pid, None).is_ok() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        if exited.is_err() {
+            let _ = kill(pid, Signal::SIGKILL);
+        }
+        assert!(exited.is_ok());
+    }
+
     #[test]
     fn only_an_unreachable_telegram_is_worth_retrying() {
         let offline = StartError::Telegram(telegram::StartError::Network("timeout".to_owned()));
@@ -264,6 +569,12 @@ mod tests {
         assert!(TelegramConnector::transient(&offline));
         assert!(!TelegramConnector::transient(&rejected));
         assert!(!TelegramConnector::transient(&missing));
+    }
+
+    #[test]
+    fn local_timeouts_keep_the_reconnect_backoff() {
+        assert!(TelegramConnector::transient(&StartError::LocalTimeout));
+        assert!(TelegramConnector::transient(&StartError::Agent(AgentError::LocalTimeout)));
     }
 
     #[tokio::test]

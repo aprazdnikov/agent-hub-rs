@@ -5,7 +5,7 @@ on:
     tags: ["v*"]
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -40,11 +40,32 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }} -p hub-app
+      - name: Install NSIS
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install nsis --version=3.10.0 --no-progress -y
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          "${env:ProgramFiles(x86)}\NSIS" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+      - name: Test Windows packaging
+        if: runner.os == 'Windows'
+        run: bash scripts/test-windows-package.sh --self-test
+      - name: Test Windows installation
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: ./scripts/test-windows-installer.ps1 "target/${{ matrix.target }}/release/agent-hub.exe" ($env:RELEASE_TAG.Substring(1))
       - name: Test macOS bundle packaging
         if: runner.os == 'macOS'
         env:
           RELEASE_TAG: ${{ github.ref_name }}
         run: bash scripts/test-macos-package.sh "target/${{ matrix.target }}/release/agent-hub" "${RELEASE_TAG#v}"
+      - name: Test Debian packaging
+        if: runner.os == 'Linux'
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: bash scripts/test-deb-package.sh "target/${{ matrix.target }}/release/agent-hub" "${RELEASE_TAG#v}"
       - name: Package
         env:
           RELEASE_TAG: ${{ github.ref_name }}
@@ -66,6 +87,12 @@ jobs:
             bash scripts/package-macos.sh "$built" "${RELEASE_TAG#v}" "stage-app/agent-hub.app"
             ditto -c -k --sequesterRsrc --keepParent "stage-app/agent-hub.app" "dist/${name}.app.zip"
           fi
+          if [ "${{ runner.os }}" = Linux ]; then
+            bash scripts/package-deb.sh "$built" "${RELEASE_TAG#v}" "dist/agent-hub-${{ matrix.target }}.deb"
+          fi
+          if [ "${{ runner.os }}" = Windows ]; then
+            bash scripts/test-windows-package.sh "$built" "${RELEASE_TAG#v}" "dist/agent-hub-${{ matrix.target }}-setup.exe"
+          fi
           cd dist
           for file in *; do
             if command -v sha256sum >/dev/null; then sha256sum "$file"; else shasum -a 256 "$file"; fi > "${file}.sha256"
@@ -79,6 +106,8 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4

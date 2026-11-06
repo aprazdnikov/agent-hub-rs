@@ -3,6 +3,7 @@ mod autostart;
 mod folder;
 mod log;
 pub mod look;
+pub mod scale;
 mod settings;
 mod status;
 mod theme;

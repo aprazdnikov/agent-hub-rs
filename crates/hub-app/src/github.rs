@@ -70,22 +70,46 @@ impl Source for GitHub {
 pub struct SelfReplace;
 
 impl Installer for SelfReplace {
+    fn mode(&self) -> crate::install_mode::Mode {
+        crate::install_mode::current()
+    }
+
     fn install(&self, binary: Vec<u8>) -> Result<(), UpdateError> {
-        let replace = |error: std::io::Error| UpdateError::Replace(error.to_string());
-        let current = std::env::current_exe().map_err(replace)?;
-        let directory = current
-            .parent()
-            .ok_or_else(|| UpdateError::Replace("у программы нет каталога".to_owned()))?;
-        // Next to the executable, so the final rename stays on one filesystem.
-        let mut file = tempfile::NamedTempFile::new_in(directory).map_err(replace)?;
-        file.write_all(&binary).map_err(replace)?;
-        file.as_file().sync_all().map_err(replace)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o755))
-                .map_err(replace)?;
-        }
-        self_replace::self_replace(file.path()).map_err(replace)
+        install_binary(&binary, self.mode())
+    }
+}
+
+fn install_binary(binary: &[u8], mode: crate::install_mode::Mode) -> Result<(), UpdateError> {
+    if mode != crate::install_mode::Mode::Portable {
+        return Err(UpdateError::Replace(
+            "Используйте установщик или пакет со страницы релизов".to_owned(),
+        ));
+    }
+    let replace = |error: std::io::Error| UpdateError::Replace(error.to_string());
+    let current = std::env::current_exe().map_err(replace)?;
+    let directory = current
+        .parent()
+        .ok_or_else(|| UpdateError::Replace("у программы нет каталога".to_owned()))?;
+    // Next to the executable, so the final rename stays on one filesystem.
+    let mut file = tempfile::NamedTempFile::new_in(directory).map_err(replace)?;
+    file.write_all(binary).map_err(replace)?;
+    file.as_file().sync_all().map_err(replace)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(file.path(), std::fs::Permissions::from_mode(0o755))
+            .map_err(replace)?;
+    }
+    self_replace::self_replace(file.path()).map_err(replace)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn package_install_refuses_self_replacement_before_file_operations() {
+        let result = super::install_binary(&[1, 2, 3], crate::install_mode::Mode::Manual);
+        assert!(
+            matches!(result, Err(crate::updater::UpdateError::Replace(message)) if message.contains("установщик"))
+        );
     }
 }

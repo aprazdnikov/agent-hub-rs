@@ -34,6 +34,7 @@ pub enum UpdateError {
 pub enum UpdateState {
     Idle,
     Available(Version),
+    ManualAvailable(Version),
     Installing(Version),
     /// Replaced on disk; the running process is still the old version until a restart.
     Installed(Version),
@@ -51,6 +52,9 @@ pub trait Source: Send + Sync + 'static {
 }
 
 pub trait Installer: Send + Sync + 'static {
+    fn mode(&self) -> crate::install_mode::Mode {
+        crate::install_mode::Mode::Portable
+    }
     fn install(&self, binary: Vec<u8>) -> Result<(), UpdateError>;
 }
 
@@ -138,6 +142,15 @@ impl<S: Source, I: Installer> Updater<S, I> {
                 return;
             }
         };
+        if self.installer.mode() == crate::install_mode::Mode::Manual {
+            self.offer = None;
+            if release.version > self.current {
+                self.publish(UpdateState::ManualAvailable(release.version));
+            } else {
+                self.publish(UpdateState::Idle);
+            }
+            return;
+        }
         self.offer = offer(&release, self.current, self.target);
         match &self.offer {
             Some(found) => {
@@ -149,10 +162,19 @@ impl<S: Source, I: Installer> Updater<S, I> {
     }
 
     async fn install(&mut self) {
+        if self.installer.mode() != crate::install_mode::Mode::Portable {
+            if let Some(found) = &self.offer {
+                self.publish(UpdateState::ManualAvailable(found.version));
+            }
+            return;
+        }
         // A repeated click must not replace the program a second time.
         let ready = match *self.state.borrow() {
             UpdateState::Available(_) | UpdateState::Failed(_) => true,
-            UpdateState::Idle | UpdateState::Installing(_) | UpdateState::Installed(_) => false,
+            UpdateState::Idle
+            | UpdateState::ManualAvailable(_)
+            | UpdateState::Installing(_)
+            | UpdateState::Installed(_) => false,
         };
         let Some(found) = self.offer.clone().filter(|_| ready) else { return };
         self.publish(UpdateState::Installing(found.version));
@@ -222,6 +244,7 @@ mod tests {
         latest: StdMutex<Option<Result<String, String>>>,
         files: HashMap<String, Vec<u8>>,
         checks: AtomicUsize,
+        downloads: AtomicUsize,
     }
 
     impl Source for Arc<FakeSource> {
@@ -236,6 +259,7 @@ mod tests {
             url: String,
             _limit: u64,
         ) -> BoxFuture<'_, Result<Vec<u8>, UpdateError>> {
+            self.downloads.fetch_add(1, Ordering::SeqCst);
             let file = self.files.get(&url).cloned().ok_or(UpdateError::Download(url));
             Box::pin(async move { file })
         }
@@ -244,9 +268,17 @@ mod tests {
     #[derive(Default)]
     struct FakeInstaller {
         installed: StdMutex<Vec<Vec<u8>>>,
+        manual: bool,
     }
 
     impl Installer for Arc<FakeInstaller> {
+        fn mode(&self) -> crate::install_mode::Mode {
+            if self.manual {
+                crate::install_mode::Mode::Manual
+            } else {
+                crate::install_mode::Mode::Portable
+            }
+        }
         fn install(&self, binary: Vec<u8>) -> Result<(), UpdateError> {
             self.installed.lock().unwrap().push(binary);
             Ok(())
@@ -269,6 +301,15 @@ mod tests {
     }
 
     fn harness(latest: Result<String, String>, sum: &str, checks: UpdateCheck) -> Harness {
+        harness_mode(latest, sum, checks, false)
+    }
+
+    fn harness_mode(
+        latest: Result<String, String>,
+        sum: &str,
+        checks: UpdateCheck,
+        manual: bool,
+    ) -> Harness {
         let source = Arc::new(FakeSource {
             latest: StdMutex::new(Some(latest)),
             files: HashMap::from([
@@ -276,8 +317,9 @@ mod tests {
                 ("sum".to_owned(), sum.as_bytes().to_vec()),
             ]),
             checks: AtomicUsize::new(0),
+            downloads: AtomicUsize::new(0),
         });
-        let installer = Arc::new(FakeInstaller::default());
+        let installer = Arc::new(FakeInstaller { manual, ..FakeInstaller::default() });
         let snapshot = Snapshot {
             saved: Some(Draft { updates: checks, ..Draft::default() }),
             ..Snapshot::default()
@@ -353,6 +395,43 @@ mod tests {
         harness.commands.send(UpdateCommand::Install).await.unwrap();
         until(&mut harness.state, |s| matches!(s, UpdateState::Installed(_))).await;
         assert_eq!(*harness.installer.installed.lock().unwrap(), [BINARY.to_vec()]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn installed_copy_offers_manual_update_and_never_installs() {
+        let mut harness =
+            harness_mode(Ok(release("v0.2.0")), &sha256_line(BINARY), UpdateCheck::Enabled, true);
+        until(&mut harness.state, |s| matches!(s, UpdateState::ManualAvailable(_))).await;
+        let version = Version::parse("0.2.0").unwrap();
+        let (snapshot, watched) = watch::channel(Snapshot::default());
+        let (state, observed) = watch::channel(UpdateState::Available(version));
+        let mut updater = Updater {
+            source: Arc::clone(&harness.source),
+            installer: Arc::new(Arc::clone(&harness.installer)),
+            current: Version::parse("0.1.0").unwrap(),
+            target: Target::LinuxX64,
+            checks: watched,
+            state,
+            repaint: Arc::new(|| {}),
+            offer: Some(Offer { version, binary: "bin".to_owned(), checksum: "sum".to_owned() }),
+        };
+        updater.install().await;
+        assert!(matches!(*observed.borrow(), UpdateState::ManualAvailable(_)));
+        assert_eq!(harness.source.downloads.load(Ordering::SeqCst), 0);
+        assert!(harness.installer.installed.lock().unwrap().is_empty());
+        drop(snapshot);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_update_does_not_depend_on_raw_binary_assets() {
+        let mut harness = harness_mode(
+            Ok(r#"{"tag_name":"v0.2.0","assets":[]}"#.to_owned()),
+            "",
+            UpdateCheck::Enabled,
+            true,
+        );
+        until(&mut harness.state, |s| matches!(s, UpdateState::ManualAvailable(_))).await;
+        assert_eq!(harness.source.downloads.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(start_paused = true)]

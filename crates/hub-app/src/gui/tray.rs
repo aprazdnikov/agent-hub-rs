@@ -141,7 +141,9 @@ impl Tray {
             tracing::warn!(%error, "tray tooltip not updated");
         }
         let (text, enabled) = match &snapshot.bot {
-            BotStatus::Running { .. } | BotStatus::Starting => ("Остановить бота", true),
+            BotStatus::Running { .. } | BotStatus::Starting | BotStatus::Retrying { .. } => {
+                ("Остановить бота", true)
+            }
             BotStatus::Stopped | BotStatus::Failed(_) => ("Запустить бота", true),
             BotStatus::Unconfigured => ("Запустить бота", false),
         };

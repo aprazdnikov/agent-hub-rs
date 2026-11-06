@@ -14,7 +14,7 @@ use crate::gui::status;
 use crate::gui::topics::TopicsView;
 use crate::gui::tray::{Tray, TrayAction};
 use crate::logging::LogBuffer;
-use crate::supervisor::{BotStatus, Command, Snapshot};
+use crate::supervisor::{BotStatus, Command, SaveStatus, Snapshot};
 use crate::updater::{UpdateCommand, UpdateState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,6 +50,7 @@ pub struct AppSetup {
     pub tray: Option<(Tray, std_mpsc::Receiver<TrayAction>)>,
     pub home: PathBuf,
     pub logs_dir: PathBuf,
+    pub ui_settings: PathBuf,
     pub updates: watch::Receiver<UpdateState>,
     pub update_commands: mpsc::Sender<UpdateCommand>,
     pub exit: ExitChoice,
@@ -68,6 +69,8 @@ pub struct HubApp {
     tab: Tab,
     exit: ExitChoice,
     restart: Confirm,
+    pending_exit: Option<Exit>,
+    save_requested: Option<u64>,
     topics: TopicsView,
     log: LogView,
     form: SettingsForm,
@@ -85,6 +88,7 @@ impl HubApp {
             tray,
             home,
             logs_dir,
+            ui_settings,
             updates,
             update_commands,
             exit,
@@ -93,9 +97,12 @@ impl HubApp {
             BotStatus::Unconfigured => Tab::Settings,
             BotStatus::Stopped
             | BotStatus::Starting
+            | BotStatus::Retrying { .. }
             | BotStatus::Running { .. }
             | BotStatus::Failed(_) => Tab::Status,
         };
+        let mut form = SettingsForm::with_autostart(autostart);
+        form.set_scale_path(ui_settings);
         Self {
             initial_window: Some(initial_window),
             commands,
@@ -109,15 +116,20 @@ impl HubApp {
             tab,
             exit,
             restart: Confirm::Hidden,
+            pending_exit: None,
+            save_requested: None,
             topics: TopicsView::default(),
             log: LogView::default(),
-            form: SettingsForm::with_autostart(autostart),
+            form,
         }
     }
 
-    fn send(commands: &mpsc::Sender<Command>, command: Command) {
+    fn send(commands: &mpsc::Sender<Command>, command: Command) -> bool {
         if commands.try_send(command).is_err() {
             tracing::warn!("command dropped: the core is busy or stopped");
+            false
+        } else {
+            true
         }
     }
 
@@ -125,9 +137,54 @@ impl HubApp {
         *self.exit.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn leave(&self, ctx: &egui::Context, how: Exit) {
+    fn saving(&self) -> bool {
+        self.save_requested.is_some()
+            || matches!(
+                self.snapshot.borrow().save_status,
+                SaveStatus::Saving | SaveStatus::Delayed
+            )
+    }
+
+    fn leave(&mut self, ctx: &egui::Context, how: Exit) {
+        if self.saving() {
+            self.pending_exit = Some(how);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            ctx.send_viewport_cmd(egui::ViewportCommand::Minimized(false));
+            ctx.request_repaint();
+        } else {
+            self.leave_now(ctx, how);
+        }
+    }
+
+    fn leave_now(&self, ctx: &egui::Context, how: Exit) {
         *self.exit.lock().unwrap_or_else(PoisonError::into_inner) = how;
         ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+    }
+
+    fn confirm_pending_exit(&mut self, ctx: &egui::Context) {
+        let Some(how) = self.pending_exit else { return };
+        let saving = self.saving();
+        let modal = egui::Modal::new(egui::Id::new("save_pending_exit")).show(ctx, |ui| {
+            if saving {
+                ui.label("Сохранение ещё выполняется. При выходе его результат неизвестен: файл и ключи могут сохраниться частично. Проверьте настройки после следующего запуска.");
+            } else {
+                ui.label("Сохранение завершено. Продолжить выход?");
+            }
+            ui.horizontal(|ui| {
+                let label = if how == Exit::Restarting { "Перезапустить" } else { "Выйти" };
+                if ui.add_enabled(!saving || how == Exit::Quitting, egui::Button::new(label)).clicked() {
+                    self.pending_exit = None;
+                    self.leave_now(ctx, how);
+                }
+                if ui.button("Продолжить работу").clicked() { self.pending_exit = None; }
+            });
+            if saving && how == Exit::Restarting {
+                ui.weak("Перезапуск доступен после завершения сохранения.");
+            }
+        });
+        if modal.should_close() {
+            self.pending_exit = None;
+        }
     }
 
     fn update_banner(&mut self, ui: &mut egui::Ui, sessions: usize) {
@@ -151,6 +208,12 @@ impl HubApp {
                             self.leave(ui.ctx(), Exit::Restarting);
                         }
                     }
+                }
+                Some(BannerAction::Release) => {
+                    ui.hyperlink_to(
+                        "Открыть релизы",
+                        "https://github.com/aprazdnikov/agent-hub-rs/releases/latest",
+                    );
                 }
                 None => {
                     ui.spinner();
@@ -194,12 +257,14 @@ impl HubApp {
                 }
                 TrayAction::Toggle => {
                     let command = match snapshot.bot {
-                        BotStatus::Running { .. } | BotStatus::Starting => Command::Stop,
+                        BotStatus::Running { .. }
+                        | BotStatus::Starting
+                        | BotStatus::Retrying { .. } => Command::Stop,
                         BotStatus::Stopped | BotStatus::Failed(_) | BotStatus::Unconfigured => {
                             Command::Start
                         }
                     };
-                    Self::send(&self.commands, command);
+                    let _ = Self::send(&self.commands, command);
                 }
                 TrayAction::Quit => self.leave(ctx, Exit::Quitting),
             }
@@ -228,7 +293,15 @@ impl eframe::App for HubApp {
             tray.show(&snapshot, &self.updates.borrow());
         }
         self.form.sync(snapshot.saved.as_ref());
+        if self.save_requested.is_some_and(|revision| revision != snapshot.save_revision) {
+            self.save_requested = None;
+        }
+        self.form.set_saving(self.saving() || snapshot.save_status == SaveStatus::Uncertain);
         let closing = ctx.input(|input| input.viewport().close_requested());
+        if closing && self.exit() == Exit::Staying && self.tray.is_none() && self.saving() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            self.pending_exit = Some(Exit::Quitting);
+        }
         if closing && self.exit() == Exit::Staying && self.tray.is_some() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             // A Linux tray may have no host to show it, and Wayland cannot hide a window:
@@ -245,7 +318,13 @@ impl eframe::App for HubApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let snapshot = self.snapshot.borrow().clone();
         let commands = self.commands.clone();
-        let mut send = |command| Self::send(&commands, command);
+        let mut save_sent = false;
+        let mut send = |command| {
+            let is_save = matches!(command, Command::Save(_));
+            if Self::send(&commands, command) && is_save {
+                save_sent = true;
+            }
+        };
         egui::Panel::top("tabs")
             .frame(
                 egui::Frame::new()
@@ -253,26 +332,37 @@ impl eframe::App for HubApp {
                     .inner_margin(egui::Margin::symmetric(20, 12)),
             )
             .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("agent-hub").size(20.0).strong());
-                    ui.add_space(20.0);
+                ui.horizontal_wrapped(|ui| {
+                    if ui.available_width() >= 500.0 {
+                        ui.label(egui::RichText::new("agent-hub").size(20.0).strong());
+                        ui.add_space(20.0);
+                    }
                     ui.selectable_value(&mut self.tab, Tab::Status, "Статус");
                     ui.selectable_value(&mut self.tab, Tab::Topics, "Темы");
                     ui.selectable_value(&mut self.tab, Tab::Log, "Лог");
                     ui.selectable_value(&mut self.tab, Tab::Settings, "Настройки");
                 });
                 // Store failures matter most on «Настройки», where the app opens in exactly those cases.
+                if self.saving() {
+                    let message = if snapshot.save_status == SaveStatus::Delayed {
+                        "Сохранение задерживается. Повтор недоступен; при выходе результат может остаться неизвестным."
+                    } else {
+                        "Сохранение выполняется; при выходе результат может остаться неизвестным."
+                    };
+                    ui.colored_label(ui.visuals().warn_fg_color, message);
+                }
                 if let Some(notice) = &snapshot.notice {
                     ui.colored_label(ui.visuals().error_fg_color, notice);
                 }
                 self.update_banner(ui, active(&snapshot));
             });
         self.confirm_restart(ui.ctx(), active(&snapshot));
+        self.confirm_pending_exit(ui.ctx());
         let margin = if self.tab == Tab::Settings { 0 } else { 24 };
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(ui.visuals().extreme_bg_color).inner_margin(margin))
             .show(ui, |ui| match self.tab {
-                Tab::Status => status::show(ui, &snapshot, &mut send),
+                Tab::Status => status::show(ui, &snapshot, self.form.has_unsaved(), &mut send),
                 Tab::Topics => self.topics.show(ui, &snapshot, &mut send),
                 Tab::Log => {
                     if let Some(action) = self.log.show(ui, &self.logs.lines(), &self.logs_dir) {
@@ -282,5 +372,44 @@ impl eframe::App for HubApp {
                 }
                 Tab::Settings => self.form.show(ui, &self.home, active(&snapshot), &mut send),
             });
+        if save_sent {
+            self.save_requested = Some(snapshot.save_revision);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quit_and_restart_wait_for_confirmation_when_save_is_queued() {
+        let (commands, _inbox) = mpsc::channel(4);
+        let (_snapshot, watched) = watch::channel(Snapshot::default());
+        let (_updates_tx, updates) = watch::channel(UpdateState::Idle);
+        let (update_commands, _update_inbox) = mpsc::channel(1);
+        let exit = Arc::new(Mutex::new(Exit::Staying));
+        let mut app = HubApp::new(AppSetup {
+            autostart: Err("unavailable".to_owned()),
+            initial_window: crate::autostart::Window::Visible,
+            commands,
+            snapshot: watched,
+            logs: LogBuffer::default(),
+            tray: None,
+            home: std::env::temp_dir(),
+            logs_dir: std::env::temp_dir(),
+            ui_settings: std::env::temp_dir().join("agent-hub-ui-test.toml"),
+            updates,
+            update_commands,
+            exit: Arc::clone(&exit),
+        });
+        app.save_requested = Some(0);
+        let ctx = egui::Context::default();
+        app.leave(&ctx, Exit::Quitting);
+        assert_eq!(app.pending_exit, Some(Exit::Quitting));
+        assert_eq!(*exit.lock().unwrap(), Exit::Staying);
+        app.leave(&ctx, Exit::Restarting);
+        assert_eq!(app.pending_exit, Some(Exit::Restarting));
+        assert_eq!(*exit.lock().unwrap(), Exit::Staying);
     }
 }

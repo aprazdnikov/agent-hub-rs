@@ -24,7 +24,7 @@ impl Secret {
 /// The store's own message; it never carries the secret itself.
 #[derive(Debug, thiserror::Error)]
 #[error("системное хранилище ключей недоступно: {0}")]
-pub struct SecretError(String);
+pub struct SecretError(pub(crate) String);
 
 pub trait Secrets: Send + Sync {
     fn read(&self, secret: Secret) -> Result<Option<String>, SecretError>;

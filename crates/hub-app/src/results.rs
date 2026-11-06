@@ -22,12 +22,14 @@ enum Operation {
     Save(Box<Pending>),
     Load(TopicKey),
     Pending(ChatId),
+    Count(ChatId),
     Update(Change),
 }
 enum Response {
     Saved(SaveOutcome),
     Last(Option<SavedResult>),
     Pending(Snapshot),
+    Count(usize),
     Updated(Option<Pending>),
 }
 struct Request {
@@ -43,6 +45,17 @@ impl FileResults {
     pub fn new(topics: &Path) -> Self {
         let path = topics.with_extension("results.json");
         Self::start(move |operation| operate(&path, operation))
+    }
+    /// Read only the number of queued results for one group through the same serial worker.
+    #[must_use]
+    pub fn count(&self, chat: ChatId) -> BoxFuture<'static, Result<usize, String>> {
+        let request = self.request(Operation::Count(chat));
+        Box::pin(async move {
+            match request.await? {
+                Response::Count(count) => Ok(count),
+                _ => Err("Некорректный ответ хранилища".to_owned()),
+            }
+        })
     }
     fn start(
         mut handle: impl FnMut(Operation) -> Result<Response, String> + Send + 'static,
@@ -154,6 +167,7 @@ fn operate(path: &Path, operation: Operation) -> Result<Response, String> {
     let response = match operation {
         Operation::Load(key) => return Ok(Response::Last(book.get(key).cloned())),
         Operation::Pending(chat) => return Ok(Response::Pending(book.snapshot(chat))),
+        Operation::Count(chat) => return Ok(Response::Count(book.snapshot(chat).entries.len())),
         Operation::Save(pending) => Response::Saved(book.enqueue(*pending, time)?),
         Operation::Update(change) => {
             // Wall-clock seconds are truncated. Round the response time up so a persisted
@@ -196,6 +210,18 @@ mod tests {
             "",
         )
         .unwrap()
+    }
+    #[tokio::test]
+    async fn count_reports_only_the_requested_group_and_storage_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("topics.json");
+        let store = FileResults::new(&path);
+        assert_eq!(store.count(key().chat).await.unwrap(), 0);
+        store.save(result("private answer")).await.unwrap();
+        assert_eq!(store.count(key().chat).await.unwrap(), 1);
+        assert_eq!(store.count(ChatId(-200)).await.unwrap(), 0);
+        fs::write(path.with_extension("results.json"), "broken").unwrap();
+        assert!(store.count(key().chat).await.is_err());
     }
     #[tokio::test]
     async fn last_result_survives_store_restart_and_preserves_markdown() {

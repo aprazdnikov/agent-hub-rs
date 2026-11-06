@@ -51,7 +51,7 @@ fn run() -> anyhow::Result<()> {
     // binary reads "<path> (deleted)" afterwards.
     let program = std::env::current_exe()?;
     let dirs = AppDirs::locate().context("не найден домашний каталог пользователя")?;
-    let lock = match InstanceLock::acquire(&dirs.lock()) {
+    let lock = Arc::new(match InstanceLock::acquire(&dirs.lock()) {
         Ok(lock) => lock,
         Err(InstanceError::Running) => {
             if launch == Launch::Manual {
@@ -60,7 +60,7 @@ fn run() -> anyhow::Result<()> {
             return Ok(());
         }
         Err(error) => return Err(error.into()),
-    };
+    });
     let logs = LogBuffer::default();
     let _guard = logging::init(&dirs.logs(), logs.clone())?;
     tracing::info!(version = env!("CARGO_PKG_VERSION"), "agent-hub started");
@@ -79,6 +79,7 @@ fn run() -> anyhow::Result<()> {
     let (commands, inbox) = mpsc::channel(COMMANDS);
     let (snapshot, watched) = watch::channel(Snapshot::default());
     let checks = watched.clone();
+    let save_on_exit = watched.clone();
     let (update_commands, update_inbox) = mpsc::channel(UPDATE_COMMANDS);
     let (update_state, updates) = watch::channel(UpdateState::Idle);
     let exit: ExitChoice = Arc::new(Mutex::new(Exit::Staying));
@@ -87,19 +88,15 @@ fn run() -> anyhow::Result<()> {
     let window = commands.clone();
     let connector = TelegramConnector::new(home.clone(), dirs.topics());
     let logs_dir = dirs.logs();
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("agent-hub")
-            .with_inner_size([960.0, 640.0])
-            .with_min_inner_size([640.0, 360.0])
-            .with_icon(Arc::new(window_icon())),
-        ..eframe::NativeOptions::default()
-    };
+    let ui_settings = dirs.ui_settings();
+    let options = window_options();
+    let save_guard = Arc::clone(&lock);
     eframe::run_native(
         "agent-hub",
         options,
         Box::new(move |creation| {
             hub_app::gui::configure_theme(&creation.egui_ctx);
+            apply_ui_scale(&creation.egui_ctx, &ui_settings);
             #[cfg(target_os = "linux")]
             hub_app::gui::follow_system_theme(&core, creation.egui_ctx.clone());
             let context = creation.egui_ctx.clone();
@@ -108,6 +105,7 @@ fn run() -> anyhow::Result<()> {
             let supervisor = Supervisor::new(SupervisorSetup {
                 connector,
                 store: Box::new(store),
+                save_guard: Some(save_guard),
                 home: home.clone(),
                 loaded,
                 snapshot,
@@ -131,6 +129,7 @@ fn run() -> anyhow::Result<()> {
                 tray,
                 home,
                 logs_dir,
+                ui_settings,
                 updates,
                 update_commands,
                 exit: window_exit,
@@ -140,15 +139,58 @@ fn run() -> anyhow::Result<()> {
     .map_err(|error| anyhow::anyhow!("окно не открылось: {error}"))?;
     stop_core(&runtime, &commands);
     runtime.shutdown_timeout(RUNTIME_GRACE);
-    let restart = *exit.lock().unwrap_or_else(PoisonError::into_inner) == Exit::Restarting;
-    // The new process must find the lock free, so it goes before the spawn.
+    let requested = *exit.lock().unwrap_or_else(PoisonError::into_inner) == Exit::Restarting;
+    restart_after_shutdown(requested, save_on_exit.borrow().save_status, lock, &program)?;
+    tracing::info!("agent-hub stopped");
+    Ok(())
+}
+
+fn restart_after_shutdown(
+    requested: bool,
+    save_status: hub_app::supervisor::SaveStatus,
+    lock: Arc<InstanceLock>,
+    program: &std::path::Path,
+) -> anyhow::Result<()> {
+    let restart = restart_allowed(requested, save_status);
+    if requested && !restart {
+        alert(
+            "Перезапуск отменён: сохранение настроек ещё не завершено. Проверьте настройки перед повторным запуском.",
+        );
+    }
+    // A remaining save worker owns another reference until its write finishes.
     drop(lock);
     if restart {
         std::process::Command::new(program).spawn()?;
         tracing::info!("restarting into the new version");
     }
-    tracing::info!("agent-hub stopped");
     Ok(())
+}
+
+fn restart_allowed(requested: bool, save_status: hub_app::supervisor::SaveStatus) -> bool {
+    requested
+        && !matches!(
+            save_status,
+            hub_app::supervisor::SaveStatus::Saving | hub_app::supervisor::SaveStatus::Delayed
+        )
+}
+
+fn window_options() -> eframe::NativeOptions {
+    eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("agent-hub")
+            .with_inner_size([960.0, 640.0])
+            .with_min_inner_size([640.0, 360.0])
+            .with_icon(Arc::new(window_icon())),
+        ..eframe::NativeOptions::default()
+    }
+}
+
+fn apply_ui_scale(ctx: &egui::Context, path: &std::path::Path) {
+    let scale = hub_app::gui::scale::Scale::load(path).unwrap_or_else(|error| {
+        tracing::warn!(%error, "UI scale not loaded; using 100%");
+        hub_app::gui::scale::Scale::default()
+    });
+    scale.apply(ctx);
 }
 
 fn spawn_updater(
@@ -192,4 +234,18 @@ fn stop_core(runtime: &tokio::runtime::Runtime, commands: &mpsc::Sender<Command>
 fn window_icon() -> egui::IconData {
     let (rgba, side) = app_icon();
     egui::IconData { rgba, width: side, height: side }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hub_app::supervisor::SaveStatus;
+
+    #[test]
+    fn restart_waits_until_save_worker_has_finished() {
+        assert!(!restart_allowed(true, SaveStatus::Saving));
+        assert!(!restart_allowed(true, SaveStatus::Delayed));
+        assert!(restart_allowed(true, SaveStatus::Idle));
+        assert!(restart_allowed(true, SaveStatus::Uncertain));
+    }
 }

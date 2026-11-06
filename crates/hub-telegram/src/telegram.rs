@@ -122,7 +122,7 @@ pub fn allowed(telegram: &TelegramSettings, chat: Option<ChatId>, user: Option<U
 
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
-    #[error("Telegram не принял токен бота")]
+    #[error("Telegram не принял токен бота; проверьте токен в настройках")]
     InvalidToken,
     #[error("Telegram недоступен: {0}")]
     Network(String),
@@ -136,11 +136,13 @@ pub enum ChatAccess {
 
 /// A chat the bot cannot see yet must not stop the start: on first setup the chat id is still
 /// unknown, and the bot has to run to log it from a `rejected update`.
-pub fn chat_access(result: Result<(), RequestError>) -> Result<ChatAccess, StartError> {
+fn chat_access(result: &Result<(), RequestError>) -> Result<ChatAccess, StartError> {
     match result {
         Ok(()) => Ok(ChatAccess::Visible),
         Err(RequestError::Api(ApiError::ChatNotFound)) => Ok(ChatAccess::Unseen),
-        Err(other) => Err(StartError::Network(other.to_string())),
+        Err(_) => Err(StartError::Network(
+            "Не удалось проверить группу; проверьте сеть и повторите запуск".to_owned(),
+        )),
     }
 }
 
@@ -148,6 +150,7 @@ pub struct Connection {
     pub bot: Bot,
     pub messenger: Arc<TelegramMessenger>,
     pub username: String,
+    pub chat_access: ChatAccess,
 }
 
 /// Checks the token and the chat before the hub starts.
@@ -158,11 +161,8 @@ pub async fn connect(token: &Token, chat: ChatId) -> Result<Connection, StartErr
         .build()
         .map_err(|error| StartError::Network(error.to_string()))?;
     let files = Bot::with_client(token.expose(), client);
-    let me = bot.get_me().await.map_err(|error| match error {
-        RequestError::Api(ApiError::InvalidToken) => StartError::InvalidToken,
-        other => StartError::Network(other.to_string()),
-    })?;
-    match chat_access(bot.get_chat(tg::ChatId(chat.0)).await.map(drop))? {
+    let (me, chat_access) = probe(&bot, chat, Duration::from_secs(10)).await?;
+    match chat_access {
         ChatAccess::Visible => {}
         ChatAccess::Unseen => {
             tracing::warn!(
@@ -174,7 +174,142 @@ pub async fn connect(token: &Token, chat: ChatId) -> Result<Connection, StartErr
     let username = me.user.username.clone().unwrap_or_default();
     let topics = topic_bot(token.expose())?;
     let messenger = Arc::new(TelegramMessenger { bot: bot.clone(), files, topics });
-    Ok(Connection { bot, messenger, username })
+    Ok(Connection { bot, messenger, username, chat_access })
+}
+
+async fn probe(
+    bot: &Bot,
+    chat: ChatId,
+    limit: Duration,
+) -> Result<(tg::Me, ChatAccess), StartError> {
+    tokio::time::timeout(limit, async {
+        let me = bot.get_me().await.map_err(|error| match error {
+            RequestError::Api(ApiError::InvalidToken) => StartError::InvalidToken,
+            _ => StartError::Network(
+                "Не удалось проверить токен; проверьте сеть и повторите запуск".to_owned(),
+            ),
+        })?;
+        let access = chat_access(&bot.get_chat(tg::ChatId(chat.0)).await.map(drop))?;
+        Ok((me, access))
+    })
+    .await
+    .map_err(|_| {
+        StartError::Network(
+            "Проверка Telegram превысила время ожидания; проверьте сеть и повторите запуск"
+                .to_owned(),
+        )
+    })?
+}
+
+/// Result of a single read-only diagnostic step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticStep {
+    NotChecked,
+    Ok,
+    InvalidToken,
+    Unavailable,
+    Network,
+    TimedOut,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticChatKind {
+    Forum,
+    Supergroup,
+    Group,
+    Other,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramDiagnostic {
+    pub token: DiagnosticStep,
+    pub chat: DiagnosticStep,
+    pub chat_kind: Option<DiagnosticChatKind>,
+    pub manage_topics: Option<bool>,
+}
+
+pub async fn diagnose(token: &Token, chat: ChatId) -> TelegramDiagnostic {
+    diagnose_with_bot(&Bot::new(token.expose()), chat, Duration::from_secs(10)).await
+}
+
+async fn diagnose_with_bot(bot: &Bot, chat: ChatId, limit: Duration) -> TelegramDiagnostic {
+    let mut report = TelegramDiagnostic {
+        token: DiagnosticStep::NotChecked,
+        chat: DiagnosticStep::NotChecked,
+        chat_kind: None,
+        manage_topics: None,
+    };
+    let deadline = tokio::time::Instant::now() + limit;
+    let me = match tokio::time::timeout_at(deadline, bot.get_me()).await {
+        Ok(Ok(me)) => {
+            report.token = DiagnosticStep::Ok;
+            me
+        }
+        Ok(Err(RequestError::Api(ApiError::InvalidToken))) => {
+            report.token = DiagnosticStep::InvalidToken;
+            return report;
+        }
+        Ok(Err(_)) => {
+            report.token = DiagnosticStep::Network;
+            return report;
+        }
+        Err(_) => {
+            report.token = DiagnosticStep::TimedOut;
+            return report;
+        }
+    };
+    let info = match tokio::time::timeout_at(deadline, bot.get_chat(tg::ChatId(chat.0))).await {
+        Ok(Ok(info)) => {
+            report.chat = DiagnosticStep::Ok;
+            info
+        }
+        Ok(Err(RequestError::Api(
+            ApiError::ChatNotFound
+            | ApiError::BotKicked
+            | ApiError::BotKickedFromSupergroup
+            | ApiError::BotKickedFromChannel,
+        ))) => {
+            report.chat = DiagnosticStep::Unavailable;
+            return report;
+        }
+        Ok(Err(_)) => {
+            report.chat = DiagnosticStep::Network;
+            return report;
+        }
+        Err(_) => {
+            report.chat = DiagnosticStep::TimedOut;
+            return report;
+        }
+    };
+    let kind = match &info.kind {
+        tg::ChatFullInfoKind::Private(_) => DiagnosticChatKind::Other,
+        tg::ChatFullInfoKind::Public(public) => match &public.kind {
+            tg::ChatFullInfoPublicKind::Channel(_) => DiagnosticChatKind::Other,
+            tg::ChatFullInfoPublicKind::Group(_) => DiagnosticChatKind::Group,
+            tg::ChatFullInfoPublicKind::Supergroup(group) if group.is_forum => {
+                DiagnosticChatKind::Forum
+            }
+            tg::ChatFullInfoPublicKind::Supergroup(_) => DiagnosticChatKind::Supergroup,
+        },
+    };
+    report.chat_kind = Some(kind);
+    if kind == DiagnosticChatKind::Forum
+        && let Ok(Ok(member)) =
+            tokio::time::timeout_at(deadline, bot.get_chat_member(tg::ChatId(chat.0), me.user.id))
+                .await
+    {
+        report.manage_topics = match member.kind {
+            tg::ChatMemberKind::Owner(_) => Some(true),
+            tg::ChatMemberKind::Administrator(admin) => Some(admin.can_manage_topics),
+            // A bot must be an administrator to create forum topics, regardless of
+            // the default or restricted permissions granted to ordinary members.
+            tg::ChatMemberKind::Restricted(_)
+            | tg::ChatMemberKind::Left
+            | tg::ChatMemberKind::Banned(_)
+            | tg::ChatMemberKind::Member(_) => Some(false),
+        };
+    }
+    report
 }
 
 pub struct TelegramMessenger {
@@ -1080,11 +1215,262 @@ mod tests {
 
     #[test]
     fn an_unseen_chat_does_not_stop_the_start() {
-        let unseen = chat_access(Err(RequestError::Api(ApiError::ChatNotFound)));
+        let unseen = chat_access(&Err(RequestError::Api(ApiError::ChatNotFound)));
         assert!(matches!(unseen, Ok(ChatAccess::Unseen)));
-        assert!(matches!(chat_access(Ok(())), Ok(ChatAccess::Visible)));
-        let rejected = chat_access(Err(RequestError::Api(ApiError::InvalidToken)));
+        assert!(matches!(chat_access(&Ok(())), Ok(ChatAccess::Visible)));
+        let rejected = chat_access(&Err(RequestError::Api(ApiError::InvalidToken)));
         assert!(matches!(rejected, Err(StartError::Network(_))));
+    }
+
+    async fn probe_server(me: serde_json::Value, chat: serde_json::Value) -> (Bot, JoinHandle<()>) {
+        use http_body_util::Full;
+        use hyper::body::Bytes;
+        use hyper_util::rt::TokioIo;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let me = me.clone();
+                let chat = chat.clone();
+                let service = hyper::service::service_fn(
+                    move |request: hyper::Request<hyper::body::Incoming>| {
+                        let body = if request.uri().path().to_ascii_lowercase().ends_with("getme") {
+                            me.clone()
+                        } else {
+                            chat.clone()
+                        };
+                        async move {
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                                Bytes::from(body.to_string()),
+                            )))
+                        }
+                    },
+                );
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .keep_alive(false)
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            }
+        });
+        let bot = Bot::new("1:secret").set_api_url(format!("http://{address}/").parse().unwrap());
+        (bot, server)
+    }
+
+    fn bot_response() -> serde_json::Value {
+        json!({"ok": true, "result": {"id": 1, "is_bot": true, "first_name": "Bot", "username": "example_bot", "can_join_groups": true, "can_read_all_group_messages": false, "supports_inline_queries": false, "has_main_web_app": false}})
+    }
+
+    #[tokio::test]
+    async fn rejected_token_is_distinguished_from_network_failure() {
+        let (bot, server) = probe_server(
+            json!({"ok": false, "error_code": 401, "description": "Unauthorized"}),
+            json!({}),
+        )
+        .await;
+        let result = probe(&bot, ChatId(-100), Duration::from_secs(1)).await;
+        server.abort();
+        assert!(matches!(result, Err(StartError::InvalidToken)));
+    }
+
+    #[tokio::test]
+    async fn unseen_chat_keeps_a_valid_bot_startable() {
+        let (bot, server) = probe_server(
+            bot_response(),
+            json!({"ok": false, "error_code": 400, "description": "Bad Request: chat not found"}),
+        )
+        .await;
+        let result = probe(&bot, ChatId(-100), Duration::from_secs(1)).await;
+        server.abort();
+        assert!(matches!(result, Ok((_, ChatAccess::Unseen))));
+    }
+
+    #[tokio::test]
+    async fn visible_chat_is_reported_after_successful_bot_api_responses() {
+        let (bot, server) = probe_server(bot_response(), json!({"ok": true, "result": {"id": -100, "type": "supergroup", "title": "Group", "max_reaction_count": 0, "accepted_gift_types": {"unlimited_gifts": false, "limited_gifts": false, "unique_gifts": false, "premium_subscription": false}}})).await;
+        let result = probe(&bot, ChatId(-100), Duration::from_secs(1)).await;
+        server.abort();
+        assert!(matches!(result, Ok((_, ChatAccess::Visible))));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_describe_forum_and_administrator_topic_right() {
+        let (bot, server) = diagnostic_server(
+            bot_response(),
+            json!({"ok": true, "result": {"id": -100, "type": "supergroup", "title": "Group", "is_forum": true, "max_reaction_count": 0, "accepted_gift_types": {"unlimited_gifts": false, "limited_gifts": false, "unique_gifts": false, "premium_subscription": false}}}),
+            json!({"ok": true, "result": {"user": {"id": 1, "is_bot": true, "first_name": "Bot"}, "status": "administrator", "can_be_edited": false, "is_anonymous": false, "can_manage_chat": true, "can_delete_messages": true, "can_manage_video_chats": true, "can_restrict_members": true, "can_promote_members": false, "can_change_info": false, "can_invite_users": true, "can_manage_topics": true}}),
+        ).await;
+        let result = diagnose_with_bot(&bot, ChatId(-100), Duration::from_secs(1)).await;
+        server.abort();
+        assert_eq!(
+            result,
+            TelegramDiagnostic {
+                token: DiagnosticStep::Ok,
+                chat: DiagnosticStep::Ok,
+                chat_kind: Some(DiagnosticChatKind::Forum),
+                manage_topics: Some(true)
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_do_not_treat_regular_member_permissions_as_admin_rights() {
+        let (bot, server) = diagnostic_server(
+            bot_response(),
+            json!({"ok": true, "result": {"id": -100, "type": "supergroup", "title": "Group", "is_forum": true, "permissions": {"can_manage_topics": true}, "max_reaction_count": 0, "accepted_gift_types": {"unlimited_gifts": false, "limited_gifts": false, "unique_gifts": false, "premium_subscription": false}}}),
+            json!({"ok": true, "result": {"user": {"id": 1, "is_bot": true, "first_name": "Bot"}, "status": "member"}}),
+        ).await;
+        let result = diagnose_with_bot(&bot, ChatId(-100), Duration::from_secs(1)).await;
+        server.abort();
+        assert_eq!(result.manage_topics, Some(false));
+    }
+
+    #[tokio::test]
+    async fn diagnostics_leave_permissions_unknown_when_member_query_fails() {
+        let (bot, server) = diagnostic_server(bot_response(), json!({"ok": true, "result": {"id": -100, "type": "supergroup", "title": "Group", "is_forum": true, "max_reaction_count": 0, "accepted_gift_types": {"unlimited_gifts": false, "limited_gifts": false, "unique_gifts": false, "premium_subscription": false}}}), json!({"ok": false, "error_code": 403, "description": "secret"})).await;
+        let report = diagnose_with_bot(&bot, ChatId(-100), Duration::from_secs(1)).await;
+        server.abort();
+        assert_eq!(report.manage_topics, None);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_distinguish_unseen_group_from_rejected_token() {
+        let (bot, server) = diagnostic_server(
+            bot_response(),
+            json!({"ok": false, "error_code": 400, "description": "Bad Request: chat not found"}),
+            json!({}),
+        )
+        .await;
+        let report = diagnose_with_bot(&bot, ChatId(-100), Duration::from_secs(1)).await;
+        server.abort();
+        assert_eq!(
+            report,
+            TelegramDiagnostic {
+                token: DiagnosticStep::Ok,
+                chat: DiagnosticStep::Unavailable,
+                chat_kind: None,
+                manage_topics: None
+            }
+        );
+        let (bot, server) = diagnostic_server(
+            json!({"ok": false, "error_code": 401, "description": "Unauthorized"}),
+            json!({}),
+            json!({}),
+        )
+        .await;
+        let report = diagnose_with_bot(&bot, ChatId(-100), Duration::from_secs(1)).await;
+        server.abort();
+        assert_eq!(
+            report,
+            TelegramDiagnostic {
+                token: DiagnosticStep::InvalidToken,
+                chat: DiagnosticStep::NotChecked,
+                chat_kind: None,
+                manage_topics: None
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_do_not_report_unknown_api_errors_as_missing_chat() {
+        let (bot, server) = diagnostic_server(
+            bot_response(),
+            json!({"ok": false, "error_code": 500, "description": "temporary upstream failure secret"}),
+            json!({}),
+        ).await;
+        let report = diagnose_with_bot(&bot, ChatId(-100), Duration::from_secs(1)).await;
+        server.abort();
+        assert_eq!(report.chat, DiagnosticStep::Network);
+    }
+
+    #[tokio::test]
+    async fn diagnostics_timeout_leaves_later_steps_unchecked() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let bot = Bot::new("1:secret").set_api_url(format!("http://{address}/").parse().unwrap());
+        let report = diagnose_with_bot(&bot, ChatId(-100), Duration::from_millis(50)).await;
+        server.abort();
+        assert_eq!(
+            report,
+            TelegramDiagnostic {
+                token: DiagnosticStep::TimedOut,
+                chat: DiagnosticStep::NotChecked,
+                chat_kind: None,
+                manage_topics: None
+            }
+        );
+    }
+
+    async fn diagnostic_server(
+        me: serde_json::Value,
+        chat: serde_json::Value,
+        member: serde_json::Value,
+    ) -> (Bot, JoinHandle<()>) {
+        use http_body_util::Full;
+        use hyper::body::Bytes;
+        use hyper_util::rt::TokioIo;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (me, chat, member) = (me.clone(), chat.clone(), member.clone());
+                let service = hyper::service::service_fn(
+                    move |request: hyper::Request<hyper::body::Incoming>| {
+                        let path = request.uri().path().to_ascii_lowercase();
+                        let response = if path.ends_with("getme") {
+                            me.clone()
+                        } else if path.ends_with("getchatmember") {
+                            member.clone()
+                        } else {
+                            chat.clone()
+                        };
+                        async move {
+                            Ok::<_, std::convert::Infallible>(hyper::Response::new(Full::new(
+                                Bytes::from(response.to_string()),
+                            )))
+                        }
+                    },
+                );
+                let _ = hyper::server::conn::http1::Builder::new()
+                    .keep_alive(false)
+                    .serve_connection(TokioIo::new(stream), service)
+                    .await;
+            }
+        });
+        (Bot::new("1:secret").set_api_url(format!("http://{address}/").parse().unwrap()), server)
+    }
+
+    #[tokio::test]
+    async fn stalled_token_check_times_out_without_exposing_credentials() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (_stream, _) = listener.accept().await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let bot = Bot::new("1:secret").set_api_url(format!("http://{address}/").parse().unwrap());
+        let result = tokio::time::timeout(
+            Duration::from_secs(1),
+            probe(&bot, ChatId(-100), Duration::from_millis(50)),
+        )
+        .await;
+        server.abort();
+        assert!(
+            matches!(result, Ok(Err(StartError::Network(message))) if !message.contains("secret"))
+        );
+    }
+
+    #[test]
+    fn chat_check_errors_never_expose_remote_error_text() {
+        let error = chat_access(&Err(RequestError::Api(ApiError::Unknown(
+            "secret https://api.telegram.org/bot1:secret/getChat".to_owned(),
+        ))))
+        .unwrap_err();
+        assert!(!error.to_string().contains("secret"));
     }
 
     #[test]

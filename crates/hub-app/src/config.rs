@@ -192,6 +192,88 @@ mod tests {
     }
 
     #[test]
+    fn failed_late_secret_write_keeps_old_file_and_retry_can_finish() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        };
+        struct FlakySecrets {
+            inner: Arc<MemorySecrets>,
+            fail: Arc<AtomicBool>,
+        }
+        impl Secrets for FlakySecrets {
+            fn read(&self, secret: Secret) -> Result<Option<String>, crate::secrets::SecretError> {
+                self.inner.read(secret)
+            }
+            fn write(
+                &self,
+                secret: Secret,
+                value: Option<&str>,
+            ) -> Result<(), crate::secrets::SecretError> {
+                if secret == Secret::QwenKey && self.fail.load(Ordering::SeqCst) {
+                    return Err(crate::secrets::SecretError("test keyring failure".to_owned()));
+                }
+                self.inner.write(secret, value)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        let secrets = Arc::new(MemorySecrets::default());
+        let fail = Arc::new(AtomicBool::new(false));
+        let store = FileSettings::new(
+            path.clone(),
+            dir.path().to_path_buf(),
+            Box::new(FlakySecrets { inner: Arc::clone(&secrets), fail: Arc::clone(&fail) }),
+        );
+        let old = draft(dir.path()).parse(dir.path()).unwrap();
+        store.save(&old).unwrap();
+        let old_file = fs::read(&path).unwrap();
+        let mut changed = draft(dir.path());
+        changed.token = "456:new-secret".to_owned();
+        changed.model = "new-model".to_owned();
+        let next = changed.parse(dir.path()).unwrap();
+        fail.store(true, Ordering::SeqCst);
+        assert!(store.save(&next).is_err());
+        assert_eq!(fs::read(&path).unwrap(), old_file);
+        assert_eq!(secrets.read(Secret::TelegramToken).unwrap().as_deref(), Some("456:new-secret"));
+        fail.store(false, Ordering::SeqCst);
+        store.save(&next).unwrap();
+        assert!(matches!(store.load().unwrap(), Loaded::Ready(loaded) if loaded == next));
+    }
+
+    #[test]
+    fn failed_file_write_can_leave_the_token_updated() {
+        struct SharedSecrets(std::sync::Arc<MemorySecrets>);
+        impl Secrets for SharedSecrets {
+            fn read(&self, secret: Secret) -> Result<Option<String>, crate::secrets::SecretError> {
+                self.0.read(secret)
+            }
+            fn write(
+                &self,
+                secret: Secret,
+                value: Option<&str>,
+            ) -> Result<(), crate::secrets::SecretError> {
+                self.0.write(secret, value)
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.toml");
+        fs::create_dir(&path).unwrap();
+        let secrets = std::sync::Arc::new(MemorySecrets::default());
+        let store = FileSettings::new(
+            path,
+            dir.path().to_path_buf(),
+            Box::new(SharedSecrets(std::sync::Arc::clone(&secrets))),
+        );
+        let settings = draft(dir.path()).parse(dir.path()).unwrap();
+        assert!(store.save(&settings).is_err());
+        assert_eq!(
+            secrets.read(Secret::TelegramToken).unwrap().as_deref(),
+            Some("123:secret-token")
+        );
+    }
+
+    #[test]
     fn missing_file_means_no_settings() {
         let dir = tempfile::tempdir().unwrap();
         assert!(matches!(store(dir.path()).load(), Ok(Loaded::Missing)));

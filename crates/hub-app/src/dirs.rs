@@ -24,6 +24,11 @@ impl AppDirs {
     }
 
     #[must_use]
+    pub fn ui_settings(&self) -> PathBuf {
+        self.config.join("ui.toml")
+    }
+
+    #[must_use]
     pub fn topics(&self) -> PathBuf {
         self.data.join("topics.json")
     }

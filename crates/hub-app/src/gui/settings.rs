@@ -39,10 +39,13 @@ pub struct SettingsForm {
     section: Section,
     agent_page: AgentPage,
     autostart: Option<super::autostart::Control>,
+    scale: super::scale::Control,
     draft: Draft,
     synced: Option<Draft>,
     revealed: Revealed,
     confirming: bool,
+    saving: bool,
+    submitted: Option<Draft>,
 }
 
 fn project_options(ui: &mut egui::Ui, project: &mut ProjectDraft) {
@@ -202,10 +205,27 @@ fn pick_file(start: &str) -> Option<String> {
 }
 
 impl SettingsForm {
+    pub fn set_saving(&mut self, saving: bool) {
+        if saving && self.submitted.is_none() {
+            self.submitted = Some(self.draft.clone());
+        } else if !saving {
+            self.submitted = None;
+        }
+        self.saving = saving;
+    }
+
+    pub fn has_unsaved(&self) -> bool {
+        self.synced.as_ref().is_none_or(|saved| *saved != self.draft)
+    }
+
     pub fn with_autostart(
         registration: Result<std::sync::Arc<dyn crate::autostart::Registration>, String>,
     ) -> Self {
         Self { autostart: Some(super::autostart::Control::new(registration)), ..Self::default() }
+    }
+
+    pub fn set_scale_path(&mut self, path: PathBuf) {
+        self.scale = super::scale::Control::new(path);
     }
 
     pub fn poll(&mut self, ctx: &egui::Context) {
@@ -218,10 +238,13 @@ impl SettingsForm {
         if self.synced.as_ref() == saved {
             return;
         }
-        let pristine = self
-            .synced
-            .as_ref()
-            .map_or(self.draft == Draft::default(), |synced| *synced == self.draft);
+        let pristine = match (self.submitted.as_ref(), saved) {
+            (Some(submitted), Some(saved)) if submitted == saved => self.draft == *submitted,
+            _ => self
+                .synced
+                .as_ref()
+                .map_or(self.draft == Draft::default(), |synced| *synced == self.draft),
+        };
         if pristine {
             self.draft = saved.cloned().unwrap_or_default();
         }
@@ -239,14 +262,7 @@ impl SettingsForm {
     /// Parses the draft once: the field errors and, when it parses, the settings.
     fn check(&self, home: &Path) -> (Vec<FieldError>, Option<Settings>) {
         match self.draft.parse(home) {
-            Ok(settings) if settings.workspace_root.is_dir() => (Vec::new(), Some(settings)),
-            Ok(settings) => (
-                vec![FieldError {
-                    field: Field::WorkspaceRoot,
-                    message: "Такого каталога нет".to_owned(),
-                }],
-                Some(settings),
-            ),
+            Ok(settings) => (Vec::new(), Some(settings)),
             Err(errors) => (errors, None),
         }
     }
@@ -259,10 +275,15 @@ impl SettingsForm {
         send: &mut impl FnMut(Command),
     ) {
         let (errors, parsed) = self.check(home);
+        let compact = ui.available_height() < 280.0;
         self.save_bar(ui, &errors, sessions, send);
         navigation::show(ui, &mut self.section, &errors);
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(24, 16)))
+            .frame(egui::Frame::new().inner_margin(if compact {
+                egui::Margin::same(8)
+            } else {
+                egui::Margin::symmetric(24, 16)
+            }))
             .show(ui, |ui| {
                 let content_width = (ui.available_width() - 12.0).min(800.0);
                 egui::ScrollArea::both()
@@ -270,25 +291,31 @@ impl SettingsForm {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         ui.set_width(content_width);
-                        ui.heading(self.section.title()).on_hover_text(self.section.description());
-                        if content_width >= 600.0 {
+                        if !compact {
+                            ui.heading(self.section.title())
+                                .on_hover_text(self.section.description());
+                        }
+                        if !compact && content_width >= 600.0 {
                             ui.label(egui::RichText::new(self.section.description()).weak());
                             ui.add_space(20.0);
-                        } else {
+                        } else if !compact {
                             ui.add_space(8.0);
                         }
                         if self.section == Section::Agents {
                             self.agent_page.show(ui, &errors);
                             ui.add_space(16.0);
                         }
-                        super::theme::surface(ui).show(ui, |ui| {
-                            ui.set_width((ui.available_width()).max(280.0));
-                            ui.spacing_mut().text_edit_width =
-                                (ui.available_width() - 260.0).clamp(140.0, 320.0);
-                            ui.push_id((self.section, self.agent_page), |ui| {
-                                self.page(ui, &errors, parsed.as_ref());
-                            });
-                        });
+                        super::theme::surface(ui).inner_margin(if compact { 8 } else { 20 }).show(
+                            ui,
+                            |ui| {
+                                ui.set_width((ui.available_width()).max(280.0));
+                                ui.spacing_mut().text_edit_width =
+                                    (ui.available_width() - 260.0).clamp(140.0, 320.0);
+                                ui.push_id((self.section, self.agent_page), |ui| {
+                                    self.page(ui, &errors, parsed.as_ref());
+                                });
+                            },
+                        );
                     });
             });
         self.confirm(ui.ctx(), sessions, send);
@@ -328,7 +355,8 @@ impl SettingsForm {
         sessions: usize,
         send: &mut impl FnMut(Command),
     ) {
-        let changed = self.synced.as_ref().is_none_or(|synced| *synced != self.draft);
+        let changed = self.has_unsaved();
+        let compact = ui.available_height() < 280.0;
         egui::Panel::bottom("settings_actions")
             .frame(
                 egui::Frame::new()
@@ -338,13 +366,14 @@ impl SettingsForm {
             .show(ui, |ui| {
                 ui.horizontal_wrapped(|ui| {
                     let save = ui.add_enabled(
-                        errors.is_empty() && changed,
+                        errors.is_empty() && changed && !self.saving,
                         egui::Button::new("Сохранить").fill(ui.visuals().selection.bg_fill),
                     );
                     if save.clicked() {
                         if telegram_changed(self.synced.as_ref(), &self.draft) && sessions > 0 {
                             self.confirming = true;
                         } else {
+                            self.submitted = Some(self.draft.clone());
                             send(Command::Save(Box::new(self.draft.clone())));
                         }
                     }
@@ -353,14 +382,27 @@ impl SettingsForm {
                         self.draft = self.synced.clone().unwrap_or_default();
                         self.confirming = false;
                     }
-                    ui.add_space(8.0);
-                    ui.weak(if changed {
-                        "Есть несохранённые изменения"
+                    if compact {
+                        if !errors.is_empty()
+                            && ui.button(format!("Ошибки ({})", errors.len())).clicked()
+                            && let Some(error) = errors.first()
+                        {
+                            self.section = Section::for_field(error.field);
+                            if let Some(page) = AgentPage::for_field(error.field) {
+                                self.agent_page = page;
+                            }
+                        }
                     } else {
-                        "Нет несохранённых изменений"
-                    });
+                        ui.add_space(8.0);
+                        ui.weak(if changed {
+                            "Есть несохранённые изменения"
+                        } else {
+                            "Нет несохранённых изменений"
+                        });
+                    }
                 });
-                if !errors.is_empty()
+                if !compact
+                    && !errors.is_empty()
                     && ui.button(format!("Исправить ошибки ({})", errors.len())).clicked()
                     && let Some(error) = errors.first()
                 {
@@ -850,6 +892,8 @@ impl SettingsForm {
     }
 
     fn application(&mut self, ui: &mut egui::Ui) {
+        self.scale.show(ui);
+        ui.add_space(20.0);
         ui.strong("Оформление");
         ui.label("Тема меняется автоматически вслед за настройками системы.");
         ui.weak(if ui.visuals().dark_mode {
@@ -879,6 +923,7 @@ impl SettingsForm {
             ));
             ui.horizontal(|ui| {
                 if ui.button("Сохранить и перезапустить").clicked() {
+                    self.submitted = Some(self.draft.clone());
                     send(Command::Save(Box::new(self.draft.clone())));
                     self.confirming = false;
                 }
@@ -1050,6 +1095,97 @@ mod tests {
         let output = render(&ctx, &mut form, egui::vec2(960.0, 900.0), vec![], &mut commands);
         assert!(has_label(&output, "Путь к qwen"));
         assert!(!has_label(&output, "Путь к claude"));
+    }
+
+    #[test]
+    fn cancel_during_save_keeps_the_restored_old_draft_after_save_finishes() {
+        let ctx = egui::Context::default();
+        super::super::theme::configure(&ctx);
+        let mut form = configured_form();
+        let old = form.draft.clone();
+        form.draft.model = "first".to_owned();
+        let submitted = form.draft.clone();
+        let mut commands = Vec::new();
+        click_label(&ctx, &mut form, "Сохранить", &mut commands);
+        assert!(matches!(commands.as_slice(), [Command::Save(_)]));
+        form.set_saving(true);
+        click_label(&ctx, &mut form, "Отменить изменения", &mut commands);
+        assert_eq!(form.draft, old);
+        form.sync(Some(&submitted));
+        form.set_saving(false);
+        assert_eq!(form.draft, old);
+        assert!(form.has_unsaved());
+    }
+
+    #[test]
+    fn submitted_draft_is_tracked_even_if_save_finishes_before_saving_status() {
+        let ctx = egui::Context::default();
+        super::super::theme::configure(&ctx);
+        let mut form = configured_form();
+        let old = form.draft.clone();
+        form.draft.model = "first".to_owned();
+        let submitted = form.draft.clone();
+        let mut commands = Vec::new();
+        click_label(&ctx, &mut form, "Сохранить", &mut commands);
+        click_label(&ctx, &mut form, "Отменить изменения", &mut commands);
+        form.sync(Some(&submitted));
+        assert_eq!(form.draft, old);
+        assert!(form.has_unsaved());
+    }
+
+    #[test]
+    fn unchanged_submitted_draft_becomes_the_saved_baseline() {
+        let mut form = configured_form();
+        form.draft.model = "first".to_owned();
+        let submitted = form.draft.clone();
+        form.set_saving(true);
+        form.sync(Some(&submitted));
+        form.set_saving(false);
+        assert_eq!(form.draft, submitted);
+        assert!(!form.has_unsaved());
+    }
+
+    #[test]
+    fn editing_while_a_save_is_running_keeps_the_newer_draft() {
+        let mut form = configured_form();
+        form.draft.model = "first".to_owned();
+        let saved_in_flight = form.draft.clone();
+        form.set_saving(true);
+        form.draft.model = "second".to_owned();
+        form.sync(Some(&saved_in_flight));
+        form.set_saving(false);
+        assert_eq!(form.draft.model, "second");
+        assert!(form.has_unsaved());
+    }
+
+    #[test]
+    fn save_button_is_disabled_while_a_save_is_in_progress() {
+        let ctx = egui::Context::default();
+        super::super::theme::configure(&ctx);
+        let mut form = configured_form();
+        form.draft.model = "changed".to_owned();
+        form.set_saving(true);
+        let mut commands = Vec::new();
+        click_label(&ctx, &mut form, "Сохранить", &mut commands);
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn parsing_form_does_not_probe_workspace_filesystem() {
+        let mut form = configured_form();
+        form.draft.workspace_root =
+            std::env::temp_dir().join("missing-workspace-for-form").display().to_string();
+        assert!(form.check(&home_or_root()).0.is_empty());
+    }
+
+    #[test]
+    fn unsaved_indicator_tracks_draft_against_saved_settings() {
+        let mut form = SettingsForm::default();
+        let draft = Draft::default();
+        form.sync(Some(&draft));
+        assert!(!form.has_unsaved());
+        form.draft.chat = "-200".into();
+        assert!(form.has_unsaved());
     }
 
     #[test]
@@ -1472,6 +1608,74 @@ mod tests {
         assert!(
             matches!(commands.as_slice(), [Command::Save(saved)] if saved.chat == "-100" && saved.actions == draft.actions)
         );
+    }
+
+    #[test]
+    fn scale_controls_work_at_maximum_zoom_and_minimum_window() {
+        let ctx = egui::Context::default();
+        super::super::theme::configure(&ctx);
+        let mut form = SettingsForm { section: Section::Application, ..SettingsForm::default() };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ui.toml");
+        super::super::scale::Scale::new(125).unwrap().save(&path).unwrap();
+        form.set_scale_path(path.clone());
+        let mut commands = Vec::new();
+        // The top tabs occupy about 50 points after zooming a 640 × 360 window to 150%.
+        let size = egui::vec2(640.0 / 1.5, 360.0 / 1.5 - 50.0);
+        for _ in 0..2 {
+            render(&ctx, &mut form, size, vec![], &mut commands);
+        }
+        for label in ["Сбросить до 100%", "Сохранить масштаб"] {
+            let mut found = None;
+            for _ in 0..20 {
+                let output = render(&ctx, &mut form, size, vec![], &mut commands);
+                found = output.shapes.iter().find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => {
+                        let rect = text.galley.rect.translate(text.pos.to_vec2());
+                        shape.clip_rect.contains_rect(rect).then_some(rect.center())
+                    }
+                    _ => None,
+                });
+                if found.is_some() {
+                    break;
+                }
+                render(
+                    &ctx,
+                    &mut form,
+                    size,
+                    vec![
+                        egui::Event::PointerMoved(egui::pos2(200.0, 75.0)),
+                        egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: egui::vec2(0.0, -20.0),
+                            phase: egui::TouchPhase::Move,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    &mut commands,
+                );
+            }
+            let position = found.unwrap_or_else(|| panic!("{label} is not reachable"));
+            for pressed in [true, false] {
+                render(
+                    &ctx,
+                    &mut form,
+                    size,
+                    vec![
+                        egui::Event::PointerMoved(position),
+                        egui::Event::PointerButton {
+                            pos: position,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    &mut commands,
+                );
+            }
+        }
+        assert_eq!(super::super::scale::Scale::load(&path).unwrap().percent(), 100);
+        assert!(commands.is_empty());
     }
 
     #[rstest]

@@ -34,7 +34,7 @@ pub fn health(status: &BotStatus) -> Health {
     match status {
         BotStatus::Running { .. } => Health::Connected,
         BotStatus::Unconfigured | BotStatus::Stopped | BotStatus::Starting => Health::Stopped,
-        BotStatus::Failed(_) => Health::Failed,
+        BotStatus::Failed(_) | BotStatus::Retrying { .. } => Health::Failed,
     }
 }
 
@@ -47,9 +47,10 @@ pub fn active(snapshot: &Snapshot) -> usize {
 pub fn tooltip(snapshot: &Snapshot) -> String {
     match &snapshot.bot {
         BotStatus::Running { .. } => {
-            format!("agent-hub — подключён · активных сессий: {}", active(snapshot))
+            format!("agent-hub — бот запущен · активных сессий: {}", active(snapshot))
         }
         BotStatus::Starting => "agent-hub — подключение…".to_owned(),
+        BotStatus::Retrying { .. } => "agent-hub — повтор подключения".to_owned(),
         BotStatus::Stopped => "agent-hub — остановлен".to_owned(),
         BotStatus::Unconfigured => "agent-hub — не настроен".to_owned(),
         BotStatus::Failed(_) => "agent-hub — ошибка".to_owned(),
@@ -62,7 +63,12 @@ pub fn status_text(status: &BotStatus) -> String {
         BotStatus::Unconfigured => "Не настроен: заполните вкладку «Настройки»".to_owned(),
         BotStatus::Stopped => "Остановлен".to_owned(),
         BotStatus::Starting => "Подключение…".to_owned(),
-        BotStatus::Running { username } => format!("Подключён как @{username}"),
+        BotStatus::Retrying { reason, at } => {
+            let remaining = at.saturating_duration_since(tokio::time::Instant::now());
+            let seconds = remaining.as_secs() + u64::from(remaining.subsec_nanos() != 0);
+            format!("Ошибка: {reason}. Повтор через {seconds} с")
+        }
+        BotStatus::Running { username } => format!("Бот запущен как @{username}"),
         BotStatus::Failed(reason) => format!("Ошибка: {reason}"),
     }
 }
@@ -142,6 +148,7 @@ pub fn telegram_changed(saved: Option<&Draft>, draft: &Draft) -> bool {
 pub enum BannerAction {
     Install,
     Restart,
+    Release,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +164,10 @@ pub fn banner(state: &UpdateState) -> Option<Banner> {
         UpdateState::Available(version) => {
             (format!("Доступна версия {version}"), Some(BannerAction::Install))
         }
+        UpdateState::ManualAvailable(version) => (
+            format!("Доступна версия {version}. Обновите приложение через пакет или установщик."),
+            Some(BannerAction::Release),
+        ),
         UpdateState::Installing(version) => (format!("Устанавливается версия {version}…"), None),
         UpdateState::Installed(version) => (
             format!("Версия {version} установлена — перезапустите приложение"),
@@ -174,9 +185,9 @@ pub fn banner(state: &UpdateState) -> Option<Banner> {
 pub fn update_item(state: &UpdateState) -> (String, bool) {
     match state {
         UpdateState::Idle | UpdateState::Failed(_) => ("Обновлений нет".to_owned(), false),
-        UpdateState::Available(version) | UpdateState::Installing(version) => {
-            (format!("Доступно обновление v{version}"), true)
-        }
+        UpdateState::Available(version)
+        | UpdateState::ManualAvailable(version)
+        | UpdateState::Installing(version) => (format!("Доступно обновление v{version}"), true),
         UpdateState::Installed(version) => (format!("Перезапустите для v{version}"), true),
     }
 }
@@ -190,6 +201,12 @@ mod tests {
     use rstest::rstest;
 
     use super::*;
+
+    #[test]
+    fn running_status_describes_the_process_not_continuous_connectivity() {
+        let text = status_text(&BotStatus::Running { username: "bot".to_owned() });
+        assert_eq!(text, "Бот запущен как @bot");
+    }
     use crate::supervisor::{AgentAuth, AgentState};
 
     #[rstest]
@@ -245,7 +262,7 @@ mod tests {
             topics: vec![view(1, TopicState::Running), view(2, TopicState::Waiting)],
             ..Snapshot::default()
         };
-        assert_eq!(tooltip(&snapshot), "agent-hub — подключён · активных сессий: 1");
+        assert_eq!(tooltip(&snapshot), "agent-hub — бот запущен · активных сессий: 1");
         assert_eq!(tooltip(&Snapshot::default()), "agent-hub — не настроен");
     }
 
@@ -291,6 +308,7 @@ mod tests {
     #[rstest]
     #[case(UpdateState::Idle, None)]
     #[case(UpdateState::Available(v("0.2.0")), Some(("Доступна версия 0.2.0", Some(BannerAction::Install))))]
+    #[case(UpdateState::ManualAvailable(v("0.2.0")), Some(("Доступна версия 0.2.0. Обновите приложение через пакет или установщик.", Some(BannerAction::Release))))]
     #[case(UpdateState::Installing(v("0.2.0")), Some(("Устанавливается версия 0.2.0…", None)))]
     #[case(UpdateState::Installed(v("0.2.0")), Some(("Версия 0.2.0 установлена — перезапустите приложение", Some(BannerAction::Restart))))]
     #[case(UpdateState::Failed("сеть".to_owned()), Some(("Обновление не установлено: сеть", Some(BannerAction::Install))))]
@@ -305,6 +323,7 @@ mod tests {
     #[rstest]
     #[case(UpdateState::Idle, ("Обновлений нет", false))]
     #[case(UpdateState::Available(v("0.2.0")), ("Доступно обновление v0.2.0", true))]
+    #[case(UpdateState::ManualAvailable(v("0.2.0")), ("Доступно обновление v0.2.0", true))]
     #[case(UpdateState::Installed(v("0.2.0")), ("Перезапустите для v0.2.0", true))]
     fn update_menu_item(#[case] state: UpdateState, #[case] expected: (&str, bool)) {
         let (text, enabled) = update_item(&state);
