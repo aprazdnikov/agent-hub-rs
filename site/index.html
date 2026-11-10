@@ -4,10 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>agent-hub — агенты Claude, Codex, Qwen, Hermes и OpenCode в Telegram</title>
-<meta name="description" content="Пять AI-агентов на вашем компьютере под управлением Telegram. В 0.10.0 — диагностика, масштаб интерфейса и установщики.">
+<meta name="description" content="Пять AI-агентов на вашем компьютере под управлением Telegram. В 0.11.0 — режимы одобрений Hermes.">
 <meta property="og:type" content="website">
 <meta property="og:title" content="agent-hub — агенты работают, пока вы в дороге">
-<meta property="og:description" content="Задачи с телефона, пять AI-агентов, диагностика подключения и масштаб интерфейса. Новое в версии 0.10.0.">
+<meta property="og:description" content="Задачи с телефона, пять AI-агентов, диагностика подключения и режимы одобрений Hermes. Новое в версии 0.11.0.">
 <meta property="og:url" content="https://aprazdnikov.github.io/agent-hub-rs/">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232b7de9'/%3E%3Cpath d='M8 16h16M16 8v16' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
@@ -133,12 +133,12 @@ h2 { font: 700 clamp(22px, 3vw, 30px)/1.2 var(--display); letter-spacing: -.01em
 <div class="wrap">
   <nav>
     <div class="logo">agent<span>-</span>hub</div>
-    <div class="links"><a href="#whats-new">В 0.10.0</a><a href="#agents">Агенты</a><a href="#start">Начать</a><a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/README.md">Документация</a><a href="https://github.com/aprazdnikov/agent-hub-rs">GitHub</a></div>
+    <div class="links"><a href="#whats-new">В 0.11.0</a><a href="#agents">Агенты</a><a href="#start">Начать</a><a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/README.md">Документация</a><a href="https://github.com/aprazdnikov/agent-hub-rs">GitHub</a></div>
   </nav>
 
   <section class="hero">
     <div>
-      <a class="version" href="#whats-new">0.10.0 · диагностика, масштаб и установка</a>
+      <a class="version" href="#whats-new">0.11.0 · одобрения Hermes</a>
       <h1>Агенты работают, пока вы в дороге</h1>
       <p class="lead">Каждая тема Telegram-группы — отдельная сессия <b>Claude Code, Codex, Qwen, Hermes или OpenCode</b> на вашем компьютере. Ставите задачу с телефона, разрешаете команды кнопкой, получаете результат.</p>
       <div class="cta">
@@ -168,8 +168,12 @@ h2 { font: 700 clamp(22px, 3vw, 30px)/1.2 var(--display); letter-spacing: -.01em
   </section>
 
   <section id="whats-new" class="release">
-    <h2>В 0.10.0 — проще настроить и восстановить работу</h2>
+    <h2>В 0.11.0 — одобрения Hermes как у остальных агентов</h2>
     <div class="features">
+      <div class="feature"><h3>Четыре режима Hermes</h3><p>Спрашивать всё, принимать правки в рабочем каталоге, не спрашивать правки вовсе или <code>yolo</code> с обходом подтверждений опасных команд. По умолчанию — прежний вопросливый режим.</p></div>
+      <div class="feature"><h3>Режим для отдельной темы</h3><p><code>/mode</code> выбирает одобрения Hermes кнопками, <code>/mode inherit</code> возвращает общие настройки. Режим применяется при каждом запуске сессии, включая восстановленную.</p></div>
+      <div class="feature"><h3>Границы остаются</h3><p>Чувствительные пути и правила запрета Hermes спрашивает при любом режиме, поэтому кнопки разрешений в теме не исчезают.</p></div>
+      <div class="feature"><h3>Проще настроить и восстановить работу</h3><p>Диагностика настроек на вкладке «Статус», состояние доставки и установщики для Windows и Debian/Ubuntu.</p></div>
       <div class="feature"><h3>У каждого параметра своё место</h3><p>Telegram и доступ, рабочие каталоги, агенты, проекты, действия, голосовые сообщения, запуск и обновления — семь разделов вместо длинной формы. У каждого агента своя страница.</p></div>
       <div class="feature"><h3>Светлая и тёмная темы</h3><p>Окно следует теме системы и переключается во время работы. На Linux для этого нужна поддержка XDG Desktop Portal в окружении рабочего стола.</p></div>
       <div class="feature"><h3>Правки остаются при переходах</h3><p>Можно настроить несколько разделов и сохранить всё вместе. Кнопки сохранения и отмены закреплены внизу, а ошибки отмечены рядом с разделами и агентами.</p></div>
@@ -205,7 +209,7 @@ h2 { font: 700 clamp(22px, 3vw, 30px)/1.2 var(--display); letter-spacing: -.01em
       <div class="feature"><h3>Claude Code</h3><p>Основной агент: подписка Claude, лимиты в <code>/limits</code>, снимки сессий.</p></div>
       <div class="feature"><h3>Codex</h3><p>Подписка ChatGPT или API-ключ OpenAI, песочница и одобрения, снимки сессий.</p></div>
       <div class="feature"><h3>Qwen Code</h3><p>Бесплатный вход или любой OpenAI-совместимый адрес; досылка сообщений посреди хода.</p></div>
-      <div class="feature"><h3>Hermes</h3><p>Профили, память и скиллы Hermes; хаб запускает <code>hermes acp</code> и не трогает его ключи.</p></div>
+      <div class="feature"><h3>Hermes</h3><p>Профили, память и скиллы Hermes; хаб запускает <code>hermes acp</code>, настраивает режимы одобрений и не трогает его ключи.</p></div>
       <div class="feature"><h3>OpenCode</h3><p>Подключается через <code>opencode acp</code>. Модель в формате <code>провайдер/модель</code> задаётся в настройках; вход и разрешения инструментов — в самом OpenCode.</p></div>
     </div>
     <p>Агент выбирается на уровне темы: <code>/new opencode ~/shop</code> или <code>/backend opencode</code>. Один и тот же бот ведёт темы разных агентов параллельно.</p>
