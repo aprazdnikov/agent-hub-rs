@@ -1,7 +1,7 @@
 //! Per-topic model and execution mode, without credentials or transport configuration.
 
 use crate::domain::BackendKind;
-use crate::settings::{Approval, PermissionMode, QwenApproval, Sandbox, Settings};
+use crate::settings::{Approval, HermesApproval, PermissionMode, QwenApproval, Sandbox, Settings};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -28,6 +28,7 @@ pub enum Mode {
     Claude(PermissionMode),
     Codex { sandbox: Sandbox, approval: Approval },
     Qwen(QwenApproval),
+    Hermes(HermesApproval),
 }
 impl Mode {
     #[must_use]
@@ -41,7 +42,8 @@ impl Mode {
                 })
                 .collect(),
             BackendKind::Qwen => QwenApproval::ALL.into_iter().map(Self::Qwen).collect(),
-            BackendKind::Hermes | BackendKind::Opencode => vec![],
+            BackendKind::Hermes => HermesApproval::ALL.into_iter().map(Self::Hermes).collect(),
+            BackendKind::Opencode => vec![],
         }
     }
     #[must_use]
@@ -50,6 +52,7 @@ impl Mode {
             Self::Claude(mode) => mode.wire().to_owned(),
             Self::Codex { sandbox, approval } => format!("{}/{}", sandbox.wire(), approval.wire()),
             Self::Qwen(mode) => mode.wire().to_owned(),
+            Self::Hermes(mode) => mode.wire().to_owned(),
         }
     }
     pub fn parse(backend: BackendKind, raw: &str) -> Result<Option<Self>, String> {
@@ -72,6 +75,7 @@ impl Mode {
             Self::Claude(PermissionMode::BypassPermissions)
                 | Self::Codex { approval: Approval::Never, .. }
                 | Self::Qwen(QwenApproval::Yolo)
+                | Self::Hermes(HermesApproval::Yolo)
         )
     }
 }
@@ -227,7 +231,9 @@ impl Preferences {
             BackendKind::Qwen => {
                 (settings.qwen.model.clone(), Some(Mode::Qwen(settings.qwen.approval)))
             }
-            BackendKind::Hermes => (settings.hermes.model.clone(), None),
+            BackendKind::Hermes => {
+                (settings.hermes.model.clone(), Some(Mode::Hermes(settings.hermes.approval)))
+            }
             BackendKind::Opencode => (settings.opencode.model.clone(), None),
         };
         let mut model_source = Source::Global;
@@ -269,6 +275,7 @@ impl Effective {
                 settings.codex.approval = approval;
             }
             Some(Mode::Qwen(mode)) => settings.qwen.approval = mode,
+            Some(Mode::Hermes(mode)) => settings.hermes.approval = mode,
             None => {}
         }
     }
@@ -276,13 +283,7 @@ impl Effective {
     pub fn describe(&self) -> String {
         let model =
             self.model.as_deref().unwrap_or("выбор CLI/сохранённой сессии (не подтверждён)");
-        let mode = self.mode.map_or_else(
-            || match self.backend {
-                BackendKind::Hermes => "default (фиксированный)".to_owned(),
-                _ => "из конфигурации CLI/сессии".to_owned(),
-            },
-            Mode::wire,
-        );
+        let mode = self.mode.map_or_else(|| "из конфигурации CLI/сессии".to_owned(), Mode::wire);
         format!(
             "Модель: {model} · {}\nРежим: {mode} · {}",
             self.model_source.label(),
@@ -359,10 +360,25 @@ mod tests {
             }
         }
         assert_eq!(Mode::all(BackendKind::Codex).len(), 9);
+        assert_eq!(Mode::all(BackendKind::Hermes).len(), 4);
+        assert_eq!(
+            Mode::parse(BackendKind::Hermes, "yolo").unwrap(),
+            Some(Mode::Hermes(HermesApproval::Yolo))
+        );
         assert!(Mode::parse(BackendKind::Hermes, "plan").is_err());
         assert!(Mode::parse(BackendKind::Opencode, "default").is_err());
         assert!(Mode::parse(BackendKind::Qwen, "bypassPermissions").is_err());
         assert!(Mode::parse(BackendKind::Codex, "workspace-write").is_err());
+    }
+
+    #[test]
+    fn hermes_yolo_is_the_only_mode_announcing_a_bypass() {
+        for mode in Mode::all(BackendKind::Hermes) {
+            assert_eq!(
+                mode.bypasses_approval(),
+                matches!(mode, Mode::Hermes(HermesApproval::Yolo))
+            );
+        }
     }
     #[test]
     fn options_reject_cross_backend_modes_even_with_identical_wire_names() {

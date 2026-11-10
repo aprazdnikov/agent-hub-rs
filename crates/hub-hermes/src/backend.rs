@@ -16,7 +16,7 @@ use hub_agent::rpc::{
 use hub_agent::tools::TOOL_SUMMARY_LIMIT;
 use hub_core::domain::{AgentEvent, Prompt, SessionId, TopicSession};
 use hub_core::render::truncate;
-use hub_core::settings::HermesSettings;
+use hub_core::settings::{HermesApproval, HermesSettings};
 use serde_json::{Value, json};
 use tokio::io::AsyncRead;
 use tokio::process::{Child, Command};
@@ -126,38 +126,59 @@ async fn open(control: SessionControl<'_>) -> Result<Opened, RpcError> {
     let initialized = client.request("initialize", protocol::initialize_params()).await?;
     let capabilities = Capabilities::parse(&initialized)?;
     let mut params = protocol::session_params(session.cwd.as_path(), tools.url(), tools.token());
-    let id = match &session.session {
-        Some(saved) => {
-            if !capabilities.load {
-                return Err(RpcError::Protocol(
-                    "Hermes не поддерживает продолжение сессии; /reset — начать заново".to_owned(),
-                ));
-            }
-            params
-                .as_object_mut()
-                .ok_or_else(|| RpcError::Protocol("invalid session parameters".to_owned()))?
-                .insert("sessionId".to_owned(), json!(saved.as_str()));
-            // session/resume silently creates a missing session in Hermes; load does not.
-            let loaded = client.request("session/load", params).await?;
-            require_object(&loaded, "session/load")?;
-            saved.clone()
+    let (id, modes) = if let Some(saved) = &session.session {
+        if !capabilities.load {
+            return Err(RpcError::Protocol(
+                "Hermes не поддерживает продолжение сессии; /reset — начать заново".to_owned(),
+            ));
         }
-        None => protocol::session_id(&client.request("session/new", params).await?)?,
+        params
+            .as_object_mut()
+            .ok_or_else(|| RpcError::Protocol("invalid session parameters".to_owned()))?
+            .insert("sessionId".to_owned(), json!(saved.as_str()));
+        // session/resume silently creates a missing session in Hermes; load does not.
+        let loaded = client.request("session/load", params).await?;
+        require_object(&loaded, "session/load")?;
+        (saved.clone(), protocol::advertised_modes(&loaded))
+    } else {
+        let created = client.request("session/new", params).await?;
+        (protocol::session_id(&created)?, protocol::advertised_modes(&created))
     };
+    if let Some(reason) = unsupported_mode(&modes, settings.approval) {
+        return Err(RpcError::Protocol(reason));
+    }
     if let Some(model) = &settings.model {
         let changed = client
             .request("session/set_model", json!({"sessionId": id.as_str(), "modelId": model}))
             .await?;
         require_object(&changed, "session/set_model")?;
     }
-    // A loaded session may have persisted accept_edits/dont_ask. Always return to explicit approvals.
+    // A loaded session may have persisted another mode. Always re-assert the configured one.
     let mode = client
-        .request("session/set_mode", json!({"sessionId": id.as_str(), "modeId": "default"}))
+        .request(
+            "session/set_mode",
+            json!({"sessionId": id.as_str(), "modeId": settings.approval.mode_id()}),
+        )
         .await?;
     require_object(&mode, "session/set_mode")?;
     // Hermes sends load replay BEFORE the response. Nothing in it is a new hub event.
     while notifications.try_recv().is_ok() {}
     Ok(Opened { id, capabilities })
+}
+
+/// The refusal reason when Hermes lists modes but none matches the configured approval. An
+/// unknown `modeId` comes back from the adapter only as an opaque internal error, so name the
+/// mode the operator picked instead. An empty list means an older adapter that declares no
+/// modes at all; the requested mode is then left for Hermes itself to accept or reject.
+fn unsupported_mode(advertised: &[String], approval: HermesApproval) -> Option<String> {
+    if advertised.is_empty() || advertised.iter().any(|available| available == approval.mode_id()) {
+        return None;
+    }
+    Some(format!(
+        "Hermes не поддерживает режим одобрений «{}»; доступны: {}",
+        approval.wire(),
+        advertised.join(", ")
+    ))
 }
 
 fn require_object(result: &Value, method: &str) -> Result<(), RpcError> {
@@ -292,8 +313,10 @@ impl HermesProcess {
         handler: Handler,
     ) -> io::Result<Self> {
         let mut command = Command::new(cli);
-        // Profile is a GLOBAL CLI option, not an argument of `acp`. No --yolo or credentials.
+        // `--yolo` and `--profile` are GLOBAL CLI options: both must precede the `acp`
+        // subcommand, and no credentials ever travel in argv.
         command
+            .args(settings.approval.launch_options())
             .args(settings.profile.iter().flat_map(|profile| ["--profile", profile.as_str()]))
             .arg("acp")
             .current_dir(cwd)

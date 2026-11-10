@@ -83,7 +83,13 @@ async fn hermes_snapshot_moves_to_another_directory_with_its_history() {
     let cli = locate(None).unwrap();
     let version = check(&cli).await.unwrap();
     let profile = std::env::var("AGENT_HUB_LIVE_HERMES_PROFILE").ok();
-    let settings = HermesSettings { cli: None, profile: profile.clone(), model: None };
+    let settings = HermesSettings {
+        cli: None,
+        profile: profile.clone(),
+        model: None,
+        // A live run never bypasses the human: the test drives real approvals through Hermes.
+        approval: hub_core::settings::HermesApproval::Default,
+    };
     let backend = HermesBackend::new(cli.clone(), settings);
     let base: PathBuf =
         std::env::temp_dir().join(format!("agent-hub-live-hermes-{}", std::process::id()));

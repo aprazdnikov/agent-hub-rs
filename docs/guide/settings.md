@@ -106,6 +106,7 @@ Linux-композитор может ограничивать сворачив�
 | Путь к `hermes` | из `PATH` | с новой сессии |
 | Профиль Hermes | выбирает Hermes | с новой сессии |
 | Модель Hermes | из настроек Hermes | с новой сессии |
+| Одобрения Hermes (`default`, `accept_edits`, `dont_ask`, `yolo`) | `default` | с новой сессии |
 | Ожидание подтверждения, с | 600 | с новой сессии |
 | Фоновые задачи, с | 1800 | с новой сессии |
 | Каталог снимков | `~/.agent-hub` | сразу |
@@ -113,7 +114,7 @@ Linux-композитор может ограничивать сворачив�
 
 В `settings.toml` это таблицы `[agents]` (`default`), `[codex]` (`cli`, `model`, `sandbox`,
 `approval`), `[qwen]` (`cli`, `model`, `approval`, `base_url`) и `[hermes]` (`cli`, `profile`,
-`model`) и `[snapshots]` (`dir`); API-ключ OpenAI хранится в
+`model`, `approval`) и `[snapshots]` (`dir`); API-ключ OpenAI хранится в
 системном хранилище ключей (`agent-hub` / `openai-api-key`), ключ Qwen — там же (`agent-hub` /
 `qwen-api-key`), не в файле. При запуске бота обязателен только агент по умолчанию; если
 второй недоступен, бот работает, а на вкладке «Статус» видна причина. Там же — версия каждого

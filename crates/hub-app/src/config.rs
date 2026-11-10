@@ -360,12 +360,13 @@ mod tests {
             cli: dir.path().join("hermes").display().to_string(),
             profile: "engineering".to_owned(),
             model: "openai/gpt-test".to_owned(),
+            approval: hub_core::settings::HermesApproval::Yolo,
         };
         let settings = form.parse(dir.path()).unwrap();
         let store = store(dir.path());
         store.save(&settings).unwrap();
         let text = std::fs::read_to_string(dir.path().join("settings.toml")).unwrap();
-        assert!(text.contains("[hermes]") && text.contains("engineering"));
+        assert!(text.contains("[hermes]") && text.contains("engineering") && text.contains("yolo"));
         match store.load().unwrap() {
             Loaded::Ready(loaded) => assert_eq!(loaded, settings),
             other => panic!("expected Ready, got {other:?}"),

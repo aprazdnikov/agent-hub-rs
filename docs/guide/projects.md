@@ -45,9 +45,9 @@
 `/mode` предлагает режимы кнопками. Можно написать `/mode plan` для Claude или Qwen,
 `/mode workspace-write/on-request` для Codex (также принимаются два слова).
 Claude: `default`, `acceptEdits`, `plan`, `bypassPermissions`; Qwen: `plan`, `default`,
-`auto-edit`, `yolo`. Codex: сочетания `read-only`, `workspace-write`, `danger-full-access`
-с `untrusted`, `on-request`, `never`. Hermes использует фиксированный `default`,
-OpenCode — режим CLI/сессии; менять их режим через эту команду нельзя.
+`auto-edit`, `yolo`. Hermes: `default`, `accept_edits`, `dont_ask`, `yolo`. Codex: сочетания
+`read-only`, `workspace-write`, `danger-full-access` с `untrusted`, `on-request`, `never`.
+OpenCode — режим CLI/сессии; менять его режим через эту команду нельзя.
 
 Каждое поле выбирается независимо: **настройка темы → копия настроек проекта → общие
 настройки**. `/mode inherit` снимает только режим темы. Изменение или удаление профиля

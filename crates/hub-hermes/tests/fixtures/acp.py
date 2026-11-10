@@ -45,6 +45,18 @@ if "--check" in sys.argv:
     print("Hermes ACP check OK")
     sys.exit(0)
 
+MODES = ["default", "accept_edits", "dont_ask"]
+
+
+def advertised_modes():
+    """What this fixture build claims, mirroring Hermes 0.22.5; `only_default_mode`
+    simulates a Hermes without the autonomous modes."""
+    if case == "no_modes":  # a Hermes that advertises nothing at all
+        return {}
+    ids = ["default"] if case == "only_default_mode" else MODES
+    return {"currentModeId": "default", "availableModes": [{"id": mode} for mode in ids]}
+
+
 turn = 0
 server = {}
 for line in sys.stdin:
@@ -81,7 +93,11 @@ for line in sys.stdin:
             if method == "session/load":
                 chunk("old replay text")
                 update({"sessionUpdate": "tool_call", "toolCallId": "old", "title": "old replay tool", "kind": "execute"})
-            send({"id": message["id"], "result": {"sessionId": "s-1"} if method == "session/new" else {}})
+            modes = advertised_modes()
+            if method == "session/new":
+                send({"id": message["id"], "result": {"sessionId": "s-1", "modes": modes}})
+            else:
+                send({"id": message["id"], "result": {"modes": modes}})
     elif method in ("session/set_model", "session/set_mode"):
         send({"id": message["id"], "result": None if case == "model_null" else {}})
     elif method == "session/prompt":

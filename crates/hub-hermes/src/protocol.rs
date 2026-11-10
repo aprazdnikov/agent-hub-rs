@@ -60,6 +60,19 @@ pub fn session_id(result: &Value) -> Result<SessionId, RpcError> {
         .ok_or_else(|| RpcError::Protocol("Hermes session/new without a session id".to_owned()))
 }
 
+/// `modes.availableModes[].id` of a session response. An absent or empty list means a Hermes
+/// build advertising nothing, where `session/set_mode` stays the only judge of the id.
+pub fn advertised_modes(result: &Value) -> Vec<String> {
+    let Some(modes) = result.pointer("/modes/availableModes").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    modes
+        .iter()
+        .filter_map(|mode| mode.get("id").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect()
+}
+
 pub struct TurnResult {
     pub reason: String,
     pub tokens: Option<u64>,

@@ -8,7 +8,7 @@ use hub_core::domain::{
     AbsolutePath, AgentEvent, BackendKind, Decision, Denied, FileDelivery, Finished, OutgoingFile,
     Prompt, Question, QuestionsOutcome, SessionId, ToolRequest, ToolUse, TopicSession, Usage,
 };
-use hub_core::settings::HermesSettings;
+use hub_core::settings::{HermesApproval, HermesSettings};
 use hub_hermes::backend::HermesBackend;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -42,11 +42,12 @@ fn topic(fixture: &Fixture, saved: Option<&str>) -> TopicSession {
     .with_session(saved.and_then(SessionId::parse))
 }
 
-fn settings() -> HermesSettings {
+fn settings(approval: HermesApproval) -> HermesSettings {
     HermesSettings {
         cli: None,
         profile: Some("test-profile".to_owned()),
         model: Some("test-model".to_owned()),
+        approval,
     }
 }
 
@@ -64,9 +65,17 @@ fn conversation() -> (Conversation, mpsc::Receiver<AgentEvent>) {
 }
 
 async fn run(fixture: &Fixture, saved: Option<&str>) -> Vec<AgentEvent> {
+    run_with(fixture, saved, HermesApproval::Default).await
+}
+
+async fn run_with(
+    fixture: &Fixture,
+    saved: Option<&str>,
+    approval: HermesApproval,
+) -> Vec<AgentEvent> {
     let (conversation, mut received) = conversation();
     let (_send, inbox) = mpsc::channel(4);
-    let backend = HermesBackend::new(fixture.cli.clone(), settings());
+    let backend = HermesBackend::new(fixture.cli.clone(), settings(approval));
     let _inbox = tokio::time::timeout(
         Duration::from_secs(15),
         backend.run(&topic(fixture, saved), prompt("hello"), inbox, conversation),
@@ -146,15 +155,21 @@ async fn absent_usage_remains_unknown_despite_estimated_usage_update() {
     ));
 }
 
+#[rstest]
+#[case::default(HermesApproval::Default, json!(["--profile", "test-profile", "acp"]), "default")]
+#[case::accept_edits(HermesApproval::AcceptEdits, json!(["--profile", "test-profile", "acp"]), "accept_edits")]
+#[case::dont_ask(HermesApproval::DontAsk, json!(["--profile", "test-profile", "acp"]), "dont_ask")]
+#[case::yolo(HermesApproval::Yolo, json!(["--yolo", "--profile", "test-profile", "acp"]), "dont_ask")]
 #[tokio::test]
-async fn launch_preserves_profile_cwd_and_approval_policy() {
+async fn launch_preserves_profile_cwd_and_approval_policy(
+    #[case] approval: HermesApproval,
+    #[case] argv: Value,
+    #[case] mode: &str,
+) {
     let fixture = Fixture::new("new");
-    let _events = run(&fixture, None).await;
+    let _events = run_with(&fixture, None, approval).await;
     let records = fixture.records();
-    assert_eq!(
-        records.first().and_then(|record| record.get("argv")),
-        Some(&json!(["--profile", "test-profile", "acp"]))
-    );
+    assert_eq!(records.first().and_then(|record| record.get("argv")), Some(&argv));
     let cwd = std::fs::canonicalize(fixture.root()).unwrap();
     assert_eq!(
         records
@@ -164,14 +179,52 @@ async fn launch_preserves_profile_cwd_and_approval_policy() {
             .map(std::path::PathBuf::from),
         Some(cwd)
     );
-    let mode =
+    let set_mode =
         records.iter().find(|record| record.get("method") == Some(&json!("session/set_mode")));
-    assert_eq!(mode.and_then(|mode| mode.pointer("/params/modeId")), Some(&json!("default")));
+    assert_eq!(set_mode.and_then(|record| record.pointer("/params/modeId")), Some(&json!(mode)));
     let model =
         records.iter().find(|record| record.get("method") == Some(&json!("session/set_model")));
     assert_eq!(
         model.and_then(|model| model.pointer("/params/modelId")),
         Some(&json!("test-model"))
+    );
+}
+
+#[test]
+fn yolo_is_the_only_approval_that_launches_a_bypass_option() {
+    for approval in HermesApproval::ALL {
+        assert_eq!(
+            approval.launch_options().contains(&"--yolo"),
+            approval == HermesApproval::Yolo,
+            "{approval:?} must not change how Hermes is launched"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_mode_hermes_does_not_advertise_fails_before_any_write_is_unasked() {
+    let fixture = Fixture::new("only_default_mode");
+    let events = run_with(&fixture, None, HermesApproval::Yolo).await;
+    assert!(matches!(events.as_slice(), [AgentEvent::Failed(reason)]
+        if reason.contains("не поддерживает режим")));
+    assert!(
+        !methods(&fixture)
+            .iter()
+            .any(|method| method == "session/set_mode" || method == "session/prompt")
+    );
+}
+
+#[tokio::test]
+async fn a_hermes_without_advertised_modes_still_gets_the_configured_mode() {
+    let fixture = Fixture::new("no_modes");
+    let events = run_with(&fixture, None, HermesApproval::DontAsk).await;
+    assert!(matches!(events.first(), Some(AgentEvent::SessionStarted(_))));
+    let records = fixture.records();
+    let set_mode =
+        records.iter().find(|record| record.get("method") == Some(&json!("session/set_mode")));
+    assert_eq!(
+        set_mode.and_then(|record| record.pointer("/params/modeId")),
+        Some(&json!("dont_ask"))
     );
 }
 
@@ -237,7 +290,7 @@ fn start(
 ) -> Harness {
     let cancel = conversation.cancel.clone();
     let (sender, inbox) = mpsc::channel(8);
-    let backend = HermesBackend::new(fixture.cli.clone(), settings());
+    let backend = HermesBackend::new(fixture.cli.clone(), settings(HermesApproval::Default));
     let topic = topic(fixture, None);
     let done =
         tokio::spawn(
@@ -367,7 +420,7 @@ async fn unsupported_images_are_rejected_before_prompt_rpc() {
         media: hub_core::domain::ImageMediaType::Png,
         data: vec![1, 2, 3],
     };
-    let backend = HermesBackend::new(fixture.cli.clone(), settings());
+    let backend = HermesBackend::new(fixture.cli.clone(), settings(HermesApproval::Default));
     let _inbox = backend
         .run(
             &topic(&fixture, None),

@@ -185,6 +185,57 @@ impl QwenApproval {
     }
 }
 
+/// When Hermes asks the human before acting. File edits follow the ACP session mode
+/// (`mode_id`), dangerous commands follow the process-wide `--yolo` bypass. Neither
+/// reaches the paths Hermes always asks about: `.git`, `.ssh`, secret files, deny rules.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HermesApproval {
+    #[default]
+    Default,
+    AcceptEdits,
+    DontAsk,
+    Yolo,
+}
+
+impl HermesApproval {
+    pub const ALL: [Self; 4] = [Self::Default, Self::AcceptEdits, Self::DontAsk, Self::Yolo];
+
+    #[must_use]
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::AcceptEdits => "accept_edits",
+            Self::DontAsk => "dont_ask",
+            Self::Yolo => "yolo",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|approval| approval.wire() == raw)
+    }
+
+    /// The ACP `session/set_mode` id. Hermes has no `yolo` mode: the bypass of command
+    /// approvals is a launch option, edits still need the most permissive mode.
+    #[must_use]
+    pub const fn mode_id(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::AcceptEdits => "accept_edits",
+            Self::DontAsk | Self::Yolo => "dont_ask",
+        }
+    }
+
+    /// Global Hermes options, which must precede the `acp` subcommand.
+    #[must_use]
+    pub const fn launch_options(self) -> &'static [&'static str] {
+        match self {
+            Self::Yolo => &["--yolo"],
+            Self::Default | Self::AcceptEdits | Self::DontAsk => &[],
+        }
+    }
+}
+
 /// An OpenAI-compatible endpoint for Qwen; the address and the key exist only together.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ApiEndpoint {
@@ -286,6 +337,7 @@ pub struct HermesSettings {
     pub cli: Option<PathBuf>,
     pub profile: Option<String>,
     pub model: Option<String>,
+    pub approval: HermesApproval,
 }
 
 /// Overrides only; authentication and provider setup remain with the `OpenCode` operator.
@@ -366,6 +418,7 @@ pub enum HermesField {
     Cli,
     Profile,
     Model,
+    Approval,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -466,15 +519,17 @@ pub struct HermesDraft {
     pub cli: String,
     pub profile: String,
     pub model: String,
+    pub approval: HermesApproval,
 }
 
 impl HermesDraft {
     fn parse(&self, home: &Path, errors: &mut Vec<FieldError>) -> Option<HermesSettings> {
-        let Self { cli, profile, model } = self;
+        let Self { cli, profile, model, approval } = self;
         let cli = check(errors, Field::Hermes(HermesField::Cli), parse_cli(cli, home));
         let profile = check(errors, Field::Hermes(HermesField::Profile), parse_profile(profile));
         let model = check(errors, Field::Hermes(HermesField::Model), parse_model(model));
-        Some(HermesSettings { cli: cli?, profile: profile?, model: model? })
+        // `approval` needs no check: the form holds the total enum, so no text can reach it.
+        Some(HermesSettings { cli: cli?, profile: profile?, model: model?, approval: *approval })
     }
 }
 
@@ -780,6 +835,7 @@ impl Draft {
                     .unwrap_or_default(),
                 profile: settings.hermes.profile.clone().unwrap_or_default(),
                 model: settings.hermes.model.clone().unwrap_or_default(),
+                approval: settings.hermes.approval,
             },
             opencode: OpencodeDraft {
                 cli: settings
@@ -1030,6 +1086,7 @@ pub struct HermesFile {
     pub cli: Option<String>,
     pub profile: Option<String>,
     pub model: Option<String>,
+    pub approval: Option<String>,
 }
 
 /// `OpenCode` overrides; credentials remain in the operator's own `OpenCode` setup.
@@ -1117,6 +1174,7 @@ impl SettingsFile {
                 cli: settings.hermes.cli.as_ref().map(|cli| cli.display().to_string()),
                 profile: settings.hermes.profile.clone(),
                 model: settings.hermes.model.clone(),
+                approval: Some(settings.hermes.approval.wire().to_owned()),
             },
             opencode: OpencodeFile {
                 cli: settings.opencode.cli.as_ref().map(|cli| cli.display().to_string()),
@@ -1177,6 +1235,13 @@ impl SettingsFile {
             Field::Qwen(QwenField::Approval),
             "Неизвестный режим одобрений",
         )?;
+        let hermes_approval = choice(
+            self.hermes.approval.as_deref(),
+            HermesApproval::Default,
+            HermesApproval::parse,
+            Field::Hermes(HermesField::Approval),
+            "Неизвестный режим одобрений",
+        )?;
         let defaults = Draft::default();
         Ok(Draft {
             speech: self.speech.to_draft(speech_key),
@@ -1211,6 +1276,7 @@ impl SettingsFile {
                 cli: self.hermes.cli.clone().unwrap_or_default(),
                 profile: self.hermes.profile.clone().unwrap_or_default(),
                 model: self.hermes.model.clone().unwrap_or_default(),
+                approval: hermes_approval,
             },
             opencode: OpencodeDraft {
                 cli: self.opencode.cli.clone().unwrap_or_default(),
@@ -1617,7 +1683,7 @@ backend = "codex"
         let text = "[telegram]\nchat = -100\nusers = [1]\n\
                     [workspace]\nroot = \"~/w\"\n\
                     [agents]\ndefault = \"hermes\"\n\
-                    [hermes]\ncli = \"~/bin/hermes\"\nprofile = \"work\"\nmodel = \"test-model\"\n";
+                    [hermes]\ncli = \"~/bin/hermes\"\nprofile = \"work\"\nmodel = \"test-model\"\napproval = \"dont_ask\"\n";
         let file: SettingsFile = toml::from_str(text).unwrap();
         let keys = Keys {
             token: "1:a".to_owned(),
@@ -1634,9 +1700,23 @@ backend = "codex"
                     cli: Some(home().join("bin/hermes")),
                     profile: Some("work".to_owned()),
                     model: Some("test-model".to_owned()),
+                    approval: HermesApproval::DontAsk,
                 }
             )
         );
+    }
+
+    #[test]
+    fn file_with_unknown_hermes_approval_is_rejected() {
+        let mut file = SettingsFile::from_settings(&draft().parse(&home()).unwrap(), &home());
+        file.hermes.approval = Some("no-limit".to_owned());
+        let keys = Keys {
+            token: String::new(),
+            api_key: String::new(),
+            speech_key: String::new(),
+            qwen_key: String::new(),
+        };
+        assert_eq!(file.to_draft(keys).unwrap_err().field, Field::Hermes(HermesField::Approval));
     }
 
     #[test]
@@ -1664,7 +1744,12 @@ backend = "codex"
     fn hermes_defaults_preserve_the_operators_setup() {
         assert_eq!(
             draft().parse(&home()).unwrap().hermes,
-            HermesSettings { cli: None, profile: None, model: None }
+            HermesSettings {
+                cli: None,
+                profile: None,
+                model: None,
+                approval: HermesApproval::Default,
+            }
         );
     }
 
@@ -1676,6 +1761,7 @@ backend = "codex"
                 cli: " ~/bin/hermes ".to_owned(),
                 profile: " work ".to_owned(),
                 model: " test-model ".to_owned(),
+                approval: HermesApproval::Yolo,
             },
             ..draft()
         };
@@ -1698,9 +1784,9 @@ backend = "codex"
     }
 
     #[rstest]
-    #[case::relative_cli(HermesDraft { cli: "hermes".to_owned(), profile: String::new(), model: String::new() }, HermesField::Cli)]
-    #[case::spaced_profile(HermesDraft { cli: String::new(), profile: "bad profile".to_owned(), model: String::new() }, HermesField::Profile)]
-    #[case::spaced_model(HermesDraft { cli: String::new(), profile: String::new(), model: "bad model".to_owned() }, HermesField::Model)]
+    #[case::relative_cli(HermesDraft { cli: "hermes".to_owned(), ..HermesDraft::default() }, HermesField::Cli)]
+    #[case::spaced_profile(HermesDraft { profile: "bad profile".to_owned(), ..HermesDraft::default() }, HermesField::Profile)]
+    #[case::spaced_model(HermesDraft { model: "bad model".to_owned(), ..HermesDraft::default() }, HermesField::Model)]
     fn hermes_invalid_values_report_their_field(
         #[case] hermes: HermesDraft,
         #[case] field: HermesField,
@@ -1713,12 +1799,24 @@ backend = "codex"
     }
 
     #[test]
+    fn hermes_approval_wire_names_are_the_hermes_contract() {
+        let names: Vec<_> = HermesApproval::ALL.into_iter().map(HermesApproval::wire).collect();
+        assert_eq!(names, ["default", "accept_edits", "dont_ask", "yolo"]);
+        // `yolo` has no ACP mode of its own: it is the launch bypass on top of `dont_ask`.
+        assert_eq!(HermesApproval::DontAsk.mode_id(), HermesApproval::Yolo.mode_id());
+        assert!(HermesApproval::Yolo.launch_options().contains(&"--yolo"));
+        assert!(HermesApproval::DontAsk.launch_options().is_empty());
+        assert_eq!(HermesApproval::parse("off"), None);
+    }
+
+    #[test]
     fn hermes_errors_are_aggregated_in_form_order() {
         let errors = Draft {
             hermes: HermesDraft {
                 cli: "relative".to_owned(),
                 profile: "bad profile".to_owned(),
                 model: "bad model".to_owned(),
+                ..HermesDraft::default()
             },
             ..draft()
         }

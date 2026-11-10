@@ -12,8 +12,9 @@ use hub_core::doctor::{CheckDraft, MAX_CHECKS};
 use hub_core::domain::BackendKind;
 use hub_core::projects::{MAX_PROJECTS, ProjectDraft};
 use hub_core::settings::{
-    ApiEndpoint, Approval, CodexField, Draft, Field, FieldError, HermesField, OpencodeField,
-    PermissionMode, ProgressMode, QwenApproval, QwenField, Sandbox, Settings, UpdateCheck,
+    ApiEndpoint, Approval, CodexField, Draft, Field, FieldError, HermesApproval, HermesField,
+    OpencodeField, PermissionMode, ProgressMode, QwenApproval, QwenField, Sandbox, Settings,
+    UpdateCheck,
 };
 use hub_core::speech::SpeechProvider;
 
@@ -855,6 +856,29 @@ impl SettingsForm {
             ui.add(input(&mut self.draft.hermes.model).hint_text("из настроек Hermes"));
         });
         messages(ui, errors, Field::Hermes(HermesField::Model));
+        field_row(ui, "Одобрения", |ui| {
+            egui::ComboBox::from_id_salt("hermes_approval")
+                .selected_text(self.draft.hermes.approval.wire())
+                .show_ui(ui, |ui| {
+                    for approval in HermesApproval::ALL {
+                        ui.selectable_value(
+                            &mut self.draft.hermes.approval,
+                            approval,
+                            approval.wire(),
+                        );
+                    }
+                });
+        });
+        if self.draft.hermes.approval == HermesApproval::Yolo {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "yolo: Hermes выполняет опасные команды без подтверждения.",
+            );
+        }
+        ui.label(
+            "Режим применяется при каждом запуске сессии, включая восстановленную. Чувствительные \
+             пути и правила запрета Hermes спрашивает всегда.",
+        );
         ui.label("Вход и провайдер настраиваются в Hermes (`hermes setup`). Хаб запускает `hermes acp`, не меняя профиль и его секреты. Новые сообщения во время работы ждут следующего хода.");
     }
 
@@ -1528,6 +1552,7 @@ mod tests {
     #[case(BackendKind::Codex, "Путь к codex")]
     #[case(BackendKind::Qwen, "Путь к qwen")]
     #[case(BackendKind::Hermes, "Профиль")]
+    #[case(BackendKind::Hermes, "Одобрения")]
     #[case(BackendKind::Opencode, "Путь к opencode")]
     fn selected_agent_settings_are_visible(#[case] backend: BackendKind, #[case] expected: &str) {
         let ctx = egui::Context::default();
