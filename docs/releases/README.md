@@ -8,7 +8,7 @@
 
 | Версия | Текст | Подготовка | Результат публикации |
 |---|---|---|---|
-| v0.11.0 | [Одобрения Hermes](v0.11.0.md) | 2026-11-10: версия workspace обновлена, тег `v0.11.0` | готовится |
+| v0.11.0 | [Одобрения Hermes](v0.11.0.md) | 2026-11-10: пользователь согласовал минорный выпуск; коммит `5627d16`, аннотированный тег `v0.11.0` | [Опубликован](https://github.com/aprazdnikov/agent-hub-rs/releases/tag/v0.11.0): 24 файла; [Release — PASS](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/42825506765) |
 | v0.10.0 | [Диагностика, масштаб и установка](v0.10.0.md) | Коммит `4c2647f`, аннотированный тег `v0.10.0` | [Опубликован](https://github.com/aprazdnikov/agent-hub-rs/releases/tag/v0.10.0): 24 файла; [Release — PASS](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/42197465409) |
 | v0.9.0 | [Новые настройки и системные темы](v0.9.0.md) | 2026-11-05: текст согласован; коммит `347f333`, аннотированный тег `v0.9.0` | [Опубликован](https://github.com/aprazdnikov/agent-hub-rs/releases/tag/v0.9.0): 20 файлов; [Release — PASS](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/42054464691) |
 | v0.8.0 | [Удобнее управлять задачами с телефона](v0.8.0.md) | 2026-11-05: пользователь поручил создать тег с подготовленным текстом; версия workspace обновлена до 0.8.0 | [Страница релиза](https://github.com/aprazdnikov/agent-hub-rs/releases/tag/v0.8.0), [запуски Release](https://github.com/aprazdnikov/agent-hub-rs/actions/workflows/release.yml) |
@@ -16,14 +16,26 @@
 Пока workflow не завершился успешно и на странице нет файлов, выпуск не считается
 завершённым. До первой публикации ссылка на страницу может возвращать 404.
 
-## Подготовка v0.11.0
+## Подготовка и публикация v0.11.0
 
-- Пользователь согласовал выпуск `v0.11.0` с [описанием](v0.11.0.md): в нем только режимы
-  одобрений Hermes. Версия workspace поднята до 0.11.0, аннотированный тег `v0.11.0`.
-- Локально на Linux: 1804 теста прошли, 13 пропущены; форматирование, Clippy с
-  `-D warnings`, `cargo deny check`, сборка `hub-app` и `git diff --check` — PASS.
-- Контракт проверен на установленном Hermes 0.22.5: живая ACP-проба режимов и
-  `session/set_mode`, положение флага `--yolo` до подкоманды `acp`.
+- Пользователь согласовал минорный выпуск `v0.11.0` с [описанием](v0.11.0.md): в него вошли
+  только режимы одобрений Hermes. Коммит `5627d16` и аннотированный тег `v0.11.0`
+  отправлены в `main` и `origin/main`.
+- Локально на Linux: 1804 теста прошли, 13 пропущены (12 живых интеграций и GUI/GIO fixture);
+  форматирование, Clippy с `-D warnings`, `cargo deny check`, сборка `hub-app` и
+  `git diff --check` — PASS.
+- Контракт проверен на установленном Hermes 0.22.5: живая ACP-проба `initialize` →
+  `session/new` → `session/set_mode` (объявлены `default`, `accept_edits`, `dont_ask`;
+  `modeId: yolo` отклонён `-32603`) и положение флага `--yolo` до подкоманды `acp`.
+- [CI](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/42825478123) прошёл на
+  Linux, Windows и macOS; [Release](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/42825506765)
+  опубликован, релиз выбран `latest`. [Pages](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/42825478178)
+  прошёл, на опубликованном сайте блок «В 0.11.0» и ссылка на версию 0.11.0.
+- Проверены 24 файла: содержимое 12 `.sha256` совпадает с SHA-256 digest соответствующих
+  артефактов по GitHub API. Описание релиза совпадает с `v0.11.0.md`.
+- Не проверялось: живой прогон Hermes с моделью в Telegram при режимах `accept_edits`,
+  `dont_ask` и `yolo` (требует расхода токенов), а также GUI-выбор режима на реальной
+  рабочей станции. Ограничение описано в [плане](../plans/2026-11-10-hermes-approval-modes.md).
 
 ## Подготовка и публикация v0.10.0
 
