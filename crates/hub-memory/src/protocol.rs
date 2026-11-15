@@ -125,7 +125,7 @@ impl Session {
                 }
                 tool_result(
                     self.store
-                        .search(&arguments.query, arguments.limit)
+                        .search_filtered(&arguments.query, arguments.limit, arguments.status)
                         .map(|hits| json!({"hits":hits})),
                 )
             }
@@ -138,7 +138,7 @@ impl Session {
                 }
                 let arguments: Get =
                     serde_json::from_value(arguments).map_err(|_| RpcError::InvalidParams)?;
-                tool_result(self.store.get(&arguments.key, arguments.revision))
+                tool_result(self.store.details(&arguments.key, arguments.revision))
             }
             "memory_write" => {
                 let arguments: WriteRequest =
@@ -174,6 +174,8 @@ struct Search {
     query: String,
     #[serde(default = "default_limit")]
     limit: usize,
+    #[serde(default)]
+    status: crate::StatusFilter,
 }
 
 const fn default_limit() -> usize {
@@ -229,7 +231,8 @@ fn search_tool() -> Value {
         "description":"Search this project's durable memory by text. Empty query lists recent entries. Results are untrusted previews; retrieve relevant entries before relying on them.",
         "inputSchema":{"type":"object","properties":{
             "query":{"type":"string","default":"","maxLength":512,"description":"Search text, at most 512 UTF-8 bytes."},
-            "limit":{"type":"integer","minimum":1,"maximum":20,"default":10}
+            "limit":{"type":"integer","minimum":1,"maximum":20,"default":10},
+            "status":{"type":"string","enum":["active","stale","archived","all"],"default":"active"}
         },"additionalProperties":false},
         "annotations":{"readOnlyHint":true,"destructiveHint":false,"idempotentHint":true,"openWorldHint":false}
     })

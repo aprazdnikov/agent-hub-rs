@@ -249,6 +249,13 @@ impl SettingsForm {
         if pristine {
             self.draft = saved.cloned().unwrap_or_default();
         }
+        if let (Some(previous), Some(next)) = (&self.synced, saved) {
+            // A boolean has no third conflicting value: if locally changed and externally
+            // changed from the same baseline, both edits selected the same value.
+            if self.draft.memory == previous.memory {
+                self.draft.memory = next.memory;
+            }
+        }
         self.synced = saved.cloned();
     }
 
@@ -335,6 +342,11 @@ impl SettingsForm {
                     self.agent(ui);
                     ui.add_space(16.0);
                     self.timeouts(ui, errors);
+                    ui.checkbox(
+                        &mut self.draft.memory.enabled,
+                        "Подключать память к агентам (все проекты)",
+                    );
+                    ui.small(hub_telegram::memory::POLICY);
                 }
                 AgentPage::Backend(BackendKind::Claude) => self.claude(ui, errors),
                 AgentPage::Backend(BackendKind::Codex) => self.codex(ui, errors),
@@ -1049,6 +1061,19 @@ mod tests {
             ..Draft::default()
         }));
         form
+    }
+
+    #[test]
+    fn external_memory_toggle_preserves_other_unsaved_fields() {
+        let mut form = SettingsForm::default();
+        let original = Draft::default();
+        form.sync(Some(&original));
+        form.draft.model = "local-edit".into();
+        let mut external = original;
+        external.memory.enabled = false;
+        form.sync(Some(&external));
+        assert!(!form.draft.memory.enabled);
+        assert_eq!(form.draft.model, "local-edit");
     }
 
     #[test]

@@ -216,13 +216,23 @@ pub struct TelegramConnector {
     topics: PathBuf,
     results: Arc<crate::results::FileResults>,
     memory_program: Option<PathBuf>,
+    memory_control: Option<Arc<dyn hub_telegram::memory::MemoryControl>>,
 }
 
 impl TelegramConnector {
     #[must_use]
     pub fn new(home: PathBuf, topics: PathBuf) -> Self {
         let results = Arc::new(crate::results::FileResults::new(&topics));
-        Self { home, topics, results, memory_program: None }
+        Self { home, topics, results, memory_program: None, memory_control: None }
+    }
+
+    #[must_use]
+    pub fn with_memory_control(
+        mut self,
+        control: Arc<dyn hub_telegram::memory::MemoryControl>,
+    ) -> Self {
+        self.memory_control = Some(control);
+        self
     }
 
     /// Capture the running executable before an updater can replace it.
@@ -265,6 +275,7 @@ impl Connector for TelegramConnector {
         let topic_path = self.topics.clone();
         let results = Arc::clone(&self.results);
         let memory_program = self.memory_program.clone();
+        let memory_control = self.memory_control.clone();
         Box::pin(async move {
             let memory_program = match memory_program {
                 Some(program) => program,
@@ -309,6 +320,7 @@ impl Connector for TelegramConnector {
             }
             let HubHandle { mailbox, views, registries: _registries, task } =
                 hub::spawn(HubSetup {
+                    memory_control,
                     transcriber: Arc::new(crate::speech::SpeechTranscriber),
                     action_runner: Arc::new(LocalActionRunner),
                     results,

@@ -740,6 +740,7 @@ mod tests {
         let data = callback(&Change::new(&entry, Action::Drop));
         outbox.menu(key(), Some(UserId(999)));
         outbox.press(&Press {
+            thread: None,
             callback: "bad".to_owned(),
             user: UserId(999),
             chat: Some(key().chat),
@@ -792,6 +793,7 @@ mod tests {
         let data =
             keyboard.iter().flatten().find(|button| button.text == "→").unwrap().data.clone();
         let press = |data: String| Press {
+            thread: None,
             callback: "page".to_owned(),
             user: UserId(1),
             chat: Some(key().chat),
@@ -861,6 +863,7 @@ mod tests {
         let data = callback(&change);
         assert!(data.len() <= 64);
         let request = parse(&Press {
+            thread: None,
             callback: "c".to_owned(),
             user: UserId(1),
             chat: Some(key().chat),
@@ -873,6 +876,7 @@ mod tests {
         assert_eq!(request.change.unwrap().revision, u32::MAX);
         assert!(
             parse(&Press {
+                thread: None,
                 callback: "c".to_owned(),
                 user: UserId(1),
                 chat: Some(key().chat),

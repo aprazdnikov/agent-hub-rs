@@ -283,6 +283,7 @@ mod tests {
 
     fn press(data: &str, message: MessageId) -> Press {
         Press {
+            thread: None,
             callback: "cb".to_owned(),
             user: UserId(1),
             chat: Some(KEY.chat),

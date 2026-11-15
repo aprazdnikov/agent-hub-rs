@@ -19,6 +19,7 @@ use crate::updater::{UpdateCommand, UpdateState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
+    Memory,
     Status,
     Topics,
     Log,
@@ -72,6 +73,7 @@ pub struct HubApp {
     pending_exit: Option<Exit>,
     save_requested: Option<u64>,
     topics: TopicsView,
+    memory: super::memory::MemoryView,
     log: LogView,
     form: SettingsForm,
 }
@@ -119,6 +121,7 @@ impl HubApp {
             pending_exit: None,
             save_requested: None,
             topics: TopicsView::default(),
+            memory: super::memory::MemoryView::default(),
             log: LogView::default(),
             form,
         }
@@ -339,6 +342,7 @@ impl eframe::App for HubApp {
                     }
                     ui.selectable_value(&mut self.tab, Tab::Status, "Статус");
                     ui.selectable_value(&mut self.tab, Tab::Topics, "Темы");
+                    ui.selectable_value(&mut self.tab, Tab::Memory, "Память");
                     ui.selectable_value(&mut self.tab, Tab::Log, "Лог");
                     ui.selectable_value(&mut self.tab, Tab::Settings, "Настройки");
                 });
@@ -364,6 +368,11 @@ impl eframe::App for HubApp {
             .show(ui, |ui| match self.tab {
                 Tab::Status => status::show(ui, &snapshot, self.form.has_unsaved(), &mut send),
                 Tab::Topics => self.topics.show(ui, &snapshot, &mut send),
+                Tab::Memory => {
+                    egui::ScrollArea::both().id_salt("memory_outer").show(ui, |ui| {
+                        self.memory.show(ui, &snapshot, &self.home, &mut send);
+                    });
+                }
                 Tab::Log => {
                     if let Some(action) = self.log.show(ui, &self.logs.lines(), &self.logs_dir) {
                         self.form.apply(action);

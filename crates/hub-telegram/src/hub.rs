@@ -108,6 +108,7 @@ pub enum TopicState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TopicView {
+    pub memory_enabled: Option<bool>,
     pub progress: TaskProgress,
     pub parameters: String,
     pub key: TopicKey,
@@ -117,6 +118,7 @@ pub struct TopicView {
 }
 
 pub enum HubMessage {
+    MemoryDone(crate::memory::Done),
     HandoffDone(crate::handoff::Done),
     VoiceDone(crate::voice::Done),
     SaveResult(SaveResult),
@@ -169,6 +171,7 @@ struct Polled {
 }
 
 pub struct HubSetup<A> {
+    pub memory_control: Option<Arc<dyn crate::memory::MemoryControl>>,
     pub transcriber: Arc<dyn crate::transcription::Transcriber>,
     pub results: Arc<dyn ResultStore>,
     pub action_runner: Arc<dyn ActionRunner>,
@@ -193,6 +196,7 @@ pub struct HubHandle {
 }
 
 struct Live {
+    memory_enabled: bool,
     card: Option<crate::progress_card::Card>,
     progress: Progress,
     parameters: Effective,
@@ -202,6 +206,7 @@ struct Live {
 }
 
 struct Hub<A> {
+    memory: crate::memory::Browser,
     handoffs: crate::handoff::Handoffs<A>,
     /// Fresh service-event bindings observed during a pending topic creation.
     /// Any user activity consumes the marker before handoff can claim the topic.
@@ -246,6 +251,7 @@ struct Hub<A> {
 #[must_use]
 pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
     let HubSetup {
+        memory_control,
         transcriber,
         results,
         agents,
@@ -264,6 +270,12 @@ pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
     let (views, watched) = watch::channel(Vec::new());
     let registries = Shared::default();
     let hub = Hub {
+        memory: crate::memory::Browser::new(
+            Sender::new(messenger.clone()),
+            mailbox.clone(),
+            home.join(".agent-hub/memory"),
+            memory_control,
+        ),
         handoffs: crate::handoff::Handoffs::new(
             agents.clone(),
             Sender::new(messenger.clone()),
@@ -321,6 +333,7 @@ impl<A: Agents> Hub<A> {
                     self.handoffs.refresh(&self.settings.borrow(), &self.topics);
                     if !self.handoffs.creating() { self.handoff_topics.clear(); }
                     self.voices.refresh(&self.settings.borrow(), &self.topics);
+                    self.memory.refresh(&self.settings.borrow(),&self.topics);
                     self.publish();
                     continue;
                 }
@@ -328,6 +341,7 @@ impl<A: Agents> Hub<A> {
                     if changed.is_err() { break; }
                     self.handoffs.refresh(&self.settings.borrow(), &self.topics);
                     self.voices.refresh(&self.settings.borrow(), &self.topics);
+                    self.memory.refresh(&self.settings.borrow(),&self.topics);
                     self.publish();
                     continue;
                 }
@@ -384,6 +398,12 @@ impl<A: Agents> Hub<A> {
             if self.shutdown.is_none() {
                 self.option_press(pressed);
             }
+        } else if pressed.data.starts_with(crate::memory::PREFIX) {
+            if self.shutdown.is_none() {
+                self.memory.press(pressed, &self.settings.borrow(), |key| {
+                    self.topics.get(&key).map(|s| s.cwd.as_path().to_path_buf())
+                });
+            }
         } else if pressed.data.starts_with(outbox::PREFIX) {
             if self.shutdown.is_none() {
                 self.outbox.press(&pressed);
@@ -421,7 +441,13 @@ impl<A: Agents> Hub<A> {
     }
 
     fn handle(&mut self, message: HubMessage) {
+        self.memory.refresh(&self.settings.borrow(), &self.topics);
         match message {
+            HubMessage::MemoryDone(done) => {
+                let cwd = self.topics.get(&done.key()).map(|s| s.cwd.as_path().to_path_buf());
+                let active_memory = self.running.get(&done.key()).map(|live| live.memory_enabled);
+                self.memory.finish(done, &self.settings.borrow(), cwd.as_ref(), active_memory);
+            }
             HubMessage::HandoffDone(done) => {
                 let transfer = self.handoffs.complete(done, &self.settings.borrow(), &self.topics);
                 if let Some(transfer) = transfer {
@@ -496,6 +522,7 @@ impl<A: Agents> Hub<A> {
                 self.shutdown = Some((done, Instant::now() + SHUTDOWN_TIMEOUT));
             }
         }
+        self.memory.refresh(&self.settings.borrow(), &self.topics);
         self.publish();
     }
 
@@ -540,6 +567,9 @@ impl<A: Agents> Hub<A> {
             self.outside_topic(inbound);
             return;
         };
+        if self.memory_attachment(&inbound, key) {
+            return;
+        }
         if inbound.album.is_some() && matches!(inbound.content, Content::Media { .. }) {
             self.album(inbound);
             return;
@@ -578,6 +608,9 @@ impl<A: Agents> Hub<A> {
                 Input::Command { command: Command::Mode, args } => {
                     self.option_command(key, inbound.user, options::Field::Mode, &args);
                 }
+                Input::Command { command: Command::Memory, args } => {
+                    self.memory_menu(key, inbound.user, &args.join(" "));
+                }
                 Input::Command { command: Command::Outbox, .. } => {
                     self.outbox.menu(key, inbound.user);
                 }
@@ -615,6 +648,12 @@ impl<A: Agents> Hub<A> {
             Content::VideoNote => self.say(Target::Topic(key), texts::VIDEO_UNSUPPORTED.to_owned()),
             Content::Ignored => {}
         }
+    }
+
+    fn memory_attachment(&mut self, inbound: &Inbound, key: TopicKey) -> bool {
+        self.topics
+            .get(&key)
+            .is_some_and(|session| self.memory.attachment(inbound, session.cwd.as_path()))
     }
 
     fn outside_topic(&mut self, inbound: Inbound) {
@@ -657,6 +696,19 @@ impl<A: Agents> Hub<A> {
         }
     }
 
+    fn doctor_menu(&mut self, key: TopicKey) {
+        let card = self.doctors.menu(key, &self.settings.borrow());
+        tokio::spawn(projects::send_card(self.sender.clone(), key, card));
+    }
+
+    fn memory_menu(&mut self, key: TopicKey, user: Option<UserId>, args: &str) {
+        if let Some(session) = self.topics.get(&key) {
+            self.memory.menu(key, user, session.cwd.as_path().to_path_buf(), args);
+        } else {
+            self.say(Target::Topic(key), "Сначала выберите проект: /projects".into());
+        }
+    }
+
     fn command(
         &mut self,
         key: TopicKey,
@@ -666,13 +718,14 @@ impl<A: Agents> Hub<A> {
         args: &[&str],
     ) {
         match command {
-            Command::Handoff | Command::Last | Command::Outbox | Command::Model | Command::Mode => {
-            } // Handled with the live user's identity in inbound().
+            Command::Memory
+            | Command::Handoff
+            | Command::Last
+            | Command::Outbox
+            | Command::Model
+            | Command::Mode => {} // Handled with the live user's identity in inbound().
             Command::Projects => self.project_menu(key),
-            Command::Doctor => {
-                let card = self.doctors.menu(key, &self.settings.borrow());
-                tokio::spawn(projects::send_card(self.sender.clone(), key, card));
-            }
+            Command::Doctor => self.doctor_menu(key),
             Command::Actions => self.actions.menu(
                 &self.settings.borrow().actions,
                 Target::Topic(key),
@@ -1016,6 +1069,7 @@ impl<A: Agents> Hub<A> {
         self.running.insert(
             key,
             Live {
+                memory_enabled: settings.memory.enabled,
                 card: card.clone(),
                 progress: progress.clone(),
                 parameters,
@@ -1664,7 +1718,7 @@ impl<A: Agents> Hub<A> {
     /// «Обновить» redraws its own message; a press while a poll runs, or while the hub stops,
     /// only stops the button's spinner.
     fn refresh(&mut self, pressed: Press) {
-        let Press { callback, user: _, chat, message, html: _, data: _ } = pressed;
+        let Press { callback, user: _, chat, message, html: _, data: _, thread: _ } = pressed;
         let sender = self.sender.clone();
         tokio::spawn(async move { sender.answer(callback, None).await });
         let idle = !self.polling && self.shutdown.is_none();
@@ -1762,6 +1816,7 @@ impl<A: Agents> Hub<A> {
             .topics
             .iter()
             .map(|(key, session)| TopicView {
+                memory_enabled: self.running.get(key).map(|live| live.memory_enabled),
                 progress: self.progress(*key),
                 parameters: self.parameters(*key, session),
                 key: *key,
@@ -2128,6 +2183,7 @@ mod tests {
             stopped.await.unwrap();
             (&mut self.handle.task).await.unwrap();
             self.handle = spawn(HubSetup {
+                memory_control: None,
                 results: self.results.clone(),
                 action_runner: Arc::new(crate::testing::FakeActionRunner),
                 doctor_runner: Arc::new(crate::testing::FakeDoctorRunner),
@@ -2192,6 +2248,7 @@ mod tests {
         let results = Arc::new(crate::testing::MemoryResults::default());
         let transcriber = Arc::new(TestTranscriber::default());
         let handle = spawn(HubSetup {
+            memory_control: None,
             transcriber: transcriber.clone(),
             results: results.clone(),
             action_runner: Arc::new(crate::testing::FakeActionRunner),
@@ -2284,6 +2341,7 @@ mod tests {
             .clone();
         world
             .send(HubMessage::Press(Press {
+                thread: None,
                 callback: "start-action".to_owned(),
                 user: UserId(1),
                 chat: Some(ChatId(-100)),
@@ -2353,6 +2411,7 @@ mod tests {
         let (message, rows) = world.messenger.last_keyboard().unwrap();
         let button = rows.into_iter().flatten().find(|button| button.text.contains(label)).unwrap();
         crate::inbound::Press {
+            thread: None,
             callback: uuid::Uuid::new_v4().to_string(),
             user: UserId(1),
             chat: Some(KEY.chat),
@@ -2432,6 +2491,7 @@ mod tests {
             })
             .unwrap();
         Press {
+            thread: None,
             callback: uuid::Uuid::new_v4().to_string(),
             user: UserId(1),
             chat: Some(KEY.chat),
@@ -3583,6 +3643,7 @@ mod tests {
 
     fn press(callback: &str, message: i32, data: &str) -> HubMessage {
         HubMessage::Press(Press {
+            thread: None,
             callback: callback.to_owned(),
             user: UserId(1),
             chat: Some(ChatId(-100)),
@@ -4191,6 +4252,7 @@ mod tests {
         ] {
             world
                 .send(HubMessage::Press(Press {
+                    thread: None,
                     callback: "foreign".to_owned(),
                     chat: Some(chat),
                     user,
@@ -4422,6 +4484,7 @@ mod tests {
         assert!(world.agents.prompts().is_empty());
         assert!(world.store.last().unwrap_or_default().is_empty());
         let forged = Press {
+            thread: None,
             callback: "wrong-user".to_owned(),
             user: UserId(2),
             chat: Some(KEY.chat),
@@ -4463,6 +4526,7 @@ mod tests {
         for (chat, message) in [(ChatId(-101), message), (KEY.chat, MessageId(10000))] {
             world
                 .send(HubMessage::Press(Press {
+                    thread: None,
                     callback: "forged".to_owned(),
                     user: UserId(1),
                     chat: Some(chat),

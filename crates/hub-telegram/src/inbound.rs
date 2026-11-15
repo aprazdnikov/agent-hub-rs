@@ -59,6 +59,7 @@ impl Inbound {
 /// A button press.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Press {
+    pub thread: Option<ThreadId>,
     pub callback: String,
     pub user: UserId,
     pub chat: Option<ChatId>,

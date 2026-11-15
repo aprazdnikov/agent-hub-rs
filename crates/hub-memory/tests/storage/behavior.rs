@@ -463,3 +463,58 @@ fn base_project_and_lock_symlinks_are_rejected() -> TestResult {
     assert!(matches!(fixture.open("one"), Err(Error::UnsafePath(_))));
     Ok(())
 }
+
+#[test]
+fn inspection_does_not_create_storage_and_finds_keys() -> TestResult {
+    let fixture = Fixture::new()?;
+    let reader = hub_memory::MemoryReader::new(&fixture.base, &fixture.project)?;
+    let empty = reader.inspect("", 0, 20)?;
+    assert!(!empty.exists);
+    assert!(!fixture.base.exists());
+    let store = fixture.open("writer")?;
+    store.write(request("unique-key", 0, "first"))?;
+    store.write(request("unique-key", 1, "second"))?;
+    let page = reader.inspect("unique-key", 0, 20)?;
+    assert_eq!((page.key_count, page.matched_count, page.entries.len()), (1, 1, 1));
+    assert_eq!(page.bytes, fs::metadata(fixture.data()?)?.len());
+    assert_eq!(reader.get("unique-key", Some(1))?.body, "first");
+    assert_eq!(store.search("unique-key", 20)?.len(), 1);
+    assert!(reader.inspect("", 1, 20)?.entries.is_empty());
+    fs::write(fixture.data()?, "broken")?;
+    assert!(matches!(reader.inspect("", 0, 20), Err(Error::Corrupt(_))));
+    Ok(())
+}
+
+#[test]
+fn inspection_pages_cover_all_keys_without_duplicates() -> TestResult {
+    let fixture = Fixture::new()?;
+    let store = fixture.open("writer")?;
+    for number in 0..25 {
+        store.write(request(&format!("key-{number:02}"), 0, "body"))?;
+    }
+    let reader = hub_memory::MemoryReader::new(&fixture.base, &fixture.project)?;
+    let mut keys = reader.inspect("key-", 0, 20)?.entries;
+    keys.extend(reader.inspect("key-", 20, 20)?.entries);
+    let mut names: Vec<_> = keys.into_iter().map(|e| e.key).collect();
+    names.sort();
+    names.dedup();
+    assert_eq!(names.len(), 25);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn inspection_rejects_symlink_and_preserves_read_permissions() -> TestResult {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let fixture = Fixture::new()?;
+    fixture.open("writer")?.write(request("key", 0, "body"))?;
+    let reader = hub_memory::MemoryReader::new(&fixture.base, &fixture.project)?;
+    let data = fixture.data()?;
+    fs::set_permissions(&data, fs::Permissions::from_mode(0o400))?;
+    reader.get("key", None)?;
+    assert_eq!(fs::metadata(&data)?.permissions().mode() & 0o777, 0o400);
+    fs::remove_file(&data)?;
+    symlink(fixture.root.path().join("missing"), &data)?;
+    assert!(matches!(reader.inspect("", 0, 20), Err(Error::UnsafePath(_))));
+    Ok(())
+}

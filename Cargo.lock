@@ -1886,6 +1886,7 @@ dependencies = [
  "sha2",
  "tempfile",
  "thiserror 2.0.21",
+ "uuid",
 ]
 
 [[package]]
@@ -1937,6 +1938,7 @@ dependencies = [
  "hub-codex",
  "hub-core",
  "hub-hermes",
+ "hub-memory",
  "hub-opencode",
  "hub-qwen",
  "hyper",

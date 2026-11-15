@@ -345,3 +345,55 @@ impl io::Write for FailedWriter {
         Ok(())
     }
 }
+
+#[test]
+fn status_filter_is_explicit_and_admin_tools_stay_absent() -> TestResult {
+    let temp = fixture()?;
+    let s = store(&temp, "test")?;
+    s.write(serde_json::from_value(write_args())?)?;
+    s.apply(s.preview(hub_memory::AdminAction::SetStatus {
+        key: "architecture".into(),
+        status: hub_memory::MemoryStatus::Archived,
+    })?)?;
+    let result = exchange(
+        s,
+        &[
+            initialization("2025-11-25"),
+            initialized(),
+            call(2, "memory_search", &json!({})),
+            call(3, "memory_search", &json!({"status":"all"})),
+            json!({"jsonrpc":"2.0","id":4,"method":"tools/list"}),
+        ],
+    )?;
+    assert_eq!(result[1]["result"]["structuredContent"]["hits"], json!([]));
+    assert_eq!(
+        result[2]["result"]["structuredContent"]["hits"].as_array().ok_or("expected array")?.len(),
+        1
+    );
+    assert_eq!(result[3]["result"]["tools"].as_array().ok_or("expected array")?.len(), 3);
+    Ok(())
+}
+
+#[test]
+fn direct_get_exposes_archived_status_and_available_revisions() -> TestResult {
+    let temp = fixture()?;
+    let opened = store(&temp, "test")?;
+    opened.write(serde_json::from_value(write_args())?)?;
+    opened.apply(opened.preview(hub_memory::AdminAction::SetStatus {
+        key: "architecture".into(),
+        status: hub_memory::MemoryStatus::Archived,
+    })?)?;
+    let result = exchange(
+        opened,
+        &[
+            initialization("2025-11-25"),
+            initialized(),
+            call(2, "memory_get", &json!({"key":"architecture"})),
+        ],
+    )?;
+    let payload = &result.get(1).ok_or("missing result")?["result"]["structuredContent"];
+    assert_eq!(payload["status"], "archived");
+    assert_eq!(payload["revisions"], json!([1]));
+    assert_eq!(payload["revision"], 1);
+    Ok(())
+}

@@ -353,6 +353,7 @@ mod tests {
     fn button(book: &mut Doctors, settings: &Arc<Settings>, thread: i32) -> Press {
         let menu = book.menu(key(thread), settings);
         Press {
+            thread: None,
             callback: "c".to_owned(),
             user: UserId(1),
             chat: Some(ChatId(-100)),

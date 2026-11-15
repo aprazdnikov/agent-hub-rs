@@ -96,8 +96,12 @@ fn run() -> anyhow::Result<()> {
     let window_exit = Arc::clone(&exit);
     let core = runtime.handle().clone();
     let window = commands.clone();
-    let connector =
-        TelegramConnector::new(home.clone(), dirs.topics()).with_memory_program(program.clone());
+    let connector = TelegramConnector::new(home.clone(), dirs.topics())
+        .with_memory_program(program.clone())
+        .with_memory_control(Arc::new(hub_app::memory::Control {
+            commands: commands.clone(),
+            snapshot: watched.clone(),
+        }));
     let logs_dir = dirs.logs();
     let ui_settings = dirs.ui_settings();
     let options = window_options();

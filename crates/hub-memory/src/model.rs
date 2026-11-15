@@ -53,6 +53,18 @@ pub struct SearchHit {
 /// Failures contain metadata and safe diagnostics, never entry contents.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("memory store was recreated; start a new session")]
+    Recreated,
+    #[error("memory preview is stale; refresh before confirming")]
+    StalePreview,
+    #[error("memory entry is archived; activate it before writing")]
+    Archived,
+    #[error("memory key was deleted; import under a new key")]
+    Deleted,
+    #[error(
+        "memory entry '{key}' revision {revision} unavailable; available: {available:?}; history pruned: {pruned}"
+    )]
+    RevisionUnavailable { key: String, revision: u32, available: Vec<u32>, pruned: bool },
     #[error("invalid memory input: {0}")]
     InvalidInput(&'static str),
     #[error("memory entry '{key}' revision {revision:?} was not found")]

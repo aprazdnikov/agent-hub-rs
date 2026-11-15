@@ -130,7 +130,7 @@ impl Agents for HubAgents {
         conversation: Conversation,
         settings: Arc<Settings>,
     ) -> BoxFuture<'a, mpsc::Receiver<Prompt>> {
-        match self.memory(session) {
+        match if settings.memory.enabled { self.memory(session) } else { Ok(None) } {
             Ok(memory) => Self::execute(session, prompt, inbox, conversation, settings, memory),
             Err(error) => Box::pin(async move { refuse(&conversation, error, inbox).await }),
         }
@@ -374,7 +374,10 @@ mod tests {
             .with_memory_program(PathBuf::from("relative-program-is-invalid"));
         let session = TopicSession::fresh(backend, AbsolutePath::new(root).unwrap())
             .with_session(hub_core::domain::SessionId::parse("saved-session"));
-        for summary in [false, true] {
+        for (summary, enabled) in [(false, true), (false, false), (true, true), (true, false)] {
+            let mut selected = (*settings).clone();
+            selected.memory.enabled = enabled;
+            let settings = Arc::new(selected);
             let (events, mut received) = mpsc::channel(4);
             let conversation = Conversation {
                 channel: Arc::new(Allowing),
@@ -392,7 +395,7 @@ mod tests {
             let Some(AgentEvent::Failed(reason)) = received.recv().await else {
                 panic!("missing failure")
             };
-            assert_eq!(reason.contains("серверу памяти"), !summary, "{reason}");
+            assert_eq!(reason.contains("серверу памяти"), !summary && enabled, "{reason}");
         }
     }
 

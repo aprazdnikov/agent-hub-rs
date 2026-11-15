@@ -11,12 +11,17 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::{Entry, Error, SearchHit, WriteRequest};
+use crate::{
+    CleanupPolicy, CleanupSummary, Entry, Error, MemoryStatus, SearchHit, SnapshotToken,
+    StatusFilter, WriteRequest,
+};
+mod lifecycle;
+pub(crate) mod portable;
 
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
 const MAX_KEYS: usize = 500;
 const MAX_REVISIONS: usize = 32;
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 const DATA_FILE: &str = "memory.json";
 const LOCK_FILE: &str = ".lock";
 
@@ -26,14 +31,27 @@ pub struct Store {
     directory: Arc<filesystem::Directory>,
     project: PathBuf,
     actor: String,
+    incarnation: String,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Snapshot {
     schema_version: u32,
     project: PathBuf,
-    #[serde(deserialize_with = "unique_histories")]
+    #[serde(default)]
+    incarnation: String,
+    #[serde(default)]
+    generation: u64,
+    #[serde(default)]
+    policy: CleanupPolicy,
+    #[serde(default, deserialize_with = "unique_map")]
+    metadata: BTreeMap<String, Metadata>,
+    #[serde(default, deserialize_with = "unique_map")]
+    tombstones: BTreeMap<String, Tombstone>,
+    #[serde(default)]
+    last_cleanup: Option<CleanupSummary>,
+    #[serde(deserialize_with = "unique_map")]
     entries: BTreeMap<String, Vec<Entry>>,
 }
 
@@ -58,13 +76,14 @@ impl Store {
                 .map_err(|_| Error::Corrupt("could not format project identity"))?;
         }
         let base = filesystem::destination(base)?;
-        let store = Self {
+        let mut store = Self {
             directory: Arc::new(filesystem::Directory::create(&base, &project_id)?),
             project,
             actor: actor.to_owned(),
+            incarnation: String::new(),
         };
         store.directory.open(LOCK_FILE, filesystem::OpenMode::Create)?;
-        store.load()?;
+        store.incarnation = store.load()?.incarnation;
         Ok(store)
     }
 
@@ -73,17 +92,25 @@ impl Store {
         validate_fields(&request.key, &request.title, &request.body, &request.sources)?;
         let _lock = self.acquire_lock()?;
         let mut snapshot = self.load()?;
+        self.check_incarnation(&snapshot)?;
+        if snapshot.tombstones.contains_key(&request.key) {
+            return Err(Error::Deleted);
+        }
+        if snapshot.status(&request.key) == MemoryStatus::Archived {
+            return Err(Error::Archived);
+        }
         if let Some(existing) = snapshot.entries.get(&request.key) {
-            if let Some(retry) = usize::try_from(request.expected_revision)
-                .ok()
-                .and_then(|revision| existing.get(revision))
+            if let Some(retry) = request
+                .expected_revision
+                .checked_add(1)
+                .and_then(|revision| existing.iter().find(|entry| entry.revision == revision))
                 .filter(|entry| same_payload(entry, &request))
             {
                 return Ok(retry.clone());
             }
             let actual = existing.last().map_or(0, |entry| entry.revision);
             ensure_revision(&request, actual)?;
-            if existing.len() >= MAX_REVISIONS {
+            if existing.len() >= MAX_REVISIONS && snapshot.policy == CleanupPolicy::Manual {
                 return Err(Error::LimitExceeded("32 revisions per key"));
             }
         } else {
@@ -112,12 +139,8 @@ impl Store {
             created_at,
         };
         snapshot.entries.entry(entry.key.clone()).or_default().push(entry.clone());
-        let bytes = serde_json::to_vec(&snapshot)
-            .map_err(|_| Error::Corrupt("could not serialize validated memory"))?;
-        if u64::try_from(bytes.len()).map_or(true, |length| length > MAX_BYTES) {
-            return Err(Error::LimitExceeded("8 MiB per project"));
-        }
-        self.directory.persist(&bytes)?;
+        snapshot.enforce_retention()?;
+        self.persist_snapshot(&mut snapshot)?;
         Ok(entry)
     }
 
@@ -141,6 +164,15 @@ impl Store {
 
     /// Searches latest revisions with case-insensitive terms; an empty query lists recent entries.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>, Error> {
+        self.search_filtered(query, limit, StatusFilter::Active)
+    }
+
+    pub fn search_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        filter: StatusFilter,
+    ) -> Result<Vec<SearchHit>, Error> {
         if query.len() > 512 {
             return Err(Error::InvalidInput("query exceeds 512 UTF-8 bytes"));
         }
@@ -154,10 +186,16 @@ impl Store {
                 .entries
                 .values()
                 .filter_map(|history| history.last())
+                .filter(|entry| filter.includes(snapshot.status(&entry.key)))
                 .filter(|entry| {
-                    let text =
-                        format!("{}\n{}\n{}", entry.title, entry.body, entry.sources.join("\n"))
-                            .to_lowercase();
+                    let text = format!(
+                        "{}\n{}\n{}\n{}",
+                        entry.key,
+                        entry.title,
+                        entry.body,
+                        entry.sources.join("\n")
+                    )
+                    .to_lowercase();
                     terms.iter().all(|term| text.contains(term))
                 })
                 .collect();
@@ -180,6 +218,37 @@ impl Store {
             .collect())
     }
 
+    fn check_incarnation(&self, snapshot: &Snapshot) -> Result<(), Error> {
+        if self.incarnation != snapshot.incarnation {
+            return Err(Error::Recreated);
+        }
+        Ok(())
+    }
+
+    fn persist_snapshot(&self, snapshot: &mut Snapshot) -> Result<(), Error> {
+        snapshot.schema_version = SCHEMA_VERSION;
+        snapshot.generation = snapshot
+            .generation
+            .checked_add(1)
+            .ok_or(Error::LimitExceeded("snapshot generation range"))?;
+        snapshot.validate(&self.project)?;
+        let bytes = serde_json::to_vec(snapshot)
+            .map_err(|_| Error::Corrupt("could not serialize memory"))?;
+        if bytes.len() as u64 > MAX_BYTES {
+            return Err(Error::LimitExceeded("8 MiB per project"));
+        }
+        if let Some(file) = self.directory.open(DATA_FILE, filesystem::OpenMode::Read)? {
+            let mut original = Vec::new();
+            file.take(MAX_BYTES + 1).read_to_end(&mut original)?;
+            let header: Header = serde_json::from_slice(&original)
+                .map_err(|_| Error::Corrupt("invalid schema header"))?;
+            if header.schema_version == 1 {
+                self.directory.backup(&original)?;
+            }
+        }
+        self.directory.persist(&bytes)
+    }
+
     fn acquire_lock(&self) -> Result<File, Error> {
         let file = self
             .directory
@@ -193,12 +262,25 @@ impl Store {
     }
 
     fn load(&self) -> Result<Snapshot, Error> {
+        Ok(self.load_with_size()?.0)
+    }
+
+    fn load_with_size(&self) -> Result<(Snapshot, u64), Error> {
         let Some(file) = self.directory.open(DATA_FILE, filesystem::OpenMode::Read)? else {
-            return Ok(Snapshot {
-                schema_version: SCHEMA_VERSION,
-                project: self.project.clone(),
-                entries: BTreeMap::new(),
-            });
+            return Ok((
+                Snapshot {
+                    schema_version: SCHEMA_VERSION,
+                    project: self.project.clone(),
+                    entries: BTreeMap::new(),
+                    incarnation: initial_incarnation(&self.project),
+                    generation: 0,
+                    policy: CleanupPolicy::Manual,
+                    metadata: BTreeMap::new(),
+                    tombstones: BTreeMap::new(),
+                    last_cleanup: None,
+                },
+                0,
+            ));
         };
         if file.metadata()?.len() > MAX_BYTES {
             return Err(Error::LimitExceeded("8 MiB per project"));
@@ -210,13 +292,22 @@ impl Store {
         }
         let header: Header = serde_json::from_slice(&bytes)
             .map_err(|_| Error::Corrupt("invalid JSON or schema header"))?;
-        if header.schema_version != SCHEMA_VERSION {
+        if !matches!(header.schema_version, 1 | SCHEMA_VERSION) {
             return Err(Error::UnsupportedVersion(header.schema_version));
         }
-        let snapshot: Snapshot = serde_json::from_slice(&bytes)
+        let mut snapshot: Snapshot = serde_json::from_slice(&bytes)
             .map_err(|_| Error::Corrupt("invalid JSON or schema fields"))?;
+        if snapshot.schema_version == 1 {
+            snapshot.incarnation = initial_incarnation(&self.project);
+            let hash = Sha256::digest(&bytes);
+            let mut prefix = [0u8; 8];
+            for (target, byte) in prefix.iter_mut().zip(hash.iter()) {
+                *target = *byte;
+            }
+            snapshot.generation = u64::from_be_bytes(prefix) >> 1;
+        }
         snapshot.validate(&self.project)?;
-        Ok(snapshot)
+        Ok((snapshot, bytes.len() as u64))
     }
 }
 
@@ -225,6 +316,21 @@ impl Snapshot {
         if self.project != project {
             return Err(Error::ProjectMismatch);
         }
+        if self.incarnation.len() > 128 || self.incarnation.is_empty() {
+            return Err(Error::Corrupt("invalid incarnation"));
+        }
+        if self.tombstones.len() > 4096 {
+            return Err(Error::LimitExceeded("4096 tombstones"));
+        }
+        for (key, dead) in &self.tombstones {
+            validate_key(key)?;
+            if dead.revision == 0 || self.entries.contains_key(key) {
+                return Err(Error::Corrupt("invalid tombstone"));
+            }
+        }
+        if self.metadata.keys().any(|key| !self.entries.contains_key(key)) {
+            return Err(Error::Corrupt("orphan entry metadata"));
+        }
         if self.entries.len() > MAX_KEYS {
             return Err(Error::Corrupt("key count exceeds the schema limit"));
         }
@@ -232,11 +338,16 @@ impl Snapshot {
             if history.is_empty() || history.len() > MAX_REVISIONS {
                 return Err(Error::Corrupt("invalid revision count"));
             }
+            let mut previous = 0;
             for (index, entry) in history.iter().enumerate() {
-                if key != &entry.key || usize::try_from(entry.revision).ok() != index.checked_add(1)
+                if key != &entry.key
+                    || entry.revision <= previous
+                    || (self.schema_version == 1
+                        && usize::try_from(entry.revision).ok() != index.checked_add(1))
                 {
                     return Err(Error::Corrupt("entry key or revision sequence is invalid"));
                 }
+                previous = entry.revision;
                 validate_fields(&entry.key, &entry.title, &entry.body, &entry.sources)
                     .and_then(|()| validate_actor(&entry.author))
                     .map_err(|_| Error::Corrupt("entry fields violate schema limits"))?;
@@ -303,285 +414,169 @@ fn same_payload(entry: &Entry, request: &WriteRequest) -> bool {
         && entry.sources == *sources
 }
 
-fn unique_histories<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<BTreeMap<String, Vec<Entry>>, D::Error> {
-    struct UniqueHistories;
-    impl<'de> serde::de::Visitor<'de> for UniqueHistories {
-        type Value = BTreeMap<String, Vec<Entry>>;
-
-        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            formatter.write_str("unique entry keys")
+fn unique_map<'de, D, T>(deserializer: D) -> Result<BTreeMap<String, T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    struct Unique<T>(std::marker::PhantomData<T>);
+    impl<'de, T: Deserialize<'de>> serde::de::Visitor<'de> for Unique<T> {
+        type Value = BTreeMap<String, T>;
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("unique keys")
         }
-
         fn visit_map<A: serde::de::MapAccess<'de>>(
             self,
             mut map: A,
         ) -> Result<Self::Value, A::Error> {
-            let mut entries = BTreeMap::new();
-            while let Some((key, value)) = map.next_entry()? {
-                if entries.insert(key, value).is_some() {
-                    return Err(serde::de::Error::custom("duplicate entry key"));
+            let mut result = BTreeMap::new();
+            while let Some((key, value)) = map.next_entry::<String, T>()? {
+                if result.insert(key, value).is_some() {
+                    return Err(serde::de::Error::custom("duplicate key"));
                 }
             }
-            Ok(entries)
+            Ok(result)
         }
     }
-    deserializer.deserialize_map(UniqueHistories)
+    deserializer.deserialize_map(Unique(std::marker::PhantomData))
 }
 
-mod filesystem {
-    use std::{
-        fs::{self, File},
-        io::Write,
-        path::{Path, PathBuf},
-    };
+#[derive(Clone, Debug, Default, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct Metadata {
+    #[serde(default)]
+    status: MemoryStatus,
+    #[serde(default)]
+    pruned: bool,
+    #[serde(default)]
+    provenance: Option<String>,
+}
+#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(deny_unknown_fields)]
+struct Tombstone {
+    revision: u32,
+    provenance: Option<String>,
+}
 
-    use crate::Error;
+mod filesystem;
 
-    use super::DATA_FILE;
+/// A read-only view that never creates a store or changes its permissions.
+#[derive(Clone, Debug)]
+pub struct MemoryReader {
+    project: PathBuf,
+    directory: PathBuf,
+}
 
-    #[derive(Clone, Copy)]
-    pub enum OpenMode {
-        Read,
-        Create,
-        Exclusive,
+#[derive(Clone, Debug)]
+pub struct MemoryPage {
+    pub offset: usize,
+    pub project: PathBuf,
+    pub directory: PathBuf,
+    pub exists: bool,
+    pub bytes: u64,
+    pub key_count: usize,
+    pub matched_count: usize,
+    pub entries: Vec<SearchHit>,
+}
+
+impl MemoryReader {
+    pub fn new(base: &Path, project: &Path) -> Result<Self, Error> {
+        let project = fs::canonicalize(project)?;
+        if !project.is_dir() {
+            return Err(Error::InvalidInput("project must be an existing directory"));
+        }
+        let identity =
+            project.to_str().ok_or(Error::InvalidInput("project path must be valid UTF-8"))?;
+        let mut hash = String::with_capacity(64);
+        for byte in Sha256::digest(identity.as_bytes()) {
+            write!(hash, "{byte:02x}")
+                .map_err(|_| Error::Corrupt("could not format project identity"))?;
+        }
+        Ok(Self { project, directory: filesystem::destination(base)?.join(hash) })
     }
 
-    pub struct Directory {
-        path: PathBuf,
-        #[cfg(unix)]
-        handle: File,
+    fn store(&self) -> Result<Option<Store>, Error> {
+        Ok(filesystem::Directory::existing(&self.directory)?.map(|directory| Store {
+            directory: Arc::new(directory),
+            project: self.project.clone(),
+            actor: "viewer".into(),
+            incarnation: String::new(),
+        }))
     }
 
-    /// Resolve pre-existing ancestors, while refusing symlinks at managed paths.
-    pub fn destination(path: &Path) -> Result<PathBuf, Error> {
-        match fs::symlink_metadata(path) {
-            Ok(metadata) if !metadata.is_dir() || metadata.file_type().is_symlink() => {
-                Err(Error::UnsafePath(path.to_owned()))
-            }
-            Ok(_) => Ok(fs::canonicalize(path)?),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                let name =
-                    path.file_name().ok_or(Error::InvalidInput("invalid memory directory"))?;
-                let parent = path
-                    .parent()
-                    .filter(|parent| !parent.as_os_str().is_empty())
-                    .unwrap_or_else(|| Path::new("."));
-                let parent = match fs::canonicalize(parent) {
-                    Ok(parent) if parent.is_dir() => parent,
-                    Ok(parent) => return Err(Error::UnsafePath(parent)),
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                        destination(parent)?
-                    }
-                    Err(error) => return Err(error.into()),
-                };
-                Ok(parent.join(name))
-            }
-            Err(error) => Err(error.into()),
-        }
+    pub fn get(&self, key: &str, revision: Option<u32>) -> Result<Entry, Error> {
+        validate_key(key)?;
+        self.store()?
+            .ok_or_else(|| Error::NotFound { key: key.to_owned(), revision })?
+            .get(key, revision)
     }
 
-    impl Directory {
-        pub fn persist(&self, bytes: &[u8]) -> Result<(), Error> {
-            // The writer lock makes one reusable staging file sufficient, including after crashes.
-            let temporary = ".memory.tmp";
-            if self.open(temporary, OpenMode::Read)?.is_some() {
-                self.remove(temporary)?;
-            }
-            let result = (|| {
-                let mut file = self
-                    .open(temporary, OpenMode::Exclusive)?
-                    .ok_or(Error::Corrupt("temporary file was not created"))?;
-                file.write_all(bytes)?;
-                file.sync_all()?;
-                self.replace(temporary)?;
-                Ok(())
-            })();
-            if result.is_err() {
-                // Best-effort removal preserves the original failure; no data is published here.
-                let _cleanup_result = self.remove(temporary);
-            }
-            result
-        }
+    pub fn inspect(&self, query: &str, offset: usize, limit: usize) -> Result<MemoryPage, Error> {
+        self.inspect_filtered(query, offset, limit, StatusFilter::Active)
     }
 
-    #[cfg(unix)]
-    impl Directory {
-        pub fn create(base: &Path, project: &str) -> Result<Self, Error> {
-            use rustix::fs::{Mode, OFlags, fchmod, mkdirat, openat};
-            use std::os::unix::fs::MetadataExt;
-            let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
-            let mode = Mode::RUSR | Mode::WUSR | Mode::XUSR;
-            let mut handle = File::open("/")?;
-            for component in base.components() {
-                let std::path::Component::Normal(component) = component else { continue };
-                let next = match openat(&handle, component, flags, Mode::empty()) {
-                    Ok(next) => next,
-                    Err(rustix::io::Errno::NOENT) => {
-                        match mkdirat(&handle, component, mode) {
-                            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                            Err(error) => return Err(std::io::Error::from(error).into()),
-                        }
-                        openat(&handle, component, flags, Mode::empty())
-                            .map_err(|error| path_error(error, base))?
-                    }
-                    Err(error) => return Err(path_error(error, base)),
-                };
-                handle = File::from(next);
-            }
-            match mkdirat(&handle, project, mode) {
-                Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                Err(error) => return Err(std::io::Error::from(error).into()),
-            }
-            let path = base.join(project);
-            let handle = File::from(
-                openat(&handle, project, flags, Mode::empty())
-                    .map_err(|error| path_error(error, &path))?,
-            );
-            if handle.metadata()?.nlink() == 0 {
-                return Err(Error::UnsafePath(path));
-            }
-            fchmod(&handle, mode).map_err(std::io::Error::from)?;
-            Ok(Self { path, handle })
+    fn inspect_filtered(
+        &self,
+        query: &str,
+        offset: usize,
+        limit: usize,
+        filter: StatusFilter,
+    ) -> Result<MemoryPage, Error> {
+        if query.len() > 512 || !(1..=20).contains(&limit) {
+            return Err(Error::InvalidInput("query must be <=512 bytes and limit 1..20"));
         }
-
-        pub fn open(&self, name: &str, mode: OpenMode) -> Result<Option<File>, Error> {
-            use rustix::fs::{Mode, OFlags, fchmod, openat};
-            use std::os::unix::fs::MetadataExt;
-            self.verify()?;
-            let flags = OFlags::NOFOLLOW
-                | OFlags::CLOEXEC
-                | OFlags::NONBLOCK
-                | match mode {
-                    OpenMode::Read => OFlags::RDONLY,
-                    OpenMode::Create => OFlags::RDWR | OFlags::CREATE,
-                    OpenMode::Exclusive => OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL,
-                };
-            let path = self.path.join(name);
-            let file = match openat(&self.handle, name, flags, Mode::RUSR | Mode::WUSR) {
-                Ok(file) => File::from(file),
-                Err(rustix::io::Errno::NOENT) => return Ok(None),
-                Err(error) => return Err(path_error(error, &path)),
-            };
-            let metadata = file.metadata()?;
-            // An atomic replacement may unlink a reader's old snapshot after it was opened.
-            if !metadata.is_file() || metadata.nlink() > 1 {
-                return Err(Error::UnsafePath(path));
-            }
-            fchmod(&file, Mode::RUSR | Mode::WUSR).map_err(std::io::Error::from)?;
-            Ok(Some(file))
-        }
-
-        fn verify(&self) -> Result<(), Error> {
-            use std::os::unix::fs::MetadataExt;
-            let current = fs::symlink_metadata(&self.path)?;
-            let opened = self.handle.metadata()?;
-            if !current.is_dir()
-                || current.file_type().is_symlink()
-                || current.dev() != opened.dev()
-                || current.ino() != opened.ino()
-            {
-                return Err(Error::UnsafePath(self.path.clone()));
-            }
-            if let Some(parent) = self.path.parent() {
-                let metadata = fs::symlink_metadata(parent)?;
-                if metadata.file_type().is_symlink() || !metadata.is_dir() {
-                    return Err(Error::UnsafePath(parent.to_owned()));
-                }
-            }
-            Ok(())
-        }
-
-        fn replace(&self, temporary: &str) -> Result<(), Error> {
-            self.verify()?;
-            rustix::fs::renameat(&self.handle, temporary, &self.handle, DATA_FILE)
-                .map_err(std::io::Error::from)?;
-            self.handle.sync_all()?;
-            Ok(())
-        }
-
-        fn remove(&self, name: &str) -> Result<(), Error> {
-            rustix::fs::unlinkat(&self.handle, name, rustix::fs::AtFlags::empty())
-                .map_err(std::io::Error::from)?;
-            Ok(())
-        }
+        let mut page = MemoryPage {
+            offset,
+            project: self.project.clone(),
+            directory: self.directory.clone(),
+            exists: false,
+            bytes: 0,
+            key_count: 0,
+            matched_count: 0,
+            entries: Vec::new(),
+        };
+        let Some(store) = self.store()? else { return Ok(page) };
+        let (snapshot, bytes) = store.load_with_size()?;
+        page.exists = bytes > 0;
+        page.bytes = bytes;
+        page.key_count = snapshot.entries.len();
+        let terms: Vec<_> = query.split_whitespace().map(str::to_lowercase).collect();
+        let mut entries: Vec<_> = snapshot
+            .entries
+            .values()
+            .filter_map(|history| history.last())
+            .filter(|entry| filter.includes(snapshot.status(&entry.key)))
+            .filter(|entry| {
+                let text = format!(
+                    "{}\n{}\n{}\n{}",
+                    entry.key,
+                    entry.title,
+                    entry.body,
+                    entry.sources.join("\n")
+                )
+                .to_lowercase();
+                terms.iter().all(|term| text.contains(term))
+            })
+            .collect();
+        entries.sort_by(|a, b| b.created_at.cmp(&a.created_at).then_with(|| a.key.cmp(&b.key)));
+        page.matched_count = entries.len();
+        page.entries = entries
+            .into_iter()
+            .skip(offset)
+            .take(limit)
+            .map(|entry| SearchHit {
+                key: entry.key.clone(),
+                revision: entry.revision,
+                kind: entry.kind,
+                title: entry.title.clone(),
+                excerpt: entry.body.chars().take(400).collect(),
+                created_at: entry.created_at,
+            })
+            .collect();
+        Ok(page)
     }
+}
 
-    #[cfg(unix)]
-    fn path_error(error: rustix::io::Errno, path: &Path) -> Error {
-        match error {
-            rustix::io::Errno::LOOP | rustix::io::Errno::NOTDIR => {
-                Error::UnsafePath(path.to_owned())
-            }
-            error => Error::Io(error.into()),
-        }
-    }
-
-    #[cfg(not(unix))]
-    impl Directory {
-        pub fn create(base: &Path, project: &str) -> Result<Self, Error> {
-            fs::create_dir_all(base)?;
-            let path = base.join(project);
-            match fs::create_dir(&path) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-                Err(error) => return Err(error.into()),
-            }
-            let directory = Self { path };
-            directory.verify()?;
-            Ok(directory)
-        }
-
-        pub fn open(&self, name: &str, mode: OpenMode) -> Result<Option<File>, Error> {
-            self.verify()?;
-            let path = self.path.join(name);
-            match fs::symlink_metadata(&path) {
-                Ok(metadata) if !metadata.is_file() || metadata.file_type().is_symlink() => {
-                    return Err(Error::UnsafePath(path));
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(error.into()),
-            }
-            let mut options = fs::OpenOptions::new();
-            match mode {
-                OpenMode::Read => {
-                    options.read(true);
-                }
-                OpenMode::Create => {
-                    options.read(true).write(true).create(true);
-                }
-                OpenMode::Exclusive => {
-                    options.write(true).create_new(true);
-                }
-            }
-            match options.open(&path) {
-                Ok(file) if file.metadata()?.is_file() => Ok(Some(file)),
-                Ok(_) => Err(Error::UnsafePath(path)),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(error) => Err(error.into()),
-            }
-        }
-
-        fn verify(&self) -> Result<(), Error> {
-            for path in [Some(self.path.as_path()), self.path.parent()].into_iter().flatten() {
-                let metadata = fs::symlink_metadata(path)?;
-                if !metadata.is_dir() || metadata.file_type().is_symlink() {
-                    return Err(Error::UnsafePath(path.to_owned()));
-                }
-            }
-            Ok(())
-        }
-
-        fn replace(&self, temporary: &str) -> Result<(), Error> {
-            self.verify()?;
-            fs::rename(self.path.join(temporary), self.path.join(DATA_FILE))?;
-            Ok(())
-        }
-
-        fn remove(&self, name: &str) -> Result<(), Error> {
-            Ok(fs::remove_file(self.path.join(name))?)
-        }
-    }
+fn initial_incarnation(project: &Path) -> String {
+    portable::digest(project.as_os_str().as_encoded_bytes())
 }
