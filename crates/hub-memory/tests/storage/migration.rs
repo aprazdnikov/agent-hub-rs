@@ -23,6 +23,8 @@ fn fixture() -> Result<(tempfile::TempDir, PathBuf, PathBuf, PathBuf)> {
     Ok((root, base, project, directory))
 }
 fn legacy(project: &std::path::Path) -> Result<Vec<u8>> {
+    // Match the v1 writer, including macOS symlinks and Windows verbatim paths.
+    let project = fs::canonicalize(project)?;
     Ok(serde_json::to_vec(&json!({"schema_version":1,"project":project,"entries":{}}))?)
 }
 #[test]

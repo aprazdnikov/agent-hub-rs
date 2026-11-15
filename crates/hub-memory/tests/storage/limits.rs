@@ -106,7 +106,9 @@ fn failed_snapshot_persist_leaves_verified_backup_and_legacy_data() -> Result {
     let base = root.path().join("memory");
     let store = Store::open(&base, &project, "test")?;
     let dir = MemoryReader::new(&base, &project)?.inspect("", 0, 20)?.directory;
-    let original = serde_json::to_vec(&json!({"schema_version":1,"project":project,"entries":{}}))?;
+    let original = serde_json::to_vec(
+        &json!({"schema_version":1,"project":fs::canonicalize(&project)?,"entries":{}}),
+    )?;
     fs::write(dir.join("memory.json"), &original)?;
     fs::create_dir(dir.join(".memory.tmp"))?;
     assert!(store.write(req()).is_err());
