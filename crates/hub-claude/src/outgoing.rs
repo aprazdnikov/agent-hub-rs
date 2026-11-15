@@ -2,6 +2,7 @@
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD;
+use hub_agent::memory::MemoryMcp;
 use hub_core::domain::{Prompt, SessionId};
 use hub_core::settings::ClaudeSettings;
 use serde_json::{Map, Value, json};
@@ -80,6 +81,16 @@ pub fn object<const N: usize>(fields: [(&str, Value); N]) -> Value {
 /// so a topic behaves like the CLI started in the same directory.
 #[must_use]
 pub fn cli_args(settings: &ClaudeSettings, session: Option<&SessionId>) -> Vec<String> {
+    cli_args_with_memory(settings, session, None)
+}
+
+/// Adds hub-owned memory only to this launch, for both new and resumed sessions.
+#[must_use]
+pub fn cli_args_with_memory(
+    settings: &ClaudeSettings,
+    session: Option<&SessionId>,
+    memory: Option<&MemoryMcp>,
+) -> Vec<String> {
     let mut args: Vec<String> = [
         "--output-format",
         "stream-json",
@@ -105,20 +116,26 @@ pub fn cli_args(settings: &ClaudeSettings, session: Option<&SessionId>) -> Vec<S
     // Replay echoes each prompt when a turn takes it in: prompts sent mid-turn are merged into
     // that turn, so counting results cannot tell when all prompts are answered.
     args.extend(
-        [
-            "--setting-sources=user,project,local",
-            "--replay-user-messages",
-            "--mcp-config",
-            MCP_CONFIG,
-        ]
-        .map(str::to_owned),
+        ["--setting-sources=user,project,local", "--replay-user-messages", "--mcp-config"]
+            .map(str::to_owned),
     );
+    args.push(memory.map_or_else(
+        || MCP_CONFIG.to_owned(),
+        |memory| {
+            json!({"mcpServers":{
+                MCP_SERVER:{"type":"sdk","name":MCP_SERVER},
+                hub_agent::memory::SERVER_NAME:memory.claude_server(),
+            }})
+            .to_string()
+        },
+    ));
     args
 }
 
 #[cfg(test)]
 mod tests {
-    use hub_core::domain::{Image, ImageMediaType};
+    use hub_agent::memory::MemoryMcp;
+    use hub_core::domain::{AbsolutePath, BackendKind, Image, ImageMediaType};
     use hub_core::settings::{Draft, PermissionMode};
     use serde_json::json;
 
@@ -221,5 +238,30 @@ mod tests {
         assert!(joined.contains("--model claude-opus-5-5"));
         assert!(joined.contains("--max-budget-usd 2.50"));
         assert!(args.contains(&"--resume=abc".to_owned()));
+    }
+
+    #[rstest::rstest]
+    #[case::new(None)]
+    #[case::resumed(Some("existing-session"))]
+    fn memory_mcp_is_added_without_replacing_chat_tools(#[case] saved: Option<&str>) {
+        let project = AbsolutePath::new(std::env::temp_dir().join("project with spaces")).unwrap();
+        let program = project.as_path().join("hub app $(literal)");
+        let memory = MemoryMcp::new(&program, &project, BackendKind::Claude).unwrap();
+        let session = saved.and_then(SessionId::parse);
+        let args =
+            cli_args_with_memory(&settings(Draft::default()), session.as_ref(), Some(&memory));
+        let config = args
+            .windows(2)
+            .find(|pair| pair.first().is_some_and(|flag| flag == "--mcp-config"))
+            .and_then(|pair| pair.get(1))
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(config).unwrap(),
+            json!({"mcpServers":{
+                "agent-hub":{"type":"sdk","name":"agent-hub"},
+                "agent-hub-memory":{"type":"stdio","command":program.to_str().unwrap(),
+                    "args":["--memory-mcp","--project-dir",project.as_path().to_str().unwrap(),"--actor","claude"],"env":{}}
+            }})
+        );
     }
 }

@@ -3,6 +3,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use hub_agent::mcp_http::SERVER_NAME;
+use hub_agent::memory::MemoryMcp;
 use hub_agent::rpc::{Notification, RpcError};
 use hub_agent::tools::TOOL_SUMMARY_LIMIT;
 use hub_core::domain::{AgentEvent, Finished, Prompt, SessionId, ToolUse, Usage};
@@ -47,9 +48,17 @@ pub fn prompt_params(session: &SessionId, prompt: &Prompt) -> Value {
     json!({"sessionId": session.as_str(), "prompt": guidance.chain(images).chain(text).collect::<Vec<_>>()})
 }
 
-pub fn session_params(cwd: &std::path::Path, url: &str, token: &str) -> Value {
-    json!({"cwd": cwd.display().to_string(), "mcpServers": [{"type": "http", "name": SERVER_NAME,
-        "url": url, "headers": [{"name": "Authorization", "value": format!("Bearer {token}")}]}]})
+pub fn session_params(
+    cwd: &std::path::Path,
+    url: &str,
+    token: &str,
+    memory: Option<&MemoryMcp>,
+) -> Value {
+    let servers = std::iter::once(json!({"type": "http", "name": SERVER_NAME,
+        "url": url, "headers": [{"name": "Authorization", "value": format!("Bearer {token}")}]}))
+    .chain(memory.map(MemoryMcp::acp_server))
+    .collect::<Vec<_>>();
+    json!({"cwd": cwd.display().to_string(), "mcpServers": servers})
 }
 
 pub fn session_id(result: &Value) -> Result<SessionId, RpcError> {

@@ -1,0 +1,3 @@
+mod memory {
+    mod cli;
+}

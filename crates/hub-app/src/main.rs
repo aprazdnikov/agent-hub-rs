@@ -27,6 +27,16 @@ const UPDATE_COMMANDS: usize = 4;
 const RUNTIME_GRACE: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().is_some_and(|arg| arg == "--memory-mcp") {
+        return match hub_memory::run_cli(args.collect()) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("agent-hub memory: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -86,7 +96,8 @@ fn run() -> anyhow::Result<()> {
     let window_exit = Arc::clone(&exit);
     let core = runtime.handle().clone();
     let window = commands.clone();
-    let connector = TelegramConnector::new(home.clone(), dirs.topics());
+    let connector =
+        TelegramConnector::new(home.clone(), dirs.topics()).with_memory_program(program.clone());
     let logs_dir = dirs.logs();
     let ui_settings = dirs.ui_settings();
     let options = window_options();

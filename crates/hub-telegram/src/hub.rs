@@ -69,6 +69,18 @@ pub trait Agents: Send + Sync + 'static {
         settings: Arc<Settings>,
     ) -> BoxFuture<'a, mpsc::Receiver<Prompt>>;
 
+    /// A history-only handoff turn. Production implementations must omit project memory.
+    fn summarize<'a>(
+        &'a self,
+        session: &'a TopicSession,
+        prompt: Prompt,
+        inbox: mpsc::Receiver<Prompt>,
+        conversation: Conversation,
+        settings: Arc<Settings>,
+    ) -> BoxFuture<'a, mpsc::Receiver<Prompt>> {
+        self.run(session, prompt, inbox, conversation, settings)
+    }
+
     /// The backend's session archive once its CLI is found and new enough; the error is the
     /// text shown to the user.
     fn archive<'a>(

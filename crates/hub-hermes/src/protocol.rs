@@ -47,9 +47,18 @@ pub fn prompt_params(session: &SessionId, prompt: &Prompt) -> Value {
     json!({"sessionId": session.as_str(), "prompt": guidance.chain(images).chain(text).collect::<Vec<_>>()})
 }
 
-pub fn session_params(cwd: &std::path::Path, url: &str, token: &str) -> Value {
-    json!({"cwd": cwd.display().to_string(), "mcpServers": [{"type": "http", "name": SERVER_NAME,
-        "url": url, "headers": [{"name": "Authorization", "value": format!("Bearer {token}")}]}]})
+#[must_use]
+pub fn session_params_with_memory(
+    cwd: &std::path::Path,
+    url: &str,
+    token: &str,
+    memory: Option<&hub_agent::memory::MemoryMcp>,
+) -> Value {
+    let servers = std::iter::once(json!({"type": "http", "name": SERVER_NAME,
+        "url": url, "headers": [{"name": "Authorization", "value": format!("Bearer {token}")}]}))
+    .chain(memory.map(hub_agent::memory::MemoryMcp::acp_server))
+    .collect::<Vec<_>>();
+    json!({"cwd": cwd.display().to_string(), "mcpServers": servers})
 }
 
 pub fn session_id(result: &Value) -> Result<SessionId, RpcError> {

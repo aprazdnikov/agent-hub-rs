@@ -46,6 +46,8 @@ pub enum AgentError {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
+    #[error("Не удалось найти исполняемый файл сервера памяти: {0}")]
+    MemoryProgram(std::io::Error),
     #[error("Не удалось проверить локальные файлы")]
     LocalCheck,
     #[error(
@@ -213,13 +215,21 @@ pub struct TelegramConnector {
     home: PathBuf,
     topics: PathBuf,
     results: Arc<crate::results::FileResults>,
+    memory_program: Option<PathBuf>,
 }
 
 impl TelegramConnector {
     #[must_use]
     pub fn new(home: PathBuf, topics: PathBuf) -> Self {
         let results = Arc::new(crate::results::FileResults::new(&topics));
-        Self { home, topics, results }
+        Self { home, topics, results, memory_program: None }
+    }
+
+    /// Capture the running executable before an updater can replace it.
+    #[must_use]
+    pub fn with_memory_program(mut self, program: PathBuf) -> Self {
+        self.memory_program = Some(program);
+        self
     }
 }
 
@@ -239,6 +249,7 @@ impl Connector for TelegramConnector {
             | StartError::LocalTimeout
             | StartError::Agent(AgentError::LocalTimeout) => true,
             StartError::Telegram(telegram::StartError::InvalidToken)
+            | StartError::MemoryProgram(_)
             | StartError::LocalCheck
             | StartError::Workspace(_)
             | StartError::Topics(_)
@@ -253,7 +264,12 @@ impl Connector for TelegramConnector {
         let home = self.home.clone();
         let topic_path = self.topics.clone();
         let results = Arc::clone(&self.results);
+        let memory_program = self.memory_program.clone();
         Box::pin(async move {
+            let memory_program = match memory_program {
+                Some(program) => program,
+                None => std::env::current_exe().map_err(StartError::MemoryProgram)?,
+            };
             let current = Arc::clone(&settings.borrow());
             let root = current.workspace_root.clone();
             let source = topic_path.clone();
@@ -297,7 +313,9 @@ impl Connector for TelegramConnector {
                     action_runner: Arc::new(LocalActionRunner),
                     results,
                     doctor_runner: Arc::new(crate::doctor::LocalDoctor::new(home.clone())),
-                    agents: Arc::new(HubAgents::new(settings.clone())),
+                    agents: Arc::new(
+                        HubAgents::new(settings.clone()).with_memory_program(memory_program),
+                    ),
                     messenger,
                     settings,
                     topics,

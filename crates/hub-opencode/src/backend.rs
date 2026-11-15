@@ -10,6 +10,7 @@ use futures::StreamExt as _;
 use hub_agent::cli::hide_window;
 use hub_agent::conversation::Conversation;
 use hub_agent::mcp_http::McpHttpServer;
+use hub_agent::memory::MemoryMcp;
 use hub_agent::rpc::{
     self, Connection, Envelope, Handler, Notification, RpcClient, RpcError, Wire,
 };
@@ -40,12 +41,19 @@ mod tests;
 pub struct OpencodeBackend {
     cli: PathBuf,
     settings: OpencodeSettings,
+    memory: Option<MemoryMcp>,
 }
 
 impl OpencodeBackend {
     #[must_use]
     pub fn new(cli: PathBuf, settings: OpencodeSettings) -> Self {
-        Self { cli, settings }
+        Self { cli, settings, memory: None }
+    }
+
+    #[must_use]
+    pub fn with_memory(mut self, memory: Option<MemoryMcp>) -> Self {
+        self.memory = memory;
+        self
     }
 
     /// Runs one conversation, returning queued prompts not yet consumed.
@@ -90,6 +98,7 @@ impl OpencodeBackend {
             client: &process.client,
             notifications: &mut process.notifications,
             tools: &tools,
+            memory: self.memory.as_ref(),
             session,
             settings: &self.settings,
             gate: &gate,
@@ -115,16 +124,19 @@ struct SessionControl<'a> {
     client: &'a RpcClient,
     notifications: &'a mut mpsc::UnboundedReceiver<Notification>,
     tools: &'a McpHttpServer,
+    memory: Option<&'a MemoryMcp>,
     session: &'a TopicSession,
     settings: &'a OpencodeSettings,
     gate: &'a Gate,
 }
 
 async fn open(control: SessionControl<'_>) -> Result<Opened, RpcError> {
-    let SessionControl { client, notifications, tools, session, settings, gate: _ } = control;
+    let SessionControl { client, notifications, tools, memory, session, settings, gate: _ } =
+        control;
     let initialized = client.request("initialize", protocol::initialize_params()).await?;
     let capabilities = Capabilities::parse(&initialized)?;
-    let mut params = protocol::session_params(session.cwd.as_path(), tools.url(), tools.token());
+    let mut params =
+        protocol::session_params(session.cwd.as_path(), tools.url(), tools.token(), memory);
     let id = match &session.session {
         Some(saved) => {
             if !capabilities.load {
@@ -172,8 +184,8 @@ async fn serve(
     inbox: &mut mpsc::Receiver<Prompt>,
     conversation: &Conversation,
 ) -> Result<(), RpcError> {
-    let SessionControl { client, notifications, tools, session, settings, gate } = control;
-    let control = SessionControl { client, notifications, tools, session, settings, gate };
+    let SessionControl { client, notifications, tools, memory, session, settings, gate } = control;
+    let control = SessionControl { client, notifications, tools, memory, session, settings, gate };
     let opened = tokio::select! {
         biased;
         () = conversation.cancel.cancelled() => return Ok(()),

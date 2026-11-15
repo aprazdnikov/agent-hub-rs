@@ -4,6 +4,7 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use hub_agent::channel::UserChannel;
 use hub_agent::conversation::{Conversation, Limits};
+use hub_agent::memory::MemoryMcp;
 use hub_core::domain::{
     AbsolutePath, AgentEvent, BackendKind, Decision, Denied, FileDelivery, Finished, OutgoingFile,
     Prompt, Question, QuestionsOutcome, SessionId, ToolRequest, ToolUse, TopicSession, Usage,
@@ -111,6 +112,42 @@ async fn loads_saved_session_without_replaying_old_events() {
         methods(&fixture),
         ["initialize", "session/load", "session/set_model", "session/set_mode", "session/prompt"]
     );
+}
+
+#[rstest]
+#[case(None, "session/new")]
+#[case(Some("s-1"), "session/load")]
+#[tokio::test]
+async fn memory_is_registered_on_new_and_loaded_sessions(
+    #[case] saved: Option<&str>,
+    #[case] method: &str,
+) {
+    let fixture = Fixture::new("load");
+    let session = topic(&fixture, saved);
+    let memory =
+        MemoryMcp::new(&fixture.root().join("agent-hub"), &session.cwd, BackendKind::Hermes)
+            .unwrap();
+    let expected = memory.acp_server();
+    let (conversation, _events) = conversation();
+    let (_send, inbox) = mpsc::channel(4);
+    let backend = HermesBackend::new(fixture.cli.clone(), settings(HermesApproval::Default))
+        .with_memory(Some(memory));
+    let _inbox = tokio::time::timeout(
+        Duration::from_secs(15),
+        backend.run(&session, prompt("hello"), inbox, conversation),
+    )
+    .await
+    .unwrap();
+    let records = fixture.records();
+    let params = records
+        .iter()
+        .find(|record| record.get("method") == Some(&json!(method)))
+        .unwrap()
+        .get("params")
+        .unwrap();
+    let servers = params.get("mcpServers").unwrap().as_array().unwrap();
+    assert_eq!(servers.get(1), Some(&expected));
+    assert_eq!(servers.first().unwrap().get("name"), Some(&json!("agent-hub")));
 }
 
 #[rstest]
