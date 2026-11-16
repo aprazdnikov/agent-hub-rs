@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 use tokio::sync::oneshot;
 
+mod context;
 mod lifecycle;
 
 type ReadResult = (u64, Result<View, String>);
@@ -31,6 +32,10 @@ pub struct MemoryView {
 }
 impl MemoryView {
     fn invalidate(&mut self) {
+        self.admin.clear_context();
+        self.invalidate_result();
+    }
+    fn invalidate_result(&mut self) {
         self.admin.clear();
         self.generation = self.generation.wrapping_add(1);
         self.result = None;
@@ -94,6 +99,18 @@ impl MemoryView {
                             Ok(view) => {
                                 if let View::List(page) = &view {
                                     self.offset = page.offset;
+                                }
+                                if let View::Admin(panel) = &view
+                                    && let hub_telegram::memory::lifecycle::Panel::ContextReady(
+                                        packet,
+                                    ) = panel.as_ref()
+                                {
+                                    if !self.admin.context_matches(packet) {
+                                        self.error = Some("Поручение изменилось. Соберите пакет заново перед копированием.".into());
+                                        self.result = None;
+                                        return;
+                                    }
+                                    ctx.copy_text(packet.text().to_owned());
                                 }
                                 self.result = Some(view);
                                 self.error = None;
@@ -250,7 +267,7 @@ impl MemoryView {
         ui.horizontal(|ui| {
             ui.label("Поиск:");
             if ui.text_edit_singleline(&mut self.query).changed() {
-                self.invalidate();
+                self.invalidate_result();
             }
             if ui.add_enabled(can_browse, egui::Button::new("Найти / обновить")).clicked()
             {
@@ -435,6 +452,7 @@ mod tests {
         let mut view = MemoryView {
             pending: Some(rx),
             result: Some(View::List(hub_memory::MemoryPage {
+                bound_projects: Vec::new(),
                 offset: 0,
                 project: PathBuf::from("/repo"),
                 directory: PathBuf::from("/store"),
@@ -488,6 +506,82 @@ mod tests {
             );
         }
         assert_eq!(view.offset, 0);
+    }
+
+    #[test]
+    fn context_selection_survives_search_but_not_project_change() {
+        let ctx = egui::Context::default();
+        let mut view = MemoryView {
+            project: "/repo".into(),
+            result: Some(View::Admin(Box::new(hub_telegram::memory::lifecycle::Panel::Details(
+                hub_memory::EntryDetails {
+                    entry: hub_memory::Entry {
+                        key: "pilot".into(),
+                        revision: 1,
+                        kind: hub_memory::EntryKind::Progress,
+                        title: "Pilot".into(),
+                        body: "body".into(),
+                        sources: vec!["test".into()],
+                        author: "test".into(),
+                        created_at: 0,
+                    },
+                    status: hub_memory::MemoryStatus::Active,
+                    revisions: vec![1],
+                    history_pruned: false,
+                },
+            )))),
+            ..Default::default()
+        };
+        let frame = |view: &mut MemoryView, events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 1800.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| view.show(ui, &Snapshot::default(), Path::new("/"), &mut |_| {}),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        frame(&mut view, Vec::new());
+        let output = frame(&mut view, Vec::new());
+        let position = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text)
+                    if text.galley.text() == "Добавить ревизию в пакет контекста" =>
+                {
+                    Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        for pressed in [true, false] {
+            frame(
+                &mut view,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        view.invalidate_result();
+        let output = frame(&mut view, Vec::new());
+        assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Text(text) if text.galley.text().contains("Пакет контекста следующему агенту (1/20)"))));
+        view.project = "/other".into();
+        view.invalidate();
+        let output = frame(&mut view, Vec::new());
+        assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Text(text) if text.galley.text().contains("Пакет контекста следующему агенту (0/20)"))));
     }
 
     #[test]

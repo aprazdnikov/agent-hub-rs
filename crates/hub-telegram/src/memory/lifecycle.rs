@@ -1,14 +1,23 @@
 //! Shared model-free administration used by the desktop and Telegram.
 use super::memory_error;
 use hub_memory::{
-    AdminAction, AdminPreview, EntryDetails, ImportChoice, ImportPreview, MemoryExport,
-    MemoryOverview, MemoryReader, SnapshotToken, StatusFilter, Store, VerifiedExport,
+    AdminAction, AdminPreview, BindingMode, BindingPreview, EntryDetails, ImportChoice,
+    ImportPreview, MemoryExport, MemoryOverview, MemoryReader, SnapshotToken, StatusFilter, Store,
+    VerifiedExport,
 };
 use std::{collections::BTreeMap, path::PathBuf};
 
 pub const AUTO_WARNING: &str = "Старые ревизии будут удаляться без дополнительного подтверждения. Без экспорта восстановить их нельзя. Сохраняются последние 32 ревизии; при заполнении 8 МиБ удаляется старая история, включая архив. Последняя ревизия каждого ключа сохраняется.";
 #[derive(Clone, Debug)]
 pub enum Action {
+    ContextHelp,
+    Context(hub_memory::ContextRequest),
+    ValidateContext(hub_memory::ContextPacket),
+    Bind {
+        source: PathBuf,
+        mode: BindingMode,
+    },
+    ApplyBinding(BindingPreview),
     ReopenImport(ImportPreview),
     Compare {
         preview: ImportPreview,
@@ -43,6 +52,9 @@ pub enum Action {
 }
 #[derive(Clone, Debug)]
 pub enum Panel {
+    Context(hub_memory::ContextPacket),
+    ContextReady(hub_memory::ContextPacket),
+    Binding(BindingPreview),
     Comparison {
         preview: ImportPreview,
         key: String,
@@ -76,8 +88,28 @@ fn execute(
     cwd: &std::path::Path,
     action: &Action,
 ) -> Result<Panel, hub_memory::Error> {
+    if matches!(action, Action::ContextHelp) {
+        return Ok(Panel::Notice(super::context::HELP.into()));
+    }
+    if let Action::Bind { source, mode } = action {
+        return Ok(Panel::Binding(BindingPreview::prepare(base, source, cwd, *mode)?));
+    }
     let reader = MemoryReader::new(base, cwd)?;
     match action {
+        Action::Context(input) => Ok(Panel::Context(reader.context(input)?)),
+        Action::ValidateContext(packet) => {
+            reader.validate_context(packet)?;
+            Ok(Panel::ContextReady(packet.clone()))
+        }
+        Action::ApplyBinding(preview) => {
+            if preview.target() != std::fs::canonicalize(cwd)?
+                || preview.base() != std::fs::canonicalize(base)?
+            {
+                return Err(hub_memory::Error::ProjectMismatch);
+            }
+            preview.apply()?;
+            Ok(Panel::Notice("Привязка сохранена. Обновите список и откройте новые агентские сессии в целевом каталоге.".into()))
+        }
         Action::ReopenImport(preview) => execute(
             base,
             cwd,
@@ -208,5 +240,41 @@ pub fn record_text(record: &hub_memory::ImportRecord<'_>, revision: Option<u32>)
         record.history_pruned,
         record.history.iter().map(|entry| entry.revision).collect::<Vec<_>>(),
         super::entry_text(entry)
+    )
+}
+
+#[must_use]
+pub fn binding_text(preview: &BindingPreview) -> String {
+    let mode = match preview.mode() {
+        BindingMode::Move => "Перенос: прежний каталог будет отключён от памяти.",
+        BindingMode::Share => "Совместная память: оба каталога останутся подключены.",
+    };
+    format!(
+        "{mode}\nИсточник: {}\nНазначение: {}\nID памяти: {}\nОбщими будут ВСЕ записи, ревизии, статусы и политика очистки, включая последующие изменения и удаления. Чаты и настройки сессий не переносятся. Для копирования отдельных записей используйте экспорт/импорт.",
+        preview.source().display(),
+        preview.target().display(),
+        preview.project_id()
+    )
+}
+
+#[must_use]
+pub fn binding_scope(projects: &[PathBuf]) -> String {
+    if projects.len() <= 1 {
+        return "Память изолирована: один каталог.".into();
+    }
+    let listed = projects
+        .iter()
+        .take(10)
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+    format!(
+        "Общая память: {} каталогов. Запись, очистка и удаление затрагивают всех.\n{listed}{}",
+        projects.len(),
+        if projects.len() > 10 {
+            "\nПоказаны первые 10 каталогов."
+        } else {
+            ""
+        }
     )
 }

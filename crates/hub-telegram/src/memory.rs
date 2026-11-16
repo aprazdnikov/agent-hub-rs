@@ -14,6 +14,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 mod admin;
+pub mod context;
 pub mod lifecycle;
 mod portable;
 
@@ -64,16 +65,17 @@ pub fn read(
     cwd: &std::path::Path,
     request: &Request,
 ) -> Result<View, String> {
+    if let Request::Admin(action) = request {
+        return lifecycle::run(base, cwd, action).map(|panel| View::Admin(Box::new(panel)));
+    }
     let reader = MemoryReader::new(base, cwd).map_err(memory_error)?;
     match request {
-        Request::Admin(action) => {
-            lifecycle::run(base, cwd, action).map(|panel| View::Admin(Box::new(panel)))
-        }
         Request::List { query, offset } => {
             reader.inspect(query, *offset, 20).map(View::List).map_err(memory_error)
         }
         Request::Get { key, revision } => read_entry(&reader, key, *revision).map(View::Entry),
-        Request::Confirm(_)
+        Request::Admin(_)
+        | Request::Confirm(_)
         | Request::Set(_)
         | Request::ExportConfirm(_)
         | Request::ExportSend(_)
@@ -95,28 +97,21 @@ fn read_entry(reader: &MemoryReader, key: &str, revision: Option<u32>) -> Result
 }
 
 fn memory_error(error: Error) -> String {
-    match error {
-        Error::RevisionUnavailable{key,revision,available,pruned} => format!("У записи «{key}» недоступна ревизия {revision}. Доступны: {available:?}. История сокращена: {pruned}."),
-        Error::Recreated => "Хранилище пересоздано. Запустите новую сессию.".into(),
-        Error::StalePreview => "Данные изменились. Обновите предварительный просмотр.".into(),
-        Error::Archived => "Запись в архиве. Сначала верните её в активные.".into(),
-        Error::Deleted => "Ключ удалён. Восстановление возможно импортом под новым ключом.".into(),
-        Error::NotFound { key, .. } => format!("Запись «{key}» не найдена в памяти выбранного проекта. Проверьте ключ и каталог проекта."),
-        Error::Busy => "Хранилище памяти занято. Повторите попытку позже.".into(),
-        Error::Corrupt(_) => "Файл памяти повреждён или имеет неверную структуру. Данные не изменены; проверьте резервную копию.".into(),
-        Error::UnsupportedVersion(version) => format!("Формат памяти версии {version} не поддерживается этой сборкой приложения."),
-        Error::ProjectMismatch => "Хранилище принадлежит другому проекту. Проверьте выбранный каталог.".into(),
-        Error::UnsafePath(path) => format!("Небезопасный путь хранилища: {}. Проверьте ссылки и тип файла.", path.display()),
-        Error::Io(error) => format!("Не удалось прочитать память: {error}. Проверьте доступность каталога и права доступа."),
-        Error::LimitExceeded(limit) => format!("Превышен лимит памяти: {limit}."),
-        Error::InvalidInput(reason) => format!("Некорректный запрос памяти: {reason}."),
-        Error::Conflict { expected, actual, .. } => format!("Запись обновилась: ожидалась ревизия {expected}, текущая — {actual}. Обновите данные."),
-    }
+    error.user_message()
 }
 
 pub fn parse(args: &str) -> Result<Request, String> {
     let mut parts = args.split_whitespace();
     match parts.next() {
+        Some("context") => {
+            let form = args.trim_start().strip_prefix("context").unwrap_or("").trim();
+            if form.is_empty() {
+                Ok(Request::Admin(Box::new(lifecycle::Action::ContextHelp)))
+            } else {
+                context::parse(form)
+                    .map(|input| Request::Admin(Box::new(lifecycle::Action::Context(input))))
+            }
+        }
         None => Ok(Request::List { query: String::new(), offset: 0 }),
         Some("search") => {
             Ok(Request::List { query: parts.collect::<Vec<_>>().join(" "), offset: 0 })
@@ -496,6 +491,12 @@ impl Browser {
         {
             return;
         }
+        if let Ok(View::Admin(panel)) = &result
+            && let lifecycle::Panel::ContextReady(packet) = panel.as_ref()
+        {
+            self.deliver_context(binding, packet.clone());
+            return;
+        }
         if let Ok(View::ExportReady { receipt, token, keep, reset }) = result {
             self.deliver_export(binding, receipt, token, keep, reset);
             return;
@@ -719,6 +720,7 @@ mod tests {
                     request: Request::List { query: String::new(), offset: 0 },
                 },
                 result: Ok(View::List(MemoryPage {
+                    bound_projects: Vec::new(),
                     project: root.clone(),
                     directory: root.clone(),
                     offset: 0,

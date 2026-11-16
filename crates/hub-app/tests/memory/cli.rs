@@ -157,3 +157,63 @@ async fn competing_memory_processes_preserve_both_writes() -> anyhow::Result<()>
     assert_eq!(keys, std::collections::BTreeSet::from([("left", 1), ("right", 1)]));
     Ok(())
 }
+
+#[tokio::test]
+async fn binding_cli_and_independent_mcp_process_resolve_same_project() -> anyhow::Result<()> {
+    let root = tempfile::tempdir()?;
+    let source = root.path().join("source with spaces");
+    let target = root.path().join("project");
+    let base = root.path().join("memory-data");
+    std::fs::create_dir(&source)?;
+    std::fs::create_dir(&target)?;
+    hub_memory::Store::open(&base, &source, "test")?.write(hub_memory::WriteRequest {
+        key: "bound".into(),
+        expected_revision: 0,
+        kind: hub_memory::EntryKind::Context,
+        title: "bound".into(),
+        body: "Shared through binding".into(),
+        sources: vec!["test".into()],
+    })?;
+    let invoke_binding = |token: Option<String>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_agent-hub"));
+        command
+            .arg("--memory-project")
+            .arg("share")
+            .arg("--from")
+            .arg(&source)
+            .arg("--to")
+            .arg(&target)
+            .arg("--store-dir")
+            .arg(&base)
+            .env_remove("DISPLAY")
+            .env_remove("WAYLAND_DISPLAY")
+            .kill_on_drop(true);
+        if let Some(token) = token {
+            command.arg("--confirm").arg(token);
+        }
+        command.output()
+    };
+    let output = tokio::time::timeout(Duration::from_secs(15), invoke_binding(None)).await??;
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(!base.join(".projects").exists());
+    let text = String::from_utf8(output.stdout)?;
+    let token = text
+        .split("--confirm ")
+        .last()
+        .ok_or_else(|| anyhow::anyhow!("missing confirmation"))?
+        .trim()
+        .to_owned();
+    let output =
+        tokio::time::timeout(Duration::from_secs(15), invoke_binding(Some(token))).await??;
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    let mut calls = handshake();
+    calls.push(json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"memory_get","arguments":{"key":"bound"}}}));
+    let replies = responses(&invoke(root.path(), &calls).await?)?;
+    let body = replies
+        .iter()
+        .find(|reply| reply.get("id") == Some(&json!(2)))
+        .and_then(|reply| reply.pointer("/result/structuredContent/body"));
+    assert_eq!(body, Some(&json!("Shared through binding")));
+    assert!(!root.path().join("config").exists());
+    Ok(())
+}

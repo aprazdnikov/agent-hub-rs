@@ -397,3 +397,46 @@ fn direct_get_exposes_archived_status_and_available_revisions() -> TestResult {
     assert_eq!(payload["revision"], 1);
     Ok(())
 }
+
+#[test]
+fn all_backend_actors_read_bound_project_and_mcp_cannot_change_binding() -> TestResult {
+    let temp = fixture()?;
+    let source = temp.path().join("project");
+    let target = temp.path().join("worktree");
+    let base = temp.path().join("memory");
+    std::fs::create_dir(&target)?;
+    exchange(
+        store(&temp, "codex")?,
+        &[initialization("2025-11-25"), initialized(), call(2, "memory_write", &write_args())],
+    )?;
+    hub_memory::BindingPreview::prepare(&base, &source, &target, hub_memory::BindingMode::Share)?
+        .apply()?;
+    for actor in ["claude", "codex", "qwen", "hermes", "opencode", "external"] {
+        let replies = exchange(
+            Store::open(&base, &target, actor)?,
+            &[
+                initialization("2025-11-25"),
+                initialized(),
+                call(2, "memory_get", &json!({"key":"architecture"})),
+                json!({"jsonrpc":"2.0","id":3,"method":"tools/list"}),
+            ],
+        )?;
+        let entry = replies
+            .iter()
+            .find(|reply| reply.get("id") == Some(&json!(2)))
+            .and_then(|reply| reply.pointer("/result/structuredContent"));
+        assert_eq!(entry.and_then(|e| e.get("revision")), Some(&json!(1)));
+        let tools = replies
+            .iter()
+            .find(|reply| reply.get("id") == Some(&json!(3)))
+            .and_then(|reply| reply.pointer("/result/tools"))
+            .and_then(Value::as_array)
+            .ok_or("missing tools")?;
+        assert_eq!(tools.len(), 3);
+        assert!(tools.iter().all(|tool| matches!(
+            tool.get("name").and_then(Value::as_str),
+            Some("memory_get" | "memory_write" | "memory_search")
+        )));
+    }
+    Ok(())
+}

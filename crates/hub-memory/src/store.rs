@@ -1,6 +1,5 @@
 use std::{
     collections::BTreeMap,
-    fmt::Write as FmtWrite,
     fs::{self, File, TryLockError},
     io::Read,
     path::{Path, PathBuf},
@@ -15,6 +14,8 @@ use crate::{
     CleanupPolicy, CleanupSummary, Entry, Error, MemoryStatus, SearchHit, SnapshotToken,
     StatusFilter, WriteRequest,
 };
+pub(crate) mod bindings;
+pub(crate) mod context;
 mod lifecycle;
 pub(crate) mod portable;
 
@@ -32,6 +33,7 @@ pub struct Store {
     project: PathBuf,
     actor: String,
     incarnation: String,
+    binding: bindings::Location,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -68,17 +70,16 @@ impl Store {
         if !project.is_dir() {
             return Err(Error::InvalidInput("project must be an existing directory"));
         }
-        let identity =
-            project.to_str().ok_or(Error::InvalidInput("project path must be valid UTF-8"))?;
-        let mut project_id = String::with_capacity(64);
-        for byte in Sha256::digest(identity.as_bytes()) {
-            write!(project_id, "{byte:02x}")
-                .map_err(|_| Error::Corrupt("could not format project identity"))?;
-        }
-        let base = filesystem::destination(base)?;
+        let binding = bindings::Location::resolve(base, &project)?;
+        let directory = binding.directory()?;
+        let project_id = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or(Error::Corrupt("invalid project ID"))?;
         let mut store = Self {
-            directory: Arc::new(filesystem::Directory::create(&base, &project_id)?),
-            project,
+            directory: Arc::new(filesystem::Directory::create(&binding.base, project_id)?),
+            project: binding.identity.clone(),
+            binding,
             actor: actor.to_owned(),
             incarnation: String::new(),
         };
@@ -266,6 +267,7 @@ impl Store {
     }
 
     fn load_with_size(&self) -> Result<(Snapshot, u64), Error> {
+        self.binding.check()?;
         let Some(file) = self.directory.open(DATA_FILE, filesystem::OpenMode::Read)? else {
             return Ok((
                 Snapshot {
@@ -465,10 +467,12 @@ mod filesystem;
 pub struct MemoryReader {
     project: PathBuf,
     directory: PathBuf,
+    binding: bindings::Location,
 }
 
 #[derive(Clone, Debug)]
 pub struct MemoryPage {
+    pub bound_projects: Vec<PathBuf>,
     pub offset: usize,
     pub project: PathBuf,
     pub directory: PathBuf,
@@ -485,20 +489,16 @@ impl MemoryReader {
         if !project.is_dir() {
             return Err(Error::InvalidInput("project must be an existing directory"));
         }
-        let identity =
-            project.to_str().ok_or(Error::InvalidInput("project path must be valid UTF-8"))?;
-        let mut hash = String::with_capacity(64);
-        for byte in Sha256::digest(identity.as_bytes()) {
-            write!(hash, "{byte:02x}")
-                .map_err(|_| Error::Corrupt("could not format project identity"))?;
-        }
-        Ok(Self { project, directory: filesystem::destination(base)?.join(hash) })
+        let binding = bindings::Location::resolve(base, &project)?;
+        Ok(Self { directory: binding.directory()?, project, binding })
     }
 
     fn store(&self) -> Result<Option<Store>, Error> {
+        self.binding.check()?;
         Ok(filesystem::Directory::existing(&self.directory)?.map(|directory| Store {
             directory: Arc::new(directory),
-            project: self.project.clone(),
+            project: self.binding.identity.clone(),
+            binding: self.binding.clone(),
             actor: "viewer".into(),
             incarnation: String::new(),
         }))
@@ -526,6 +526,7 @@ impl MemoryReader {
             return Err(Error::InvalidInput("query must be <=512 bytes and limit 1..20"));
         }
         let mut page = MemoryPage {
+            bound_projects: self.binding.projects()?,
             offset,
             project: self.project.clone(),
             directory: self.directory.clone(),

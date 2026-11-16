@@ -18,7 +18,7 @@ pub(super) fn parse_admin(args: &str) -> Result<Request, String> {
         [status @ ("archive"|"stale"|"activate"),key]=>Action::Preview(AdminAction::SetStatus{key:(*key).into(),status:match *status {"archive"=>MemoryStatus::Archived,"stale"=>MemoryStatus::Stale,_=>MemoryStatus::Active}}),
         ["delete",keys @ ..] if !keys.is_empty()=>Action::Preview(AdminAction::Delete{keys:keys.iter().map(|s|(*s).into()).collect()}),
         ["prune",key,numbers @ ..] if !numbers.is_empty()=>Action::Preview(AdminAction::Prune{revisions:std::collections::BTreeMap::from([((*key).into(),numbers.iter().map(|s|s.parse::<u32>()).collect::<Result<Vec<_>,_>>().map_err(|_|"Укажите номера ревизий через пробел")?)])}),
-        _=>return Err("/memory · search ТЕКСТ · get КЛЮЧ [РЕВИЗИЯ] · status · filter active|stale|archived|all · policy auto|manual · archive|stale|activate КЛЮЧ · prune КЛЮЧ РЕВИЗИИ · delete КЛЮЧИ · export · import · reset · cancel".into()),
+        _=>return Err("/memory · search ТЕКСТ · get КЛЮЧ [РЕВИЗИЯ] · status · filter active|stale|archived|all · policy auto|manual · archive|stale|activate КЛЮЧ · prune КЛЮЧ РЕВИЗИИ · delete КЛЮЧИ · export · import · reset · context · cancel".into()),
     };
     Ok(admin(action))
 }
@@ -30,6 +30,29 @@ impl Browser {
         keyboard: &mut Vec<Vec<Button>>,
     ) -> String {
         match panel {
+            Panel::Context(packet) => {
+                keyboard.push(vec![self.button(
+                    "Проверить и получить текст пакета".into(),
+                    Binding {
+                        request: admin(Action::ValidateContext(packet.clone())),
+                        ..binding.clone()
+                    },
+                )]);
+                super::context::summary(packet)
+            }
+            Panel::ContextReady(packet) => packet.text().into(),
+
+            Panel::Binding(preview) => {
+                keyboard.push(vec![self.button(
+                    "Подтвердить привязку".into(),
+                    Binding {
+                        request: admin(Action::ApplyBinding(preview.clone())),
+                        ..binding.clone()
+                    },
+                )]);
+                lifecycle::binding_text(preview)
+            }
+
             Panel::Comparison { preview, key, local_revision, incoming_revision } => self
                 .comparison_card(
                     preview,
@@ -150,8 +173,9 @@ impl Browser {
             )]);
         }
         format!(
-            "Проект: {}\nОчистка: {}\nКлючи: {}/500 · отметки удаления: {}/4096 · {} / 8388608 байт\nПоследняя очистка: {:?}\nФильтр: /memory filter all|active|stale|archived\nПеренос: /memory export · /memory import\nНовое поколение: /memory reset",
+            "Проект: {}\n{}\nОчистка: {}\nКлючи: {}/500 · отметки удаления: {}/4096 · {} / 8388608 байт\nПоследняя очистка: {:?}\nФильтр: /memory filter all|active|stale|archived\nПеренос: /memory export · /memory import\nНовое поколение: /memory reset",
             overview.page.project.display(),
+            lifecycle::binding_scope(&overview.page.bound_projects),
             lifecycle::policy_name(overview.policy),
             overview.page.key_count,
             overview.tombstone_count,

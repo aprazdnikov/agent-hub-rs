@@ -1,6 +1,6 @@
 use super::{PathBuf, Receiver, Request, egui, entry_text, mpsc};
 use hub_memory::{
-    AdminAction, CleanupPolicy, ImportChoice, ImportKind, MemoryStatus, StatusFilter,
+    AdminAction, BindingMode, CleanupPolicy, ImportChoice, ImportKind, MemoryStatus, StatusFilter,
 };
 use hub_telegram::memory::lifecycle::{AUTO_WARNING, Action, Panel, preview_text};
 use std::collections::{BTreeMap, BTreeSet};
@@ -14,7 +14,10 @@ enum Picker {
 type PickResult = (u64, Picker, Option<PathBuf>);
 #[derive(Default)]
 pub(super) struct AdminUi {
+    context: super::context::ContextDraft,
     filter: StatusFilter,
+    binding_source: String,
+    binding_mode: BindingMode,
     picking: Option<Receiver<PickResult>>,
     names: BTreeMap<String, String>,
     removed: BTreeSet<u32>,
@@ -24,7 +27,14 @@ fn request(action: Action) -> Request {
     Request::Admin(Box::new(action))
 }
 impl AdminUi {
+    pub(super) fn context_matches(&self, packet: &hub_memory::ContextPacket) -> bool {
+        self.context.matches(packet)
+    }
+    pub(super) fn clear_context(&mut self) {
+        self.context = super::context::ContextDraft::default();
+    }
     pub(super) fn clear(&mut self) {
+        self.binding_source.clear();
         self.names.clear();
         self.removed.clear();
         self.excluded.clear();
@@ -60,7 +70,12 @@ impl AdminUi {
         ui.add_enabled_ui(enabled, |ui| {
             ui.horizontal_wrapped(|ui| {
                 egui::ComboBox::from_id_salt("memory_status_filter")
-                    .selected_text(format!("{:?}", self.filter))
+                    .selected_text(match self.filter {
+                        StatusFilter::Active => "Активные",
+                        StatusFilter::Stale => "Устаревшие",
+                        StatusFilter::Archived => "Архив",
+                        StatusFilter::All => "Все",
+                    })
                     .show_ui(ui, |ui| {
                         for (value, label) in [
                             (StatusFilter::Active, "Активные"),
@@ -104,11 +119,29 @@ impl AdminUi {
                 }
             });
         });
-        action
+        let context_action = self.context.controls(ui, enabled);
+        context_action.or(self.binding_controls(ui, enabled)).or(action)
     }
     pub(super) fn panel(&mut self, ui: &mut egui::Ui, panel: &Panel) -> Option<Request> {
         let mut action = None;
         match panel {
+            Panel::Context(packet) => return self.context.preview(ui, packet, false),
+            Panel::ContextReady(packet) => return self.context.preview(ui, packet, true),
+
+            Panel::Binding(preview) => {
+                ui.label(hub_telegram::memory::lifecycle::binding_text(preview));
+                if ui.button("Подтвердить привязку памяти").clicked() {
+                    action = Some(request(Action::ApplyBinding(preview.clone())));
+                }
+                if ui.button("Отмена").clicked() {
+                    action = Some(request(Action::Overview {
+                        filter: self.filter,
+                        query: String::new(),
+                        offset: 0,
+                    }));
+                }
+            }
+
             Panel::Comparison { preview, key, local_revision, incoming_revision } => {
                 return Self::comparison_panel(
                     ui,
@@ -198,6 +231,7 @@ impl AdminUi {
         let mut action = None;
 
         ui.label(format!("Проект: {}", overview.page.project.display()));
+        ui.label(hub_telegram::memory::lifecycle::binding_scope(&overview.page.bound_projects));
         ui.label(format!(
             "Очистка: {}. Ключи: {}/500 · отметки удаления: {}/4096 · {} / 8388608 байт",
             hub_telegram::memory::lifecycle::policy_name(overview.policy),
@@ -263,6 +297,7 @@ impl AdminUi {
             hub_telegram::memory::lifecycle::status_name(details.status),
             details.history_pruned
         ));
+        self.context.select(ui, &details.entry);
         ui.label(entry_text(&details.entry));
         ui.horizontal_wrapped(|ui| {
             for revision in &details.revisions {
@@ -427,6 +462,26 @@ impl AdminUi {
         if ui.button("Вернуться к решениям импорта").clicked() {
             action = Some(request(Action::ReopenImport(preview.clone())));
         }
+        action
+    }
+}
+
+impl AdminUi {
+    fn binding_controls(&mut self, ui: &mut egui::Ui, enabled: bool) -> Option<Request> {
+        let mut action = None;
+        ui.collapsing("Перенос проекта и общая память worktree", |ui| {
+            ui.add_enabled_ui(enabled, |ui| {
+                ui.label("Назначение — выбранный выше каталог проекта. Источник — абсолютный путь прежнего каталога или другого worktree.");
+                ui.text_edit_singleline(&mut self.binding_source);
+                ui.horizontal(|ui| {
+                    ui.selectable_value(&mut self.binding_mode, BindingMode::Move, "Перенести привязку");
+                    ui.selectable_value(&mut self.binding_mode, BindingMode::Share, "Подключить общую память");
+                });
+                if ui.add_enabled(!self.binding_source.trim().is_empty(), egui::Button::new("Предварительный просмотр привязки")).clicked() {
+                    action = Some(request(Action::Bind { source:PathBuf::from(self.binding_source.trim()), mode:self.binding_mode }));
+                }
+            });
+        });
         action
     }
 }

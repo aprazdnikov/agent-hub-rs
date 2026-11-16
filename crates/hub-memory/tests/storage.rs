@@ -8,3 +8,9 @@ mod limits;
 mod migration;
 #[path = "storage/portable.rs"]
 mod portable;
+
+#[path = "storage/bindings.rs"]
+mod bindings;
+
+#[path = "storage/context.rs"]
+mod context;

@@ -42,3 +42,49 @@ fn cli_rejects_invalid_arguments_without_creating_store() -> Result<(), Box<dyn 
     }
     Ok(())
 }
+
+#[test]
+fn project_cli_requires_preview_confirmation_and_preserves_isolation()
+-> Result<(), Box<dyn std::error::Error>> {
+    use hub_memory::{
+        BindingMode, BindingPreview, EntryKind, Store, WriteRequest, run_project_cli,
+    };
+    let temp = tempfile::tempdir()?;
+    let source = temp.path().join("source");
+    let target = temp.path().join("target");
+    let base = temp.path().join("memory");
+    std::fs::create_dir(&source)?;
+    std::fs::create_dir(&target)?;
+    let store = Store::open(&base, &source, "test")?;
+    store.write(WriteRequest {
+        key: "key".into(),
+        expected_revision: 0,
+        kind: EntryKind::Context,
+        title: "title".into(),
+        body: "body".into(),
+        sources: vec!["test".into()],
+    })?;
+    let args = vec![
+        OsString::from("share"),
+        "--from".into(),
+        source.into_os_string(),
+        "--to".into(),
+        target.clone().into_os_string(),
+        "--store-dir".into(),
+        base.clone().into_os_string(),
+    ];
+    let output = run_project_cli(args.clone())?;
+    assert!(output.contains("--confirm"));
+    assert!(!base.join(".projects").exists());
+    let mut wrong = args.clone();
+    wrong.extend(["--confirm".into(), "wrong".into()]);
+    assert!(run_project_cli(wrong).is_err());
+    assert!(!base.join(".projects").exists());
+    let preview =
+        BindingPreview::prepare(&base, &temp.path().join("source"), &target, BindingMode::Share)?;
+    let mut confirmed = args;
+    confirmed.extend(["--confirm".into(), preview.confirmation().into()]);
+    assert!(run_project_cli(confirmed)?.contains("сохранена"));
+    assert_eq!(Store::open(&base, &target, "qwen")?.get("key", None)?.revision, 1);
+    Ok(())
+}

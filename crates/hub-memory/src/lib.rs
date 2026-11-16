@@ -21,3 +21,12 @@ pub use store::portable::{
     ImportChoice, ImportConflict, ImportItem, ImportKind, ImportPreview, ImportRecord,
     MemoryExport, VerifiedExport,
 };
+
+pub use store::bindings::{BindingMode, BindingPreview};
+
+mod project_cli;
+pub use project_cli::run_project_cli;
+
+mod presentation;
+
+pub use store::context::{ContextBrief, ContextPacket, ContextRequest, ContextSelection};

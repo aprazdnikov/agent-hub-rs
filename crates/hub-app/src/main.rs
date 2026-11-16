@@ -28,8 +28,14 @@ const RUNTIME_GRACE: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
-    if args.next().is_some_and(|arg| arg == "--memory-mcp") {
-        return match hub_memory::run_cli(args.collect()) {
+    let command = args.next();
+    if command.as_deref().is_some_and(|arg| arg == "--memory-mcp" || arg == "--memory-project") {
+        let result = if command.as_deref().is_some_and(|arg| arg == "--memory-project") {
+            hub_memory::run_project_cli(args.collect()).map(|output| println!("{output}"))
+        } else {
+            hub_memory::run_cli(args.collect())
+        };
+        return match result {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("agent-hub memory: {error}");

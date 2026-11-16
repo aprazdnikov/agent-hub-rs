@@ -287,7 +287,7 @@ impl Store {
             token,
             local,
             source: export.snapshot.project.clone(),
-            target: self.project.clone(),
+            target: self.binding.cwd.clone(),
             items,
             after_bytes,
             export,

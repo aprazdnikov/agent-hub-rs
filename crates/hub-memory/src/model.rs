@@ -53,6 +53,18 @@ pub struct SearchHit {
 /// Failures contain metadata and safe diagnostics, never entry contents.
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    #[error("{0}")]
+    ContextInput(&'static str),
+    #[error("context package requires {required} bytes, budget is {limit}")]
+    ContextBudget { required: usize, limit: usize },
+    #[error("project binding publication is uncertain for '{}': {cause}; check the destination before retrying", target.display())]
+    BindingPublicationUncertain { target: PathBuf, cause: Box<Error> },
+    #[error("project memory binding changed or was moved; reopen the project in a new session")]
+    BindingChanged,
+    #[error(
+        "destination already has memory or a binding; use export/import to resolve it explicitly"
+    )]
+    BindingOccupied,
     #[error("memory store was recreated; start a new session")]
     Recreated,
     #[error("memory preview is stale; refresh before confirming")]

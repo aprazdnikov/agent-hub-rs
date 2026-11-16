@@ -101,6 +101,15 @@ impl Directory {
 
 #[cfg(unix)]
 impl Directory {
+    /// A newly created registry must itself survive a crash before its contents are published.
+    pub fn sync_parent(&self) -> Result<(), Error> {
+        self.verify()?;
+        let path = self.path.parent().ok_or(Error::Corrupt("registry parent missing"))?;
+        let parent = Self::existing(path)?.ok_or(Error::Corrupt("registry parent disappeared"))?;
+        parent.handle.sync_all()?;
+        Ok(())
+    }
+
     fn publish_backup(&self, staging: &str, target: &str) -> Result<(), Error> {
         self.verify()?;
         rustix::fs::linkat(

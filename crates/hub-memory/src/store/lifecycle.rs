@@ -216,7 +216,7 @@ impl Store {
     }
 }
 impl Snapshot {
-    fn details(&self, key: &str, revision: Option<u32>) -> Result<EntryDetails, Error> {
+    pub(super) fn details(&self, key: &str, revision: Option<u32>) -> Result<EntryDetails, Error> {
         let history =
             self.entries.get(key).ok_or_else(|| Error::NotFound { key: key.into(), revision })?;
         let entry = match revision {
