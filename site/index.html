@@ -4,10 +4,10 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>agent-hub — агенты Claude, Codex, Qwen, Hermes и OpenCode в Telegram</title>
-<meta name="description" content="Пять AI-агентов на вашем компьютере под управлением Telegram. В 0.11.0 — режимы одобрений Hermes.">
+<meta name="description" content="Пять AI-агентов на вашем компьютере под управлением Telegram. В 1.0.0 — общая память проекта и задачи с сохранением результатов.">
 <meta property="og:type" content="website">
 <meta property="og:title" content="agent-hub — агенты работают, пока вы в дороге">
-<meta property="og:description" content="Задачи с телефона, пять AI-агентов, диагностика подключения и режимы одобрений Hermes. Новое в версии 0.11.0.">
+<meta property="og:description" content="Пять AI-агентов, общая память проекта и ручные задачи с восстановлением после перезапуска. Новое в версии 1.0.0.">
 <meta property="og:url" content="https://aprazdnikov.github.io/agent-hub-rs/">
 <meta name="color-scheme" content="light dark">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232b7de9'/%3E%3Cpath d='M8 16h16M16 8v16' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
@@ -133,12 +133,12 @@ h2 { font: 700 clamp(22px, 3vw, 30px)/1.2 var(--display); letter-spacing: -.01em
 <div class="wrap">
   <nav>
     <div class="logo">agent<span>-</span>hub</div>
-    <div class="links"><a href="#whats-new">В 0.11.0</a><a href="#agents">Агенты</a><a href="#start">Начать</a><a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/README.md">Документация</a><a href="https://github.com/aprazdnikov/agent-hub-rs">GitHub</a></div>
+    <div class="links"><a href="#whats-new">В 1.0.0</a><a href="#agents">Агенты</a><a href="#start">Начать</a><a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/README.md">Документация</a><a href="https://github.com/aprazdnikov/agent-hub-rs">GitHub</a></div>
   </nav>
 
   <section class="hero">
     <div>
-      <a class="version" href="#whats-new">0.11.0 · одобрения Hermes</a>
+      <a class="version" href="#whats-new">1.0.0 · память и задачи</a>
       <h1>Агенты работают, пока вы в дороге</h1>
       <p class="lead">Каждая тема Telegram-группы — отдельная сессия <b>Claude Code, Codex, Qwen, Hermes или OpenCode</b> на вашем компьютере. Ставите задачу с телефона, разрешаете команды кнопкой, получаете результат.</p>
       <div class="cta">
@@ -168,11 +168,11 @@ h2 { font: 700 clamp(22px, 3vw, 30px)/1.2 var(--display); letter-spacing: -.01em
   </section>
 
   <section id="whats-new" class="release">
-    <h2>В 0.11.0 — одобрения Hermes как у остальных агентов</h2>
+    <h2>В 1.0.0 — общая память и продолжение задач</h2>
     <div class="features">
-      <div class="feature"><h3>Четыре режима Hermes</h3><p>Спрашивать всё, принимать правки в рабочем каталоге, не спрашивать правки вовсе или <code>yolo</code> с обходом подтверждений опасных команд. По умолчанию — прежний вопросливый режим.</p></div>
-      <div class="feature"><h3>Режим для отдельной темы</h3><p><code>/mode</code> выбирает одобрения Hermes кнопками, <code>/mode inherit</code> возвращает общие настройки. Режим применяется при каждом запуске сессии, включая восстановленную.</p></div>
-      <div class="feature"><h3>Границы остаются</h3><p>Чувствительные пути и правила запрета Hermes спрашивает при любом режиме, поэтому кнопки разрешений в теме не исчезают.</p></div>
+      <div class="feature"><h3>Память проекта для пяти агентов</h3><p>Решения, прогресс и источники доступны в новых сессиях и другому агенту. Поиск, история и управление — во вкладке «Память» и через <code>/memory</code>.</p></div>
+      <div class="feature"><h3>Проверяемая передача контекста</h3><p>Соберите пакет из выбранных записей и поручения, проверьте его свежесть и передайте следующему агенту. Процедура продолжения помогает сверить источники и фактический прогресс.</p></div>
+      <div class="feature"><h3>Задачи с историей результатов</h3><p>Сохраните поручение, выберите агента и запустите вручную. После перезапуска результат останется доступен; продолжение требует явно заданного следующего шага.</p></div>
       <div class="feature"><h3>Проще настроить и восстановить работу</h3><p>Диагностика настроек на вкладке «Статус», состояние доставки и установщики для Windows и Debian/Ubuntu.</p></div>
       <div class="feature"><h3>У каждого параметра своё место</h3><p>Telegram и доступ, рабочие каталоги, агенты, проекты, действия, голосовые сообщения, запуск и обновления — семь разделов вместо длинной формы. У каждого агента своя страница.</p></div>
       <div class="feature"><h3>Светлая и тёмная темы</h3><p>Окно следует теме системы и переключается во время работы. На Linux для этого нужна поддержка XDG Desktop Portal в окружении рабочего стола.</p></div>
