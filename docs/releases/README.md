@@ -8,7 +8,7 @@
 
 | Версия | Текст | Подготовка | Результат публикации |
 |---|---|---|---|
-| v1.0.0 | [Общая память проекта](v1.0.0.md) | Выпуск разрешён пользователем; [проверки](../research/2026-11-21-v1.0.0-readiness.md); CI `54517aa` — 6/6 PASS | Подготовлен к публикации; итог Release проверяется после тега |
+| v1.0.0 | [Общая память проекта](v1.0.0.md) | Релизный коммит `e577805`, [CI — 6/6 PASS](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/44894626289) | [Опубликован](https://github.com/aprazdnikov/agent-hub-rs/releases/tag/v1.0.0), latest; 24 файла и SHA-256 проверены; [Release — PASS](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/44895372407) |
 | v0.11.0 | [Одобрения Hermes](v0.11.0.md) | 2026-11-10: пользователь согласовал минорный выпуск; коммит `5627d16`, аннотированный тег `v0.11.0` | [Опубликован](https://github.com/aprazdnikov/agent-hub-rs/releases/tag/v0.11.0): 24 файла; [Release — PASS](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/42825506765) |
 | v0.10.0 | [Диагностика, масштаб и установка](v0.10.0.md) | Коммит `4c2647f`, аннотированный тег `v0.10.0` | [Опубликован](https://github.com/aprazdnikov/agent-hub-rs/releases/tag/v0.10.0): 24 файла; [Release — PASS](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/42197465409) |
 | v0.9.0 | [Новые настройки и системные темы](v0.9.0.md) | 2026-11-05: текст согласован; коммит `347f333`, аннотированный тег `v0.9.0` | [Опубликован](https://github.com/aprazdnikov/agent-hub-rs/releases/tag/v0.9.0): 20 файлов; [Release — PASS](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/42054464691) |
@@ -16,6 +16,31 @@
 
 Пока workflow не завершился успешно и на странице нет файлов, выпуск не считается
 завершённым. До первой публикации ссылка на страницу может возвращать 404.
+
+## Результат публикации v1.0.0 — 2026-11-21
+
+- [Релиз](https://github.com/aprazdnikov/agent-hub-rs/releases/tag/v1.0.0)
+  опубликован, не draft/prerelease; GitHub `releases/latest` возвращает v1.0.0.
+- PR #8 слит в main. Релизный коммит и цель аннотированного тега v1.0.0:
+  `e577805932ca7da428ed31c41df299cc4ad46f83`.
+- [CI итогового main](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/44894626289)
+  — 6/6 PASS: Linux, Windows, macOS, cargo-deny и две проверки упаковки.
+- [Release](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/44895372407)
+  — PASS: Windows x64, Linux x64 GNU, macOS Intel и Apple Silicon, затем публикация.
+- Все 24 файла скачаны: 12 артефактов и 12 `.sha256`. SHA-256 каждого файла
+  совпал с digest GitHub API; все 12 файлов сумм совпали с артефактами.
+  Шесть архивов проверены чтением: вложенные бинарники совпали с отдельными файлами.
+  Архитектуры четырёх бинарников проверены; Debian control — agent-hub 1.0.0 amd64.
+- Описание GitHub Release совпало с Markdown из тега (с нормализацией CRLF и
+  завершающего перевода строки).
+- [Pages](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/44894626361)
+  — PASS; HTML [публичного сайта](https://aprazdnikov.github.io/agent-hub-rs/)
+  побайтно совпал с site/index.html релизного коммита.
+- Ручные живые проверки, автозапуск и `/handoff` подтверждены пользователем;
+  отдельная матрица ОС/моделей и логи не предоставлены. Агент не запускал скачанные
+  релизные бинарники на пользовательском рабочем столе и не менял его настройки.
+- Windows/macOS остаются неподписанными, нотарификация не заявляется. MEM-08
+  отложен. Ограничения пилота MEM-06 и транзитивной chrono описаны в отчётах.
 
 ## Подготовка и публикация v0.11.0
 
