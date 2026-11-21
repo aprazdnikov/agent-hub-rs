@@ -6,7 +6,6 @@ use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use chrono::{Datelike, Timelike};
 use hub_agent::archive::{ArchiveError, Exported, SessionArchive};
 use hub_core::domain::{AbsolutePath, BackendKind, SessionId, TopicKey, TopicSession};
 use hub_core::snapshot::{BackendData, Manifest, Minute, RelPath, SnapshotName};
@@ -50,20 +49,20 @@ pub struct Restoration {
 
 #[must_use]
 pub fn local_minute() -> Minute {
-    let now = chrono::Local::now();
+    let now = jiff::Zoned::now();
     Minute {
-        year: now.year(),
-        month: now.month(),
-        day: now.day(),
-        hour: now.hour(),
-        minute: now.minute(),
+        year: i32::from(now.year()),
+        month: now.month().unsigned_abs().into(),
+        day: now.day().unsigned_abs().into(),
+        hour: now.hour().unsigned_abs().into(),
+        minute: now.minute().unsigned_abs().into(),
     }
 }
 
 /// UTC `YYYY-MM-DDTHH:MM:SSZ`, the manifest's `created_at`.
 #[must_use]
 pub fn utc_now() -> String {
-    chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    jiff::Timestamp::now().strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
 }
 
 /// Topics other than `key` bound to the same agent session.
@@ -344,6 +343,6 @@ mod tests {
     fn created_at_is_utc_to_the_second() {
         let stamp = utc_now();
         assert_eq!(stamp.len(), "2026-10-09T15:30:12Z".len());
-        assert!(chrono::NaiveDateTime::parse_from_str(&stamp, "%Y-%m-%dT%H:%M:%SZ").is_ok());
+        assert!(stamp.parse::<jiff::Timestamp>().is_ok());
     }
 }

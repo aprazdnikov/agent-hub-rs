@@ -7,6 +7,9 @@ use serde::{Deserialize, Serialize};
 pub const MAX_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_RESULTS: usize = 100;
 pub const RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
+// Preserve the v1 file's original upper bound (262142-12-31T23:59:59Z).
+// Storage validity must not shrink with the calendar library used for display.
+const MAX_COMPLETED_AT: i64 = 8_210_266_876_799;
 pub const MAX_FILE_BYTES: usize =
     MAX_RESULTS * (MAX_TEXT_BYTES + 8192 + 128) * 6 + outbox::MAX_BYTES * 6 + 4096;
 
@@ -49,7 +52,7 @@ impl SavedResult {
             || self.run.len() != 32
             || !self.run.bytes().all(|b| b.is_ascii_hexdigit())
             || self.completed_at < 0
-            || chrono::DateTime::from_timestamp(self.completed_at, 0).is_none()
+            || self.completed_at > MAX_COMPLETED_AT
             || BackendKind::parse(&self.backend).is_none()
             || self.cwd.is_empty()
             || self.cwd.len() > 4096
@@ -264,6 +267,24 @@ mod tests {
         .with_session(SessionId::parse("session"));
         SavedResult::new(key(thread), "a".repeat(32), time, &session, text.to_owned()).unwrap()
     }
+    #[rstest::rstest]
+    #[case(-1, false)]
+    #[case(0, true)]
+    #[case(253_402_300_800, true)]
+    #[case(8_210_266_876_799, true)]
+    #[case(8_210_266_876_800, false)]
+    fn stored_timestamp_range_is_backward_compatible(#[case] time: i64, #[case] valid: bool) {
+        let session = TopicSession::fresh(
+            BackendKind::Codex,
+            AbsolutePath::new(std::env::temp_dir()).unwrap(),
+        )
+        .with_session(SessionId::parse("session"));
+        assert_eq!(
+            SavedResult::new(key(1), "a".repeat(32), time, &session, "text".into()).is_ok(),
+            valid
+        );
+    }
+
     #[test]
     fn last_results_round_trip_and_replace_only_the_same_topic() {
         let mut book = Results::default();

@@ -1807,11 +1807,11 @@ name = "hub-claude"
 version = "1.0.0"
 dependencies = [
  "base64 0.23.1",
- "chrono",
  "futures",
  "hub-agent",
  "hub-core",
  "insta",
+ "jiff",
  "rstest",
  "rust_decimal",
  "serde",
@@ -1830,10 +1830,10 @@ name = "hub-codex"
 version = "1.0.0"
 dependencies = [
  "base64 0.23.1",
- "chrono",
  "futures",
  "hub-agent",
  "hub-core",
+ "jiff",
  "rstest",
  "serde_json",
  "tempfile",
@@ -1847,7 +1847,7 @@ dependencies = [
 name = "hub-core"
 version = "1.0.0"
 dependencies = [
- "chrono",
+ "jiff",
  "pulldown-cmark",
  "rstest",
  "rust_decimal",
@@ -1929,7 +1929,6 @@ dependencies = [
 name = "hub-telegram"
 version = "1.0.0"
 dependencies = [
- "chrono",
  "dunce",
  "futures",
  "http-body-util",
@@ -1943,6 +1942,7 @@ dependencies = [
  "hub-qwen",
  "hyper",
  "hyper-util",
+ "jiff",
  "reqwest",
  "rstest",
  "serde_json",

@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
 use futures::future::BoxFuture;
 use hub_agent::archive::SessionArchive;
 use hub_agent::conversation::Conversation;
@@ -26,6 +25,7 @@ use hub_core::render::render_limits;
 use hub_core::settings::Settings;
 use hub_core::snapshot::{SnapshotName, default_name};
 use hub_core::topics::{Titles, Topics};
+use jiff::Timestamp;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep_until};
@@ -521,7 +521,7 @@ impl<A: Agents> Hub<A> {
                 }
             }
             HubMessage::Press(pressed) => self.press(pressed),
-            HubMessage::Quota(update) => self.quotas.apply(update, Utc::now()),
+            HubMessage::Quota(update) => self.quotas.apply(update, Timestamp::now()),
             HubMessage::Limits(LimitsDone(polled)) => self.limits_done(polled),
             HubMessage::Deliver { key, prompt } => self.deliver(key, prompt),
             HubMessage::FlushAlbum(group) => {
@@ -1853,12 +1853,13 @@ impl<A: Agents> Hub<A> {
             tokio::spawn(async move { sender.edit(chat, message, text, Format::Plain).await });
             return;
         };
-        let now = Utc::now();
+        let now = Timestamp::now();
         let reports: Vec<QuotaReport> =
             outcomes.into_iter().map(|outcome| self.quotas.settle(outcome, now)).collect();
         tracing::info!(backends = reports.len(), "limits card");
         let default = self.settings.borrow().default_backend;
-        let card = render_limits(&limits::ordered(reports, default), now, &chrono::Local);
+        let card =
+            render_limits(&limits::ordered(reports, default), now, &jiff::tz::TimeZone::system());
         tokio::spawn(async move {
             sender.edit_html(chat, message, card).await;
             sender.edit_keyboard(chat, message, limits::refresh_keyboard()).await;
@@ -3072,7 +3073,7 @@ mod tests {
         let record = hub_core::results::SavedResult::new(
             KEY,
             "c".repeat(32),
-            chrono::Utc::now().timestamp(),
+            jiff::Timestamp::now().as_second(),
             &TopicSession::fresh(
                 BackendKind::Codex,
                 AbsolutePath::new(world.root.path().to_path_buf()).unwrap(),

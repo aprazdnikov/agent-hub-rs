@@ -341,7 +341,7 @@ pub struct MemoryResults {
 impl MemoryResults {
     pub fn now(&self) -> i64 {
         let time = self.time.load(std::sync::atomic::Ordering::SeqCst);
-        if time == 0 { chrono::Utc::now().timestamp() } else { time }
+        if time == 0 { jiff::Timestamp::now().as_second() } else { time }
     }
 }
 impl crate::results::ResultStore for MemoryResults {

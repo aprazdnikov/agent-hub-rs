@@ -264,7 +264,7 @@ async fn collect(
                         let record = SavedResult::new(
                             key,
                             uuid::Uuid::new_v4().simple().to_string(),
-                            chrono::Utc::now().timestamp(),
+                            jiff::Timestamp::now().as_second(),
                             &session,
                             pending.text.clone(),
                         )

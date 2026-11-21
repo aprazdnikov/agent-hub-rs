@@ -247,7 +247,7 @@ fn render(project: &Project, report: &Result<Report, String>, states: &[String])
     let mut text = format!(
         "🩺 {}\nПроверено: {} UTC\n",
         project.name(),
-        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
+        jiff::Timestamp::now().strftime("%Y-%m-%d %H:%M:%S")
     );
     match report {
         Ok(report) => {

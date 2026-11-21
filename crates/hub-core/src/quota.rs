@@ -3,7 +3,7 @@
 //! Strings come from the agents' answers: parsers pass them through `clean_label`, and
 //! `render::render_limits` escapes them.
 
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 
 use crate::domain::BackendKind;
 use crate::render::truncate;
@@ -87,7 +87,7 @@ pub enum WindowKind {
 pub struct UsageWindow {
     pub kind: WindowKind,
     pub percent: Percent,
-    pub resets_at: Option<DateTime<Utc>>,
+    pub resets_at: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -95,7 +95,7 @@ pub enum QuotaSource {
     /// Just asked the agent.
     Fresh,
     /// The last values live sessions reported, as of `at`.
-    Cached { at: DateTime<Utc> },
+    Cached { at: Timestamp },
     /// The agent's protocol has no subscription limits.
     NotReported,
     /// Nothing to show; the reason is shown instead.
@@ -126,7 +126,7 @@ impl QuotaReport {
         backend: BackendKind,
         plan: Option<Label>,
         windows: Vec<UsageWindow>,
-        at: DateTime<Utc>,
+        at: Timestamp,
     ) -> Self {
         Self { backend, plan, windows: capped(windows), source: QuotaSource::Cached { at } }
     }
@@ -234,7 +234,7 @@ mod tests {
 
     #[test]
     fn a_cached_report_keeps_at_most_eight_windows() {
-        let at = DateTime::<Utc>::UNIX_EPOCH;
+        let at = Timestamp::UNIX_EPOCH;
         let report = QuotaReport::cached(BackendKind::Claude, None, many(), at);
         assert_eq!(report.windows().len(), WINDOW_LIMIT);
         assert_eq!(report.source, QuotaSource::Cached { at });

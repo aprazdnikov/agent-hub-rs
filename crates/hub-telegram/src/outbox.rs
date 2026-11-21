@@ -267,9 +267,14 @@ async fn run(
         if settings.borrow().telegram != identity {
             return;
         }
-        let result =
-            step(store.as_ref(), &sender, &mut settings, &identity, chrono::Utc::now().timestamp())
-                .await;
+        let result = step(
+            store.as_ref(),
+            &sender,
+            &mut settings,
+            &identity,
+            jiff::Timestamp::now().as_second(),
+        )
+        .await;
         if settings.borrow().telegram != identity {
             return;
         }
@@ -359,7 +364,7 @@ fn card(
         text.push_str("\nОжидающих ответов в этой теме нет.");
     }
     let mut keyboard = Vec::new();
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     if not_before > now {
         let _ = writeln!(text, "\nTelegram просит подождать до {}.", timestamp(not_before));
     }
@@ -421,8 +426,10 @@ fn card(
     Outgoing::plain(text).with_keyboard(keyboard)
 }
 fn timestamp(time: i64) -> String {
-    chrono::DateTime::from_timestamp(time, 0)
-        .map_or_else(|| "позже".to_owned(), |time| time.format("%d.%m %H:%M UTC").to_string())
+    jiff::Timestamp::from_second(time).map_or_else(
+        |_| format!("Unix-время: {time}"),
+        |time| time.strftime("%d.%m %H:%M UTC").to_string(),
+    )
 }
 
 #[cfg(test)]
