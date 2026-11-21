@@ -234,6 +234,7 @@ mod tests {
     }
     fn press(data: String) -> Press {
         Press {
+            thread: None,
             callback: "c".to_owned(),
             user: UserId(1),
             chat: Some(ChatId(-100)),

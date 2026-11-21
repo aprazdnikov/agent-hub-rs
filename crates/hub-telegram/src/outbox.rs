@@ -267,9 +267,14 @@ async fn run(
         if settings.borrow().telegram != identity {
             return;
         }
-        let result =
-            step(store.as_ref(), &sender, &mut settings, &identity, chrono::Utc::now().timestamp())
-                .await;
+        let result = step(
+            store.as_ref(),
+            &sender,
+            &mut settings,
+            &identity,
+            jiff::Timestamp::now().as_second(),
+        )
+        .await;
         if settings.borrow().telegram != identity {
             return;
         }
@@ -359,7 +364,7 @@ fn card(
         text.push_str("\nОжидающих ответов в этой теме нет.");
     }
     let mut keyboard = Vec::new();
-    let now = chrono::Utc::now().timestamp();
+    let now = jiff::Timestamp::now().as_second();
     if not_before > now {
         let _ = writeln!(text, "\nTelegram просит подождать до {}.", timestamp(not_before));
     }
@@ -421,8 +426,10 @@ fn card(
     Outgoing::plain(text).with_keyboard(keyboard)
 }
 fn timestamp(time: i64) -> String {
-    chrono::DateTime::from_timestamp(time, 0)
-        .map_or_else(|| "позже".to_owned(), |time| time.format("%d.%m %H:%M UTC").to_string())
+    jiff::Timestamp::from_second(time).map_or_else(
+        |_| format!("Unix-время: {time}"),
+        |time| time.strftime("%d.%m %H:%M UTC").to_string(),
+    )
 }
 
 #[cfg(test)]
@@ -740,6 +747,7 @@ mod tests {
         let data = callback(&Change::new(&entry, Action::Drop));
         outbox.menu(key(), Some(UserId(999)));
         outbox.press(&Press {
+            thread: None,
             callback: "bad".to_owned(),
             user: UserId(999),
             chat: Some(key().chat),
@@ -792,6 +800,7 @@ mod tests {
         let data =
             keyboard.iter().flatten().find(|button| button.text == "→").unwrap().data.clone();
         let press = |data: String| Press {
+            thread: None,
             callback: "page".to_owned(),
             user: UserId(1),
             chat: Some(key().chat),
@@ -861,6 +870,7 @@ mod tests {
         let data = callback(&change);
         assert!(data.len() <= 64);
         let request = parse(&Press {
+            thread: None,
             callback: "c".to_owned(),
             user: UserId(1),
             chat: Some(key().chat),
@@ -873,6 +883,7 @@ mod tests {
         assert_eq!(request.change.unwrap().revision, u32::MAX);
         assert!(
             parse(&Press {
+                thread: None,
                 callback: "c".to_owned(),
                 user: UserId(1),
                 chat: Some(key().chat),

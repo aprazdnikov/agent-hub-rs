@@ -8,10 +8,10 @@ use std::io;
 use std::path::Path;
 use std::time::Duration;
 
-use chrono::DateTime;
 use hub_agent::rpc::{RpcClient, RpcError};
 use hub_core::domain::BackendKind;
 use hub_core::quota::{Label, Percent, QuotaReport, QuotaUpdate, UsageWindow, WindowKind};
+use jiff::Timestamp;
 use serde_json::{Value, json};
 
 use crate::backend::{AppServer, Stderr, handshake, refusing};
@@ -135,7 +135,7 @@ fn parse_window(name: &str, window: &Value) -> Result<UsageWindow, ProbeError> {
     let resets_at = window
         .get("resetsAt")
         .and_then(Value::as_i64)
-        .and_then(|seconds| DateTime::from_timestamp(seconds, 0));
+        .and_then(|seconds| Timestamp::from_second(seconds).ok());
     Ok(UsageWindow { kind, percent, resets_at })
 }
 

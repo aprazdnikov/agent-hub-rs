@@ -292,6 +292,7 @@ mod tests {
     }
     fn press(context: &Context, data: String) -> Press {
         Press {
+            thread: None,
             callback: "c".to_owned(),
             user: context.user,
             chat: Some(context.key.chat),

@@ -4,6 +4,7 @@ use std::time::Duration;
 use futures::future::BoxFuture;
 use hub_agent::channel::UserChannel;
 use hub_agent::conversation::{Conversation, Limits};
+use hub_agent::memory::MemoryMcp;
 use hub_core::domain::{
     AbsolutePath, AgentEvent, BackendKind, Decision, Denied, FileDelivery, Finished, OutgoingFile,
     Prompt, Question, QuestionsOutcome, SessionId, ToolRequest, ToolUse, TopicSession, Usage,
@@ -98,6 +99,58 @@ async fn loads_saved_session_without_replaying_old_events() {
         methods(&fixture),
         ["initialize", "session/load", "session/set_model", "session/prompt"]
     );
+}
+
+#[rstest]
+#[case::new_with_memory(None, true, "session/new")]
+#[case::load_with_memory(Some("s-1"), true, "session/load")]
+#[case::new_without_memory(None, false, "session/new")]
+#[case::load_without_memory(Some("s-1"), false, "session/load")]
+#[tokio::test]
+async fn memory_registration_preserves_chat_tools_and_model(
+    #[case] saved: Option<&str>,
+    #[case] memory_enabled: bool,
+    #[case] method: &str,
+) {
+    let fixture = Fixture::new("load");
+    let session = topic(&fixture, saved);
+    let memory = memory_enabled.then(|| {
+        MemoryMcp::new(&fixture.root().join("agent-hub"), &session.cwd, BackendKind::Opencode)
+            .unwrap()
+    });
+    let expected_memory = memory.as_ref().map(MemoryMcp::acp_server);
+    let (conversation, _events) = conversation();
+    let (_send, inbox) = mpsc::channel(4);
+    let backend = OpencodeBackend::new(fixture.cli.clone(), settings()).with_memory(memory);
+    let _inbox = tokio::time::timeout(
+        Duration::from_secs(15),
+        backend.run(&session, prompt("hello"), inbox, conversation),
+    )
+    .await
+    .unwrap();
+    let records = fixture.records();
+    let servers = records
+        .iter()
+        .find(|record| record.get("method") == Some(&json!(method)))
+        .and_then(|record| record.pointer("/params/mcpServers"))
+        .unwrap()
+        .as_array()
+        .unwrap();
+    let names: Vec<_> =
+        servers.iter().filter_map(|server| server.get("name").and_then(Value::as_str)).collect();
+    assert_eq!(
+        names,
+        if memory_enabled { vec!["agent-hub", "agent-hub-memory"] } else { vec!["agent-hub"] }
+    );
+    assert_eq!(servers.get(1), expected_memory.as_ref());
+    assert_eq!(servers.first().unwrap().get("type"), Some(&json!("http")));
+    let model =
+        records.iter().find(|record| record.get("method") == Some(&json!("session/set_model")));
+    assert_eq!(
+        model.and_then(|record| record.pointer("/params/modelId")),
+        Some(&json!("opencode/test-model"))
+    );
+    assert!(!methods(&fixture).iter().any(|method| method == "session/set_mode"));
 }
 
 #[rstest]

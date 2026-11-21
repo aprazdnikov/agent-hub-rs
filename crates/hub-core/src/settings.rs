@@ -357,6 +357,7 @@ pub struct Timeouts {
 /// Parsed settings. `workspace_root` is absolute; whether it exists is checked by the shell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
+    pub memory: MemorySettings,
     pub speech: SpeechSettings,
     pub progress_mode: ProgressMode,
     pub actions: Vec<Action>,
@@ -552,6 +553,7 @@ impl OpencodeDraft {
 /// The settings form as typed by the user.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Draft {
+    pub memory: MemorySettings,
     pub speech: SpeechDraft,
     pub progress_mode: ProgressMode,
     pub actions: Vec<ActionDraft>,
@@ -578,6 +580,7 @@ pub struct Draft {
 impl Default for Draft {
     fn default() -> Self {
         Self {
+            memory: MemorySettings::default(),
             speech: SpeechDraft::default(),
             progress_mode: ProgressMode::default(),
             actions: Vec::new(),
@@ -606,6 +609,7 @@ impl Default for Draft {
 impl fmt::Debug for Draft {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let Self {
+            memory,
             speech,
             progress_mode,
             actions,
@@ -629,6 +633,7 @@ impl fmt::Debug for Draft {
             updates,
         } = self;
         f.debug_struct("Draft")
+            .field("memory", memory)
             .field("speech", speech)
             .field("progress_mode", progress_mode)
             .field("actions", actions)
@@ -732,6 +737,7 @@ impl Draft {
             return Err(errors);
         };
         Ok(Settings {
+            memory: self.memory,
             speech,
             progress_mode: self.progress_mode,
             actions,
@@ -758,6 +764,7 @@ impl Draft {
     #[must_use]
     pub fn from_settings(settings: &Settings) -> Self {
         Self {
+            memory: settings.memory,
             speech: SpeechDraft::from(&settings.speech),
             progress_mode: settings.progress_mode,
             actions: settings.actions.iter().map(Action::to_draft).collect(),
@@ -1001,6 +1008,8 @@ fn parse_seconds(raw: &str) -> Result<Duration, String> {
 #[serde(deny_unknown_fields)]
 pub struct SettingsFile {
     #[serde(default, skip_serializing_if = "is_default")]
+    pub memory: MemorySettings,
+    #[serde(default, skip_serializing_if = "is_default")]
     pub speech: SpeechFile,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub actions: Vec<ActionDraft>,
@@ -1138,6 +1147,7 @@ impl SettingsFile {
     /// readable by versions that do not know `[snapshots]`.
     pub fn from_settings(settings: &Settings, home: &Path) -> Self {
         Self {
+            memory: settings.memory,
             speech: SpeechFile::from(&settings.speech),
             actions: settings.actions.iter().map(Action::to_draft).collect(),
             projects: settings.projects.iter().map(Project::to_draft).collect(),
@@ -1244,6 +1254,7 @@ impl SettingsFile {
         )?;
         let defaults = Draft::default();
         Ok(Draft {
+            memory: self.memory,
             speech: self.speech.to_draft(speech_key),
             progress_mode: self.telegram.progress,
             actions: self.actions.clone(),
@@ -1324,6 +1335,19 @@ mod tests {
 
     fn home() -> PathBuf {
         PathBuf::from(if cfg!(windows) { r"C:\Users\me" } else { "/home/me" })
+    }
+
+    #[test]
+    fn memory_disabled_survives_file_and_draft_roundtrip() {
+        let mut value = draft();
+        value.memory.enabled = false;
+        let settings = value.parse(&home()).unwrap();
+        let file = SettingsFile::from_settings(&settings, &home());
+        let encoded = toml::to_string(&file).unwrap();
+        let decoded: SettingsFile = toml::from_str(&encoded).unwrap();
+        assert!(!decoded.memory.enabled);
+        assert!(!Draft::from_settings(&settings).memory.enabled);
+        assert!(super::MemorySettings::default().enabled);
     }
 
     fn draft() -> Draft {
@@ -2182,5 +2206,17 @@ root = \"~/w\"
         assert_eq!(approvals, ["untrusted", "on-request", "never"]);
         assert_eq!(Sandbox::parse("read-only"), Some(Sandbox::ReadOnly));
         assert_eq!(Approval::parse("yolo"), None);
+    }
+}
+
+/// Global hub-owned memory connection policy; standalone CLI configurations are independent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct MemorySettings {
+    pub enabled: bool,
+}
+impl Default for MemorySettings {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }

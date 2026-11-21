@@ -248,6 +248,7 @@ mod tests {
 
     fn topic(thread: i32, name: &str, backend: BackendKind, state: TopicState) -> TopicView {
         TopicView {
+            memory_enabled: None,
             progress: hub_core::progress::TaskProgress::default(),
             parameters: String::new(),
             key: TopicKey { chat: ChatId(-1_001_234_567_890), thread: ThreadId(thread) },

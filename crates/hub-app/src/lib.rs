@@ -20,3 +20,5 @@ pub mod updater;
 pub mod updates;
 
 pub mod results;
+
+pub mod memory;

@@ -247,7 +247,7 @@ fn render(project: &Project, report: &Result<Report, String>, states: &[String])
     let mut text = format!(
         "🩺 {}\nПроверено: {} UTC\n",
         project.name(),
-        chrono::Utc::now().format("%Y-%m-%d %H:%M:%S")
+        jiff::Timestamp::now().strftime("%Y-%m-%d %H:%M:%S")
     );
     match report {
         Ok(report) => {
@@ -353,6 +353,7 @@ mod tests {
     fn button(book: &mut Doctors, settings: &Arc<Settings>, thread: i32) -> Press {
         let menu = book.menu(key(thread), settings);
         Press {
+            thread: None,
             callback: "c".to_owned(),
             user: UserId(1),
             chat: Some(ChatId(-100)),

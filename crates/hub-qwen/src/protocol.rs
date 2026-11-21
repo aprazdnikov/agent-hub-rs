@@ -72,24 +72,37 @@ pub fn initialize_params(version: &str) -> Value {
     })
 }
 
-fn mcp_servers(tools: &HubTools<'_>) -> Value {
-    json!([{
+fn mcp_servers(tools: &HubTools<'_>) -> Vec<Value> {
+    vec![json!({
         "type": "http",
         "name": SERVER_NAME,
         "url": tools.url,
         "headers": [{"name": "Authorization", "value": format!("Bearer {}", tools.token)}],
-    }])
+    })]
 }
 
 /// `session/new` for a fresh topic session, `session/load` for a saved one.
 #[must_use]
 pub fn open_session(session: &TopicSession, tools: &HubTools<'_>) -> (Call, Value) {
+    open_session_with_memory(session, tools, None)
+}
+
+#[must_use]
+pub fn open_session_with_memory(
+    session: &TopicSession,
+    tools: &HubTools<'_>,
+    memory: Option<&hub_agent::memory::MemoryMcp>,
+) -> (Call, Value) {
     let cwd = session.cwd.as_path().display().to_string();
+    let servers = mcp_servers(tools)
+        .into_iter()
+        .chain(memory.map(hub_agent::memory::MemoryMcp::acp_server))
+        .collect::<Vec<_>>();
     match &session.session {
-        None => (Call::SessionNew, json!({"cwd": cwd, "mcpServers": mcp_servers(tools)})),
+        None => (Call::SessionNew, json!({"cwd": cwd, "mcpServers": servers})),
         Some(saved) => (
             Call::SessionLoad,
-            json!({"sessionId": saved.as_str(), "cwd": cwd, "mcpServers": mcp_servers(tools)}),
+            json!({"sessionId": saved.as_str(), "cwd": cwd, "mcpServers": servers}),
         ),
     }
 }
@@ -364,6 +377,37 @@ mod tests {
 
     fn tools() -> HubTools<'static> {
         HubTools { url: "http://127.0.0.1:4321/mcp", token: "t0k3n" }
+    }
+
+    #[rstest]
+    #[case(None)]
+    #[case(Some(session()))]
+    fn project_memory_is_connected_on_new_and_loaded_sessions(#[case] saved: Option<SessionId>) {
+        let session = TopicSession::fresh(BackendKind::Qwen, cwd()).with_session(saved);
+        let memory = hub_agent::memory::MemoryMcp::new(
+            &cwd().as_path().join("agent-hub"),
+            &session.cwd,
+            BackendKind::Qwen,
+        )
+        .unwrap();
+        let (_, params) = open_session_with_memory(&session, &tools(), Some(&memory));
+        assert_eq!(
+            params.get("mcpServers"),
+            Some(&json!([
+                {"type": "http", "name": SERVER_NAME, "url": tools().url,
+                 "headers": [{"name": "Authorization", "value": "Bearer t0k3n"}]},
+                memory.acp_server(),
+            ]))
+        );
+    }
+
+    #[rstest]
+    #[case(None)]
+    #[case(Some(session()))]
+    fn memory_is_omitted_for_history_only_sessions(#[case] saved: Option<SessionId>) {
+        let session = TopicSession::fresh(BackendKind::Qwen, cwd()).with_session(saved);
+        let (_, params) = open_session(&session, &tools());
+        assert_eq!(params.get("mcpServers"), Some(&json!(mcp_servers(&tools()))));
     }
 
     #[test]

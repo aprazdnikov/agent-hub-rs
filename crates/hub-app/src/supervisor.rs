@@ -27,6 +27,18 @@ pub const RETRY_MAX: Duration = Duration::from_mins(5);
 const OUTBOX_REFRESH: Duration = Duration::from_secs(5);
 
 pub enum Command {
+    Tasks {
+        key: TopicKey,
+        project: PathBuf,
+        backend: BackendKind,
+        request: hub_telegram::hub::tasks::Request,
+        reply: oneshot::Sender<Result<Vec<hub_core::tasks::Task>, String>>,
+    },
+    SetMemory {
+        enabled: bool,
+        revision: u64,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Save(Box<Draft>),
     Start,
     Stop,
@@ -197,6 +209,7 @@ pub struct Supervisor<C: Connector> {
     store: Option<Box<dyn SettingsStore>>,
     save_guard: Option<Arc<crate::instance::InstanceLock>>,
     saving: Option<tokio::task::JoinHandle<SaveJob>>,
+    memory_reply: Option<oneshot::Sender<Result<(), String>>>,
     save_slow_at: Option<Instant>,
     stop_during_save: bool,
     home: PathBuf,
@@ -267,6 +280,7 @@ impl<C: Connector> Supervisor<C> {
             store: Some(store),
             save_guard,
             saving: None,
+            memory_reply: None,
             save_slow_at: None,
             stop_during_save: false,
             home,
@@ -415,6 +429,43 @@ impl<C: Connector> Supervisor<C> {
 
     async fn handle(&mut self, command: Command) {
         match command {
+            Command::Tasks { key, project, backend, request, reply } => {
+                if let Some(mailbox) = self.mailbox() {
+                    let message = HubMessage::Tasks { key, project, backend, request, reply };
+                    if let Err(error) = mailbox.try_send(message)
+                        && let HubMessage::Tasks { reply, .. } = error.into_inner()
+                    {
+                        let _ =
+                            reply.send(Err("Бот занят или остановлен. Повторите запрос.".into()));
+                    }
+                } else {
+                    let _ = reply.send(Err("Для управления задачами запустите бота.".into()));
+                }
+            }
+            Command::SetMemory { enabled, revision, reply } => {
+                if self.saving.is_some()
+                    || self.store.is_none()
+                    || revision != self.state.save_revision
+                {
+                    let _ = reply.send(Err(
+                        "Настройки изменились или сохраняются. Обновите и повторите".into(),
+                    ));
+                } else if let Some(mut draft) = self.state.saved.clone() {
+                    draft.memory.enabled = enabled;
+                    self.save(draft);
+                    if self.saving.is_some() {
+                        self.memory_reply = Some(reply);
+                    } else {
+                        let _ = reply.send(Err(self
+                            .state
+                            .notice
+                            .clone()
+                            .unwrap_or_else(|| "Сохранение не начато".into())));
+                    }
+                } else {
+                    let _ = reply.send(Err("Сначала сохраните настройки приложения".into()));
+                }
+            }
             Command::Save(draft) => self.save(*draft),
             Command::Start => {
                 if self.bot.is_none() && self.connecting.is_none() && self.settings.is_some() {
@@ -498,7 +549,11 @@ impl<C: Connector> Supervisor<C> {
     async fn finish_save(&mut self, outcome: Result<SaveJob, tokio::task::JoinError>) {
         self.saving = None;
         self.save_slow_at = None;
+        let memory_reply = self.memory_reply.take();
         let Ok(SaveJob { store, draft, settings, result }) = outcome else {
+            if let Some(reply) = memory_reply {
+                let _ = reply.send(Err("Результат сохранения неизвестен".into()));
+            }
             self.state.save_status = SaveStatus::Uncertain;
             self.notice(Some(
                 "Результат сохранения неизвестен; проверьте настройки после перезапуска".to_owned(),
@@ -508,6 +563,9 @@ impl<C: Connector> Supervisor<C> {
         self.store = Some(store);
         self.state.save_status = SaveStatus::Idle;
         if let Err(error) = result {
+            if let Some(reply) = memory_reply {
+                let _ = reply.send(Err(error.clone()));
+            }
             self.notice(Some(error));
             return;
         }
@@ -543,6 +601,9 @@ impl<C: Connector> Supervisor<C> {
             None => self.settings = Some(watch::Sender::new(Arc::new(settings))),
         }
         self.publish();
+        if let Some(reply) = memory_reply {
+            let _ = reply.send(Ok(()));
+        }
         match apply {
             Apply::Start => self.start(),
             Apply::Restart => {
@@ -773,7 +834,10 @@ mod tests {
                             HubMessage::Reset(key) => {
                                 format!("reset {}/{}", key.chat.0, key.thread.0)
                             }
-                            HubMessage::HandoffDone(_)
+                            HubMessage::TaskResultUnavailable { .. }
+                            | HubMessage::Tasks { .. }
+                            | HubMessage::MemoryDone(_)
+                            | HubMessage::HandoffDone(_)
                             | HubMessage::VoiceDone(_)
                             | HubMessage::SaveResult(_)
                             | HubMessage::LastDone(_)
@@ -996,6 +1060,33 @@ mod tests {
             repaint: Arc::new(|| {}),
         });
         assert_eq!(watched.borrow().bot, expected);
+    }
+
+    #[tokio::test]
+    async fn memory_toggle_persists_without_restarting_bot_and_rejects_stale_revision() {
+        let mut harness = harness(Ok(Loaded::Ready(settings("-100", ""))), &[Outcome::Hang], false);
+        harness.until("running", running).await;
+        let revision = harness.snapshot.borrow().save_revision;
+        let (reply, rx) = oneshot::channel();
+        harness.send(Command::SetMemory { enabled: false, revision, reply }).await;
+        assert!(rx.await.unwrap().is_ok());
+        harness.until("disabled", |s| s.saved.as_ref().is_some_and(|d| !d.memory.enabled)).await;
+        assert_eq!((harness.connects(), harness.stops()), (1, 0));
+        let (reply, rx) = oneshot::channel();
+        harness.send(Command::SetMemory { enabled: true, revision, reply }).await;
+        assert!(rx.await.unwrap().is_err());
+        assert!(!harness.snapshot.borrow().saved.as_ref().unwrap().memory.enabled);
+    }
+
+    #[tokio::test]
+    async fn failed_memory_save_does_not_change_live_setting() {
+        let mut harness = harness(Ok(Loaded::Ready(settings("-100", ""))), &[Outcome::Hang], true);
+        harness.until("running", running).await;
+        let revision = harness.snapshot.borrow().save_revision;
+        let (reply, rx) = oneshot::channel();
+        harness.send(Command::SetMemory { enabled: false, revision, reply }).await;
+        assert!(rx.await.unwrap().is_err());
+        assert!(harness.snapshot.borrow().saved.as_ref().unwrap().memory.enabled);
     }
 
     #[tokio::test]
@@ -1550,6 +1641,7 @@ mod tests {
         let mut harness = harness(Ok(Loaded::Ready(settings("-100", ""))), &[], false);
         harness.until("running", running).await;
         let view = TopicView {
+            memory_enabled: None,
             progress: hub_core::progress::TaskProgress::default(),
             parameters: String::new(),
             key: TopicKey { chat: ChatId(-100), thread: ThreadId(7) },

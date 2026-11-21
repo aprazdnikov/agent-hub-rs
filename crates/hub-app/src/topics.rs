@@ -56,6 +56,40 @@ impl FileTopics {
 }
 
 impl TopicStore for FileTopics {
+    fn load_tasks(&mut self) -> Result<hub_core::tasks::TaskBook, String> {
+        use std::io::Read;
+        let path = self.path.with_extension("tasks.json");
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(value) => value,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                return Ok(hub_core::tasks::TaskBook::default());
+            }
+            Err(error) => return Err(format!("Не удалось прочитать задачи: {error}")),
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return Err("Файл задач должен быть обычным файлом, а не ссылкой".into());
+        }
+        let mut bytes = Vec::new();
+        fs::File::open(&path)
+            .map_err(|e| e.to_string())?
+            .take(hub_core::tasks::MAX_READ_BYTES as u64 + 1)
+            .read_to_end(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        hub_core::tasks::TaskBook::decode(&bytes)
+    }
+    fn save_tasks(&mut self, book: &hub_core::tasks::TaskBook) -> Result<(), String> {
+        // Refuse to replace a corrupt/unknown sidecar, including external edits since startup.
+        self.load_tasks()?;
+        let path = self.path.with_extension("tasks.json");
+        write_atomic(&path, &book.encode()?)
+            .map_err(|e| format!("Не удалось сохранить задачи: {e}"))?;
+        #[cfg(unix)]
+        fs::File::open(path.parent().ok_or("Нет каталога задач")?)
+            .and_then(|directory| directory.sync_all())
+            .map_err(|e| format!("Запись задач могла сохраниться, но её долговечность не подтверждена: {e}. Перезапустите бота перед повтором."))?;
+        Ok(())
+    }
+
     fn save_recent_projects(&mut self, recent: &RecentProjects) -> Result<(), String> {
         let path = self.path.with_extension("projects.json");
         let text = recent.dump().map_err(|error| error.to_string())?;
@@ -173,5 +207,22 @@ mod tests {
         fs::create_dir(path.with_extension("titles.json")).unwrap();
         assert!(store.save_titles(&Titles::new()).is_err());
         assert_eq!(fs::read(&path).unwrap(), before);
+    }
+    #[test]
+    fn task_sidecar_survives_reopen_and_refuses_unknown_format() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("topics.json");
+        let mut store = FileTopics::new(path.clone());
+        let mut tasks = store.load_tasks().unwrap();
+        assert!(!path.with_extension("tasks.json").exists());
+        let id = tasks.create(root.path().to_path_buf(), "qwen", "Check", "Read README").unwrap();
+        tasks.begin(id, 1, None).unwrap();
+        store.save_tasks(&tasks).unwrap();
+        assert_eq!(FileTopics::new(path.clone()).load_tasks().unwrap(), tasks);
+        assert!(!path.exists(), "task state is independent of topic bindings");
+        fs::write(path.with_extension("tasks.json"), b"unknown").unwrap();
+        assert!(store.load_tasks().is_err());
+        assert!(store.save_tasks(&tasks).is_err());
+        assert_eq!(fs::read(path.with_extension("tasks.json")).unwrap(), b"unknown");
     }
 }

@@ -88,10 +88,11 @@ impl<A: Agents> SummaryRun<A> {
             cancel: cancel.clone(),
             limits: Limits::new(Duration::ZERO),
         };
-        let backend = AssertUnwindSafe(agents.run(&session, prompt, inbox, conversation, settings))
-            .catch_unwind()
-            .map(|result| result.map_err(|_| CRASHED))
-            .boxed();
+        let backend =
+            AssertUnwindSafe(agents.summarize(&session, prompt, inbox, conversation, settings))
+                .catch_unwind()
+                .map(|result| result.map_err(|_| CRASHED))
+                .boxed();
         let mut stream = Stream { backend, received, ended: false };
         let mut capture =
             Capture { source, text: String::new(), units: 0, finished: None, turns: 0 };
@@ -318,6 +319,7 @@ mod tests {
         release_cleanup: Notify,
         retained_events: Mutex<Option<mpsc::Sender<AgentEvent>>>,
         exited: AtomicBool,
+        summarizing: AtomicBool,
     }
 
     struct Exited<'a>(&'a AtomicBool);
@@ -328,6 +330,18 @@ mod tests {
     }
 
     impl Agents for FakeAgents {
+        fn summarize<'a>(
+            &'a self,
+            session: &'a TopicSession,
+            prompt: Prompt,
+            inbox: mpsc::Receiver<Prompt>,
+            conversation: Conversation,
+            settings: Arc<Settings>,
+        ) -> BoxFuture<'a, mpsc::Receiver<Prompt>> {
+            self.summarizing.store(true, Ordering::SeqCst);
+            self.run(session, prompt, inbox, conversation, settings)
+        }
+
         fn run<'a>(
             &'a self,
             session: &'a TopicSession,
@@ -448,6 +462,7 @@ mod tests {
                 release_cleanup: Notify::new(),
                 retained_events: Mutex::new(None),
                 exited: AtomicBool::new(false),
+                summarizing: AtomicBool::new(false),
             }),
             session: TopicSession::fresh(BackendKind::Codex, AbsolutePath::new(root).unwrap())
                 .with_session(SessionId::parse("source-session")),
@@ -455,6 +470,17 @@ mod tests {
             cancel: CancellationToken::new(),
             progress: Progress::new(),
         }
+    }
+
+    #[tokio::test]
+    async fn summary_uses_the_history_only_agent_entry_point() {
+        let run = run(
+            vec![AgentEvent::AssistantText("Known context".to_owned()), finished()],
+            Ending::Return,
+        );
+        let agents = run.agents.clone();
+        run.execute().await.unwrap();
+        assert!(agents.summarizing.load(Ordering::SeqCst));
     }
 
     #[tokio::test]

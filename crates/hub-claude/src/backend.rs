@@ -12,10 +12,11 @@ use tokio::process::Command;
 use tokio::sync::mpsc;
 use tokio_util::codec::{FramedRead, LinesCodec};
 
-use crate::outgoing::{ENTRYPOINT, cli_args};
+use crate::outgoing::{ENTRYPOINT, cli_args_with_memory};
 use crate::session::converse;
 use hub_agent::cli::hide_window;
 use hub_agent::conversation::Conversation;
+use hub_agent::memory::MemoryMcp;
 
 // After stdin closes the CLI finishes on its own; this bounds the wait before killing it.
 const EXIT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -24,12 +25,19 @@ const MAX_STDERR_LINE: usize = 64 * 1024;
 pub struct ClaudeBackend {
     cli: PathBuf,
     settings: ClaudeSettings,
+    memory: Option<MemoryMcp>,
 }
 
 impl ClaudeBackend {
     #[must_use]
     pub fn new(cli: PathBuf, settings: ClaudeSettings) -> Self {
-        Self { cli, settings }
+        Self { cli, settings, memory: None }
+    }
+
+    #[must_use]
+    pub fn with_memory(mut self, memory: Option<MemoryMcp>) -> Self {
+        self.memory = memory;
+        self
     }
 
     /// Runs one conversation and returns the inbox with the prompts it did not take.
@@ -42,7 +50,11 @@ impl ClaudeBackend {
     ) -> mpsc::Receiver<Prompt> {
         let mut command = Command::new(&self.cli);
         command
-            .args(cli_args(&self.settings, session.session.as_ref()))
+            .args(cli_args_with_memory(
+                &self.settings,
+                session.session.as_ref(),
+                self.memory.as_ref(),
+            ))
             .current_dir(session.cwd.as_path())
             .env(ENTRYPOINT.0, ENTRYPOINT.1)
             .stdin(Stdio::piped())

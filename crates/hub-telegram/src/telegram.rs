@@ -106,6 +106,9 @@ fn reference(file: &tg::FileMeta, name: Option<String>) -> FileRef {
 pub fn pressed(query: &CallbackQuery) -> Press {
     let message = query.regular_message();
     Press {
+        thread: message
+            .and_then(|message| message.thread_id.filter(|_| message.is_topic_message))
+            .map(|thread| ThreadId(thread.0.0)),
         callback: query.id.0.clone(),
         user: UserId(query.from.id.0),
         chat: message.map(|message| ChatId(message.chat.id.0)),

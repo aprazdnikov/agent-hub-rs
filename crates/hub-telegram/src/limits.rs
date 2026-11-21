@@ -3,10 +3,10 @@
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Utc};
 use hub_core::domain::BackendKind;
 use hub_core::questions::Button;
 use hub_core::quota::{Label, QuotaReport, QuotaSource, QuotaUpdate, UsageWindow, WINDOW_LIMIT};
+use jiff::Timestamp;
 
 use crate::texts;
 
@@ -20,7 +20,7 @@ pub type Outcome = (BackendKind, Result<QuotaReport, String>);
 struct Cached {
     plan: Option<Label>,
     windows: Vec<UsageWindow>,
-    at: DateTime<Utc>,
+    at: Timestamp,
 }
 
 /// One entry per backend with at most `WINDOW_LIMIT` windows.
@@ -33,7 +33,7 @@ impl QuotaCache {
     /// A live session's rolling update, merged per window kind: a named window replaces the
     /// cached one of its kind, others keep their values, a missing plan keeps the cached plan.
     /// An update never clears data.
-    pub fn apply(&mut self, update: QuotaUpdate, at: DateTime<Utc>) {
+    pub fn apply(&mut self, update: QuotaUpdate, at: Timestamp) {
         if update.windows().is_empty() && update.plan.is_none() {
             return;
         }
@@ -60,7 +60,7 @@ impl QuotaCache {
     /// What the card shows for one probe: a fresh report, which also replaces the cache; any
     /// other report is a final answer, returned as is; for a failure, the cache dated by its
     /// last update, or the failure's reason when there is none.
-    pub fn settle(&mut self, outcome: Outcome, now: DateTime<Utc>) -> QuotaReport {
+    pub fn settle(&mut self, outcome: Outcome, now: Timestamp) -> QuotaReport {
         let (backend, result) = outcome;
         match result {
             Ok(report) => {
@@ -109,11 +109,11 @@ mod tests {
         Label, Percent, QuotaReport, QuotaSource, QuotaUpdate, UsageWindow, WindowKind,
     };
 
-    use chrono::{DateTime, Utc};
+    use jiff::Timestamp;
 
     use super::*;
 
-    fn at(raw: &str) -> DateTime<Utc> {
+    fn at(raw: &str) -> Timestamp {
         raw.parse().unwrap()
     }
 

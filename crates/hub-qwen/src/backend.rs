@@ -12,6 +12,7 @@ use hub_agent::channel::UserChannel;
 use hub_agent::cli::hide_window;
 use hub_agent::conversation::Conversation;
 use hub_agent::mcp_http::McpHttpServer;
+use hub_agent::memory::MemoryMcp;
 use hub_agent::rpc::{
     self, Connection, Envelope, Handler, Notification, RpcClient, RpcError, Wire,
 };
@@ -26,7 +27,8 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::{FramedRead, LinesCodec};
 
 use crate::protocol::{
-    AUTH_REQUIRED, Call, HubTools, TurnTracker, initialize_params, open_session, parse_session_id,
+    AUTH_REQUIRED, Call, HubTools, TurnTracker, initialize_params, open_session_with_memory,
+    parse_session_id,
 };
 use crate::requests;
 use crate::session::{Drain, DrainRequests, RpcAgent, Turns, converse, drain_channel, emit, fail};
@@ -62,12 +64,19 @@ impl QwenAuth {
 pub struct QwenBackend {
     cli: PathBuf,
     settings: QwenSettings,
+    memory: Option<MemoryMcp>,
 }
 
 impl QwenBackend {
     #[must_use]
     pub fn new(cli: PathBuf, settings: QwenSettings) -> Self {
-        Self { cli, settings }
+        Self { cli, settings, memory: None }
+    }
+
+    #[must_use]
+    pub fn with_memory(mut self, memory: Option<MemoryMcp>) -> Self {
+        self.memory = memory;
+        self
     }
 
     /// Runs one conversation and returns the inbox with the prompts it did not take.
@@ -105,7 +114,16 @@ impl QwenBackend {
             drains: &mut drains,
         };
         let hub = HubTools { url: tools.url(), token: tools.token() };
-        let inbox = serve(link, &hub, session, prompt, inbox, &conversation).await;
+        let inbox = serve_with_memory(
+            link,
+            &hub,
+            session,
+            prompt,
+            inbox,
+            &conversation,
+            self.memory.as_ref(),
+        )
+        .await;
         agent.stop().await;
         // Only now: qwen's MCP client must not see the server vanish in the middle of a call.
         drop(tools);
@@ -136,11 +154,23 @@ pub async fn serve(
     inbox: mpsc::Receiver<Prompt>,
     conversation: &Conversation,
 ) -> mpsc::Receiver<Prompt> {
+    serve_with_memory(link, tools, session, prompt, inbox, conversation, None).await
+}
+
+async fn serve_with_memory(
+    link: Link<'_>,
+    tools: &HubTools<'_>,
+    session: &TopicSession,
+    prompt: Prompt,
+    inbox: mpsc::Receiver<Prompt>,
+    conversation: &Conversation,
+    memory: Option<&MemoryMcp>,
+) -> mpsc::Receiver<Prompt> {
     let Link { client, notifications, drains } = link;
     let opened = tokio::select! {
         biased;
         () = conversation.cancel.cancelled() => return inbox,
-        opened = open(client, notifications, tools, session) => opened,
+        opened = open(client, notifications, tools, session, memory) => opened,
     };
     let id = match opened {
         Ok(id) => id,
@@ -212,9 +242,10 @@ async fn open(
     notifications: &mut mpsc::UnboundedReceiver<Notification>,
     tools: &HubTools<'_>,
     session: &TopicSession,
+    memory: Option<&MemoryMcp>,
 ) -> Result<SessionId, OpenError> {
     client.request(Call::Initialize.method(), initialize_params(env!("CARGO_PKG_VERSION"))).await?;
-    let (call, params) = open_session(session, tools);
+    let (call, params) = open_session_with_memory(session, tools, memory);
     let opened = client.request(call.method(), params).await;
     // A loaded session replays its history as updates before the reply; none of it is news.
     while notifications.try_recv().is_ok() {}

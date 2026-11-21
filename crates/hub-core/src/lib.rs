@@ -22,3 +22,5 @@ pub mod workspace;
 pub mod options;
 pub mod outbox;
 pub mod results;
+
+pub mod tasks;

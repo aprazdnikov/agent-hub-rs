@@ -27,6 +27,22 @@ const UPDATE_COMMANDS: usize = 4;
 const RUNTIME_GRACE: Duration = Duration::from_secs(2);
 
 fn main() -> ExitCode {
+    let mut args = std::env::args_os().skip(1);
+    let command = args.next();
+    if command.as_deref().is_some_and(|arg| arg == "--memory-mcp" || arg == "--memory-project") {
+        let result = if command.as_deref().is_some_and(|arg| arg == "--memory-project") {
+            hub_memory::run_project_cli(args.collect()).map(|output| println!("{output}"))
+        } else {
+            hub_memory::run_cli(args.collect())
+        };
+        return match result {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("agent-hub memory: {error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
@@ -86,7 +102,12 @@ fn run() -> anyhow::Result<()> {
     let window_exit = Arc::clone(&exit);
     let core = runtime.handle().clone();
     let window = commands.clone();
-    let connector = TelegramConnector::new(home.clone(), dirs.topics());
+    let connector = TelegramConnector::new(home.clone(), dirs.topics())
+        .with_memory_program(program.clone())
+        .with_memory_control(Arc::new(hub_app::memory::Control {
+            commands: commands.clone(),
+            snapshot: watched.clone(),
+        }));
     let logs_dir = dirs.logs();
     let ui_settings = dirs.ui_settings();
     let options = window_options();

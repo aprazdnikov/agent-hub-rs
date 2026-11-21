@@ -7,7 +7,7 @@ license.workspace = true
 publish.workspace = true
 
 [dependencies]
-chrono.workspace = true
+jiff.workspace = true
 dunce.workspace = true
 futures.workspace = true
 hub-agent.workspace = true
@@ -17,6 +17,7 @@ hub-qwen.workspace = true
 hub-hermes.workspace = true
 hub-opencode.workspace = true
 hub-core.workspace = true
+hub-memory.workspace = true
 reqwest.workspace = true
 teloxide.workspace = true
 thiserror.workspace = true

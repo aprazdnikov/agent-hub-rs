@@ -10,6 +10,7 @@ use futures::StreamExt as _;
 use hub_agent::cli::hide_window;
 use hub_agent::conversation::Conversation;
 use hub_agent::mcp_http::McpHttpServer;
+use hub_agent::memory::MemoryMcp;
 use hub_agent::rpc::{
     self, Connection, Envelope, Handler, Notification, RpcClient, RpcError, Wire,
 };
@@ -40,12 +41,19 @@ mod tests;
 pub struct HermesBackend {
     cli: PathBuf,
     settings: HermesSettings,
+    memory: Option<MemoryMcp>,
 }
 
 impl HermesBackend {
     #[must_use]
     pub fn new(cli: PathBuf, settings: HermesSettings) -> Self {
-        Self { cli, settings }
+        Self { cli, settings, memory: None }
+    }
+
+    #[must_use]
+    pub fn with_memory(mut self, memory: Option<MemoryMcp>) -> Self {
+        self.memory = memory;
+        self
     }
 
     /// Runs one conversation, returning queued prompts not yet consumed.
@@ -91,6 +99,7 @@ impl HermesBackend {
             client: &process.client,
             notifications: &mut process.notifications,
             tools: &tools,
+            memory: self.memory.as_ref(),
             session,
             settings: &self.settings,
             gate: &gate,
@@ -116,16 +125,23 @@ struct SessionControl<'a> {
     client: &'a RpcClient,
     notifications: &'a mut mpsc::UnboundedReceiver<Notification>,
     tools: &'a McpHttpServer,
+    memory: Option<&'a MemoryMcp>,
     session: &'a TopicSession,
     settings: &'a HermesSettings,
     gate: &'a Gate,
 }
 
 async fn open(control: SessionControl<'_>) -> Result<Opened, RpcError> {
-    let SessionControl { client, notifications, tools, session, settings, gate: _ } = control;
+    let SessionControl { client, notifications, tools, memory, session, settings, gate: _ } =
+        control;
     let initialized = client.request("initialize", protocol::initialize_params()).await?;
     let capabilities = Capabilities::parse(&initialized)?;
-    let mut params = protocol::session_params(session.cwd.as_path(), tools.url(), tools.token());
+    let mut params = protocol::session_params_with_memory(
+        session.cwd.as_path(),
+        tools.url(),
+        tools.token(),
+        memory,
+    );
     let (id, modes) = if let Some(saved) = &session.session {
         if !capabilities.load {
             return Err(RpcError::Protocol(
@@ -195,8 +211,8 @@ async fn serve(
     inbox: &mut mpsc::Receiver<Prompt>,
     conversation: &Conversation,
 ) -> Result<(), RpcError> {
-    let SessionControl { client, notifications, tools, session, settings, gate } = control;
-    let control = SessionControl { client, notifications, tools, session, settings, gate };
+    let SessionControl { client, notifications, tools, memory, session, settings, gate } = control;
+    let control = SessionControl { client, notifications, tools, memory, session, settings, gate };
     let opened = tokio::select! {
         biased;
         () = conversation.cancel.cancelled() => return Ok(()),

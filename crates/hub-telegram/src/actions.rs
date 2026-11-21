@@ -355,6 +355,7 @@ mod tests {
 
     fn press(data: &str, user: u64) -> Press {
         Press {
+            thread: None,
             callback: uuid::Uuid::new_v4().to_string(),
             user: UserId(user),
             chat: Some(ChatId(-100)),

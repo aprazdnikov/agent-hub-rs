@@ -6,11 +6,11 @@ use std::path::Path;
 use std::process::Stdio;
 use std::time::Duration;
 
-use chrono::{DateTime, Utc};
 use futures::StreamExt;
 use hub_agent::cli::hide_window;
 use hub_core::domain::BackendKind;
 use hub_core::quota::{Label, Percent, QuotaReport, QuotaUpdate, UsageWindow, WindowKind};
+use jiff::Timestamp;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
@@ -357,8 +357,8 @@ fn usage_window(
     Some(UsageWindow { kind, percent, resets_at: resets_at.and_then(iso_time) })
 }
 
-fn iso_time(raw: &str) -> Option<DateTime<Utc>> {
-    DateTime::parse_from_rfc3339(raw).ok().map(|time| time.with_timezone(&Utc))
+fn iso_time(raw: &str) -> Option<Timestamp> {
+    raw.parse().ok()
 }
 
 /// `max` → `Max`.
@@ -390,11 +390,11 @@ pub fn event_update(info: &RateLimitInfo) -> Option<QuotaUpdate> {
     Some(QuotaUpdate::new(BackendKind::Claude, None, vec![window]))
 }
 
-fn unix_time(raw: i64) -> Option<DateTime<Utc>> {
+fn unix_time(raw: i64) -> Option<Timestamp> {
     if raw > MILLIS_FROM {
-        DateTime::from_timestamp_millis(raw)
+        Timestamp::from_millisecond(raw).ok()
     } else {
-        DateTime::from_timestamp(raw, 0)
+        Timestamp::from_second(raw).ok()
     }
 }
 
@@ -407,7 +407,7 @@ mod tests {
 
     const RECORDED: &str = include_str!("../tests/fixtures/get_usage.json");
 
-    fn at(raw: &str) -> DateTime<Utc> {
+    fn at(raw: &str) -> Timestamp {
         raw.parse().unwrap()
     }
 

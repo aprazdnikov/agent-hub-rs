@@ -14,3 +14,7 @@ pub use settings::home_or_root;
 pub use theme::configure as configure_theme;
 #[cfg(target_os = "linux")]
 pub use theme::linux::follow_system as follow_system_theme;
+
+mod memory;
+
+mod tasks;

@@ -10,6 +10,7 @@ use std::time::Duration;
 use futures::StreamExt;
 use hub_agent::cli::hide_window;
 use hub_agent::conversation::Conversation;
+use hub_agent::memory::MemoryMcp;
 use hub_core::domain::{AgentEvent, Prompt, SessionId, TopicSession};
 use hub_core::settings::CodexSettings;
 use serde_json::json;
@@ -20,8 +21,8 @@ use tokio::task::JoinHandle;
 use tokio_util::codec::{FramedRead, LinesCodec};
 
 use crate::protocol::{
-    Call, CodexAuth, TurnTracker, auth_state, initialize_params, login_params, open_thread,
-    parse_thread_id,
+    Call, CodexAuth, TurnTracker, auth_state, initialize_params, login_params,
+    open_thread_with_memory, parse_thread_id,
 };
 use crate::requests;
 use crate::session::{RpcThread, converse};
@@ -43,12 +44,19 @@ pub const APP_SERVER_FAILED: &str = "Codex app-server завершился, по
 pub struct CodexBackend {
     cli: PathBuf,
     settings: CodexSettings,
+    memory: Option<MemoryMcp>,
 }
 
 impl CodexBackend {
     #[must_use]
     pub fn new(cli: PathBuf, settings: CodexSettings) -> Self {
-        Self { cli, settings }
+        Self { cli, settings, memory: None }
+    }
+
+    #[must_use]
+    pub fn with_memory(mut self, memory: Option<MemoryMcp>) -> Self {
+        self.memory = memory;
+        self
     }
 
     /// Runs one conversation and returns the inbox with the prompts it did not take.
@@ -72,7 +80,16 @@ impl CodexBackend {
             }
         };
         let link = Link { client: &server.client, notifications: &mut server.notifications };
-        let inbox = serve(link, &self.settings, session, prompt, inbox, &conversation).await;
+        let inbox = serve_with_memory(
+            link,
+            &self.settings,
+            session,
+            prompt,
+            inbox,
+            &conversation,
+            self.memory.as_ref(),
+        )
+        .await;
         server.stop().await;
         inbox
     }
@@ -92,11 +109,23 @@ pub async fn serve(
     inbox: mpsc::Receiver<Prompt>,
     conversation: &Conversation,
 ) -> mpsc::Receiver<Prompt> {
+    serve_with_memory(link, settings, session, prompt, inbox, conversation, None).await
+}
+
+async fn serve_with_memory(
+    link: Link<'_>,
+    settings: &CodexSettings,
+    session: &TopicSession,
+    prompt: Prompt,
+    inbox: mpsc::Receiver<Prompt>,
+    conversation: &Conversation,
+    memory: Option<&MemoryMcp>,
+) -> mpsc::Receiver<Prompt> {
     let Link { client, notifications } = link;
     let opened = tokio::select! {
         biased;
         () = conversation.cancel.cancelled() => return inbox,
-        opened = open(client, settings, session) => opened,
+        opened = open(client, settings, session, memory) => opened,
     };
     let thread = match opened {
         Ok(thread) => thread,
@@ -162,12 +191,13 @@ async fn open(
     client: &RpcClient,
     settings: &CodexSettings,
     session: &TopicSession,
+    memory: Option<&MemoryMcp>,
 ) -> Result<SessionId, OpenError> {
     let auth = probe(client, settings).await?;
     if auth == CodexAuth::Missing {
         return Err(OpenError::NotLoggedIn);
     }
-    let (call, params) = open_thread(session, settings);
+    let (call, params) = open_thread_with_memory(session, settings, memory);
     match client.request(call.method(), params).await {
         Ok(result) => Ok(parse_thread_id(&result)?),
         Err(RpcError::Remote { message, .. }) => Err(match &session.session {

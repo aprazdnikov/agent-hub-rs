@@ -1,8 +1,7 @@
-use std::fmt::Display;
 use std::num::NonZeroUsize;
 use std::time::Duration;
 
-use chrono::{DateTime, Datelike, TimeZone, Utc, Weekday};
+use jiff::{Timestamp, Zoned, civil::Weekday, tz::TimeZone};
 use rust_decimal::Decimal;
 
 use crate::domain::{BackendKind, Finished, Usage};
@@ -115,13 +114,9 @@ const BAR_CELLS: usize = 10;
 
 /// The `/limits` card as Telegram HTML, times in `tz`; every string from the agents escaped.
 #[must_use]
-pub fn render_limits<Tz>(reports: &[QuotaReport], now: DateTime<Utc>, tz: &Tz) -> String
-where
-    Tz: TimeZone,
-    Tz::Offset: Display,
-{
-    let now = now.with_timezone(tz);
-    let header = format!("{LIMITS_TITLE} · {}", now.format("%d.%m %H:%M"));
+pub fn render_limits(reports: &[QuotaReport], now: Timestamp, tz: &TimeZone) -> String {
+    let now = now.to_zoned(tz.clone());
+    let header = format!("{LIMITS_TITLE} · {}", now.strftime("%d.%m %H:%M"));
     let silent: Vec<&str> = reports
         .iter()
         .filter(|report| matches!(report.source, QuotaSource::NotReported))
@@ -139,11 +134,7 @@ where
     std::iter::once(header).chain(blocks).chain(tail).collect::<Vec<_>>().join("\n")
 }
 
-fn report_lines<Tz>(report: &QuotaReport, now: &DateTime<Tz>) -> Vec<String>
-where
-    Tz: TimeZone,
-    Tz::Offset: Display,
-{
+fn report_lines(report: &QuotaReport, now: &Zoned) -> Vec<String> {
     let plan = report
         .plan
         .as_ref()
@@ -154,7 +145,7 @@ where
             return vec![format!("{head} ⚠️ {}", escape(reason.as_str()))];
         }
         QuotaSource::Cached { at } => {
-            format!("{head} (на {})", moment(&at.with_timezone(&now.timezone()), now))
+            format!("{head} (на {})", moment(&at.to_zoned(now.time_zone().clone()), now))
         }
         QuotaSource::Fresh | QuotaSource::NotReported => head,
     };
@@ -169,52 +160,40 @@ where
         .collect()
 }
 
-fn window_line<Tz>(window: &UsageWindow, width: usize, now: &DateTime<Tz>) -> String
-where
-    Tz: TimeZone,
-    Tz::Offset: Display,
-{
+fn window_line(window: &UsageWindow, width: usize, now: &Zoned) -> String {
     let percent = window.percent.get();
     let filled = usize::from(percent.saturating_add(5) / 10).min(BAR_CELLS);
     let bar = format!("{}{}", "▓".repeat(filled), "░".repeat(BAR_CELLS - filled));
     let name = label(&window.kind);
     let pad = " ".repeat(width.saturating_sub(name.chars().count()));
     let reset = window.resets_at.map_or_else(String::new, |at| {
-        format!(" · сброс {}", reset_text(&at.with_timezone(&now.timezone()), now))
+        format!(" · сброс {}", reset_text(&at.to_zoned(now.time_zone().clone()), now))
     });
     format!("<code>  {}{pad} {bar} {percent:>2}%</code>{reset}", escape(&name))
 }
 
-fn reset_text<Tz>(at: &DateTime<Tz>, now: &DateTime<Tz>) -> String
-where
-    Tz: TimeZone,
-    Tz::Offset: Display,
-{
-    match at.date_naive().signed_duration_since(now.date_naive()).num_days() {
-        0 => format!("в {}", at.format("%H:%M")),
-        1..=6 => format!("{} {}", weekday(at.weekday()), at.format("%H:%M")),
-        _ => at.format("%d.%m %H:%M").to_string(),
+fn reset_text(at: &Zoned, now: &Zoned) -> String {
+    match at.date().duration_since(now.date()).as_secs() / 86_400 {
+        0 => format!("в {}", at.strftime("%H:%M")),
+        1..=6 => format!("{} {}", weekday(at.weekday()), at.strftime("%H:%M")),
+        _ => at.strftime("%d.%m %H:%M").to_string(),
     }
 }
 
-fn moment<Tz>(at: &DateTime<Tz>, now: &DateTime<Tz>) -> String
-where
-    Tz: TimeZone,
-    Tz::Offset: Display,
-{
-    let pattern = if at.date_naive() == now.date_naive() { "%H:%M" } else { "%d.%m %H:%M" };
-    at.format(pattern).to_string()
+fn moment(at: &Zoned, now: &Zoned) -> String {
+    let pattern = if at.date() == now.date() { "%H:%M" } else { "%d.%m %H:%M" };
+    at.strftime(pattern).to_string()
 }
 
 const fn weekday(day: Weekday) -> &'static str {
     match day {
-        Weekday::Mon => "пн",
-        Weekday::Tue => "вт",
-        Weekday::Wed => "ср",
-        Weekday::Thu => "чт",
-        Weekday::Fri => "пт",
-        Weekday::Sat => "сб",
-        Weekday::Sun => "вс",
+        Weekday::Monday => "пн",
+        Weekday::Tuesday => "вт",
+        Weekday::Wednesday => "ср",
+        Weekday::Thursday => "чт",
+        Weekday::Friday => "пт",
+        Weekday::Saturday => "сб",
+        Weekday::Sunday => "вс",
     }
 }
 
@@ -243,7 +222,7 @@ mod tests {
     use std::num::NonZeroUsize;
     use std::time::Duration;
 
-    use chrono::FixedOffset;
+    use jiff::tz::offset;
     use rstest::rstest;
     use rust_decimal::Decimal;
 
@@ -389,12 +368,12 @@ mod tests {
         );
     }
 
-    fn at(raw: &str) -> DateTime<Utc> {
+    fn at(raw: &str) -> Timestamp {
         raw.parse().unwrap()
     }
 
-    fn msk() -> FixedOffset {
-        FixedOffset::east_opt(3 * 3600).unwrap()
+    fn msk() -> TimeZone {
+        TimeZone::fixed(offset(3))
     }
 
     fn label(raw: &str) -> Label {
@@ -499,6 +478,23 @@ mod tests {
             at(cached),
         );
         assert_eq!(card(&[report]).lines().nth(1), Some(head));
+    }
+
+    #[rstest]
+    #[case("2026-03-08T04:30:00Z", "2026-03-08T07:30:00Z", " · сброс вс 03:30")]
+    #[case("2026-11-01T03:30:00Z", "2026-11-01T06:30:00Z", " · сброс вс 01:30")]
+    fn reset_uses_the_offset_at_its_own_instant(
+        #[case] now: &str,
+        #[case] reset: &str,
+        #[case] suffix: &str,
+    ) {
+        let tz = TimeZone::posix("EST5EDT,M3.2.0,M11.1.0").unwrap();
+        let report = QuotaReport::fresh(
+            BackendKind::Claude,
+            None,
+            vec![window(WindowKind::FiveHour, 50, Some(reset))],
+        );
+        assert!(render_limits(&[report], at(now), &tz).ends_with(suffix));
     }
 
     #[test]

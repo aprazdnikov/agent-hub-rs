@@ -130,7 +130,17 @@ pub fn hub_tools() -> Value {
 /// `thread/start` for a new topic session, `thread/resume` for a saved one.
 #[must_use]
 pub fn open_thread(session: &TopicSession, settings: &CodexSettings) -> (Call, Value) {
+    open_thread_with_memory(session, settings, None)
+}
+
+#[must_use]
+pub fn open_thread_with_memory(
+    session: &TopicSession,
+    settings: &CodexSettings,
+    memory: Option<&hub_agent::memory::MemoryMcp>,
+) -> (Call, Value) {
     let mut params = Map::new();
+    params.insert("config".to_owned(), hub_agent::memory::codex_config(memory));
     params.insert("cwd".to_owned(), Value::from(session.cwd.as_path().display().to_string()));
     params.insert("sandbox".to_owned(), Value::from(settings.sandbox.wire()));
     params.insert("approvalPolicy".to_owned(), Value::from(settings.approval.wire()));
@@ -328,6 +338,37 @@ mod tests {
         TurnId::new(id.to_owned())
     }
 
+    #[rstest]
+    #[case(None)]
+    #[case(Some(thread()))]
+    fn memory_is_explicitly_disabled_without_a_descriptor(#[case] saved: Option<SessionId>) {
+        let session = TopicSession::fresh(BackendKind::Codex, cwd()).with_session(saved);
+        let (_, params) = open_thread(&session, &settings(None));
+        assert_eq!(
+            params.pointer("/config/mcp_servers.agent-hub-memory/enabled"),
+            Some(&json!(false))
+        );
+    }
+
+    #[rstest]
+    #[case(None)]
+    #[case(Some(thread()))]
+    fn memory_is_added_on_both_new_and_resumed_threads(#[case] saved: Option<SessionId>) {
+        let session = TopicSession::fresh(BackendKind::Codex, cwd()).with_session(saved);
+        let program = cwd().as_path().join("agent-hub");
+        let memory =
+            hub_agent::memory::MemoryMcp::new(&program, &session.cwd, BackendKind::Codex).unwrap();
+        let (_, params) = open_thread_with_memory(&session, &settings(None), Some(&memory));
+        assert_eq!(
+            params.get("config"),
+            Some(&json!({"mcp_servers.agent-hub-memory": {
+                "command": program.to_str().unwrap(),
+                "args": ["--memory-mcp", "--project-dir", session.cwd.as_path().to_str().unwrap(), "--actor", "codex"],
+                "enabled": true, "startup_timeout_sec": 10, "tool_timeout_sec": 30,
+            }}))
+        );
+    }
+
     #[test]
     fn new_session_starts_a_thread_with_hub_tools() {
         let session = TopicSession::fresh(BackendKind::Codex, cwd());
@@ -342,6 +383,7 @@ mod tests {
                     "approvalsReviewer": "user",
                     "model": "gpt-5.5-codex",
                     "dynamicTools": hub_tools(),
+                    "config": hub_agent::memory::codex_config(None),
                 })
             )
         );
@@ -360,6 +402,7 @@ mod tests {
                     "approvalPolicy": "on-request",
                     "approvalsReviewer": "user",
                     "threadId": "t-1",
+                    "config": hub_agent::memory::codex_config(None),
                 })
             )
         );

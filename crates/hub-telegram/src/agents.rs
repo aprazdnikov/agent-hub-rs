@@ -1,13 +1,14 @@
 //! The agent backends behind the hub; adding one is a new `BackendKind` variant and a match arm.
 
 use std::env;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use futures::future::{BoxFuture, join_all};
 use hub_agent::archive::SessionArchive;
 use hub_agent::conversation::Conversation;
+use hub_agent::memory::MemoryMcp;
 use hub_claude::archive::ClaudeArchive;
 use hub_claude::backend::ClaudeBackend;
 use hub_codex::archive::CodexArchive;
@@ -27,12 +28,96 @@ use crate::limits::Outcome;
 
 pub struct HubAgents {
     settings: watch::Receiver<Arc<Settings>>,
+    memory_program: Option<PathBuf>,
 }
 
 impl HubAgents {
     #[must_use]
     pub fn new(settings: watch::Receiver<Arc<Settings>>) -> Self {
-        Self { settings }
+        Self { settings, memory_program: None }
+    }
+
+    #[must_use]
+    pub fn with_memory_program(mut self, program: PathBuf) -> Self {
+        self.memory_program = Some(program);
+        self
+    }
+
+    fn memory(&self, session: &TopicSession) -> Result<Option<MemoryMcp>, String> {
+        self.memory_program
+            .as_deref()
+            .map(|program| MemoryMcp::new(program, &session.cwd, session.backend))
+            .transpose()
+    }
+
+    fn execute(
+        session: &TopicSession,
+        prompt: Prompt,
+        inbox: mpsc::Receiver<Prompt>,
+        conversation: Conversation,
+        settings: Arc<Settings>,
+        memory: Option<MemoryMcp>,
+    ) -> BoxFuture<'_, mpsc::Receiver<Prompt>> {
+        // Hub froze and resolved these settings before downloads or process startup.
+        Box::pin(async move {
+            match session.backend {
+                BackendKind::Claude => {
+                    match hub_claude::version::locate(settings.claude.cli.as_deref()) {
+                        Ok(cli) => {
+                            ClaudeBackend::new(cli, settings.claude.clone())
+                                .with_memory(memory)
+                                .run(session, prompt, inbox, conversation)
+                                .await
+                        }
+                        Err(error) => refuse(&conversation, error.to_string(), inbox).await,
+                    }
+                }
+                BackendKind::Codex => {
+                    match hub_codex::version::locate(settings.codex.cli.as_deref()) {
+                        Ok(cli) => {
+                            CodexBackend::new(cli, settings.codex.clone())
+                                .with_memory(memory)
+                                .run(session, prompt, inbox, conversation)
+                                .await
+                        }
+                        Err(error) => refuse(&conversation, error.to_string(), inbox).await,
+                    }
+                }
+                BackendKind::Hermes => {
+                    match hub_hermes::version::locate(settings.hermes.cli.as_deref()) {
+                        Ok(cli) => {
+                            HermesBackend::new(cli, settings.hermes.clone())
+                                .with_memory(memory)
+                                .run(session, prompt, inbox, conversation)
+                                .await
+                        }
+                        Err(error) => refuse(&conversation, error.to_string(), inbox).await,
+                    }
+                }
+                BackendKind::Opencode => {
+                    match hub_opencode::version::locate(settings.opencode.cli.as_deref()) {
+                        Ok(cli) => {
+                            OpencodeBackend::new(cli, settings.opencode.clone())
+                                .with_memory(memory)
+                                .run(session, prompt, inbox, conversation)
+                                .await
+                        }
+                        Err(error) => refuse(&conversation, error.to_string(), inbox).await,
+                    }
+                }
+                BackendKind::Qwen => {
+                    match hub_qwen::version::locate(settings.qwen.cli.as_deref()) {
+                        Ok(cli) => {
+                            QwenBackend::new(cli, settings.qwen.clone())
+                                .with_memory(memory)
+                                .run(session, prompt, inbox, conversation)
+                                .await
+                        }
+                        Err(error) => refuse(&conversation, error.to_string(), inbox).await,
+                    }
+                }
+            }
+        })
     }
 }
 
@@ -45,61 +130,21 @@ impl Agents for HubAgents {
         conversation: Conversation,
         settings: Arc<Settings>,
     ) -> BoxFuture<'a, mpsc::Receiver<Prompt>> {
-        // Hub froze and resolved these settings before downloads or process startup.
-        Box::pin(async move {
-            match session.backend {
-                BackendKind::Claude => {
-                    match hub_claude::version::locate(settings.claude.cli.as_deref()) {
-                        Ok(cli) => {
-                            ClaudeBackend::new(cli, settings.claude.clone())
-                                .run(session, prompt, inbox, conversation)
-                                .await
-                        }
-                        Err(error) => refuse(&conversation, error.to_string(), inbox).await,
-                    }
-                }
-                BackendKind::Codex => {
-                    match hub_codex::version::locate(settings.codex.cli.as_deref()) {
-                        Ok(cli) => {
-                            CodexBackend::new(cli, settings.codex.clone())
-                                .run(session, prompt, inbox, conversation)
-                                .await
-                        }
-                        Err(error) => refuse(&conversation, error.to_string(), inbox).await,
-                    }
-                }
-                BackendKind::Hermes => {
-                    match hub_hermes::version::locate(settings.hermes.cli.as_deref()) {
-                        Ok(cli) => {
-                            HermesBackend::new(cli, settings.hermes.clone())
-                                .run(session, prompt, inbox, conversation)
-                                .await
-                        }
-                        Err(error) => refuse(&conversation, error.to_string(), inbox).await,
-                    }
-                }
-                BackendKind::Opencode => {
-                    match hub_opencode::version::locate(settings.opencode.cli.as_deref()) {
-                        Ok(cli) => {
-                            OpencodeBackend::new(cli, settings.opencode.clone())
-                                .run(session, prompt, inbox, conversation)
-                                .await
-                        }
-                        Err(error) => refuse(&conversation, error.to_string(), inbox).await,
-                    }
-                }
-                BackendKind::Qwen => {
-                    match hub_qwen::version::locate(settings.qwen.cli.as_deref()) {
-                        Ok(cli) => {
-                            QwenBackend::new(cli, settings.qwen.clone())
-                                .run(session, prompt, inbox, conversation)
-                                .await
-                        }
-                        Err(error) => refuse(&conversation, error.to_string(), inbox).await,
-                    }
-                }
-            }
-        })
+        match if settings.memory.enabled { self.memory(session) } else { Ok(None) } {
+            Ok(memory) => Self::execute(session, prompt, inbox, conversation, settings, memory),
+            Err(error) => Box::pin(async move { refuse(&conversation, error, inbox).await }),
+        }
+    }
+
+    fn summarize<'a>(
+        &'a self,
+        session: &'a TopicSession,
+        prompt: Prompt,
+        inbox: mpsc::Receiver<Prompt>,
+        conversation: Conversation,
+        settings: Arc<Settings>,
+    ) -> BoxFuture<'a, mpsc::Receiver<Prompt>> {
+        Self::execute(session, prompt, inbox, conversation, settings, None)
     }
 
     fn archive<'a>(
@@ -299,6 +344,58 @@ mod tests {
         }
         fn send_file(&self, _file: OutgoingFile) -> BoxFuture<'_, FileDelivery> {
             Box::pin(async { FileDelivery::Delivered })
+        }
+    }
+
+    #[rstest::rstest]
+    #[case(BackendKind::Claude)]
+    #[case(BackendKind::Codex)]
+    #[case(BackendKind::Qwen)]
+    #[case(BackendKind::Hermes)]
+    #[case(BackendKind::Opencode)]
+    #[tokio::test]
+    async fn summaries_do_not_construct_or_enable_project_memory(#[case] backend: BackendKind) {
+        let root = std::env::temp_dir();
+        let missing = root.join("definitely-not-a-memory-test-agent");
+        let mut form = Draft {
+            token: "1:a".to_owned(),
+            chat: "-100".to_owned(),
+            users: "1".to_owned(),
+            workspace_root: root.display().to_string(),
+            ..Draft::default()
+        };
+        form.cli = missing.display().to_string();
+        form.codex.cli = missing.display().to_string();
+        form.qwen.cli = missing.display().to_string();
+        form.hermes.cli = missing.display().to_string();
+        form.opencode.cli = missing.display().to_string();
+        let settings = Arc::new(form.parse(&root).unwrap());
+        let agents = HubAgents::new(watch::Sender::new(settings.clone()).subscribe())
+            .with_memory_program(PathBuf::from("relative-program-is-invalid"));
+        let session = TopicSession::fresh(backend, AbsolutePath::new(root).unwrap())
+            .with_session(hub_core::domain::SessionId::parse("saved-session"));
+        for (summary, enabled) in [(false, true), (false, false), (true, true), (true, false)] {
+            let mut selected = (*settings).clone();
+            selected.memory.enabled = enabled;
+            let settings = Arc::new(selected);
+            let (events, mut received) = mpsc::channel(4);
+            let conversation = Conversation {
+                channel: Arc::new(Allowing),
+                events,
+                cancel: CancellationToken::new(),
+                limits: Limits::new(Duration::from_secs(1)),
+            };
+            let (_sender, inbox) = mpsc::channel(1);
+            let prompt = Prompt::new("summary".to_owned(), Vec::new()).unwrap();
+            let _inbox = if summary {
+                agents.summarize(&session, prompt, inbox, conversation, settings.clone()).await
+            } else {
+                agents.run(&session, prompt, inbox, conversation, settings.clone()).await
+            };
+            let Some(AgentEvent::Failed(reason)) = received.recv().await else {
+                panic!("missing failure")
+            };
+            assert_eq!(reason.contains("серверу памяти"), !summary && enabled, "{reason}");
         }
     }
 

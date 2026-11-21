@@ -71,7 +71,7 @@ impl LastResults {
                 }
                 match result {
                     Ok(Some(record)) => {
-                        let time = chrono::DateTime::from_timestamp(record.completed_at(), 0).map_or_else(|| "неизвестно".to_owned(), |time| time.format("%Y-%m-%d %H:%M:%S UTC").to_string());
+                        let time = jiff::Timestamp::from_second(record.completed_at()).map_or_else(|_| format!("Unix-время: {}", record.completed_at()), |time| time.strftime("%Y-%m-%d %H:%M:%S UTC").to_string());
                         let header = format!("📄 Последний сохранённый ответ\n{time} · {}\nКаталог: {}\nХод: {}", record.backend(), record.cwd(), record.run());
                         // The metadata may exceed Telegram's limit for a very long path.
                         for chunk in hub_core::render::split_message(&header, TELEGRAM_TEXT_LIMIT) {
