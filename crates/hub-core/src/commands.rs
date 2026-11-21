@@ -5,6 +5,7 @@ use crate::snapshot::{NameError, SnapshotName};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
+    Task,
     Memory,
     Actions,
     Projects,
@@ -28,7 +29,7 @@ pub enum Command {
 }
 
 impl Command {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::New,
         Self::Backend,
         Self::Model,
@@ -44,6 +45,7 @@ impl Command {
         Self::Last,
         Self::Outbox,
         Self::Memory,
+        Self::Task,
         Self::Save,
         Self::Saves,
         Self::Restore,
@@ -54,6 +56,7 @@ impl Command {
     #[must_use]
     pub const fn name(self) -> &'static str {
         match self {
+            Self::Task => "task",
             Self::Memory => "memory",
             Self::Actions => "actions",
             Self::Projects => "projects",
@@ -80,6 +83,7 @@ impl Command {
     #[must_use]
     pub const fn description(self) -> &'static str {
         match self {
+            Self::Task => "задачи проекта и ручные запуски",
             Self::Memory => "Память проекта",
             Self::Actions => "запуск и остановка пользовательских действий",
             Self::Projects => "выбрать проект для этой темы (сброс контекста)",
@@ -124,6 +128,7 @@ impl Command {
             | Self::Doctor
             | Self::Last
             | Self::Outbox => "",
+            Self::Task => " [create|get|run|resume]",
             Self::Memory => " [search ТЕКСТ | get КЛЮЧ [РЕВИЗИЯ]]",
         }
     }
@@ -294,7 +299,7 @@ mod tests {
             assert!((1..=256).contains(&command.description().chars().count()));
             assert_eq!(Command::parse(name), Some(command));
         }
-        assert_eq!(names.len(), 20);
+        assert_eq!(names.len(), 21);
     }
 
     #[test]
@@ -304,8 +309,8 @@ mod tests {
             names,
             [
                 "new", "backend", "model", "mode", "cwd", "reset", "stop", "status", "limits",
-                "actions", "projects", "doctor", "last", "outbox", "memory", "save", "saves",
-                "restore", "handoff", "help"
+                "actions", "projects", "doctor", "last", "outbox", "memory", "task", "save",
+                "saves", "restore", "handoff", "help"
             ]
         );
     }

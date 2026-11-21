@@ -103,6 +103,9 @@ fn memory_error(error: Error) -> String {
 pub fn parse(args: &str) -> Result<Request, String> {
     let mut parts = args.split_whitespace();
     match parts.next() {
+        Some("procedure") if parts.next().is_none() => {
+            Ok(Request::Admin(Box::new(lifecycle::Action::Procedure)))
+        }
         Some("context") => {
             let form = args.trim_start().strip_prefix("context").unwrap_or("").trim();
             if form.is_empty() {

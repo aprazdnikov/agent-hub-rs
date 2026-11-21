@@ -27,7 +27,18 @@ pub const RETRY_MAX: Duration = Duration::from_mins(5);
 const OUTBOX_REFRESH: Duration = Duration::from_secs(5);
 
 pub enum Command {
-    SetMemory { enabled: bool, revision: u64, reply: oneshot::Sender<Result<(), String>> },
+    Tasks {
+        key: TopicKey,
+        project: PathBuf,
+        backend: BackendKind,
+        request: hub_telegram::hub::tasks::Request,
+        reply: oneshot::Sender<Result<Vec<hub_core::tasks::Task>, String>>,
+    },
+    SetMemory {
+        enabled: bool,
+        revision: u64,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Save(Box<Draft>),
     Start,
     Stop,
@@ -418,6 +429,19 @@ impl<C: Connector> Supervisor<C> {
 
     async fn handle(&mut self, command: Command) {
         match command {
+            Command::Tasks { key, project, backend, request, reply } => {
+                if let Some(mailbox) = self.mailbox() {
+                    let message = HubMessage::Tasks { key, project, backend, request, reply };
+                    if let Err(error) = mailbox.try_send(message)
+                        && let HubMessage::Tasks { reply, .. } = error.into_inner()
+                    {
+                        let _ =
+                            reply.send(Err("Бот занят или остановлен. Повторите запрос.".into()));
+                    }
+                } else {
+                    let _ = reply.send(Err("Для управления задачами запустите бота.".into()));
+                }
+            }
             Command::SetMemory { enabled, revision, reply } => {
                 if self.saving.is_some()
                     || self.store.is_none()
@@ -810,7 +834,9 @@ mod tests {
                             HubMessage::Reset(key) => {
                                 format!("reset {}/{}", key.chat.0, key.thread.0)
                             }
-                            HubMessage::MemoryDone(_)
+                            HubMessage::TaskResultUnavailable { .. }
+                            | HubMessage::Tasks { .. }
+                            | HubMessage::MemoryDone(_)
                             | HubMessage::HandoffDone(_)
                             | HubMessage::VoiceDone(_)
                             | HubMessage::SaveResult(_)

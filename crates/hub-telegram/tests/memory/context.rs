@@ -53,3 +53,25 @@ fn malformed_context_form_is_rejected_instead_of_dropping_fields() {
         assert!(parse(&form).is_err());
     }
 }
+
+#[test]
+fn procedure_is_available_without_project_or_storage_and_rejects_arguments() -> Result {
+    let root = tempfile::tempdir()?;
+    let base = root.path().join("absent-memory");
+    let project = root.path().join("absent-project");
+    let request = parse("procedure")?;
+    let View::Admin(panel) = read(&base, &project, &request)? else {
+        return Err("expected procedure panel".into());
+    };
+    let Panel::Notice(text) = *panel else {
+        return Err("expected procedure text".into());
+    };
+    assert!(text.contains("continue-work@1"));
+    assert!(text.contains("expected_revision"));
+    assert!(text.encode_utf16().count() <= 3500);
+    assert!(!base.exists());
+    assert!(!project.exists());
+    assert!(parse("procedure 2").is_err());
+    assert!(parse("procedure extra").is_err());
+    Ok(())
+}

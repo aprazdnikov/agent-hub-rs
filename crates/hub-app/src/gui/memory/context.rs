@@ -38,6 +38,7 @@ impl ContextDraft {
         ui.small("Поля поручения и сборка — в блоке «Пакет контекста следующему агенту» выше.");
     }
     pub(super) fn controls(&mut self, ui: &mut egui::Ui, enabled: bool) -> Option<Request> {
+        procedure(ui);
         let mut action = None;
         ui.collapsing(format!("Пакет контекста следующему агенту ({}/20)",self.selected.len()),|ui| {
             ui.add_enabled_ui(enabled,|ui| {
@@ -106,6 +107,16 @@ impl ContextDraft {
     }
 }
 
+fn procedure(ui: &mut egui::Ui) {
+    ui.collapsing("Процедура: продолжить работу по памяти", |ui| {
+        ui.label("Шаблон continue-work@1. Передайте выбранному агенту вместе с конкретной задачей. Копирование не запускает работу и не меняет память.");
+        ui.add(egui::Label::new(hub_memory::CONTINUE_WORK_V1).selectable(true));
+        if ui.button("Скопировать процедуру").clicked() {
+            ui.ctx().copy_text(hub_memory::CONTINUE_WORK_V1.to_owned());
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +175,61 @@ mod tests {
         assert!(rebuilt.text().contains("Не удалять данные"));
         draft.selected.clear();
         assert!(!frame(&draft, &rebuilt), "removing a record must invalidate the preview");
+    }
+    #[test]
+    fn procedure_copy_requires_expansion_and_copies_exact_text() {
+        let ctx = egui::Context::default();
+        let frame = |events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1200.0, 3000.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                procedure,
+            );
+            output.textures_delta.clear();
+            output
+        };
+        let position = |output: &egui::FullOutput, label: &str| {
+            output.shapes.iter().find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text() == label => {
+                    Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                }
+                _ => None,
+            })
+        };
+        let click = |pos| {
+            for pressed in [true, false] {
+                let output = frame(vec![
+                    egui::Event::PointerMoved(pos),
+                    egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::default(),
+                    },
+                ]);
+                if !pressed {
+                    return output;
+                }
+            }
+            unreachable!()
+        };
+        frame(vec![]);
+        let closed = frame(vec![]);
+        assert!(position(&closed, "Скопировать процедуру").is_none());
+        assert!(closed.platform_output.commands.is_empty());
+        click(position(&closed, "Процедура: продолжить работу по памяти").unwrap());
+        // Disable animation to make the expanded content immediately available in tests.
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        frame(vec![]);
+        let opened = frame(vec![]);
+        let copied = click(position(&opened, "Скопировать процедуру").unwrap());
+        assert!(copied.platform_output.commands.iter().any(|command| matches!(command,
+            egui::OutputCommand::CopyText(text) if text == hub_memory::CONTINUE_WORK_V1)));
     }
 }

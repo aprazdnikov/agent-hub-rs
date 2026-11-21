@@ -67,7 +67,7 @@ pub fn summary(packet: &ContextPacket) -> String {
     )
 }
 
-fn parts(text: &str) -> Vec<&str> {
+pub(crate) fn parts(text: &str) -> Vec<&str> {
     let mut result = Vec::new();
     let mut rest = text;
     while !rest.is_empty() {

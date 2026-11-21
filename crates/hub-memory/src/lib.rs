@@ -30,3 +30,7 @@ pub use project_cli::run_project_cli;
 mod presentation;
 
 pub use store::context::{ContextBrief, ContextPacket, ContextRequest, ContextSelection};
+
+/// Explicitly selected, versioned procedure; never injected into agent sessions.
+pub const CONTINUE_WORK_V1: &str =
+    include_str!("../../../docs/guide/procedures/continue-work-v1.md");

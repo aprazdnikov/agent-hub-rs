@@ -251,6 +251,7 @@ async fn collect(
                 tracing::info!(usage = ?finished.usage, background = finished.background, "turn finished");
                 if !context.cancel.is_cancelled() {
                     if pending.overflow {
+                        let _=mailbox.send(HubMessage::TaskResultUnavailable {key,generation:context.generation,reason:"Ответ превышает 64 КиБ; полный текст результата не сохранён в задаче. Смотрите сообщения этого запуска в Telegram.".into()}).await;
                         output
                             .send_all(
                                 Style::Plain,

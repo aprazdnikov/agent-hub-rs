@@ -18,7 +18,7 @@ pub(super) fn parse_admin(args: &str) -> Result<Request, String> {
         [status @ ("archive"|"stale"|"activate"),key]=>Action::Preview(AdminAction::SetStatus{key:(*key).into(),status:match *status {"archive"=>MemoryStatus::Archived,"stale"=>MemoryStatus::Stale,_=>MemoryStatus::Active}}),
         ["delete",keys @ ..] if !keys.is_empty()=>Action::Preview(AdminAction::Delete{keys:keys.iter().map(|s|(*s).into()).collect()}),
         ["prune",key,numbers @ ..] if !numbers.is_empty()=>Action::Preview(AdminAction::Prune{revisions:std::collections::BTreeMap::from([((*key).into(),numbers.iter().map(|s|s.parse::<u32>()).collect::<Result<Vec<_>,_>>().map_err(|_|"Укажите номера ревизий через пробел")?)])}),
-        _=>return Err("/memory · search ТЕКСТ · get КЛЮЧ [РЕВИЗИЯ] · status · filter active|stale|archived|all · policy auto|manual · archive|stale|activate КЛЮЧ · prune КЛЮЧ РЕВИЗИИ · delete КЛЮЧИ · export · import · reset · context · cancel".into()),
+        _=>return Err("/memory · search ТЕКСТ · get КЛЮЧ [РЕВИЗИЯ] · status · filter active|stale|archived|all · policy auto|manual · archive|stale|activate КЛЮЧ · prune КЛЮЧ РЕВИЗИИ · delete КЛЮЧИ · export · import · reset · context · procedure · cancel".into()),
     };
     Ok(admin(action))
 }

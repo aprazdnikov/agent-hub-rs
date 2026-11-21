@@ -10,6 +10,7 @@ use std::{collections::BTreeMap, path::PathBuf};
 pub const AUTO_WARNING: &str = "Старые ревизии будут удаляться без дополнительного подтверждения. Без экспорта восстановить их нельзя. Сохраняются последние 32 ревизии; при заполнении 8 МиБ удаляется старая история, включая архив. Последняя ревизия каждого ключа сохраняется.";
 #[derive(Clone, Debug)]
 pub enum Action {
+    Procedure,
     ContextHelp,
     Context(hub_memory::ContextRequest),
     ValidateContext(hub_memory::ContextPacket),
@@ -88,6 +89,9 @@ fn execute(
     cwd: &std::path::Path,
     action: &Action,
 ) -> Result<Panel, hub_memory::Error> {
+    if matches!(action, Action::Procedure) {
+        return Ok(Panel::Notice(hub_memory::CONTINUE_WORK_V1.into()));
+    }
     if matches!(action, Action::ContextHelp) {
         return Ok(Panel::Notice(super::context::HELP.into()));
     }

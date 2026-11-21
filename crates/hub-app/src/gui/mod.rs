@@ -16,3 +16,5 @@ pub use theme::configure as configure_theme;
 pub use theme::linux::follow_system as follow_system_theme;
 
 mod memory;
+
+mod tasks;
