@@ -1,11 +1,14 @@
 use super::{Command, Snapshot, TasksView, local, result::Tab};
 use crate::{
     desktop_tasks::{Attention, TaskRow, excerpt},
-    gui::look::agent_title,
+    gui::{
+        look::agent_title,
+        theme::{self, Tone},
+    },
     local_execution::{Interaction, Kind, Live},
 };
 use eframe::egui;
-use hub_core::domain::BackendKind;
+use hub_core::domain::{BackendKind, ToolRequest};
 use std::{
     borrow::Cow,
     collections::BTreeMap,
@@ -16,7 +19,7 @@ use uuid::Uuid;
 #[derive(Default)]
 pub(super) struct Inbox {
     project: Option<PathBuf>,
-    expanded: Option<(Uuid, Uuid)>,
+    details: Option<(Uuid, Uuid)>,
 }
 
 pub(super) fn jobs(snapshot: &Snapshot) -> impl Iterator<Item = &Live> {
@@ -58,6 +61,12 @@ fn items(snapshot: &Snapshot) -> impl Iterator<Item = Item<'_>> {
 
 pub(in crate::gui) fn attention_count(snapshot: &Snapshot) -> usize {
     items(snapshot).count()
+}
+
+/// Attention items of one project; feeds the sidebar badge.
+#[cfg_attr(not(test), expect(dead_code, reason = "ahead of use in Task 7 sidebar badge"))]
+pub(super) fn project_attention(snapshot: &Snapshot, project: &Path) -> usize {
+    items(snapshot).filter(|item| item.project() == project).count()
 }
 
 type Projects<'a> = BTreeMap<&'a Path, Cow<'a, str>>;
@@ -127,58 +136,55 @@ impl<'a> Item<'a> {
             Self::Request(live, request, row) => {
                 let key = (live.token, request.id);
                 ui.push_id(key, |ui| {
-                    let (action, reason) = match &request.kind {
-                        Kind::Questions(questions) => {
-                            let summary = questions.split_first().map_or_else(
-                                || live.status.clone(),
-                                |(first, rest)| {
-                                    let text = excerpt(first.text());
-                                    if rest.is_empty() {
-                                        text
-                                    } else {
-                                        format!("{text} · ещё {}", rest.len())
-                                    }
-                                },
-                            );
-                            ("Ответить", summary)
-                        }
-                        Kind::Permission(tool) => {
-                            let tool_name = hub_core::render::truncate(tool.tool.trim(), 40);
-                            let details = excerpt(&tool.summary);
-                            (
-                                "Посмотреть запрос",
-                                if details.is_empty() {
-                                    tool_name
-                                } else {
-                                    format!("{tool_name} · {details}")
-                                },
-                            )
-                        }
+                    let (glyph, chip_label, tone) = match &request.kind {
+                        Kind::Questions(_) => ("?", "Вопрос", Tone::Accent),
+                        Kind::Permission(_) => ("⚠", "Разрешение", Tone::Warning),
                     };
                     let title = row.map_or_else(
                         || Cow::Owned(format!("Задача #{}", live.id)),
                         |r| Cow::Borrowed(r.title.as_str()),
                     );
-                    let expanded = inbox.expanded == Some(key);
-                    if row_header(
-                        ui,
-                        project,
-                        &live.project,
-                        row,
-                        &title,
-                        (!expanded).then_some((reason.as_str(), action)),
-                    ) {
-                        inbox.expanded = Some(key);
-                        ui.ctx().request_repaint();
-                    }
-                    if expanded {
-                        ui.add_space(4.0);
-                        panel.decision(ui, live, request, send);
-                        if ui.button("Свернуть").clicked() {
-                            inbox.expanded = None;
+                    let collapsible = matches!(&request.kind, Kind::Permission(tool)
+                        if tool.summary != excerpt(&tool.summary));
+                    let collapsed = collapsible && inbox.details != Some(key);
+                    let shown = match &request.kind {
+                        Kind::Permission(tool) if collapsed => Cow::Owned(Interaction {
+                            id: request.id,
+                            kind: Kind::Permission(ToolRequest {
+                                tool: tool.tool.clone(),
+                                summary: excerpt(&tool.summary),
+                            }),
+                        }),
+                        _ => Cow::Borrowed(request),
+                    };
+                    theme::card(ui).show(ui, |ui| {
+                        card_header(
+                            ui,
+                            Header {
+                                project,
+                                path: &live.project,
+                                row,
+                                title: &title,
+                                glyph,
+                                tone,
+                                end: HeaderEnd::Chip(chip_label),
+                            },
+                        );
+                        ui.add_space(6.0);
+                        panel.decision(ui, live, &shown, send);
+                        if collapsible
+                            && ui
+                                .link(if collapsed {
+                                    "Подробнее"
+                                } else {
+                                    "Свернуть"
+                                })
+                                .clicked()
+                        {
+                            inbox.details = collapsed.then_some(key);
                             ui.ctx().request_repaint();
                         }
-                    }
+                    });
                 });
                 None
             }
@@ -192,16 +198,34 @@ impl<'a> Item<'a> {
                     Attention::Git => ("Проверить Git", Tab::Parameters),
                     Attention::Queue => ("Открыть очередь", Tab::Parameters),
                 };
+                let (glyph, tone) = match reason {
+                    Attention::Review => ("✓", Tone::Accent),
+                    Attention::CheckFailed | Attention::AgentFailed | Attention::Interrupted => {
+                        ("!", Tone::Error)
+                    }
+                    Attention::Git | Attention::Queue => ("⚠", Tone::Warning),
+                };
                 let summary = if row.summary.is_empty() { reason.label() } else { &row.summary };
                 ui.push_id((&row.project, row.id), |ui| {
-                    row_header(
-                        ui,
-                        project,
-                        &row.project,
-                        Some(row),
-                        &row.title,
-                        Some((summary, action)),
-                    )
+                    theme::card(ui)
+                        .show(ui, |ui| {
+                            let clicked = card_header(
+                                ui,
+                                Header {
+                                    project,
+                                    path: &row.project,
+                                    row: Some(row),
+                                    title: &row.title,
+                                    glyph,
+                                    tone,
+                                    end: HeaderEnd::Action(action),
+                                },
+                            );
+                            review_chips(ui, row, reason);
+                            ui.add(egui::Label::new(egui::RichText::new(summary).weak()).wrap());
+                            clicked
+                        })
+                        .inner
                 })
                 .inner
                 .then_some((row, tab))
@@ -210,55 +234,102 @@ impl<'a> Item<'a> {
     }
 }
 
-fn row_header(
-    ui: &mut egui::Ui,
-    project: &str,
-    path: &Path,
-    row: Option<&TaskRow>,
-    title: &str,
-    preview: Option<(&str, &str)>,
-) -> bool {
+fn review_chips(ui: &mut egui::Ui, row: &TaskRow, reason: Attention) {
+    if reason != Attention::Review || (row.checks.is_none() && row.files == 0) {
+        return;
+    }
+    ui.horizontal_wrapped(|ui| {
+        if let Some((passed, total)) = row.checks {
+            theme::chip(ui, Tone::Neutral, &format!("Проверки · {passed}/{total}"));
+        }
+        if row.files > 0 {
+            theme::chip(ui, Tone::Neutral, &format!("Файлов · {}", row.files));
+        }
+    });
+}
+
+struct Header<'a> {
+    project: &'a str,
+    path: &'a Path,
+    row: Option<&'a TaskRow>,
+    title: &'a str,
+    glyph: &'a str,
+    tone: Tone,
+    end: HeaderEnd<'a>,
+}
+
+enum HeaderEnd<'a> {
+    Chip(&'a str),
+    Action(&'a str),
+}
+
+fn icon_plate(ui: &mut egui::Ui, glyph: &str, tone: Tone) {
+    let (bg, fg) = theme::tone_colors(ui, tone);
+    egui::Frame::new().fill(bg).corner_radius(8).show(ui, |ui| {
+        ui.set_min_size(egui::vec2(26.0, 26.0));
+        ui.centered_and_justified(|ui| {
+            ui.add(
+                egui::Label::new(egui::RichText::new(glyph).strong().color(fg)).selectable(false),
+            );
+        });
+    });
+}
+
+fn card_header(ui: &mut egui::Ui, header: Header<'_>) -> bool {
+    let Header { project, path, row, title, glyph, tone, end } = header;
+    let metadata = row.map_or_else(
+        || project.to_owned(),
+        |r| {
+            let agent = match BackendKind::parse(&r.backend) {
+                Some(kind) => agent_title(kind),
+                None => r.backend.as_str(),
+            };
+            format!("{project} · {agent}")
+        },
+    );
     let details = |ui: &mut egui::Ui| {
         ui.spacing_mut().item_spacing.y = 3.0;
-        let metadata = row.map_or_else(
-            || project.to_owned(),
-            |r| {
-                let agent = match BackendKind::parse(&r.backend) {
-                    Some(kind) => agent_title(kind),
-                    None => r.backend.as_str(),
-                };
-                format!("{project} · {agent}")
-            },
-        );
-        ui.add(egui::Label::new(egui::RichText::new(metadata).small().weak()).truncate())
-            .on_hover_text(path.display().to_string());
         ui.add(egui::Label::new(egui::RichText::new(title).strong()).wrap());
-        if let Some((reason, _)) = preview {
-            ui.add(egui::Label::new(egui::RichText::new(reason).weak()).wrap());
-        }
+        ui.add(egui::Label::new(egui::RichText::new(&metadata).small().weak()).truncate())
+            .on_hover_text(path.display().to_string());
     };
-    let width = ui.available_width();
-    let Some((_, action)) = preview else {
-        ui.vertical(details);
-        return false;
+    let grow = |ui: &mut egui::Ui| {
+        ui.set_width(ui.available_width());
+        details(ui);
     };
-    if width < 440.0 {
-        ui.vertical(details);
-        return ui.button(action).clicked();
-    }
-    ui.allocate_ui_with_layout(
-        egui::vec2(width, ui.spacing().interact_size.y),
-        egui::Layout::right_to_left(egui::Align::Center),
-        |ui| {
-            let clicked = ui.button(action).clicked();
-            ui.vertical(|ui| {
-                ui.set_width(ui.available_width());
-                details(ui);
+    match end {
+        HeaderEnd::Chip(label) => {
+            ui.horizontal(|ui| {
+                icon_plate(ui, glyph, tone);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    theme::chip(ui, tone, label);
+                    ui.vertical(grow);
+                });
             });
-            clicked
-        },
-    )
-    .inner
+            false
+        }
+        HeaderEnd::Action(action) => {
+            let narrow = ui.available_width() < 440.0;
+            if narrow {
+                ui.horizontal(|ui| {
+                    icon_plate(ui, glyph, tone);
+                    ui.vertical(grow);
+                });
+                ui.button(action).clicked()
+            } else {
+                ui.horizontal(|ui| {
+                    icon_plate(ui, glyph, tone);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        let clicked = ui.button(action).clicked();
+                        ui.vertical(grow);
+                        clicked
+                    })
+                    .inner
+                })
+                .inner
+            }
+        }
+    }
 }
 
 impl TasksView {
@@ -269,8 +340,8 @@ impl TasksView {
         send: &mut impl FnMut(Command),
     ) -> bool {
         self.local_panel.sync(ui, snapshot);
-        if self.inbox.expanded.is_some_and(|key| !has_request(snapshot, key)) {
-            self.inbox.expanded = None;
+        if self.inbox.details.is_some_and(|key| !has_request(snapshot, key)) {
+            self.inbox.details = None;
         }
         ui.set_max_width(ui.available_width().min(1040.0));
         let projects: Projects<'_> = snapshot
@@ -284,7 +355,7 @@ impl TasksView {
             .chain(self.sidebar.projects().map(|(path, name)| (path, Cow::Borrowed(name))))
             .collect();
         self.inbox.heading(ui, &projects);
-        self.local_panel.feedback(ui, self.inbox.project.as_deref(), self.inbox.expanded);
+        self.local_panel.feedback(ui, self.inbox.project.as_deref(), self.inbox.details);
         if let Err(error) = &snapshot.task_index {
             ui.colored_label(
                 ui.visuals().error_fg_color,
@@ -298,29 +369,26 @@ impl TasksView {
         let mut open_chat = false;
         egui::ScrollArea::vertical().id_salt(("inbox_items", &self.inbox.project)).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            for (results, heading) in
+            let is_review = |item: &Item| matches!(item, Item::Task(_, Attention::Review));
+            let review_count = visible.iter().filter(|item| is_review(item)).count();
+            for ((results, heading), count) in
                 [(false, "Ждут вашего ответа"), (true, "Результаты на проверку")]
+                    .into_iter()
+                    .zip([visible.len() - review_count, review_count])
             {
-                let mut group = visible
-                    .iter()
-                    .copied()
-                    .filter(|item| matches!(item, Item::Task(_, Attention::Review)) == results)
-                    .peekable();
-                if group.peek().is_none() {
+                if count == 0 {
                     continue;
                 }
-                ui.label(egui::RichText::new(heading).strong().weak());
+                ui.label(egui::RichText::new(format!("{heading} · {count}")).strong().weak());
                 ui.separator();
-                for item in group {
-                    ui.add_space(3.0);
+                for item in visible.iter().copied().filter(|item| is_review(item) == results) {
+                    ui.add_space(6.0);
                     let project = project_label(item.project(), &projects);
                     if let Some(row) =
                         item.show(ui, &project, &mut self.inbox, &mut self.local_panel, send)
                     {
                         target = Some(row);
                     }
-                    ui.add_space(3.0);
-                    ui.separator();
                 }
                 ui.add_space(10.0);
             }

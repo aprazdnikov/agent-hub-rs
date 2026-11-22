@@ -104,7 +104,6 @@ pub fn surface(ui: &egui::Ui) -> egui::Frame {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Tone {
     Accent,
-    #[cfg_attr(not(test), expect(dead_code, reason = "ahead of use in later GUI-refresh tasks"))]
     Warning,
     Error,
     Neutral,
@@ -160,7 +159,6 @@ pub(super) fn chip(ui: &mut egui::Ui, tone: Tone, text: &str) -> egui::Response 
         .inner
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "ahead of use in later GUI-refresh tasks"))]
 pub(super) fn card(ui: &egui::Ui) -> egui::Frame {
     egui::Frame::new()
         .fill(ui.visuals().panel_fill)

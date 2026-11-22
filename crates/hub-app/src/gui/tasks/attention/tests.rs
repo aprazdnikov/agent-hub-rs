@@ -127,12 +127,11 @@ fn parallel_permission_shows_full_request_and_recovers_from_failed_delivery_in_p
         ..Default::default()
     });
     assert_eq!(attention_count(&screen.snapshot), 2);
-    let preview = format!("Bash · {}", excerpt(&full));
-    assert!(screen.contains(&preview));
-    screen.click("Посмотреть запрос", 1);
+    assert!(screen.contains("Разрешение"));
+    assert!(!screen.contains(&full));
+    screen.click("Подробнее", 0);
     assert!(screen.contains(&full));
-    assert!(!screen.contains(&preview));
-    screen.click("Разрешить один раз", 0);
+    screen.click("Разрешить один раз", 1);
     let Some(Command::LocalAnswer { token, id, answer: Answer::Allow, reply }) =
         screen.commands.pop()
     else {
@@ -141,7 +140,7 @@ fn parallel_permission_shows_full_request_and_recovers_from_failed_delivery_in_p
     assert_eq!((token, Some(id)), (second.token, second.interaction.as_ref().map(|r| r.id)));
     reply.send(Err("Не удалось доставить ответ".into())).unwrap();
     assert!(screen.contains("Не удалось доставить ответ"));
-    screen.click("Отклонить", 0);
+    screen.click("Отклонить", 1);
     assert!(
         matches!(screen.commands.pop(), Some(Command::LocalAnswer { token: actual, id: req, answer: Answer::Deny, .. }) if actual == token && req == id)
     );
@@ -164,6 +163,8 @@ fn switching_project_and_request_restores_multiselect_and_free_text() {
             archived: false,
             summary: String::new(),
             reason: None,
+            files: 0,
+            checks: None,
         })
         .collect();
     let mut screen = Screen::new(Snapshot {
@@ -171,7 +172,6 @@ fn switching_project_and_request_restores_multiselect_and_free_text() {
         task_index: Ok(rows),
         ..Default::default()
     });
-    screen.click("Ответить", 0);
     screen.click("Основная", 0);
     screen.click("Архивная", 0);
     screen.click("Основная", 0);
@@ -179,11 +179,9 @@ fn switching_project_and_request_restores_multiselect_and_free_text() {
     screen.frame(vec![egui::Event::Text("остальные позже".into())]);
     screen.click("Все проекты", 0);
     screen.click("Atlas", 0);
-    screen.click("Ответить", 0);
     screen.click("Основная", 0);
     screen.click("Atlas", 0);
     screen.click("Hub", 0);
-    screen.click("Ответить", 0);
     screen.click("Отправить ответ", 0);
     assert!(
         matches!(screen.commands.pop(), Some(Command::LocalAnswer { token, id, answer: Answer::Text(values), .. }) if token == first.token && Some(id) == first.interaction.as_ref().map(|r|r.id) && values == ["Архивная, остальные позже"])
@@ -195,14 +193,12 @@ fn switching_project_and_request_restores_multiselect_and_free_text() {
 fn permission_changed_between_press_and_release_cannot_authorize_the_new_job() {
     let mut screen =
         Screen::new(Snapshot { local: Some(permission(1, "cargo check")), ..Default::default() });
-    screen.click("Посмотреть запрос", 0);
     let pos = screen.rect("Разрешить один раз", 0).center();
     screen.pointer(pos, true);
     screen.snapshot.local = Some(permission(1, "cargo clean"));
     screen.pointer(pos, false);
     assert!(screen.commands.is_empty());
-    assert!(!screen.contains("Разрешить один раз"));
-    screen.click("Посмотреть запрос", 0);
+    assert!(screen.contains("Разрешить один раз"));
     assert!(screen.contains("cargo clean"));
 }
 
@@ -210,7 +206,6 @@ fn permission_changed_between_press_and_release_cannot_authorize_the_new_job() {
 fn oversized_unicode_answer_leaves_denial_available() {
     let mut screen =
         Screen::new(Snapshot { local: Some(question("Hub", 1)), ..Default::default() });
-    screen.click("Ответить", 0);
     let labels = screen.frame(vec![]);
     assert_eq!(labels.iter().filter(|(text, _)| text == "Какие версии проверить?").count(), 1);
     screen.click("Ответ или свой вариант", 0);
@@ -232,13 +227,13 @@ fn index_error_keeps_live_decisions_and_scoped_empty_state_can_be_cleared() {
         ..Default::default()
     });
     assert!(screen.contains("Не удалось загрузить задачи. Не удалось прочитать файл."));
-    assert!(screen.contains("Ответить"));
+    assert!(screen.contains("Вопрос"));
     assert!(!screen.contains("Всё разобрано."));
     screen.view.inbox.project = Some(std::env::temp_dir().join("Atlas"));
     screen.snapshot.task_index = Ok(Vec::new());
     assert!(screen.contains("В этом проекте всё разобрано."));
     screen.click("Показать все проекты", 0);
-    assert!(screen.contains("Ответить"));
+    assert!(screen.contains("Вопрос"));
 }
 
 #[test]
@@ -303,7 +298,6 @@ fn stored_attention_opens_the_corresponding_task_section() {
 fn failed_reply_remains_visible_if_the_request_disappears_before_the_next_frame() {
     let mut screen =
         Screen::new(Snapshot { local: Some(permission(1, "cargo test")), ..Default::default() });
-    screen.click("Посмотреть запрос", 0);
     screen.click("Разрешить один раз", 0);
     let Some(Command::LocalAnswer { reply, .. }) = screen.commands.pop() else {
         panic!("missing permission answer")
@@ -332,7 +326,6 @@ fn each_question_requires_its_own_answer_and_preserves_order() {
         local: Some(job(3, "Hub", Kind::Questions(vec![first, second]))),
         ..Default::default()
     });
-    screen.click("Ответить", 0);
     screen.click("Сохранить", 0);
     screen.click("Отправить ответы", 0);
     assert!(screen.commands.is_empty());
@@ -345,11 +338,66 @@ fn each_question_requires_its_own_answer_and_preserves_order() {
 }
 
 #[test]
+fn question_card_answers_without_expand_step() {
+    let live = question("Hub", 1);
+    let mut screen = Screen::new(Snapshot { local: Some(live.clone()), ..Default::default() });
+    assert!(screen.contains("Ждут вашего ответа · 1"));
+    assert!(screen.contains("Вопрос"));
+    assert!(screen.contains("Какие версии проверить?"));
+    assert!(screen.contains("Отправить ответ"));
+    assert!(!screen.contains("Ответить"));
+    screen.click("Основная", 0);
+    screen.click("Отправить ответ", 0);
+    assert!(
+        matches!(screen.commands.pop(), Some(Command::LocalAnswer { token, id, answer: Answer::Text(values), .. }) if token == live.token && Some(id) == live.interaction.as_ref().map(|r| r.id) && values == ["Основная"])
+    );
+}
+
+#[test]
+fn permission_card_shows_actions_and_details_toggle() {
+    let long = format!("cargo test --locked\n{}\n--package hub-app", "workspace check ".repeat(30));
+    let live = permission(1, &long);
+    let mut screen = Screen::new(Snapshot { local: Some(live.clone()), ..Default::default() });
+    assert!(screen.contains("Разрешить один раз"));
+    assert!(screen.contains("Отклонить"));
+    assert!(screen.contains("Подробнее"));
+    assert!(!screen.contains(&long));
+    screen.click("Подробнее", 0);
+    assert!(screen.contains(&long));
+    assert!(screen.contains("Свернуть"));
+    screen.click("Свернуть", 0);
+    assert!(!screen.contains(&long));
+    screen.click("Разрешить один раз", 0);
+    assert!(
+        matches!(screen.commands.pop(), Some(Command::LocalAnswer { token, id, answer: Answer::Allow, .. }) if token == live.token && Some(id) == live.interaction.as_ref().map(|r| r.id))
+    );
+}
+
+#[test]
+fn narrow_inbox_stacks_action_below_content() {
+    let mut book = hub_core::tasks::TaskBook::default();
+    let id = book.create(std::env::temp_dir(), "codex", "Поиск по каталогу", "Проверь").unwrap();
+    let row = TaskRow {
+        reason: Some(Attention::Review),
+        summary: "Готово".into(),
+        ..TaskRow::from(book.get(id).unwrap())
+    };
+    let mut screen = Screen::new(Snapshot { task_index: Ok(vec![row]), ..Default::default() });
+    screen.size = egui::vec2(400.0, 600.0);
+    assert!(screen.contains("✓"));
+    assert!(screen.contains("Результаты на проверку · 1"));
+    let title = screen.rect("Поиск по каталогу", 0);
+    let action = screen.rect("Проверить", 0);
+    assert!(action.top() >= title.bottom(), "action must stack below the content at 400px");
+}
+
+#[test]
 fn narrow_inbox_supports_keyboard_and_clicks_in_button_padding() {
+    let long = format!("cargo test --locked\n{}\n--package hub-app", "workspace check ".repeat(30));
     let mut screen =
-        Screen::new(Snapshot { local: Some(permission(1, "cargo test")), ..Default::default() });
+        Screen::new(Snapshot { local: Some(permission(1, &long)), ..Default::default() });
     screen.size = egui::vec2(330.0, 560.0);
-    let target = screen.rect("Посмотреть запрос", 0).center();
+    let target = screen.rect("Подробнее", 0).center();
     let key = |screen: &mut Screen, key| {
         for pressed in [true, false] {
             screen.frame(vec![egui::Event::Key {
@@ -369,12 +417,45 @@ fn narrow_inbox_supports_keyboard_and_clicks_in_button_padding() {
             .and_then(|id| screen.ctx.read_response(id))
             .is_some_and(|r| r.rect.height() < 50.0 && r.rect.contains(target))
     });
-    assert!(focused, "the permission row action must be reachable with Tab");
+    assert!(focused, "the permission details link must be reachable with Tab");
     key(&mut screen, egui::Key::Enter);
-    assert!(screen.contains("cargo test"));
+    assert!(screen.contains(&long));
     let beside_text = screen.rect("Свернуть", 0).right_center() + egui::vec2(4.0, 0.0);
     screen.pointer(beside_text, true);
     screen.pointer(beside_text, false);
-    assert!(screen.contains("Посмотреть запрос"));
+    assert!(!screen.contains(&long), "a click in the link's padding collapses the summary");
+    assert!(screen.contains("Подробнее"));
     assert!(screen.commands.is_empty());
+}
+
+#[test]
+fn review_card_shows_check_and_file_chips() {
+    let row = TaskRow {
+        id: 1,
+        project: std::env::temp_dir().join("Hub"),
+        title: "Поиск по каталогу".into(),
+        prompt: "Проверь".into(),
+        backend: "codex".into(),
+        status: hub_core::tasks::TaskStatus::NeedsReview,
+        archived: false,
+        reason: Some(Attention::Review),
+        summary: "Готово".into(),
+        files: 2,
+        checks: Some((2, 3)),
+    };
+    let mut screen = Screen::new(Snapshot { task_index: Ok(vec![row]), ..Default::default() });
+    assert!(screen.contains("Проверки · 2/3"));
+    assert!(screen.contains("Файлов · 2"));
+    assert!(screen.contains("Результаты на проверку · 1"));
+}
+
+#[test]
+fn project_attention_counts_inbox_items_per_project() {
+    let first = permission(1, "cargo check");
+    let second = question("Atlas", 2);
+    let snapshot =
+        Snapshot { local_jobs: vec![first.clone(), second.clone()], ..Default::default() };
+    assert_eq!(project_attention(&snapshot, &first.project), 1);
+    assert_eq!(project_attention(&snapshot, &second.project), 1);
+    assert_eq!(project_attention(&snapshot, std::path::Path::new("/absent")), 0);
 }

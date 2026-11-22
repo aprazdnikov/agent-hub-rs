@@ -42,6 +42,10 @@ pub struct TaskRow {
     pub archived: bool,
     pub reason: Option<Attention>,
     pub summary: String,
+    /// Files of the last run; feeds the «Файлов · N» chip in the inbox.
+    pub files: usize,
+    /// Passed and total checks of the last run, when it reported any; feeds «Проверки · X/Y».
+    pub checks: Option<(usize, usize)>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attention {
@@ -68,6 +72,13 @@ impl Attention {
 impl From<&Task> for TaskRow {
     fn from(task: &Task) -> Self {
         let attention = attention(task);
+        let run = task.runs.last();
+        let checks = run
+            .map(|run| {
+                let total = run.workflow_report.checks.len();
+                (run.workflow_report.checks.iter().filter(|check| check.passed).count(), total)
+            })
+            .filter(|(_, total)| *total > 0);
         Self {
             id: task.id,
             project: task.project.clone(),
@@ -78,6 +89,8 @@ impl From<&Task> for TaskRow {
             archived: task.archived,
             reason: attention.map(|(reason, _)| reason),
             summary: attention.map_or_else(String::new, |(_, text)| excerpt(text)),
+            files: run.map_or(0, |run| run.files.len()),
+            checks,
         }
     }
 }

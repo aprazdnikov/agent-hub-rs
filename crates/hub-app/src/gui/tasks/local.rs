@@ -56,10 +56,10 @@ impl Panel {
         &self,
         ui: &mut egui::Ui,
         project: Option<&Path>,
-        expanded: Option<(Uuid, Uuid)>,
+        details: Option<(Uuid, Uuid)>,
     ) {
         for (key, editor) in &self.editors {
-            if Some(*key) == expanded
+            if Some(*key) == details
                 || editor.feedback_until.is_none()
                 || project.is_some_and(|p| p != editor.project)
             {
