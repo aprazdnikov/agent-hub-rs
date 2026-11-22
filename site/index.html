@@ -1,250 +1,470 @@
 <!doctype html>
 <html lang="ru">
 <head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>agent-hub — агенты Claude, Codex, Qwen, Hermes и OpenCode в Telegram</title>
-<meta name="description" content="Пять AI-агентов на вашем компьютере под управлением Telegram. В 1.0.0 — общая память проекта и задачи с сохранением результатов.">
-<meta property="og:type" content="website">
-<meta property="og:title" content="agent-hub — агенты работают, пока вы в дороге">
-<meta property="og:description" content="Пять AI-агентов, общая память проекта и ручные задачи с восстановлением после перезапуска. Новое в версии 1.0.0.">
-<meta property="og:url" content="https://aprazdnikov.github.io/agent-hub-rs/">
-<meta name="color-scheme" content="light dark">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%232b7de9'/%3E%3Cpath d='M8 16h16M16 8v16' stroke='white' stroke-width='3' stroke-linecap='round'/%3E%3C/svg%3E">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Unbounded:wght@500;700&family=Onest:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-<style>
-/* Layout: one narrow column; hero splits text | phone with a forum, then short blocks, one CTA at the end */
-:root {
-  --bg: #f3f5f8;
-  --surface: #ffffff;
-  --ink: #142033;
-  --muted: #5b6b80;
-  --line: #d9e0ea;
-  --accent: #2b7de9;
-  --accent-ink: #ffffff;
-  --ok: #1f9d55;
-  --wait: #c27b0c;
-  --chat: #e7eef7;
-  --bubble: #ffffff;
-  --mine: #d7ecff;
-  --display: "Unbounded", "Segoe UI", system-ui, sans-serif;
-  --body: "Onest", "Segoe UI", system-ui, sans-serif;
-  --mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
-}
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --bg: #0e1520; --surface: #151f2e; --ink: #e6edf6; --muted: #93a3b8; --line: #263347;
-    --accent: #5aa2ff; --accent-ink: #08111d; --ok: #4cc785; --wait: #e6a640;
-    --chat: #101a28; --bubble: #1b2738; --mine: #1d3a5c; color-scheme: dark;
-  }
-}
-:root[data-theme="dark"] {
-  --bg: #0e1520; --surface: #151f2e; --ink: #e6edf6; --muted: #93a3b8; --line: #263347;
-  --accent: #5aa2ff; --accent-ink: #08111d; --ok: #4cc785; --wait: #e6a640;
-  --chat: #101a28; --bubble: #1b2738; --mine: #1d3a5c; color-scheme: dark;
-}
-* { box-sizing: border-box; }
-body { margin: 0; background: var(--bg); color: var(--ink); font: 400 17px/1.55 var(--body); }
-.wrap { max-width: 1040px; margin: 0 auto; padding-inline: 20px; padding-block: 0 64px; }
-a { color: var(--accent); }
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>agent-hub — ИИ-агенты в одном окне</title>
+  <meta name="description" content="Настольное приложение для Claude Code, Codex, Qwen Code, Hermes и OpenCode. Запускайте задачи в папке проекта, отвечайте агентам и проверяйте изменения. Telegram подключается по желанию.">
+  <link rel="canonical" href="https://aprazdnikov.github.io/agent-hub-rs/">
+  <meta property="og:type" content="website">
+  <meta property="og:locale" content="ru_RU">
+  <meta property="og:title" content="agent-hub — ИИ-агенты в одном окне">
+  <meta property="og:description" content="Ставьте задачи, отвечайте агентам и проверяйте их работу в настольном приложении для Windows, macOS и Linux.">
+  <meta property="og:url" content="https://aprazdnikov.github.io/agent-hub-rs/">
+  <meta property="og:image" content="https://aprazdnikov.github.io/agent-hub-rs/screenshots/inbox.png">
+  <meta property="og:image:width" content="960">
+  <meta property="og:image:height" content="640">
+  <meta property="og:image:alt" content="Входящие в agent-hub с вопросом агента и результатом на проверку">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAhUlEQVR42u2X2Q0AIAhDncglXNRNdQQpFKmJJP6pfXhwtPaS9TmWZZSIpsBExUMQLHEXBFscgjhtcrIQREQYAUkXd0Eg4oy5JgD0fpF1sPfoi4dOgem96xTY3lv3+AAf4B2Akm94NRCVh2LZZHQ1HZcXJBIlmURRKlGWSzQmEq2ZRHOabRu3HzmKKHXLhQAAAABJRU5ErkJggg==">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Onest:wght@400;500;600;700&amp;family=Unbounded:wght@500;600&amp;display=swap">
+  <style>
+    :root {
+      color-scheme: light dark;
+      --page: #f8f9f7;
+      --ink: #1c2521;
+      --muted: #506259;
+      --accent: #0d644f;
+      --accent-hover: #084937;
+      --on-accent: #ffffff;
+      --soft: #e3eee7;
+      --line: #cbd6ce;
+      --stage: #174639;
+      --on-stage: #f5faf6;
+      --stage-muted: #cee2d5;
+      --stage-line: #729685;
+      --focus: #224fc2;
+      --on-stage-focus: #ffd66c;
+      --body: "Onest", "Segoe UI", system-ui, sans-serif;
+      --display: "Unbounded", "Onest", "Segoe UI", system-ui, sans-serif;
+    }
 
-nav { display: flex; align-items: center; justify-content: space-between; gap: 16px; padding-block: 24px 0; flex-wrap: wrap; }
-.logo { font: 700 18px var(--display); letter-spacing: -.01em; }
-.logo span { color: var(--accent); }
-nav .links { display: flex; gap: 20px; font-size: 15px; }
-nav .links a { color: var(--muted); text-decoration: none; }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --page: #171b19;
+        --ink: #e6ece7;
+        --muted: #a9b9af;
+        --accent: #99dec0;
+        --accent-hover: #b9ecd5;
+        --on-accent: #123b2d;
+        --soft: #253b30;
+        --line: #405047;
+        --stage: #21483b;
+        --focus: #a4c1ff;
+      }
+    }
 
-.hero { display: grid; grid-template-columns: 1.1fr .9fr; gap: 48px; align-items: center; padding-block: 56px 40px; }
-.hero > * { min-width: 0; }
-h1 { font: 700 clamp(30px, 5vw, 50px)/1.08 var(--display); letter-spacing: -.02em; margin: 0 0 20px; text-wrap: balance; }
-.lead { font-size: 19px; color: var(--muted); max-width: 34em; margin: 0 0 28px; }
-.lead b { color: var(--ink); font-weight: 600; }
-.cta { display: flex; gap: 12px; flex-wrap: wrap; }
-.btn { display: inline-flex; align-items: center; gap: 8px; padding: 13px 20px; border-radius: 10px; font: 600 16px var(--body); text-decoration: none; border: 1px solid var(--line); color: var(--ink); background: var(--surface); }
-.btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
-.btn:focus-visible { outline: 3px solid var(--accent); outline-offset: 2px; }
-.fine { margin-top: 16px; font-size: 14px; color: var(--muted); }
-.version { display: inline-block; margin-bottom: 16px; font: 500 14px var(--mono); text-underline-offset: 4px; }
+    * { box-sizing: border-box; }
 
-/* phone with a Telegram forum */
-.phone { background: var(--chat); border: 1px solid var(--line); border-radius: 28px; padding: 14px; max-width: 380px; width: 100%; justify-self: center; box-shadow: 0 24px 60px -30px rgba(20, 32, 51, .45); }
-.phone header { display: flex; justify-content: space-between; font: 600 14px var(--body); padding: 4px 6px 12px; }
-.phone header small { color: var(--muted); font-weight: 400; }
-.topics { display: grid; gap: 6px; margin-bottom: 12px; }
-.topic { display: grid; grid-template-columns: 1fr auto; gap: 2px 8px; background: var(--bubble); border-radius: 12px; padding: 9px 12px; font-size: 14px; }
-.topic b { font-weight: 600; }
-.topic .who { font: 12px var(--mono); color: var(--muted); }
-.st { font-size: 12px; font-weight: 600; align-self: center; grid-row: span 2; }
-.st.ok { color: var(--ok); } .st.wait { color: var(--wait); } .st.run { color: var(--accent); }
-.msg { background: var(--bubble); border-radius: 14px; padding: 10px 12px; font-size: 14px; line-height: 1.45; }
-.msg + .msg { margin-top: 8px; }
-.msg.mine { background: var(--mine); margin-left: 40px; }
-.msg code { font: 12.5px var(--mono); }
-.keys { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; margin-top: 8px; }
-.keys span { text-align: center; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 7px; font-size: 13px; font-weight: 600; color: var(--accent); }
+    body {
+      margin: 0;
+      background: var(--page);
+      color: var(--ink);
+      font: 400 1.0625rem/1.55 var(--body);
+    }
 
-.story { display: grid; grid-template-columns: auto 1fr; gap: 28px; align-items: center; background: var(--surface); border: 1px solid var(--line); border-radius: 18px; padding: 28px 32px; margin-block: 8px 56px; }
-.story .num { font: 700 56px/1 var(--display); color: var(--accent); font-variant-numeric: tabular-nums; }
-.story .num small { display: block; font: 500 14px var(--body); color: var(--muted); margin-top: 6px; }
-.story p { margin: 0; max-width: 40em; }
+    h1, h2, h3, p, figure, fieldset, ol, ul { margin: 0; }
+    h1, h2, h3 { font-weight: 600; line-height: 1.15; text-wrap: balance; }
+    h2 { font-size: clamp(1.95rem, 3.3vw, 3.1rem); letter-spacing: -.045em; }
+    h3 { font-size: clamp(1.2rem, 1.7vw, 1.5rem); letter-spacing: -.025em; }
+    a { color: var(--accent); text-decoration-thickness: .08em; text-underline-offset: .2em; }
+    a:hover { color: var(--accent-hover); text-decoration-thickness: .14em; }
+    a:focus-visible { outline: 3px solid var(--focus); outline-offset: 4px; border-radius: 3px; }
+    section[id], main[id] { scroll-margin-block-start: 1rem; }
+    code { font: .92em ui-monospace, "DejaVu Sans Mono", monospace; white-space: nowrap; }
+    .wrap { width: min(80rem, 100% - clamp(2rem, 7vw, 7rem)); margin-inline: auto; }
 
-h2 { font: 700 clamp(22px, 3vw, 30px)/1.2 var(--display); letter-spacing: -.01em; margin: 0 0 24px; text-wrap: balance; }
-.features { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 32px 40px; margin-bottom: 64px; }
-.feature h3 { font: 600 18px var(--body); margin: 0 0 6px; }
-.feature p { margin: 0; color: var(--muted); }
-.feature code { font: 14px var(--mono); color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 6px; padding: 1px 6px; }
-.release { background: var(--surface); border: 1px solid var(--line); border-radius: 18px; padding: 28px 32px; margin-bottom: 56px; }
-.release .features { margin-bottom: 24px; gap: 24px 40px; }
-.release > p { margin: 0; color: var(--muted); }
+    .visually-hidden {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      padding: 0;
+      margin: -1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+      border: 0;
+    }
 
-.flow { overflow-x: auto; margin-bottom: 64px; }
-.flow ol { display: flex; gap: 12px; list-style: none; padding: 0; margin: 0; min-width: 640px; }
-.flow li { flex: 1; background: var(--surface); border: 1px solid var(--line); border-radius: 14px; padding: 16px; font-size: 15px; position: relative; }
-.flow li b { display: block; font: 600 15px var(--body); margin-bottom: 4px; }
-.flow li span { color: var(--muted); font-size: 14px; }
-.flow li + li::before { content: "→"; position: absolute; left: -12px; top: 50%; transform: translate(-50%, -50%); color: var(--muted); }
-.flow p { color: var(--muted); font-size: 15px; margin: 14px 0 0; }
+    .skip {
+      position: absolute;
+      top: .65rem;
+      left: .65rem;
+      z-index: 1;
+      padding: .6rem 1rem;
+      background: var(--page);
+      transform: translateY(-160%);
+    }
 
-#agents, #start { margin-bottom: 64px; }
-.steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 20px; counter-reset: s; margin-bottom: 24px; }
-.steps div { counter-increment: s; }
-.steps div::before { content: counter(s); display: grid; place-items: center; width: 32px; height: 32px; border-radius: 50%; background: var(--accent); color: var(--accent-ink); font: 700 15px var(--display); margin-bottom: 10px; }
-.steps b { display: block; margin-bottom: 4px; }
-.steps span { color: var(--muted); font-size: 15px; }
+    .skip:focus { transform: translateY(0); }
 
-.final { text-align: left; background: var(--ink); color: var(--bg); border-radius: 20px; padding: 36px 32px; display: grid; gap: 20px; }
-.final h2 { color: var(--bg); margin: 0; }
-.final p { margin: 0; opacity: .8; max-width: 40em; }
-.final .btn { background: transparent; color: var(--bg); border-color: color-mix(in srgb, var(--bg) 35%, transparent); }
-.final .btn.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+    .masthead {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: .5rem 1.5rem;
+      padding-block: 1.1rem;
+      border-bottom: 1px solid var(--line);
+    }
 
-@media (max-width: 760px) {
-  .hero { grid-template-columns: 1fr; gap: 36px; padding-block: 32px 24px; }
-  .features, .steps { grid-template-columns: 1fr; }
-  .story { grid-template-columns: 1fr; padding: 22px; gap: 12px; }
-  .release { padding: 22px; }
-  nav .links { display: none; }
-}
-</style>
+    .identity, .brand, nav ul, .footer-links, .download-group {
+      display: flex;
+      align-items: center;
+      flex-wrap: wrap;
+    }
+
+    .identity { gap: .85rem; }
+    .brand {
+      gap: .65rem;
+      min-height: 44px;
+      color: var(--ink);
+      text-decoration: none;
+      font: 600 1.15rem/1 var(--display);
+      letter-spacing: -.055em;
+    }
+
+    .brand:hover { color: var(--accent); }
+    .brand-mark {
+      display: grid;
+      width: 1.8rem;
+      aspect-ratio: 1;
+      place-items: center;
+      border-radius: 50%;
+      background: #2ea043;
+    }
+
+    .brand-mark::before {
+      content: "";
+      width: 46%;
+      height: 46%;
+      box-sizing: content-box;
+      border: .16rem solid white;
+      border-radius: 50%;
+    }
+
+    .version { color: var(--muted); font-size: .83rem; font-variant-numeric: tabular-nums; }
+    nav ul, .footer-links { list-style: none; gap: .15rem 1.5rem; padding: 0; }
+    nav a, .footer-links a {
+      display: inline-flex;
+      min-height: 44px;
+      align-items: center;
+      text-decoration: none;
+      font-size: .93rem;
+      font-weight: 500;
+    }
+
+    nav a { color: var(--ink); }
+    nav a:hover, .footer-links a:hover { text-decoration: underline; }
+
+    .hero {
+      display: grid;
+      grid-template-columns: 1.2fr 1fr;
+      align-items: center;
+      gap: 2rem clamp(2rem, 6vw, 7rem);
+      padding-block: clamp(2.4rem, 5.7vw, 5.4rem) clamp(2rem, 4.2vw, 3.8rem);
+    }
+
+    h1 {
+      max-width: 12em;
+      font: 500 clamp(2.8rem, 4.9vw, 4.5rem)/1.13 var(--display);
+      letter-spacing: -.045em;
+    }
+
+    .lead { max-width: 36em; font-size: clamp(1.05rem, 1.5vw, 1.29rem); line-height: 1.53; }
+    .download-group { gap: .55rem 1.05rem; margin-top: 1.2rem; }
+    .download {
+      display: inline-flex;
+      min-height: 46px;
+      align-items: center;
+      justify-content: center;
+      padding: .67rem 1.18rem;
+      border-radius: .48rem;
+      background: var(--accent);
+      color: var(--on-accent);
+      text-decoration: none;
+      font-weight: 600;
+    }
+
+    .download:hover { background: var(--accent-hover); color: var(--on-accent); }
+    .platforms { color: var(--muted); font-size: .93rem; }
+
+    /* A single native radio group keeps both previews usable with a keyboard and without scripts. */
+    .gallery {
+      position: relative;
+      display: grid;
+      grid-template-columns: minmax(13rem, .34fr) minmax(0, 1fr);
+      grid-template-rows: auto 1fr;
+      grid-template-areas: "choices shot" "note shot";
+      align-items: start;
+      gap: clamp(1.5rem, 3vw, 2.8rem);
+      min-inline-size: 0;
+      padding: clamp(1.25rem, 3vw, 2.75rem);
+      border: 0;
+      border-radius: 1.25rem;
+      background: var(--stage);
+      color: var(--on-stage);
+    }
+
+    .choices { grid-area: choices; display: flex; flex-wrap: wrap; gap: .25rem; }
+    .choices label {
+      display: inline-flex;
+      align-items: center;
+      min-height: 44px;
+      padding: .55rem .8rem;
+      border: 1px solid var(--stage-line);
+      border-radius: .4rem;
+      color: var(--on-stage);
+      font-size: .9rem;
+      font-weight: 500;
+      line-height: 1.2;
+      cursor: pointer;
+    }
+
+    .choices label:hover { background: #326351; }
+    #screen-inbox:checked ~ .choices [for="screen-inbox"],
+    #screen-chat:checked ~ .choices [for="screen-chat"] {
+      background: var(--on-stage);
+      border-color: var(--on-stage);
+      color: var(--stage);
+    }
+
+    #screen-inbox:focus-visible ~ .choices [for="screen-inbox"],
+    #screen-chat:focus-visible ~ .choices [for="screen-chat"],
+    .preview:focus-visible {
+      outline: 3px solid var(--on-stage-focus);
+      outline-offset: 3px;
+    }
+
+    #screen-inbox:checked ~ .chat, #screen-chat:checked ~ .inbox { display: none; }
+    .screen-note { grid-area: note; max-width: 32em; }
+    .screen-note h2 { max-width: 15em; font-size: clamp(1.6rem, 2.8vw, 2.5rem); }
+    .screen-note p { margin-top: .85rem; color: var(--stage-muted); line-height: 1.5; }
+    .shot { grid-area: shot; min-width: 0; }
+    .preview { display: block; border-radius: .5rem; color: var(--on-stage); text-decoration: none; }
+    .preview img {
+      display: block;
+      width: 100%;
+      height: auto;
+      border-radius: .5rem;
+      cursor: zoom-in;
+    }
+
+    .preview span {
+      display: flex;
+      width: fit-content;
+      align-items: center;
+      min-height: 44px;
+      margin: .15rem 0 -.65rem auto;
+      font-size: .875rem;
+      text-decoration: underline;
+    }
+
+    .preview:hover { color: white; }
+    .preview:hover span { text-decoration-thickness: .14em; }
+
+    .project-guide, .getting-started {
+      margin-block: clamp(3.4rem, 7vw, 6.2rem);
+      display: grid;
+      align-items: start;
+      gap: clamp(1.55rem, 4vw, 4.2rem);
+    }
+
+    .project-guide { grid-template-columns: minmax(15rem, .78fr) minmax(0, 1.22fr); }
+    .project-guide > h2 { max-width: 11em; }
+    .guide-list { display: grid; gap: 1.35rem; }
+    .guide-list article { padding-bottom: 1.35rem; border-bottom: 1px solid var(--line); }
+    .guide-list article:last-child { padding-bottom: 0; border: 0; }
+    .guide-list p, .steps p, .telegram p { color: var(--muted); }
+    .guide-list p { margin-top: .45rem; max-width: 63ch; }
+    .guide-list a, .telegram a { font-weight: 500; }
+
+    .getting-started {
+      grid-template-columns: minmax(0, 1.15fr) minmax(0, .85fr);
+      padding-top: clamp(2.6rem, 5vw, 4.5rem);
+      border-top: 1px solid var(--line);
+    }
+
+    .steps { display: grid; gap: 1.3rem; margin: 1.6rem 0 0; padding-inline-start: 2rem; }
+    .steps li { padding-inline-start: .25rem; }
+    .steps li::marker { color: var(--accent); font-weight: 700; }
+    .steps h3 { font-size: 1.16rem; line-height: 1.45; }
+    .steps p { max-width: 55ch; margin-top: .12rem; }
+    .telegram { padding: clamp(1.25rem, 2.8vw, 2.3rem); border-radius: .8rem; background: var(--soft); }
+    .telegram h2 { font-size: clamp(1.55rem, 2.3vw, 2rem); }
+    .telegram p { margin-top: .9rem; }
+    .telegram > a { display: inline-block; margin-top: 1.1rem; }
+    .footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      flex-wrap: wrap;
+      gap: .25rem 1.5rem;
+      border-top: 1px solid var(--line);
+      padding-block: 1.15rem 1.5rem;
+    }
+
+    .footer .name { font: 500 .93rem var(--display); letter-spacing: -.045em; }
+
+    @media (max-width: 58rem) {
+      .hero { grid-template-columns: 1fr 1fr; }
+      .gallery {
+        grid-template-columns: max-content minmax(0, 1fr);
+        grid-template-areas: "choices note" "shot shot";
+        grid-template-rows: auto auto;
+        align-items: start;
+        gap: 1.3rem;
+      }
+      .screen-note { max-width: none; }
+      .screen-note h2 { font-size: 1.4rem; }
+      .screen-note p { margin-top: .3rem; font-size: 1rem; }
+      .guide-list { gap: 1.15rem; }
+    }
+
+    @media (max-width: 43rem) {
+      .masthead { gap: .15rem 1.2rem; padding-block: .65rem; }
+      nav ul { gap: 0 1rem; }
+      .hero, .project-guide, .getting-started { grid-template-columns: minmax(0, 1fr); }
+      .hero { gap: 1rem; }
+      h1 { font-size: clamp(2.4rem, 8.5vw, 3.45rem); }
+      .gallery {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-areas: "choices" "shot" "note";
+        gap: 1.1rem;
+      }
+      .screen-note h2 { font-size: 1.45rem; }
+      .project-guide > h2 { max-width: none; }
+      .getting-started { gap: 2rem; }
+    }
+
+    @media (max-width: 26rem) {
+      .gallery { padding: 1rem; border-radius: .85rem; }
+      .download-group { align-items: flex-start; flex-direction: column; }
+      .masthead nav { flex-basis: 100%; }
+    }
+
+    @media (forced-colors: active) {
+      #screen-inbox:checked ~ .choices [for="screen-inbox"],
+      #screen-chat:checked ~ .choices [for="screen-chat"] { border: 2px solid Highlight; }
+      .download { border: 1px solid ButtonText; }
+    }
+  </style>
 </head>
 <body>
+  <a class="skip" href="#main">Перейти к содержанию</a>
+  <header class="wrap masthead">
+    <div class="identity">
+      <a class="brand" href="#main"><span class="brand-mark" aria-hidden="true"></span>agent-hub</a>
+      <span class="version">v1.1.0</span>
+    </div>
+    <nav aria-label="Основная навигация">
+      <ul>
+        <li><a href="#interface">Интерфейс</a></li>
+        <li><a href="#start">Начать</a></li>
+        <li><a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/README.md">Документация</a></li>
+      </ul>
+    </nav>
+  </header>
 
-<div class="wrap">
-  <nav>
-    <div class="logo">agent<span>-</span>hub</div>
-    <div class="links"><a href="#whats-new">В 1.0.0</a><a href="#agents">Агенты</a><a href="#start">Начать</a><a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/README.md">Документация</a><a href="https://github.com/aprazdnikov/agent-hub-rs">GitHub</a></div>
-  </nav>
-
-  <section class="hero">
-    <div>
-      <a class="version" href="#whats-new">1.0.0 · память и задачи</a>
-      <h1>Агенты работают, пока вы в дороге</h1>
-      <p class="lead">Каждая тема Telegram-группы — отдельная сессия <b>Claude Code, Codex, Qwen, Hermes или OpenCode</b> на вашем компьютере. Ставите задачу с телефона, разрешаете команды кнопкой, получаете результат.</p>
-      <div class="cta">
-        <a class="btn primary" href="https://github.com/aprazdnikov/agent-hub-rs/releases/latest">Скачать</a>
-        <a class="btn" href="https://github.com/aprazdnikov/agent-hub-rs">★ Звезда на GitHub</a>
+  <main id="main" class="wrap">
+    <section class="hero" aria-labelledby="title">
+      <h1 id="title">ИИ-агенты в&nbsp;одном окне</h1>
+      <div>
+        <p class="lead">Поручите задачу Claude Code, Codex, Qwen Code, Hermes или OpenCode. Агент работает в папке проекта на вашем компьютере. Подключите Telegram, если хотите отвечать с телефона.</p>
+        <div class="download-group">
+          <a class="download" href="https://github.com/aprazdnikov/agent-hub-rs/releases/latest">Скачать agent-hub</a>
+          <span class="platforms">Windows, macOS и Linux</span>
+        </div>
       </div>
-      <p class="fine">Для Windows, macOS и Linux · открытый код · без стороннего сервера</p>
-    </div>
+    </section>
 
-    <div class="phone" aria-label="Пример форум-группы в Telegram">
-      <header>Мои агенты <small>3 темы</small></header>
-      <div class="topics">
-        <div class="topic"><b>backend: тесты</b><span class="st ok">✅ готово</span><span class="who">Claude · ~/shop/backend</span></div>
-        <div class="topic"><b>agent-hub: релиз</b><span class="st run">⏳ работает</span><span class="who">Codex · ~/agent-hub</span></div>
-        <div class="topic"><b>миграция БД</b><span class="st wait">❓ ждёт вас</span><span class="who">Claude · ~/shop/db</span></div>
+    <section id="interface" aria-label="Интерфейс приложения">
+      <fieldset class="gallery">
+        <legend class="visually-hidden">Выберите экран приложения</legend>
+        <input class="visually-hidden" type="radio" name="screen" id="screen-inbox" checked>
+        <input class="visually-hidden" type="radio" name="screen" id="screen-chat">
+        <div class="choices">
+          <label for="screen-inbox">Входящие</label>
+          <label for="screen-chat">Чат задачи</label>
+        </div>
+        <div class="screen-note inbox">
+          <h2>Что ждёт решения</h2>
+          <p>При запуске открываются «Входящие». Ответьте на вопрос агента, разрешите действие или проверьте готовый результат. Фильтр покажет задачи выбранного проекта.</p>
+        </div>
+        <figure class="shot inbox">
+          <a class="preview" href="screenshots/inbox.png">
+            <img src="screenshots/inbox.png" width="960" height="640" alt="Входящие с вопросом агента и результатом другой задачи на проверку">
+            <span>Открыть снимок целиком</span>
+          </a>
+        </figure>
+        <div class="screen-note chat">
+          <h2>Переписка по задаче</h2>
+          <p>Выберите задачу в дереве проектов слева. В чате сохраняются поручения и ответы. Откройте результат, чтобы посмотреть файлы и оставить замечание к строке изменений.</p>
+        </div>
+        <figure class="shot chat">
+          <a class="preview" href="screenshots/task-chat.png">
+            <img src="screenshots/task-chat.png" width="960" height="640" alt="Дерево проектов слева и чат выбранной задачи с ответом агента и полем сообщения">
+            <span>Открыть снимок целиком</span>
+          </a>
+        </figure>
+      </fieldset>
+    </section>
+
+    <section class="project-guide" aria-labelledby="project-title">
+      <h2 id="project-title">Как организовать работу в проекте</h2>
+      <div class="guide-list">
+        <article>
+          <h3>Проверка и ревью</h3>
+          <p>В правилах проекта выберите исполнителя, команду проверки и ревьюера. Если тесты упадут, исполнитель получит одну попытку исправления. После успешной проверки ревьюер посмотрит изменения, а результат примете вы.</p>
+        </article>
+        <article>
+          <h3>Очередь задач</h3>
+          <p>Ставьте задачи в очередь, пока агент занят. В основной папке они выполняются по одной. В отдельных рабочих деревьях Git можно запустить две задачи параллельно. <a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/guide/tasks.md">Руководство по задачам</a></p>
+        </article>
+        <article>
+          <h3>Общая память</h3>
+          <p>Включите память проекта, чтобы агенты могли сохранять принятые решения, ход работы и ссылки на источники. Эти записи доступны в новых задачах и при смене агента. <a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/guide/memory.md">Как работает память</a></p>
+        </article>
       </div>
-      <div class="msg mine">Прогони миграции на тестовой базе и покажи diff схемы</div>
-      <div class="msg">Нужно разрешение на команду:<br><code>make migrate ENV=test</code>
-        <div class="keys"><span>Разрешить</span><span>Отклонить</span></div>
+    </section>
+
+    <section id="start" class="getting-started" aria-labelledby="start-title">
+      <div>
+        <h2 id="start-title">Первый запуск без Telegram</h2>
+        <ol class="steps">
+          <li>
+            <h3>Настройте одного агента</h3>
+            <p>Установите консольную версию выбранного агента, настройте доступ к модели и проверьте запуск в терминале. <a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/guide/agents.md">Настройка агентов</a></p>
+          </li>
+          <li>
+            <h3>Установите agent-hub</h3>
+            <p>Скачайте сборку для своей системы, сверьте SHA-256 и откройте приложение. <a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/guide/getting-started.md">Инструкция по установке</a></p>
+          </li>
+          <li>
+            <h3>Откройте папку и поставьте задачу</h3>
+            <p>В дереве проектов нажмите «Открыть папку…», затем «Новая задача». Выберите «Локально» и агента, введите поручение и нажмите «Начать задачу».</p>
+          </li>
+        </ol>
       </div>
-    </div>
-  </section>
+      <aside class="telegram">
+        <h2>Если нужен Telegram</h2>
+        <p>Создайте бота через <a href="https://t.me/BotFather">@BotFather</a>. Добавьте его в группу с включёнными темами и назначьте администратором с правом «Управление темами».</p>
+        <p>В настройках agent-hub укажите корень рабочих каталогов. В разделе «Telegram и доступ» заполните токен, ID группы и ID пользователей, которым разрешён доступ. Сохраните настройки.</p>
+        <p>Оставьте приложение запущенным. В теме того же проекта отправьте <code>/task follow ID</code>, подставив номер задачи из чата. Вопросы и результаты этой задачи появятся и на телефоне.</p>
+        <a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/guide/telegram.md">Руководство по Telegram</a>
+      </aside>
+    </section>
+  </main>
 
-  <section class="story">
-    <div class="num">6+<small>задач за 3–4 часа</small></div>
-    <p>Пришлось срочно уехать, а задач было много. Пока ездил, в шести темах шли шесть сессий: я ставил задачи, отвечал на вопросы и подтверждал команды с телефона. Вернулся к готовым результатам.</p>
-  </section>
-
-  <section id="whats-new" class="release">
-    <h2>В 1.0.0 — общая память и продолжение задач</h2>
-    <div class="features">
-      <div class="feature"><h3>Память проекта для пяти агентов</h3><p>Решения, прогресс и источники доступны в новых сессиях и другому агенту. Откройте «Память проекта» в меню рядом с его названием или используйте <code>/memory</code>.</p></div>
-      <div class="feature"><h3>Проверяемая передача контекста</h3><p>Соберите пакет из выбранных записей и поручения, проверьте его свежесть и передайте следующему агенту. Процедура продолжения помогает сверить источники и фактический прогресс.</p></div>
-      <div class="feature"><h3>Задачи с историей результатов</h3><p>Сохраните поручение, выберите агента и запустите вручную. После перезапуска результат останется доступен; продолжение требует явно заданного следующего шага.</p></div>
-      <div class="feature"><h3>Входящие для работы с агентами</h3><p>Ответьте на вопрос, разрешите действие или проверьте результат в одном списке по всем проектам.</p></div>
-      <div class="feature"><h3>У каждого параметра своё место</h3><p>Telegram и доступ, рабочие каталоги, агенты, проекты, действия, голосовые сообщения, запуск и обновления — семь разделов вместо длинной формы. У каждого агента своя страница.</p></div>
-      <div class="feature"><h3>Светлая и тёмная темы</h3><p>Окно следует теме системы и переключается во время работы. На Linux для этого нужна поддержка XDG Desktop Portal в окружении рабочего стола.</p></div>
-      <div class="feature"><h3>Правки остаются при переходах</h3><p>Можно настроить несколько разделов и сохранить всё вместе. Кнопки сохранения и отмены закреплены внизу, а ошибки отмечены рядом с разделами и агентами.</p></div>
-      <div class="feature"><h3>Масштаб под ваш экран</h3><p>Размер интерфейса можно настроить от 75 до 150% относительно системного масштаба, предварительно посмотреть и сохранить отдельно от настроек бота.</p></div>
-      <div class="feature"><h3>Диагностика подключения</h3><p>Откройте «Настройки → Диагностика», чтобы проверить настройки Telegram, права бота, рабочий каталог и CLI выбранного агента.</p></div>
-      <div class="feature"><h3>Обновление установленной версии</h3><p>Для установленного пакета и macOS-приложения agent-hub предлагает страницу релиза; переносную копию можно обновить из окна.</p></div>
-      <div class="feature"><h3>Удобно и в небольшом окне</h3><p>В узком окне боковое меню заменяется списком разделов. Кнопка «Исправить ошибки» открывает страницу с первым неверно заполненным полем.</p></div>
-    </div>
-    <p>Подробности — в <a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/guide/settings.md">руководстве по настройкам</a>. Установка, агенты, проекты и работа в Telegram собраны в <a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/README.md">документации</a>.</p>
-  </section>
-
-  <section>
-    <h2>Управляйте задачами с телефона</h2>
-    <div class="features">
-      <div class="feature"><h3>Тема — это сессия</h3><p>Создали тему — получили агента в своей рабочей директории. Темы работают параллельно, контекст переживает перезапуски.</p></div>
-      <div class="feature"><h3>Разрешения кнопками</h3><p>Команды и правки файлов агент спрашивает кнопками прямо в теме. Вопросы с вариантами ответа тоже.</p></div>
-      <div class="feature"><h3>Проекты, модели и режимы</h3><p><code>/projects</code> выбирает сохранённый каталог и агента. <code>/model</code> и <code>/mode</code> задают параметры для темы; необходимый сброс контекста требует подтверждения.</p></div>
-      <div class="feature"><h3>Голосовые задачи</h3><p>Надиктуйте задачу, проверьте распознанный текст, исправьте и подтвердите запуск. Распознавание настраивается отдельно: локально через Whisper.cpp и FFmpeg или через внешний API.</p></div>
-      <div class="feature"><h3>Передача другому агенту</h3><p><code>/handoff</code> готовит сводку для проверки. Получатель продолжает работу в новой теме с теми же файлами проекта; исходная тема сохраняется.</p></div>
-      <div class="feature"><h3>Прогресс и последний ответ</h3><p>Карточка прогресса показывает этап, инструменты и кнопку остановки. <code>/status</code> уточняет состояние, <code>/last</code> возвращает сохранённый ответ без нового запроса к модели.</p></div>
-      <div class="feature"><h3>Доставка после сбоя связи</h3><p>Финальный текст сохраняется в очереди, которая переживает перезапуск. Окно показывает число ожидающих ответов; <code>/outbox</code> позволяет проверить, повторить или удалить доставку.</p></div>
-      <div class="feature"><h3>Команды и проверки проекта</h3><p><code>/actions</code> запускает и останавливает заранее заданные команды на компьютере. <code>/doctor</code> проверяет каталог, CLI и настроенные HTTP/TCP-ресурсы.</p></div>
-      <div class="feature"><h3>Снимки сессий</h3><p><code>/save</code> сохраняет сессию, <code>/restore</code> продолжает её в новой теме.</p></div>
-      <div class="feature"><h3>Лимиты подписок</h3><p><code>/limits</code> показывает, сколько осталось в окнах Claude и Codex и когда сброс.</p></div>
-      <div class="feature"><h3>Темы легко найти</h3><p>Названия сохраняются между перезапусками. В приложении есть поиск, фильтры, переход в Telegram и открытие каталога проекта.</p></div>
-      <div class="feature"><h3>Запуск вместе с системой</h3><p>Автозапуск при входе включается отдельно в настройках Windows, macOS и Linux. Приложение показывает состояние регистрации в ОС.</p></div>
-    </div>
-  </section>
-
-  <section id="agents">
-    <h2>Пять агентов на выбор</h2>
-    <div class="features">
-      <div class="feature"><h3>Claude Code</h3><p>Основной агент: подписка Claude, лимиты в <code>/limits</code>, снимки сессий.</p></div>
-      <div class="feature"><h3>Codex</h3><p>Подписка ChatGPT или API-ключ OpenAI, песочница и одобрения, снимки сессий.</p></div>
-      <div class="feature"><h3>Qwen Code</h3><p>Бесплатный вход или любой OpenAI-совместимый адрес; досылка сообщений посреди хода.</p></div>
-      <div class="feature"><h3>Hermes</h3><p>Профили, память и скиллы Hermes; хаб запускает <code>hermes acp</code>, настраивает режимы одобрений и не трогает его ключи.</p></div>
-      <div class="feature"><h3>OpenCode</h3><p>Подключается через <code>opencode acp</code>. Модель в формате <code>провайдер/модель</code> задаётся в настройках; вход и разрешения инструментов — в самом OpenCode.</p></div>
-    </div>
-    <p>Агент выбирается на уровне темы: <code>/new opencode ~/shop</code> или <code>/backend opencode</code>. Один и тот же бот ведёт темы разных агентов параллельно.</p>
-  </section>
-
-  <section id="how" class="flow">
-    <h2>Как устроено</h2>
-    <ol>
-      <li><b>Telegram</b><span>форум-группа, темы</span></li>
-      <li><b>Ваш бот</b><span>токен от @BotFather</span></li>
-      <li><b>agent-hub</b><span>приложение в трее на вашем компьютере</span></li>
-      <li><b>CLI агентов</b><span>claude, codex, qwen, hermes, opencode</span></li>
-    </ol>
-    <p>Агенты работают на вашем компьютере от вашего пользователя. Сообщения проходят через Telegram, а данные для модели — через выбранного провайдера. Доступ к боту ограничен списком user_id. Подробнее — <a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/guide/security.md">о безопасности и границах доступа</a>.</p>
-  </section>
-
-  <section id="start">
-    <h2>Начать работу</h2>
-    <div class="steps">
-      <div><b>Подготовьте приложение и агента</b><span>Установите CLI нужного агента и войдите в него. Скачайте установщик Windows, пакет Debian/Ubuntu или архив для своей ОС; для macOS — .app.zip.</span></div>
-      <div><b>Создайте бота и группу</b><span>включите темы, сделайте бота администратором</span></div>
-      <div><b>Заполните настройки</b><span>Укажите токен, ID группы, разрешённые user_id и рабочий каталог. В «Агенты → Общие» выберите агента, сохраните и создайте первую тему.</span></div>
-    </div>
-    <p class="fine">Права бота, установка и получение ID — в <a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/guide/getting-started.md">пошаговой инструкции</a>.</p>
-  </section>
-
-  <section class="final">
-    <h2>Попробуйте на своих задачах</h2>
-    <p>agent-hub — открытый проект на Rust. Если пригодился, поставьте звезду. Нашли ошибку или хотите новый агент — приходите с issue и PR.</p>
-    <div class="cta">
-      <a class="btn primary" href="https://github.com/aprazdnikov/agent-hub-rs/releases/latest">Скачать</a>
-      <a class="btn" href="https://github.com/aprazdnikov/agent-hub-rs">★ GitHub</a>
-      <a class="btn" href="https://github.com/aprazdnikov/agent-hub-rs/issues">Issues</a>
-    </div>
-  </section>
-</div>
+  <footer class="wrap footer">
+    <span class="name">agent-hub</span>
+    <ul class="footer-links">
+      <li><a href="https://github.com/aprazdnikov/agent-hub-rs">Исходный код</a></li>
+      <li><a href="https://github.com/aprazdnikov/agent-hub-rs/blob/main/LICENSE">Лицензия MIT</a></li>
+    </ul>
+  </footer>
 </body>
 </html>

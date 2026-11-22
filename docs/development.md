@@ -11,8 +11,8 @@
 
 ```bash
 cargo build -p hub-app --bin agent-hub --locked
-cargo test --workspace
-cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace --locked
+cargo clippy --workspace --all-targets --locked -- -D warnings
 cargo fmt --all --check
 cargo deny check
 node --test scripts/test-macos-authorization.mjs
@@ -50,8 +50,9 @@ cargo run -p hub-app --bin agent-hub
 
 ```bash
 cargo build --release --locked -p hub-app
-bash scripts/test-macos-package.sh target/release/agent-hub 0.9.0
-bash scripts/package-macos.sh target/release/agent-hub 0.9.0 dist/agent-hub.app
+version=$(cargo pkgid --locked -p hub-app | sed 's/.*[#@]//')
+bash scripts/test-macos-package.sh target/release/agent-hub "$version"
+bash scripts/package-macos.sh target/release/agent-hub "$version" dist/agent-hub.app
 open dist/agent-hub.app
 ```
 
@@ -66,21 +67,26 @@ open dist/agent-hub.app
 `readelf` и Python 3; тест не устанавливает пакет):
 
 ```bash
-bash scripts/test-deb-package.sh target/release/agent-hub 0.9.0
-bash scripts/package-deb.sh target/release/agent-hub 0.9.0 dist/agent-hub.deb
+cargo build --release --locked -p hub-app
+version=$(cargo pkgid --locked -p hub-app | sed 's/.*[#@]//')
+bash scripts/test-deb-package.sh target/release/agent-hub "$version"
+bash scripts/package-deb.sh target/release/agent-hub "$version" dist/agent-hub.deb
 ```
 
-Windows-установщик собирается из x64 PE через NSIS 3.10. На Windows изолированный
-`scripts/test-windows-installer.ps1` проверяет установку, обновление и удаление в
-временном каталоге и тестовом разделе HKCU. Проверка добавлена в CI; её наличие в
-репозитории не означает, что она уже прошла на GitHub Actions.
+Windows-установщик собирается из x64 PE через NSIS 3.10. На Windows скрипт
+`scripts/test-windows-installer.ps1` проверяет установку, обновление и удаление
+во временном каталоге и тестовом разделе HKCU.
 
-Выпуск релиза: поднять `version` в корневом `Cargo.toml`, закоммитить и поставить тег
-`vX.Y.Z` — workflow `release.yml` соберёт четыре платформы, архивы, бинарники и `.sha256` и
-опубликует релиз. Для macOS дополнительно создаются `.app.zip` и их `.sha256`; прежние
-артефакты сохраняются. Подготовлены дополнительные `.deb` и Windows installer; их
-публикация зависит от прохождения проверок упаковки в workflow. Тег должен совпадать
-с версией.
+## Выпуск релиза
 
-Планы и история: [каталог документации](README.md). Порядок публикации и журнал
-выпуска: [релизы](releases/README.md).
+1. Обновите версию workspace в `Cargo.toml` и `Cargo.lock`. Подготовьте непустой
+   `docs/releases/vX.Y.Z.md`. Этот Markdown станет описанием на GitHub.
+2. После слияния дождитесь CI на итоговом коммите `main`. Поставьте на него
+   аннотированный тег `vX.Y.Z` с версией из `Cargo.toml` и отправьте тег в `origin`.
+3. Дождитесь workflow Release. Он собирает Windows x64, Linux x64 и обе архитектуры macOS,
+   проверяет упаковку и публикует отдельные бинарники, архивы, установщик Windows,
+   приложения macOS и пакет Debian. К каждому файлу прилагается `.sha256`.
+4. Проверьте цель тега, описание на GitHub и SHA-256 скачанных файлов.
+   Сайт публикуется отдельным workflow Pages при изменении `site/` в `main`.
+
+Подробности и журнал выпусков см. в [порядке выпуска](releases/README.md#порядок-выпуска).

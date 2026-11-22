@@ -8,7 +8,8 @@
 
 | Версия | Текст | Подготовка | Результат публикации |
 |---|---|---|---|
-| v1.0.0 | [Общая память проекта](v1.0.0.md) | Релизный коммит `e577805`, [CI — 6/6 PASS](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/44894626289) | [Опубликован](https://github.com/aprazdnikov/agent-hub-rs/releases/tag/v1.0.0), latest; 24 файла и SHA-256 проверены; [Release — PASS](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/44895372407) |
+| v1.1.0 | [Задачи на компьютере и в Telegram](v1.1.0.md) | Проверки workspace и сборки для четырёх платформ | [Сборки и контрольные суммы](https://github.com/aprazdnikov/agent-hub-rs/releases/tag/v1.1.0) |
+| v1.0.0 | [Общая память проекта](v1.0.0.md) | Релизный коммит `e577805`, [CI — 6/6 PASS](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/44894626289) | [Опубликован](https://github.com/aprazdnikov/agent-hub-rs/releases/tag/v1.0.0), 24 файла и SHA-256 проверены; [Release — PASS](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/44895372407) |
 | v0.11.0 | [Одобрения Hermes](v0.11.0.md) | 2026-11-10: пользователь согласовал минорный выпуск; коммит `5627d16`, аннотированный тег `v0.11.0` | [Опубликован](https://github.com/aprazdnikov/agent-hub-rs/releases/tag/v0.11.0): 24 файла; [Release — PASS](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/42825506765) |
 | v0.10.0 | [Диагностика, масштаб и установка](v0.10.0.md) | Коммит `4c2647f`, аннотированный тег `v0.10.0` | [Опубликован](https://github.com/aprazdnikov/agent-hub-rs/releases/tag/v0.10.0): 24 файла; [Release — PASS](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/42197465409) |
 | v0.9.0 | [Новые настройки и системные темы](v0.9.0.md) | 2026-11-05: текст согласован; коммит `347f333`, аннотированный тег `v0.9.0` | [Опубликован](https://github.com/aprazdnikov/agent-hub-rs/releases/tag/v0.9.0): 20 файлов; [Release — PASS](https://github.com/aprazdnikov/agent-hub-rs/actions/runs/42054464691) |
