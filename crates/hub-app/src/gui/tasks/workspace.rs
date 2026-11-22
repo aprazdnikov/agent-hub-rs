@@ -299,7 +299,11 @@ impl TasksView {
                     self.parameters(ui, task, &available, &next, snapshot, send);
                 });
             }
-            _ => self.review(ui, task, &mut next, &available, send),
+            result::Tab::Summary
+            | result::Tab::Changes
+            | result::Tab::Checks
+            | result::Tab::Files
+            | result::Tab::History => self.review(ui, task, &mut next, &available, send),
         });
         if task.runs.is_empty() {
             if next == task.prompt {

@@ -1,5 +1,5 @@
 //! Task review tabs and annotations against the saved patch of a particular attempt.
-use crate::gui::theme::{Tone, bubble, chip, tone_colors};
+use crate::gui::theme::{Tone, bubble, chip, tab, tone_colors};
 use eframe::egui;
 use hub_core::tasks::{Run, RunState, Task};
 use jiff::{Timestamp, Zoned, tz::TimeZone};
@@ -13,6 +13,7 @@ pub(super) enum Tab {
     Summary,
     Changes,
     Checks,
+    Files,
     History,
 }
 #[derive(Default)]
@@ -62,84 +63,98 @@ impl View {
         editable: bool,
     ) -> Option<String> {
         let run = Self::review_run(task)?;
-        let section = self.tab;
-        if matches!(section, Tab::Checks | Tab::Changes | Tab::History) {
-            self.tab = Tab::Summary;
-        }
         if self.run != Some(run.id) {
             self.file_error = None;
             self.anchor = None;
             self.note.clear();
             self.run = Some(run.id);
         }
-        ui.add(
-            egui::Label::new(if run.result.is_empty() { run.state.label() } else { &run.result })
-                .wrap()
-                .selectable(true),
-        );
-        if !run.diagnostic.is_empty() {
-            ui.colored_label(ui.visuals().error_fg_color, &run.diagnostic);
+        if let Some(target) = self.tab_bar(ui, task, run) {
+            self.tab = target;
         }
-        ui.add_space(6.0);
-        let annotation = egui::CollapsingHeader::new("Изменения")
-            .id_salt(("result_diff", &task.project, task.id, run.id))
-            .open((section == Tab::Changes).then_some(true))
-            .show(ui, |ui| self.changes(ui, task, run, next, editable))
-            .body_returned
-            .flatten();
-        let checks = &run.workflow_report.checks;
-        let count = checks.iter().filter(|check| check.passed).count();
-        let checks_label = if checks.is_empty() {
-            "Проверки".to_owned()
-        } else {
-            format!("Проверки · пройдено {count} из {}", checks.len())
-        };
-        egui::CollapsingHeader::new(checks_label)
-            .id_salt(("result_checks", &task.project, task.id, run.id))
-            .open((section == Tab::Checks).then_some(true))
-            .show(ui, |ui| report(ui, run));
-        if !run.files.is_empty() {
-            ui.collapsing(format!("Файлы ({})", run.files.len()), |ui| self.files(ui, run));
-        }
-        egui::CollapsingHeader::new(format!("История попыток ({})", task.runs.len()))
-            .id_salt(("result_history", &task.project, task.id))
-            .open((section == Tab::History).then_some(true))
-            .show(ui, |ui| {
-                for attempt in task.runs.iter().rev() {
-                    ui.collapsing(
-                        format!(
-                            "Попытка {} · {} · {}",
-                            attempt.id,
-                            attempt.state.label(),
-                            attempt.backend.as_deref().unwrap_or(&task.backend)
-                        ),
-                        |ui| {
-                            ui.label(&attempt.step);
-                            if let Some(rules) = &attempt.rules {
-                                ui.label(rules.describe());
-                            }
-                            if !attempt.diagnostic.is_empty() {
-                                ui.label(&attempt.diagnostic);
-                            }
-                            ui.label(if attempt.result.is_empty() {
-                                "Сохранённого ответа нет"
-                            } else {
-                                &attempt.result
-                            });
-                            self.files(ui, attempt);
-                            if !attempt.workflow_report.is_empty() {
-                                report(ui, attempt);
-                            }
-                            if !attempt.diff.is_empty() {
-                                ui.collapsing("Сохранённые изменения", |ui| {
-                                    ui.monospace(&attempt.diff);
-                                });
-                            }
-                        },
-                    );
+        match self.tab {
+            Tab::Summary => {
+                summary(ui, run);
+                None
+            }
+            Tab::Changes => self.changes(ui, task, run, next, editable),
+            Tab::Checks => {
+                report(ui, run);
+                None
+            }
+            Tab::Files => {
+                if run.files.is_empty() {
+                    ui.weak("Сохранённых файлов нет.");
+                } else {
+                    self.files(ui, run);
                 }
-            });
-        annotation
+                None
+            }
+            Tab::History => {
+                self.history(ui, task);
+                None
+            }
+            // Chat and Parameters render their own screens; review bodies exist only for these five.
+            Tab::Chat | Tab::Parameters => None,
+        }
+    }
+    /// The section tabs from the spec «Экран результата»; clicks move `tab` directly, so the
+    /// row keeps annotations, the line note and the diff anchor that `select` would reset.
+    fn tab_bar(&self, ui: &mut egui::Ui, task: &Task, run: &Run) -> Option<Tab> {
+        let checks = &run.workflow_report.checks;
+        let passed = checks.iter().filter(|check| check.passed).count();
+        let diff_files = run.diff.lines().filter(|line| line.starts_with("diff --git ")).count();
+        let tabs = [
+            (Tab::Summary, "Сводка".to_owned()),
+            (Tab::Changes, format!("Изменения · {diff_files} {}", file_count_word(diff_files))),
+            (Tab::Checks, format!("Проверки · {passed}/{}", checks.len())),
+            (Tab::Files, format!("Файлы · {}", run.files.len())),
+            (Tab::History, format!("История · {}", task.runs.len())),
+        ];
+        let mut chosen = None;
+        ui.horizontal_wrapped(|ui| {
+            for (target, label) in &tabs {
+                if tab(ui, self.tab == *target, label).clicked() {
+                    chosen = Some(*target);
+                }
+            }
+        });
+        chosen
+    }
+    fn history(&mut self, ui: &mut egui::Ui, task: &Task) {
+        for attempt in task.runs.iter().rev() {
+            ui.collapsing(
+                format!(
+                    "Попытка {} · {} · {}",
+                    attempt.id,
+                    attempt.state.label(),
+                    attempt.backend.as_deref().unwrap_or(&task.backend)
+                ),
+                |ui| {
+                    ui.label(&attempt.step);
+                    if let Some(rules) = &attempt.rules {
+                        ui.label(rules.describe());
+                    }
+                    if !attempt.diagnostic.is_empty() {
+                        ui.label(&attempt.diagnostic);
+                    }
+                    ui.label(if attempt.result.is_empty() {
+                        "Сохранённого ответа нет"
+                    } else {
+                        &attempt.result
+                    });
+                    self.files(ui, attempt);
+                    if !attempt.workflow_report.is_empty() {
+                        report(ui, attempt);
+                    }
+                    if !attempt.diff.is_empty() {
+                        ui.collapsing("Сохранённые изменения", |ui| {
+                            ui.monospace(&attempt.diff);
+                        });
+                    }
+                },
+            );
+        }
     }
     pub(super) fn transcript(ui: &mut egui::Ui, task: &Task, view: &mut Self) {
         for run in &task.runs {
@@ -209,12 +224,8 @@ impl View {
                 for (i, line) in run.diff.lines().enumerate() {
                     if let Some((path, side, n)) = cursor.step(line) {
                         let anchor = format!("{path}:{n} ({side}), попытка {}\n{line}", run.id);
-                        let color = match (line.starts_with('+'), ui.visuals().dark_mode) {
-                            (true, true) => egui::Color32::from_rgb(133, 218, 165),
-                            (true, false) => egui::Color32::from_rgb(28, 102, 59),
-                            (false, true) => egui::Color32::from_rgb(253, 166, 160),
-                            (false, false) => egui::Color32::from_rgb(148, 49, 47),
-                        };
+                        let tone = if line.starts_with('+') { Tone::Accent } else { Tone::Error };
+                        let color = tone_colors(ui, tone).1;
                         let text =
                             egui::RichText::new(format!("{n:>4}  {line}")).monospace().color(color);
                         ui.push_id(i, |ui| {
@@ -429,6 +440,18 @@ fn agent_contents(ui: &mut egui::Ui, task: &Task, run: &Run, view: &mut View, fl
     });
 }
 
+// The «Изменения · N …» tab keeps Russian agreement for the count (mockup: «3 файла»).
+fn file_count_word(count: usize) -> &'static str {
+    match count % 100 {
+        11..=14 => "файлов",
+        _ => match count % 10 {
+            1 => "файл",
+            2..=4 => "файла",
+            _ => "файлов",
+        },
+    }
+}
+
 fn annotate(next: &str, anchor: &str, note: &str) -> Option<String> {
     if note.trim().is_empty() {
         return None;
@@ -436,6 +459,30 @@ fn annotate(next: &str, anchor: &str, note: &str) -> Option<String> {
     let note = format!("Исправь замечание к {anchor}\n{}", note.trim());
     let step = if next.trim().is_empty() { note } else { format!("{next}\n\n{note}") };
     (step.len() <= 16 * 1024).then_some(step)
+}
+fn summary(ui: &mut egui::Ui, run: &Run) {
+    ui.add(
+        egui::Label::new(if run.result.is_empty() { run.state.label() } else { &run.result })
+            .wrap()
+            .selectable(true),
+    );
+    if !run.diagnostic.is_empty() {
+        ui.colored_label(ui.visuals().error_fg_color, &run.diagnostic);
+    }
+    let checks = &run.workflow_report.checks;
+    if run.files.is_empty() && checks.is_empty() {
+        return;
+    }
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        if !run.files.is_empty() {
+            chip(ui, Tone::Neutral, &format!("Файлов · {}", run.files.len()));
+        }
+        if !checks.is_empty() {
+            let passed = checks.iter().filter(|check| check.passed).count();
+            chip(ui, Tone::Neutral, &format!("Проверки · {passed}/{}", checks.len()));
+        }
+    });
 }
 fn report(ui: &mut egui::Ui, run: &Run) {
     if !run.diagnostic.is_empty() {
@@ -520,6 +567,10 @@ impl<'a> Lines<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hub_core::tasks::{
+        ResultFile, TaskBook,
+        workflow::{CheckResult, WorkflowReport},
+    };
     #[test]
     fn diff_headers_inside_a_hunk_are_annotated_as_content() {
         let mut lines = Lines::default();
@@ -538,5 +589,163 @@ mod tests {
                 && step.ends_with("Пустая строка")
         );
         assert!(annotate(&"я".repeat(8192), "lib:10", "Ещё").is_none());
+    }
+
+    fn ts() -> Timestamp {
+        Timestamp::from_second(1_700_000_000).unwrap()
+    }
+
+    fn tabs_fixture() -> Task {
+        let mut book = TaskBook::default();
+        let id =
+            book.create(std::env::temp_dir(), "qwen", "Вкладки результата", "Проверь").unwrap();
+        let run = book.begin(id, 1, None, ts()).unwrap();
+        book.record(id, run, "Итог попытки").unwrap();
+        book.finish(id, run, RunState::Completed, ts()).unwrap();
+        let mut task = book.get(id).unwrap().clone();
+        let run = &mut task.runs[0];
+        run.diff = "diff --git a/lib b/lib\n--- a/lib\n+++ b/lib\n@@ -1,1 +1,2 @@\n контекст\n+новая строка\n"
+            .to_owned();
+        run.files = vec![ResultFile {
+            key: "f".repeat(32),
+            name: "report.txt".to_owned(),
+            caption: String::new(),
+            bytes: 12,
+        }];
+        run.workflow_report = WorkflowReport {
+            checks: vec![
+                CheckResult { passed: true, output: "ok".to_owned() },
+                CheckResult { passed: false, output: "fail".to_owned() },
+            ],
+            review: String::new(),
+        };
+        task
+    }
+
+    fn frame(
+        ctx: &egui::Context,
+        view: &mut View,
+        task: &Task,
+        events: Vec<egui::Event>,
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_ui(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 900.0),
+                )),
+                events,
+                ..Default::default()
+            },
+            |ui| {
+                view.show(ui, task, "Следующий шаг", true);
+            },
+        );
+        output.textures_delta.clear();
+        output
+    }
+
+    fn labels(output: &egui::FullOutput) -> Vec<&str> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) => Some(text.galley.text()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn click(ctx: &egui::Context, view: &mut View, task: &Task, text: &str) {
+        frame(ctx, view, task, vec![]);
+        let output = frame(ctx, view, task, vec![]);
+        let position = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(label) if label.galley.text() == text => {
+                    Some(label.galley.rect.translate(label.pos.to_vec2()).center())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("missing text: {text}"));
+        for pressed in [true, false] {
+            frame(
+                ctx,
+                view,
+                task,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+    }
+
+    #[test]
+    fn review_tabs_switch_sections_one_at_a_time() {
+        let task = tabs_fixture();
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let mut view = View::default();
+        view.select(Tab::Summary, Some(task.id));
+        frame(&ctx, &mut view, &task, vec![]);
+        let out = frame(&ctx, &mut view, &task, vec![]);
+        let texts = labels(&out);
+        for tab in ["Сводка", "Изменения · 1 файл", "Проверки · 1/2", "Файлы · 1", "История · 1"]
+        {
+            assert!(texts.contains(&tab), "missing tab {tab}");
+        }
+        assert!(texts.contains(&"Итог попытки"), "Сводка shows the saved result");
+        assert!(
+            !texts.iter().any(|text| text.contains("новая строка")),
+            "diff lines stay hidden outside Изменения"
+        );
+        assert!(!texts.contains(&"report.txt"), "files stay hidden outside Файлы");
+        assert!(
+            !texts.iter().any(|text| text.starts_with("Проверка 1")),
+            "checks stay hidden outside Проверки"
+        );
+        click(&ctx, &mut view, &task, "Файлы · 1");
+        let out = frame(&ctx, &mut view, &task, vec![]);
+        let texts = labels(&out);
+        assert!(texts.contains(&"report.txt"), "Файлы lists the saved files");
+        assert!(!texts.contains(&"Итог попытки"), "only one section at a time");
+        assert!(
+            !texts.iter().any(|text| text.contains("новая строка")),
+            "Файлы does not draw the diff"
+        );
+        click(&ctx, &mut view, &task, "Изменения · 1 файл");
+        let out = frame(&ctx, &mut view, &task, vec![]);
+        let texts = labels(&out);
+        assert!(
+            texts.iter().any(|text| text.contains("новая строка")),
+            "Изменения shows the annotated diff"
+        );
+        assert!(!texts.contains(&"report.txt"), "Изменения does not draw the file list");
+        assert_eq!(view.tab(&task), Tab::Changes);
+        click(&ctx, &mut view, &task, "Проверки · 1/2");
+        let out = frame(&ctx, &mut view, &task, vec![]);
+        let texts = labels(&out);
+        assert!(texts.contains(&"Проверка 1 · прошла"));
+        assert!(texts.contains(&"Проверка 2 · не прошла"));
+        assert!(
+            !texts.iter().any(|text| text.contains("новая строка")),
+            "Проверки does not draw the diff"
+        );
+        click(&ctx, &mut view, &task, "История · 1");
+        let out = frame(&ctx, &mut view, &task, vec![]);
+        let texts = labels(&out);
+        assert!(texts.iter().any(|text| text.starts_with("Попытка 1 ·")));
+        assert!(!texts.contains(&"report.txt"), "history bodies stay collapsed");
+        click(&ctx, &mut view, &task, "Сводка");
+        let out = frame(&ctx, &mut view, &task, vec![]);
+        let texts = labels(&out);
+        assert!(texts.contains(&"Итог попытки"), "Сводка returns with the result label");
     }
 }

@@ -2201,14 +2201,26 @@ mod tests {
         let output = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
         for section in [
             "Готовый результат",
-            "Изменения",
-            "Проверки",
-            "История попыток (1)",
+            "Сводка",
+            "Изменения · 0 файлов",
+            "Проверки · 0/0",
+            "Файлы · 0",
+            "История · 1",
             "Принять результат",
             "На доработку",
         ] {
             assert!(labels(&output).contains(&section), "missing {section}");
         }
+        click_text(&ctx, &mut view, &snapshot, "Изменения · 0 файлов", &mut commands);
+        let output = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert!(
+            labels(&output).contains(&"Для этой попытки снимок изменений отсутствует."),
+            "the empty diff section says so"
+        );
+        assert!(
+            !labels(&output).contains(&"Готовый результат"),
+            "Сводка is hidden while Изменения is active"
+        );
     }
     #[test]
     fn changing_task_memory_preserves_the_composer_draft() {
@@ -2989,5 +3001,102 @@ mod tests {
         click_text(&ctx, &mut view, &snapshot, "Разобрать запуск", &mut commands);
         assert!(commands.is_empty(), "investigation is navigation, not a request");
         assert_eq!(view.result_view.tab(&view.tasks[0]), result::Tab::Checks);
+    }
+
+    #[test]
+    fn inbox_check_link_lands_on_checks_tab() {
+        use crate::desktop_tasks::{Attention, TaskRow};
+        let project = test_project();
+        let mut book = hub_core::tasks::TaskBook::default();
+        let id = book.create(project.clone(), "qwen", "Упавшая проверка", "Проверь").unwrap();
+        let run = book.begin(id, 1, None, ts()).unwrap();
+        book.record(id, run, "Ответ с упавшей проверкой").unwrap();
+        book.finish(id, run, RunState::Completed, ts()).unwrap();
+        let mut tasks = book.tasks().to_vec();
+        tasks[0].runs[0].workflow_report = hub_core::tasks::workflow::WorkflowReport {
+            checks: vec![hub_core::tasks::workflow::CheckResult {
+                passed: false,
+                output: "exit 101".into(),
+            }],
+            review: String::new(),
+        };
+        let row = TaskRow {
+            reason: Some(Attention::CheckFailed),
+            summary: "Проверка не прошла".into(),
+            ..TaskRow::from(&tasks[0])
+        };
+        let snapshot = Snapshot { task_index: Ok(vec![row]), ..Default::default() };
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let mut view = TasksView::default();
+        let mut commands = Vec::new();
+        let inbox = |view: &mut TasksView,
+                     commands: &mut Vec<Command>,
+                     events: Vec<egui::Event>|
+         -> egui::FullOutput {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    view.show_attention(ui, &snapshot, &mut |command| commands.push(command));
+                },
+            );
+            output.textures_delta.clear();
+            output
+        };
+        inbox(&mut view, &mut commands, vec![]);
+        let out = inbox(&mut view, &mut commands, vec![]);
+        let position = out
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(label) if label.galley.text() == "Открыть проверку" => {
+                    Some(label.galley.rect.translate(label.pos.to_vec2()).center())
+                }
+                _ => None,
+            })
+            .expect("the failed-check card offers «Открыть проверку»");
+        for pressed in [true, false] {
+            inbox(
+                &mut view,
+                &mut commands,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(view.review_from_inbox, "the link leaves a way back to the inbox");
+        // The first task screen frame only asks for the task list; the review needs the reply.
+        input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let Command::LocalTasks { reply, .. } = commands.pop().unwrap() else {
+            panic!("local list")
+        };
+        reply.send(Ok(TaskSnapshot { tasks, ..Default::default() })).unwrap();
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert_eq!(
+            view.result_view.tab(&view.tasks[0]),
+            result::Tab::Checks,
+            "the Checks tab survives the review screen render"
+        );
+        let texts = labels(&out);
+        assert!(texts.contains(&"Проверки · 0/1"), "the tab row counts the failed check");
+        assert!(texts.contains(&"Проверка 1 · не прошла"));
+        assert!(texts.contains(&"exit 101"), "the checks section is the active one");
+        assert!(
+            !texts.contains(&"Ответ с упавшей проверкой"),
+            "the summary section stays closed under the deep link"
+        );
     }
 }

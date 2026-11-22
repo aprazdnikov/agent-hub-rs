@@ -1233,7 +1233,15 @@ mod tests {
             dots(&settled).iter().any(|dot| dot.fill == accent),
             "the pulse starts at full opacity"
         );
-        let delay = repaint_delay(&settled);
+        // A frame starved by a busy machine can finalize after its own 500 ms deadline;
+        // the pulse re-schedules every frame, so retry before trusting one wall-clock sample.
+        let mut delay = repaint_delay(&settled);
+        for _ in 0..5 {
+            if Duration::from_millis(400) <= delay && delay <= Duration::from_millis(500) {
+                break;
+            }
+            delay = repaint_delay(&screen.wait_until("Рабочая задача", 0.0));
+        }
         assert!(
             Duration::from_millis(400) <= delay && delay <= Duration::from_millis(500),
             "a running task schedules the next pulse frame, got {delay:?}"

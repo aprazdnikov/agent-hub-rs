@@ -127,7 +127,7 @@ pub(super) fn review_color(ui: &egui::Ui) -> Color32 {
     }
 }
 
-/// (bg, fg) for a status tone; error fg duplicates `tasks/result.rs` diff colors until Task 8 migrates it.
+/// (bg, fg) for a status tone; also the single source for diff line colors in `tasks/result.rs`.
 pub(super) fn tone_colors(ui: &egui::Ui, tone: Tone) -> (Color32, Color32) {
     let visuals = ui.visuals();
     match tone {
