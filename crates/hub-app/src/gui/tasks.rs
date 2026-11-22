@@ -727,13 +727,17 @@ mod tests {
     use hub_core::domain::{AbsolutePath, ChatId, ThreadId, TopicSession};
     use hub_core::tasks::RunState;
     use hub_telegram::hub::{TopicState, TopicView};
+    fn test_project() -> PathBuf {
+        hub_telegram::paths::workspace_root(&std::env::temp_dir()).unwrap().as_path().to_owned()
+    }
+
     fn topic(key: TopicKey) -> TopicView {
         TopicView {
             key,
             title: Some("Test".into()),
             session: TopicSession::fresh(
                 BackendKind::Qwen,
-                AbsolutePath::new(std::env::temp_dir()).unwrap(),
+                AbsolutePath::new(test_project()).unwrap(),
             ),
             state: TopicState::Waiting,
             memory_enabled: None,
@@ -819,7 +823,7 @@ mod tests {
         }
     }
     fn review_fixture() -> (hub_core::tasks::TaskBook, u64, Snapshot, TasksView) {
-        let project = std::env::temp_dir();
+        let project = test_project();
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut book = hub_core::tasks::TaskBook::default();
         let id = book.create(project.clone(), "qwen", "Проверка чата", "Исходный вопрос").unwrap();
@@ -1044,7 +1048,7 @@ mod tests {
     fn saved_prompt_fixture() -> (hub_core::tasks::TaskBook, u64, Snapshot, TasksView) {
         let (_, _, snapshot, mut view) = review_fixture();
         let mut book = hub_core::tasks::TaskBook::default();
-        let id = book.create(std::env::temp_dir(), "qwen", "Тест", "Исходное поручение").unwrap();
+        let id = book.create(test_project(), "qwen", "Тест", "Исходное поручение").unwrap();
         view.tasks = book.tasks().to_vec();
         (book, id, snapshot, view)
     }
@@ -1179,7 +1183,7 @@ mod tests {
         let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
         assert!(labels(&out).contains(&"Память выключена · тема Telegram"));
         view.local_mode = Some(true);
-        view.local_project.choose(&std::env::temp_dir());
+        view.local_project.choose(&test_project());
         let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
         assert!(labels(&out).contains(&"Память включена · общие настройки"));
     }
@@ -1248,8 +1252,7 @@ mod tests {
                 transcript.bottom() <= result.top().min(draft.top()),
                 "history overlaps controls at {width}×{height}"
             );
-            let crumb =
-                format!("{}  /  #1", std::env::temp_dir().file_name().unwrap().to_string_lossy());
+            let crumb = format!("{}  /  #1", test_project().file_name().unwrap().to_string_lossy());
             assert!(
                 (bounds(&output, "Проверка чата").left() - bounds(&output, &crumb).left()).abs()
                     < 2.0
@@ -1376,7 +1379,7 @@ mod tests {
     #[test]
     fn git_check_failure_preserves_the_continuation_draft() {
         use hub_core::tasks::{TaskBook, git::GitPolicy};
-        let project = std::env::temp_dir();
+        let project = test_project();
         let mut book = TaskBook::default();
         let id = book.create(project.clone(), "qwen", "Task", "Read").unwrap();
         let mut rules = book.rules(&project);
@@ -1415,7 +1418,7 @@ mod tests {
         use hub_core::tasks::{TaskBook, git::GitPolicy};
         let ctx = egui::Context::default();
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
-        let project = std::env::temp_dir();
+        let project = test_project();
         let mut book = TaskBook::default();
         let id = book.create(project.clone(), "qwen", "Task", "Read").unwrap();
         let mut rules = book.rules(&project);
@@ -1451,7 +1454,7 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.all_styles_mut(|style| style.animation_time = 0.0);
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
-        let project = std::env::temp_dir();
+        let project = test_project();
         let mut book = TaskBook::default();
         let id = book.create(project.clone(), "qwen", "Task", "Read").unwrap();
         let mut rules = book.rules(&project);
@@ -1526,11 +1529,10 @@ mod tests {
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let other = TopicKey { chat: key.chat, thread: ThreadId(8) };
         let mut other_topic = topic(other);
-        other_topic.session.cwd =
-            AbsolutePath::new(std::env::temp_dir().join("other-project")).unwrap();
+        other_topic.session.cwd = AbsolutePath::new(test_project().join("other-project")).unwrap();
         let mut view = TasksView {
             selected: Some(key),
-            scope: Some((Some(key), std::env::temp_dir(), BackendKind::Qwen)),
+            scope: Some((Some(key), test_project(), BackendKind::Qwen)),
             refreshed: Some(Instant::now()),
             ..Default::default()
         };
@@ -1598,10 +1600,10 @@ mod tests {
         ctx.all_styles_mut(|style| style.animation_time = 0.0);
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut book = hub_core::tasks::TaskBook::default();
-        book.create(std::env::temp_dir(), "qwen", "Task", "Read").unwrap();
+        book.create(test_project(), "qwen", "Task", "Read").unwrap();
         let mut view = TasksView {
             selected: Some(key),
-            scope: Some((Some(key), std::env::temp_dir(), BackendKind::Qwen)),
+            scope: Some((Some(key), test_project(), BackendKind::Qwen)),
             tasks: book.tasks().to_vec(),
             refreshed: Some(Instant::now()),
             ..Default::default()
@@ -1676,11 +1678,11 @@ mod tests {
         ctx.all_styles_mut(|style| style.animation_time = 0.0);
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut book = hub_core::tasks::TaskBook::default();
-        let id = book.create(std::env::temp_dir(), "qwen", "Task", "Read").unwrap();
+        let id = book.create(test_project(), "qwen", "Task", "Read").unwrap();
         book.begin(id, 1, None).unwrap();
         let mut view = TasksView {
             selected: Some(key),
-            scope: Some((Some(key), std::env::temp_dir(), BackendKind::Qwen)),
+            scope: Some((Some(key), test_project(), BackendKind::Qwen)),
             tasks: book.tasks().to_vec(),
             refreshed: Some(Instant::now()),
             ..Default::default()
@@ -1702,10 +1704,10 @@ mod tests {
         ctx.all_styles_mut(|style| style.animation_time = 0.0);
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut book = hub_core::tasks::TaskBook::default();
-        let id = book.create(std::env::temp_dir(), "qwen", "Task", "Read").unwrap();
+        let id = book.create(test_project(), "qwen", "Task", "Read").unwrap();
         let mut view = TasksView {
             selected: Some(key),
-            scope: Some((Some(key), std::env::temp_dir(), BackendKind::Qwen)),
+            scope: Some((Some(key), test_project(), BackendKind::Qwen)),
             tasks: book.tasks().to_vec(),
             refreshed: Some(Instant::now()),
             ..Default::default()
@@ -1752,7 +1754,7 @@ mod tests {
         let ctx = egui::Context::default();
         ctx.all_styles_mut(|style| style.animation_time = 0.0);
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
-        let project = std::env::temp_dir();
+        let project = test_project();
         let mut book = hub_core::tasks::TaskBook::default();
         let id = book.create(project.clone(), "qwen", "Task", "Первый вопрос").unwrap();
         book.begin(id, 1, None).unwrap();
@@ -1842,13 +1844,13 @@ mod tests {
         ctx.all_styles_mut(|style| style.animation_time = 0.0);
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut book = hub_core::tasks::TaskBook::default();
-        let id = book.create(std::env::temp_dir(), "codex", "Task", "Read").unwrap();
+        let id = book.create(test_project(), "codex", "Task", "Read").unwrap();
         book.begin(id, 1, None).unwrap();
         book.record(id, 1, "Готовый результат").unwrap();
         book.finish(id, 1, RunState::Completed).unwrap();
         let mut view = TasksView {
             selected: Some(key),
-            scope: Some((Some(key), std::env::temp_dir(), BackendKind::Qwen)),
+            scope: Some((Some(key), test_project(), BackendKind::Qwen)),
             tasks: book.tasks().to_vec(),
             refreshed: Some(Instant::now()),
             ..Default::default()
@@ -1895,7 +1897,7 @@ mod tests {
     #[test]
     fn changing_task_memory_preserves_the_composer_draft() {
         let mut book = hub_core::tasks::TaskBook::default();
-        let id = book.create(std::env::temp_dir(), "codex", "Task", "Read").unwrap();
+        let id = book.create(test_project(), "codex", "Task", "Read").unwrap();
         let before = book.get(id).unwrap().clone();
         book.set_memory(id, before.revision, Some(true)).unwrap();
         assert!(only_execution_preferences_changed(&before, book.get(id).unwrap()));
@@ -1909,7 +1911,7 @@ mod tests {
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let receiving = TopicKey { chat: key.chat, thread: ThreadId(8) };
         let mut book = hub_core::tasks::TaskBook::default();
-        let id = book.create(std::env::temp_dir(), "codex", "Task", "Read").unwrap();
+        let id = book.create(test_project(), "codex", "Task", "Read").unwrap();
         book.begin(id, 1, None).unwrap();
         book.record(id, 1, "Previous result").unwrap();
         book.finish(id, 1, RunState::Completed).unwrap();
@@ -1919,7 +1921,7 @@ mod tests {
             hub_core::tasks::TaskBook::decode(&serde_json::to_vec(&raw).unwrap()).unwrap();
         let mut view = TasksView {
             selected: Some(key),
-            scope: Some((Some(key), std::env::temp_dir(), BackendKind::Codex)),
+            scope: Some((Some(key), test_project(), BackendKind::Codex)),
             tasks: book.tasks().to_vec(),
             refreshed: Some(Instant::now()),
             ..Default::default()
@@ -1978,10 +1980,10 @@ mod tests {
         ctx.all_styles_mut(|style| style.animation_time = 0.0);
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut book = hub_core::tasks::TaskBook::default();
-        let id = book.create(std::env::temp_dir(), "codex", "Task", "Read").unwrap();
+        let id = book.create(test_project(), "codex", "Task", "Read").unwrap();
         let mut view = TasksView {
             selected: Some(key),
-            scope: Some((Some(key), std::env::temp_dir(), BackendKind::Qwen)),
+            scope: Some((Some(key), test_project(), BackendKind::Qwen)),
             tasks: book.tasks().to_vec(),
             refreshed: Some(Instant::now()),
             ..Default::default()
@@ -2018,11 +2020,11 @@ mod tests {
         ctx.all_styles_mut(|style| style.animation_time = 0.0);
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut book = hub_core::tasks::TaskBook::default();
-        let id = book.create(std::env::temp_dir(), "qwen", "Task", "Read\n  source").unwrap();
+        let id = book.create(test_project(), "qwen", "Task", "Read\n  source").unwrap();
         let expected = book.get(id).unwrap().preview(None).unwrap();
         let mut view = TasksView {
             selected: Some(key),
-            scope: Some((Some(key), std::env::temp_dir(), BackendKind::Qwen)),
+            scope: Some((Some(key), test_project(), BackendKind::Qwen)),
             tasks: book.tasks().to_vec(),
             refreshed: Some(Instant::now()),
             ..Default::default()
@@ -2046,10 +2048,10 @@ mod tests {
         ctx.all_styles_mut(|style| style.animation_time = 0.0);
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut book = hub_core::tasks::TaskBook::default();
-        book.create(std::env::temp_dir(), "qwen", "Existing", "Read").unwrap();
+        book.create(test_project(), "qwen", "Existing", "Read").unwrap();
         let mut view = TasksView {
             selected: Some(key),
-            scope: Some((Some(key), std::env::temp_dir(), BackendKind::Qwen)),
+            scope: Some((Some(key), test_project(), BackendKind::Qwen)),
             tasks: book.tasks().to_vec(),
             title: "New task".into(),
             prompt: "Check".into(),
@@ -2085,7 +2087,7 @@ mod tests {
         );
         view.request(Request::List, &mut |command| commands.push(command));
         assert!(commands.is_empty(), "pending mutation blocks duplicate actions and refresh");
-        let id = book.create(std::env::temp_dir(), "qwen", "New task", "Check").unwrap();
+        let id = book.create(test_project(), "qwen", "New task", "Check").unwrap();
         reply
             .send(Ok(TaskSnapshot {
                 tasks: vec![book.get(id).unwrap().clone()],
@@ -2104,7 +2106,7 @@ mod tests {
             let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
             let mut view = TasksView {
                 selected: Some(key),
-                scope: Some((Some(key), std::env::temp_dir(), BackendKind::Qwen)),
+                scope: Some((Some(key), test_project(), BackendKind::Qwen)),
                 title: "Название черновика".into(),
                 prompt: "Текст поручения".into(),
                 refreshed: Some(Instant::now()),
@@ -2185,7 +2187,7 @@ mod tests {
     #[test]
     fn occupied_topic_only_blocks_launch_not_review_of_an_inactive_task() {
         let mut book = hub_core::tasks::TaskBook::default();
-        let id = book.create(std::env::temp_dir(), "qwen", "Task", "Read").unwrap();
+        let id = book.create(test_project(), "qwen", "Task", "Read").unwrap();
         let mut view = TasksView::default();
         let available = view.availability(book.get(id).unwrap(), BackendKind::Qwen, true);
         assert!(available.edit && !available.launch);
@@ -2195,7 +2197,7 @@ mod tests {
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let (sender, receiver) = oneshot::channel();
         view.pending = Some(Pending {
-            scope: (Some(key), std::env::temp_dir(), BackendKind::Qwen),
+            scope: (Some(key), test_project(), BackendKind::Qwen),
             effect: Effect::Edit,
             reply: receiver,
         });
@@ -2207,9 +2209,9 @@ mod tests {
     fn workflow_failure_keeps_visible_status_and_form_until_acknowledged() {
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut book = hub_core::tasks::TaskBook::default();
-        let id = book.create(std::env::temp_dir(), "qwen", "Task", "Read").unwrap();
+        let id = book.create(test_project(), "qwen", "Task", "Read").unwrap();
         let mut view = TasksView {
-            scope: Some((Some(key), std::env::temp_dir(), BackendKind::Qwen)),
+            scope: Some((Some(key), test_project(), BackendKind::Qwen)),
             tasks: book.tasks().to_vec(),
             title: "Draft".into(),
             prompt: "Text".into(),
@@ -2257,7 +2259,7 @@ mod tests {
         };
         assert_eq!(sent, key);
         let mut book = hub_core::tasks::TaskBook::default();
-        book.create(std::env::temp_dir(), "qwen", "Old scope", "Read").unwrap();
+        book.create(test_project(), "qwen", "Old scope", "Read").unwrap();
         reply
             .send(Ok(TaskSnapshot { tasks: book.tasks().to_vec(), ..TaskSnapshot::default() }))
             .unwrap();
@@ -2269,7 +2271,7 @@ mod tests {
     #[test]
     fn start_command_uses_visible_revision_and_selected_scope() {
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
-        let project = std::env::temp_dir();
+        let project = test_project();
         let mut view = TasksView {
             scope: Some((Some(key), project.clone(), BackendKind::Qwen)),
             ..Default::default()
@@ -2292,7 +2294,7 @@ mod tests {
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut view = TasksView {
             selected: Some(key),
-            scope: Some((Some(key), std::env::temp_dir().join("old"), BackendKind::Qwen)),
+            scope: Some((Some(key), test_project().join("old"), BackendKind::Qwen)),
             title: "private title".into(),
             prompt: "private prompt".into(),
             ..Default::default()
@@ -2309,9 +2311,9 @@ mod tests {
     fn managed_task_new_revision_clears_previous_continuation_step() {
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut book = hub_core::tasks::TaskBook::default();
-        let id = book.create(std::env::temp_dir(), "qwen", "Task", "First").unwrap();
+        let id = book.create(test_project(), "qwen", "Task", "First").unwrap();
         let mut view = TasksView {
-            scope: Some((Some(key), std::env::temp_dir(), BackendKind::Qwen)),
+            scope: Some((Some(key), test_project(), BackendKind::Qwen)),
             tasks: book.tasks().to_vec(),
             ..Default::default()
         };

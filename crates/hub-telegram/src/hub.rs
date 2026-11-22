@@ -7130,9 +7130,10 @@ mod tests {
         })
         .await;
         world.send(HubMessage::Press(confirm)).await;
+        let project = workspace_root(&world.root.path().join("project")).unwrap();
         eventually("project rebound", || {
-            world.store.last().is_some_and(|s| {
-                s.get(&KEY).is_some_and(|s| s.cwd.as_path() == world.root.path().join("project"))
+            world.store.last().is_some_and(|sessions| {
+                sessions.get(&KEY).is_some_and(|session| session.cwd == project)
             })
         })
         .await;

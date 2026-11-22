@@ -1309,9 +1309,28 @@ mod tests {
         }
     }
 
+    fn create_local_task(
+        service: &hub_core::tasks::service::TaskService,
+        project: &std::path::Path,
+    ) -> u64 {
+        let created = crate::desktop_tasks::request(
+            service,
+            project,
+            BackendKind::Qwen,
+            hub_telegram::hub::tasks::Request::Create {
+                title: "Read".into(),
+                prompt: "Inspect".into(),
+            },
+            None,
+            &home(),
+        )
+        .unwrap();
+        created.tasks[0].id
+    }
+
     #[tokio::test]
     async fn first_settings_save_connects_telegram_without_stopping_shared_work() {
-        use hub_core::tasks::service::{Access, TaskService};
+        use hub_core::tasks::service::TaskService;
         use hub_telegram::hub::tasks::Request;
         let mut harness = harness(Ok(Loaded::Missing), &[], false);
         let root = tempfile::tempdir().unwrap();
@@ -1319,9 +1338,7 @@ mod tests {
         let service = Arc::new(TaskService::new(Box::new(crate::topics::FileTopics::new(
             root.path().join("topics.json"),
         ))));
-        let id = service
-            .access(Access::Edit, |book, _| book.create(project.clone(), "qwen", "Read", "Inspect"))
-            .unwrap();
+        let id = create_local_task(&service, &project);
         *harness.probe.tasks.lock().unwrap() = Some(service);
         let (reply, result) = oneshot::channel();
         harness
@@ -1347,21 +1364,14 @@ mod tests {
 
     #[tokio::test]
     async fn local_execution_without_credentials_stops_on_quit_and_keeps_history() {
-        use hub_core::tasks::{
-            RunState, TaskBook,
-            service::{Access, TaskService},
-        };
+        use hub_core::tasks::{RunState, service::TaskService};
         use hub_telegram::hub::tasks::Request;
         let mut harness = harness(Ok(Loaded::Missing), &[], false);
         let root = tempfile::tempdir().unwrap();
         let service = Arc::new(TaskService::new(Box::new(crate::topics::FileTopics::new(
             root.path().join("topics.json"),
         ))));
-        let id = service
-            .access(Access::Edit, |book: &mut TaskBook, _| {
-                book.create(root.path().to_path_buf(), "qwen", "Read", "Inspect")
-            })
-            .unwrap();
+        let id = create_local_task(&service, root.path());
         *harness.probe.tasks.lock().unwrap() = Some(service.clone());
         let (reply, result) = oneshot::channel();
         harness
@@ -1386,7 +1396,7 @@ mod tests {
 
     #[tokio::test]
     async fn local_execution_keeps_running_when_bot_starts_and_stops() {
-        use hub_core::tasks::service::{Access, TaskService};
+        use hub_core::tasks::service::TaskService;
         use hub_telegram::hub::tasks::Request;
         let mut harness = harness(Ok(Loaded::Ready(settings("-100", ""))), &[], false);
         harness.until("running", running).await;
@@ -1397,9 +1407,7 @@ mod tests {
         let service = Arc::new(TaskService::new(Box::new(crate::topics::FileTopics::new(
             root.path().join("topics.json"),
         ))));
-        let id = service
-            .access(Access::Edit, |book, _| book.create(project.clone(), "qwen", "Read", "Inspect"))
-            .unwrap();
+        let id = create_local_task(&service, &project);
         *harness.probe.tasks.lock().unwrap() = Some(service);
         let (reply, result) = oneshot::channel();
         harness

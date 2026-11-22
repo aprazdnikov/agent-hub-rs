@@ -337,7 +337,9 @@ mod tests {
         view.refresh(home.path());
         let (_, result) =
             view.pending.as_ref().unwrap().recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        assert!(matches!(result.unwrap(), View::List(page) if page.project == target.path()));
+        assert!(
+            matches!(result.unwrap(), View::List(page) if page.project == std::fs::canonicalize(target.path()).unwrap())
+        );
     }
 
     #[test]
