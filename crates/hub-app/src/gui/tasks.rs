@@ -1540,7 +1540,9 @@ mod tests {
             let _ = render(&mut view);
             let output = render(&mut view);
             assert_eq!(bounds(&output, "Отправить"), send);
-            let result = bounds(&output, "Открыть результат");
+            // Outside compact the review state keeps its result entry in the header only, so
+            // the composer row tops the pinned stack; compact adds its inline button inside
+            // that same row (see the compact header test).
             let draft = bounds(&output, "Черновик сообщения");
             assert!(send.bottom() <= screen.bottom() && send.bottom() > height - 80.0);
             let transcript = output
@@ -1554,7 +1556,7 @@ mod tests {
                 })
                 .unwrap();
             assert!(
-                transcript.bottom() <= result.top().min(draft.top()),
+                transcript.bottom() <= draft.top(),
                 "history overlaps controls at {width}×{height}"
             );
             let crumb = format!("{}  /  #1", test_project().file_name().unwrap().to_string_lossy());
@@ -2181,8 +2183,8 @@ mod tests {
 
         assert_eq!(
             labels(&output).iter().filter(|label| **label == "Открыть результат").count(),
-            2,
-            "header primary plus the pinned result bar"
+            1,
+            "non-compact review state: only the header primary, no duplicate in the pinned bar"
         );
         assert!(!labels(&output).contains(&"Управление задачей"));
         click_text(&ctx, &mut view, &snapshot, "Отправить", &mut commands);
@@ -2829,6 +2831,44 @@ mod tests {
             panic!("delete")
         };
         assert_eq!(deleted, id);
+    }
+
+    #[test]
+    fn delete_confirm_renders_one_row_per_tab() {
+        let (_, id, snapshot, mut view) = review_fixture();
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let mut commands = Vec::new();
+        // The confirm question text is the row's identity: the buttons can sit under the
+        // Parameters fold, but never does a second question line appear on any tab.
+        let rows = |out: &egui::FullOutput| {
+            out.shapes
+                .iter()
+                .filter(|shape| {
+                    matches!(&shape.shape, egui::Shape::Text(text)
+                        if text.galley.text().contains("вместе с перепиской и вложениями?"))
+                })
+                .count()
+        };
+        click_text(&ctx, &mut view, &snapshot, "⋯", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "Удалить…", &mut commands);
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert_eq!(rows(&out), 1, "chat: one confirm row");
+        assert_eq!(all_text_rects(&out, "Удалить безвозвратно").len(), 1, "chat buttons visible");
+        view.result_view.select(result::Tab::Parameters, Some(id));
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert_eq!(rows(&out), 0, "the Parameters section starts collapsed");
+        click_text(&ctx, &mut view, &snapshot, "Управление задачей", &mut commands);
+        let _ = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert_eq!(rows(&out), 1, "Parameters keeps its own single row");
+        click_text(&ctx, &mut view, &snapshot, "В чат", &mut commands);
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert_eq!(rows(&out), 1, "chat again: one row");
+        click_text(&ctx, &mut view, &snapshot, "Отмена", &mut commands);
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert_eq!(rows(&out), 0, "cancel clears it");
+        assert!(commands.is_empty(), "confirm rows never dispatch on their own");
     }
 
     fn draft_telegram_fixture() -> (u64, Snapshot, TasksView) {

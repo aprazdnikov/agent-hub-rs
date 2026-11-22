@@ -352,11 +352,12 @@ impl TasksView {
             ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y,
         );
         let inline_result = has_result && compact && !needs_answer;
-        let result_space = if has_result && !inline_result {
-            button_height + ui.spacing().item_spacing.y
-        } else {
-            0.0
-        };
+        // design.md:171 — «Открыть результат» duplicates inline only in compact mode; outside
+        // it the header primary owns the review state, so the pinned bar keeps the button
+        // only for the result-bearing states whose header primary is something else.
+        let pinned_result = has_result && !inline_result && task.status != TaskStatus::NeedsReview;
+        let result_space =
+            if pinned_result { button_height + ui.spacing().item_spacing.y } else { 0.0 };
         let composer_height = if needs_answer {
             (ui.available_height() * 0.60).clamp(130.0, 380.0)
         } else {
@@ -376,8 +377,7 @@ impl TasksView {
             .frame(egui::Frame::NONE)
             .show_separator_line(false)
             .show(ui, |ui| {
-                if has_result && !inline_result && ui.button("Открыть результат").clicked()
-                {
+                if pinned_result && ui.button("Открыть результат").clicked() {
                     self.result_view.select(result::Tab::Summary, Some(task.id));
                 }
                 ui.separator();
@@ -431,7 +431,10 @@ impl TasksView {
             ui.spacing_mut().item_spacing.y = 3.0;
         }
         self.breadcrumb(ui, task);
-        let confirming = self.confirm_delete == Some((task.id, task.revision));
+        // The pending-delete row renders in exactly one place per tab: here while the Chat tab
+        // is active; on Parameters it belongs to «Управление задачей» (workflow_controls).
+        let confirming = self.confirm_delete == Some((task.id, task.revision))
+            && matches!(self.result_view.tab(task), result::Tab::Chat);
         ui.horizontal(|ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 // A pending delete replaces the actions and the menu: the user must answer it first.
