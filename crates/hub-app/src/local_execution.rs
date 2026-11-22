@@ -16,6 +16,7 @@ use hub_core::{
     },
 };
 use hub_telegram::{git::GitRunner, hub::tasks::Request};
+use jiff::Timestamp;
 pub use shared::SharedRuntime;
 use std::{
     path::{Path, PathBuf},
@@ -236,7 +237,7 @@ impl Runtime {
                 }
                 Action::Start(next) => {
                     let mut check = book.clone();
-                    check.begin(id, revision, next.as_deref())?;
+                    check.begin(id, revision, next.as_deref(), Timestamp::now())?;
                 }
             }
             Ok(book.get(id)?.clone())
@@ -350,7 +351,7 @@ impl Drop for Attempt {
     fn drop(&mut self) {
         if !self.finished
             && let Err(error) = self.service.access(Access::Internal, |book, _| {
-                book.finish(self.id, self.run, RunState::Interrupted)
+                book.finish(self.id, self.run, RunState::Interrupted, Timestamp::now())
             })
         {
             tracing::error!(%error,"cannot finalize desktop attempt");
@@ -442,7 +443,7 @@ impl Worker {
                 .get(task.id)?
                 .preview_with_rules(next.as_deref(), &book.rules(&task.project))?;
             let prompt = Prompt::new(text, vec![]).ok_or("Пустое поручение")?;
-            let run = book.begin(task.id, task.revision, next.as_deref())?;
+            let run = book.begin(task.id, task.revision, next.as_deref(), Timestamp::now())?;
             Ok((
                 run,
                 prompt,
@@ -527,7 +528,7 @@ impl Worker {
             tracing::warn!(%error, "Не удалось сохранить изменения попытки");
         }
         let checkpoint = self.service.access(Access::Internal, |book, _| {
-            book.finish(attempt.id, attempt.run, state)?;
+            book.finish(attempt.id, attempt.run, state, Timestamp::now())?;
             let task = book.get(attempt.id)?;
             let run = task.runs.last().ok_or("Нет попытки задачи")?;
             let passed = run.workflow_report.checks.iter().filter(|check| check.passed).count();

@@ -1,5 +1,41 @@
-use hub_core::tasks::{RunState, TaskBook};
+use hub_core::tasks::{Run, RunState, TaskBook};
+use jiff::Timestamp;
 use std::path::PathBuf;
+
+#[cfg(test)]
+fn ts() -> Timestamp {
+    Timestamp::from_second(1_700_000_000).unwrap()
+}
+
+#[test]
+fn run_timestamps_are_injected_and_recovery_leaves_finish_empty() {
+    let mut book = TaskBook::default();
+    let id = book.create(std::env::temp_dir(), "qwen", "T", "Read").unwrap();
+    let now = ts();
+    let run = book.begin(id, 1, None, now).unwrap();
+    assert_eq!(book.get(id).unwrap().runs[0].started_at, Some(now));
+    assert_eq!(book.get(id).unwrap().runs[0].finished_at, None);
+    book.finish(id, run, RunState::Completed, now).unwrap();
+    assert_eq!(book.get(id).unwrap().runs[0].finished_at, Some(now));
+}
+
+#[test]
+fn recover_does_not_stamp_finish_time() {
+    let mut book = TaskBook::default();
+    let id = book.create(std::env::temp_dir(), "qwen", "T", "Read").unwrap();
+    book.begin(id, 1, None, ts()).unwrap();
+    assert!(book.recover());
+    assert_eq!(book.get(id).unwrap().runs[0].state, RunState::Interrupted);
+    assert_eq!(book.get(id).unwrap().runs[0].finished_at, None);
+}
+
+#[test]
+fn old_run_without_dates_loads() {
+    let json = r#"{"id":1,"step":"s","state":"completed","result":"r"}"#;
+    let run: Run = serde_json::from_str(json).unwrap();
+    assert_eq!(run.started_at, None);
+    assert_eq!(run.finished_at, None);
+}
 
 #[test]
 fn explicit_runs_are_revision_checked_and_recovered_without_replay() {
@@ -10,21 +46,22 @@ fn explicit_runs_are_revision_checked_and_recovered_without_replay() {
     let b = book
         .create(std::env::temp_dir().join("project"), "codex", "Other", "Inspect tests")
         .unwrap();
-    let run = book.begin(a, 1, None).unwrap();
-    assert!(book.begin(a, 1, None).is_err());
-    assert!(book.begin(b, 1, None).is_err());
+    let run = book.begin(a, 1, None, ts()).unwrap();
+    assert!(book.begin(a, 1, None, ts()).is_err());
+    assert!(book.begin(b, 1, None, ts()).is_err());
     let mut recovered = TaskBook::decode(&book.encode().unwrap()).unwrap();
     assert!(recovered.recover());
     let task = recovered.get(a).unwrap();
     assert_eq!(task.runs.last().unwrap().state, RunState::Interrupted);
     let revision = task.revision;
-    assert!(recovered.begin(a, revision, None).is_err());
-    let second =
-        recovered.begin(a, revision, Some("Verify prior effects, then inspect tests")).unwrap();
+    assert!(recovered.begin(a, revision, None, ts()).is_err());
+    let second = recovered
+        .begin(a, revision, Some("Verify prior effects, then inspect tests"), ts())
+        .unwrap();
     assert_ne!(run, second);
-    assert!(recovered.finish(a, run, RunState::Completed).is_err());
+    assert!(recovered.finish(a, run, RunState::Completed, ts()).is_err());
     recovered.record(a, second, "Verified").unwrap();
-    recovered.finish(a, second, RunState::Completed).unwrap();
+    recovered.finish(a, second, RunState::Completed, ts()).unwrap();
     assert_eq!(recovered.get(a).unwrap().runs.last().unwrap().result, "Verified");
 }
 
@@ -44,15 +81,16 @@ fn task_and_run_limits_refuse_without_truncating_or_losing_history() {
     let id = book.create(std::env::temp_dir(), "qwen", "Task", "Inspect").unwrap();
     for attempt in 0..32 {
         let revision = book.get(id).unwrap().revision;
-        let run =
-            book.begin(id, revision, if attempt == 0 { None } else { Some("Next step") }).unwrap();
+        let run = book
+            .begin(id, revision, if attempt == 0 { None } else { Some("Next step") }, ts())
+            .unwrap();
         let oversized = "x".repeat(64 * 1024 + 1);
         assert!(book.record(id, run, &oversized).is_err());
         book.record(id, run, "Verified").unwrap();
-        book.finish(id, run, RunState::Completed).unwrap();
+        book.finish(id, run, RunState::Completed, ts()).unwrap();
     }
     let prior = book.encode().unwrap();
-    assert!(book.begin(id, book.get(id).unwrap().revision, Some("Another")).is_err());
+    assert!(book.begin(id, book.get(id).unwrap().revision, Some("Another"), ts()).is_err());
     assert_eq!(book.encode().unwrap(), prior);
     for _ in 1..100 {
         book.create(std::env::temp_dir(), "qwen", "Other", "Inspect").unwrap();
@@ -89,9 +127,9 @@ fn legacy_tasks_gain_review_state_without_losing_history() {
     use hub_core::tasks::TaskStatus;
     let mut book = TaskBook::default();
     let id = book.create(std::env::temp_dir(), "qwen", "Проверка", "Прочитать файл").unwrap();
-    let run = book.begin(id, 1, None).unwrap();
+    let run = book.begin(id, 1, None, ts()).unwrap();
     book.record(id, run, "Полный результат").unwrap();
-    book.finish(id, run, RunState::Completed).unwrap();
+    book.finish(id, run, RunState::Completed, ts()).unwrap();
     let mut raw = serde_json::to_value(&book).unwrap();
     for task in raw["tasks"].as_array_mut().unwrap() {
         task.as_object_mut().unwrap().remove("status");
@@ -109,19 +147,19 @@ fn acceptance_archive_and_reopen_are_explicit_revision_checked_actions() {
     let mut book = TaskBook::default();
     let id = book.create(std::env::temp_dir(), "qwen", "Task", "Read").unwrap();
     assert_eq!(book.get(id).unwrap().status, TaskStatus::Planned);
-    let run = book.begin(id, 1, None).unwrap();
+    let run = book.begin(id, 1, None, ts()).unwrap();
     assert!(book.set_status(id, 2, TaskStatus::Accepted).is_err());
     assert!(book.set_archived(id, 2, true).is_err());
-    book.finish(id, run, RunState::Completed).unwrap();
+    book.finish(id, run, RunState::Completed, ts()).unwrap();
     assert_eq!(book.get(id).unwrap().status, TaskStatus::NeedsReview);
     assert!(book.set_status(id, 2, TaskStatus::Accepted).is_err());
     book.set_status(id, 3, TaskStatus::Accepted).unwrap();
-    assert!(book.begin(id, 4, Some("Next")).is_err());
+    assert!(book.begin(id, 4, Some("Next"), ts()).is_err());
     book.set_status(id, 4, TaskStatus::Planned).unwrap();
     book.set_archived(id, 5, true).unwrap();
-    assert!(book.begin(id, 6, Some("Next")).is_err());
+    assert!(book.begin(id, 6, Some("Next"), ts()).is_err());
     book.set_archived(id, 6, false).unwrap();
-    book.begin(id, 7, Some("Next")).unwrap();
+    book.begin(id, 7, Some("Next"), ts()).unwrap();
     assert!(book.recover());
     assert_eq!(book.get(id).unwrap().status, TaskStatus::NeedsReview);
 }
@@ -175,9 +213,9 @@ fn explicit_null_status_is_corruption_not_a_legacy_default() {
 fn transfer_preserves_legacy_run_authorship_and_never_starts_a_model() {
     let mut book = TaskBook::default();
     let id = book.create(std::env::temp_dir(), "qwen", "Task", "Read").unwrap();
-    let run = book.begin(id, 1, None).unwrap();
+    let run = book.begin(id, 1, None, ts()).unwrap();
     book.record(id, run, "Old answer").unwrap();
-    book.finish(id, run, RunState::Completed).unwrap();
+    book.finish(id, run, RunState::Completed, ts()).unwrap();
     let mut raw = serde_json::to_value(&book).unwrap();
     raw["tasks"][0]["runs"][0].as_object_mut().unwrap().remove("backend");
     let mut book = TaskBook::decode(&serde_json::to_vec(&raw).unwrap()).unwrap();
@@ -189,9 +227,9 @@ fn transfer_preserves_legacy_run_authorship_and_never_starts_a_model() {
     assert_eq!(task.runs.len(), 1);
     assert_eq!(task.runs[0].backend.as_deref(), Some("qwen"));
     assert_eq!(task.runs[0].result, "Old answer");
-    let run = book.begin(id, 5, Some("Verify prior effects")).unwrap();
+    let run = book.begin(id, 5, Some("Verify prior effects"), ts()).unwrap();
     assert_eq!(book.get(id).unwrap().runs[1].backend.as_deref(), Some("hermes"));
-    book.finish(id, run, RunState::Completed).unwrap();
+    book.finish(id, run, RunState::Completed, ts()).unwrap();
     assert_eq!(TaskBook::decode(&book.encode().unwrap()).unwrap(), book);
 }
 
@@ -204,9 +242,9 @@ fn transfer_requires_editable_task_current_revision_and_known_agent() {
     assert!(book.assign(id, 0, "codex").is_err());
     assert!(book.assign(id, 1, "invalid").is_err());
     assert_eq!(book, before);
-    book.begin(id, 1, None).unwrap();
+    book.begin(id, 1, None, ts()).unwrap();
     assert!(book.assign(id, 2, "codex").is_err());
-    book.finish(id, 1, RunState::Completed).unwrap();
+    book.finish(id, 1, RunState::Completed, ts()).unwrap();
     book.set_archived(id, 3, true).unwrap();
     assert!(book.assign(id, 4, "codex").is_err());
     book.set_archived(id, 4, false).unwrap();
@@ -226,9 +264,9 @@ fn task_preview_is_read_only_and_preserves_multiline_step_and_previous_result() 
     let preview = book.get(id).unwrap().preview(None).unwrap();
     assert!(preview.contains("Read\n  code"));
     assert_eq!(book, before);
-    book.begin(id, 1, None).unwrap();
+    book.begin(id, 1, None, ts()).unwrap();
     book.record(id, 1, "Answer\n  exact").unwrap();
-    book.finish(id, 1, RunState::Completed).unwrap();
+    book.finish(id, 1, RunState::Completed, ts()).unwrap();
     let task = book.get(id).unwrap();
     assert!(task.preview(None).is_err());
     assert!(task.preview(Some(" ")).is_err());
@@ -242,23 +280,23 @@ fn continuation_includes_recent_turns_in_order_and_keeps_large_latest_reply_inta
     let id = book.create(std::env::temp_dir(), "qwen", "Chat", "First").unwrap();
     for (next, result) in [(None, "One"), (Some("Second"), "Two"), (Some("Third"), "Three")] {
         let revision = book.get(id).unwrap().revision;
-        let run = book.begin(id, revision, next).unwrap();
+        let run = book.begin(id, revision, next, ts()).unwrap();
         book.record(id, run, result).unwrap();
-        book.finish(id, run, RunState::Completed).unwrap();
+        book.finish(id, run, RunState::Completed, ts()).unwrap();
     }
     let task = book.get(id).unwrap();
     let context = task.preview(Some("Next")).unwrap();
     assert!(context.find("qwen: One").unwrap() < context.find("Пользователь: Second").unwrap());
     assert!(context.find("qwen: Two").unwrap() < context.find("Пользователь: Third").unwrap());
     let revision = task.revision;
-    let run = book.begin(id, revision, Some("Fourth")).unwrap();
+    let run = book.begin(id, revision, Some("Fourth"), ts()).unwrap();
     let large = "я".repeat(32768);
     book.record(id, run, &large).unwrap();
-    book.finish(id, run, RunState::Completed).unwrap();
+    book.finish(id, run, RunState::Completed, ts()).unwrap();
     assert!(book.get(id).unwrap().preview(Some("Next")).unwrap().contains(&large));
-    let run = book.begin(id, book.get(id).unwrap().revision, Some("Fifth")).unwrap();
+    let run = book.begin(id, book.get(id).unwrap().revision, Some("Fifth"), ts()).unwrap();
     book.record(id, run, "Five").unwrap();
-    book.finish(id, run, RunState::Completed).unwrap();
+    book.finish(id, run, RunState::Completed, ts()).unwrap();
     let context = book.get(id).unwrap().preview(Some("Next")).unwrap();
     assert!(context.contains("Более ранние сообщения") && context.contains("qwen: Five"));
     assert!(!context.contains("qwen: One") && !context.contains(&large));
@@ -279,10 +317,10 @@ fn project_rules_are_revisioned_isolated_and_snapshotted_per_run() {
     let preview = book.get(id).unwrap().preview_with_rules(None, &book.rules(&project)).unwrap();
     assert!(preview.contains("Сначала обнови Dev"));
     assert!(preview.contains("редакция 1"));
-    let run = book.begin(id, 1, None).unwrap();
+    let run = book.begin(id, 1, None, ts()).unwrap();
     book.set_rules(project.clone(), 1, false, "Новое правило").unwrap();
     assert_eq!(book.get(id).unwrap().runs[0].rules.as_ref().unwrap().text, "Сначала обнови Dev");
-    book.finish(id, run, RunState::Completed).unwrap();
+    book.finish(id, run, RunState::Completed, ts()).unwrap();
     let preview =
         book.get(id).unwrap().preview_with_rules(Some("Next"), &book.rules(&project)).unwrap();
     assert!(!preview.contains("Новое правило"));
@@ -314,7 +352,7 @@ fn git_preparation_requires_durable_success_and_recovers_without_replay() {
     let mut rules = book.rules(&project);
     rules.git = Some(GitPolicy { remote: "origin".into(), base: "Dev".into() });
     book.configure_rules(project, 0, rules).unwrap();
-    assert!(book.begin(id, 1, None).is_err());
+    assert!(book.begin(id, 1, None, ts()).is_err());
     book.prepare_git(id, 1, "feat/test").unwrap();
     assert!(book.get(id).unwrap().active());
     let mut recovered = TaskBook::decode(&book.encode().unwrap()).unwrap();
@@ -324,12 +362,12 @@ fn git_preparation_requires_durable_success_and_recovers_without_replay() {
         PreparationState::Interrupted
     );
     assert!(!recovered.recover());
-    assert!(recovered.begin(id, 3, None).is_err());
+    assert!(recovered.begin(id, 3, None, ts()).is_err());
     book.finish_git(id, 2, Ok("a".repeat(40))).unwrap();
     assert_eq!(book.get(id).unwrap().revision, 3);
     assert!(book.finish_git(id, 2, Ok("b".repeat(40))).is_err());
     book.note_git(id, 3, "Выбрана другая ветка").unwrap();
-    book.begin(id, 4, None).unwrap();
+    book.begin(id, 4, None, ts()).unwrap();
     assert!(book.get(id).unwrap().git.as_ref().unwrap().message.is_empty());
     assert!(book.prepare_git(id, 5, "feat/other").is_err());
     assert!(TaskBook::decode(&book.encode().unwrap()).is_ok());
@@ -384,7 +422,7 @@ fn full_book_with_two_isolated_runs_can_finish_both_in_order() {
     }
     let mut book = TaskBook::decode(&serde_json::to_vec(&raw).unwrap()).unwrap();
     assert_eq!(book.encode().unwrap().len(), limit);
-    book.finish(4, 32, RunState::Completed).unwrap();
+    book.finish(4, 32, RunState::Completed, ts()).unwrap();
     // The other worker is still running; reopening must preserve its attempt.
     let mut book = TaskBook::decode(&book.encode().unwrap()).unwrap();
     assert!(book.recover());
@@ -423,9 +461,9 @@ fn editing_a_saved_prompt_checks_revision_and_keeps_the_first_run_immutable() {
     assert!(book.edit_prompt(id, 5, "В архиве").is_err());
     book.set_archived(id, 5, false).unwrap();
     let mut book = TaskBook::decode(&book.encode().unwrap()).unwrap();
-    let run = book.begin(id, 6, None).unwrap();
+    let run = book.begin(id, 6, None, ts()).unwrap();
     assert_eq!(book.get(id).unwrap().runs[0].step, "Исправленное");
-    book.finish(id, run, RunState::Completed).unwrap();
+    book.finish(id, run, RunState::Completed, ts()).unwrap();
     assert!(book.edit_prompt(id, 8, "После запуска").is_err());
     assert_eq!(book.get(id).unwrap().prompt, "Исправленное");
 }

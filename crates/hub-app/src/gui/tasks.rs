@@ -727,6 +727,9 @@ mod tests {
     use hub_core::domain::{AbsolutePath, ChatId, ThreadId, TopicSession};
     use hub_core::tasks::RunState;
     use hub_telegram::hub::{TopicState, TopicView};
+    fn ts() -> jiff::Timestamp {
+        jiff::Timestamp::from_second(1_700_000_000).unwrap()
+    }
     fn test_project() -> PathBuf {
         hub_telegram::paths::workspace_root(&std::env::temp_dir()).unwrap().as_path().to_owned()
     }
@@ -827,9 +830,9 @@ mod tests {
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut book = hub_core::tasks::TaskBook::default();
         let id = book.create(project.clone(), "qwen", "Проверка чата", "Исходный вопрос").unwrap();
-        book.begin(id, 1, None).unwrap();
+        book.begin(id, 1, None, ts()).unwrap();
         book.record(id, 1, "Ответ агента").unwrap();
-        book.finish(id, 1, RunState::Completed).unwrap();
+        book.finish(id, 1, RunState::Completed, ts()).unwrap();
         let snapshot = Snapshot {
             bot: BotStatus::Running { username: "bot".into() },
             topics: vec![topic(key)],
@@ -915,7 +918,7 @@ mod tests {
             assert_eq!((requested, next.as_deref()), (id, Some("Проверьте итог")));
             assert!(!view.take_inbox_return());
             if succeeds {
-                book.begin(id, revision, next.as_deref()).unwrap();
+                book.begin(id, revision, next.as_deref(), ts()).unwrap();
                 reply
                     .send(Ok(TaskSnapshot { tasks: book.tasks().to_vec(), ..Default::default() }))
                     .unwrap();
@@ -1022,8 +1025,8 @@ mod tests {
         };
         let mut other_book = hub_core::tasks::TaskBook::default();
         let other_id = other_book.create(other_path, "qwen", "Соседний проект", "Шаг").unwrap();
-        other_book.begin(other_id, 1, None).unwrap();
-        other_book.finish(other_id, 1, RunState::Completed).unwrap();
+        other_book.begin(other_id, 1, None, ts()).unwrap();
+        other_book.finish(other_id, 1, RunState::Completed, ts()).unwrap();
         assert_eq!(id, other_id, "distinct projects with the same id must remain isolated");
         reply
             .send(Ok(TaskSnapshot { tasks: other_book.tasks().to_vec(), ..Default::default() }))
@@ -1387,8 +1390,8 @@ mod tests {
         book.configure_rules(project.clone(), 0, rules).unwrap();
         book.prepare_git(id, 1, "task/first").unwrap();
         book.finish_git(id, 2, Ok("a".repeat(40))).unwrap();
-        let run = book.begin(id, 3, None).unwrap();
-        book.finish(id, run, RunState::Completed).unwrap();
+        let run = book.begin(id, 3, None, ts()).unwrap();
+        book.finish(id, run, RunState::Completed, ts()).unwrap();
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut view = TasksView {
             scope: Some((Some(key), project.clone(), BackendKind::Qwen)),
@@ -1679,7 +1682,7 @@ mod tests {
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut book = hub_core::tasks::TaskBook::default();
         let id = book.create(test_project(), "qwen", "Task", "Read").unwrap();
-        book.begin(id, 1, None).unwrap();
+        book.begin(id, 1, None, ts()).unwrap();
         let mut view = TasksView {
             selected: Some(key),
             scope: Some((Some(key), test_project(), BackendKind::Qwen)),
@@ -1757,9 +1760,9 @@ mod tests {
         let project = test_project();
         let mut book = hub_core::tasks::TaskBook::default();
         let id = book.create(project.clone(), "qwen", "Task", "Первый вопрос").unwrap();
-        book.begin(id, 1, None).unwrap();
+        book.begin(id, 1, None, ts()).unwrap();
         book.record(id, 1, "Первый ответ").unwrap();
-        book.finish(id, 1, RunState::Completed).unwrap();
+        book.finish(id, 1, RunState::Completed, ts()).unwrap();
         let revision = book.get(id).unwrap().revision;
         let mut view = TasksView {
             selected: Some(key),
@@ -1805,7 +1808,7 @@ mod tests {
         assert_eq!(view.next[&id], draft);
         click_text(&ctx, &mut view, &snapshot, "Отправить", &mut commands);
         let Command::Tasks { reply, .. } = commands.pop().unwrap() else { panic!("retry") };
-        let run = book.begin(id, revision, Some(draft)).unwrap();
+        let run = book.begin(id, revision, Some(draft), ts()).unwrap();
         book.record(id, run, "Промежуточный ответ").unwrap();
         reply
             .send(Ok(TaskSnapshot { tasks: book.tasks().to_vec(), ..Default::default() }))
@@ -1830,7 +1833,7 @@ mod tests {
         view.next.insert(id, "Черновик во время работы".into());
         view.request(Request::List, &mut |command| commands.push(command));
         let Command::Tasks { reply, .. } = commands.pop().unwrap() else { panic!("refresh") };
-        book.finish(id, run, RunState::Completed).unwrap();
+        book.finish(id, run, RunState::Completed, ts()).unwrap();
         reply
             .send(Ok(TaskSnapshot { tasks: book.tasks().to_vec(), ..Default::default() }))
             .unwrap();
@@ -1845,9 +1848,9 @@ mod tests {
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut book = hub_core::tasks::TaskBook::default();
         let id = book.create(test_project(), "codex", "Task", "Read").unwrap();
-        book.begin(id, 1, None).unwrap();
+        book.begin(id, 1, None, ts()).unwrap();
         book.record(id, 1, "Готовый результат").unwrap();
-        book.finish(id, 1, RunState::Completed).unwrap();
+        book.finish(id, 1, RunState::Completed, ts()).unwrap();
         let mut view = TasksView {
             selected: Some(key),
             scope: Some((Some(key), test_project(), BackendKind::Qwen)),
@@ -1912,9 +1915,9 @@ mod tests {
         let receiving = TopicKey { chat: key.chat, thread: ThreadId(8) };
         let mut book = hub_core::tasks::TaskBook::default();
         let id = book.create(test_project(), "codex", "Task", "Read").unwrap();
-        book.begin(id, 1, None).unwrap();
+        book.begin(id, 1, None, ts()).unwrap();
         book.record(id, 1, "Previous result").unwrap();
-        book.finish(id, 1, RunState::Completed).unwrap();
+        book.finish(id, 1, RunState::Completed, ts()).unwrap();
         let mut raw = serde_json::to_value(&book).unwrap();
         raw["tasks"][0]["runs"][0].as_object_mut().unwrap().remove("backend");
         let mut book =
@@ -2191,9 +2194,9 @@ mod tests {
         let mut view = TasksView::default();
         let available = view.availability(book.get(id).unwrap(), BackendKind::Qwen, true);
         assert!(available.edit && !available.launch);
-        book.begin(id, 1, None).unwrap();
+        book.begin(id, 1, None, ts()).unwrap();
         assert!(!view.availability(book.get(id).unwrap(), BackendKind::Qwen, false).edit);
-        book.finish(id, 1, RunState::Completed).unwrap();
+        book.finish(id, 1, RunState::Completed, ts()).unwrap();
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let (sender, receiver) = oneshot::channel();
         view.pending = Some(Pending {
@@ -2321,7 +2324,7 @@ mod tests {
         let mut commands = Vec::new();
         view.request(Request::List, &mut |command| commands.push(command));
         let Command::Tasks { reply, .. } = commands.pop().unwrap() else { panic!("task request") };
-        book.begin(id, 1, None).unwrap();
+        book.begin(id, 1, None, ts()).unwrap();
         reply
             .send(Ok(TaskSnapshot { tasks: book.tasks().to_vec(), ..TaskSnapshot::default() }))
             .unwrap();

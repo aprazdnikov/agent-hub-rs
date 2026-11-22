@@ -1776,6 +1776,7 @@ dependencies = [
  "hub-opencode",
  "hub-qwen",
  "hub-telegram",
+ "jiff",
  "keyring",
  "log",
  "nix",

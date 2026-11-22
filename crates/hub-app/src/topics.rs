@@ -162,6 +162,9 @@ mod tests {
 
     use super::*;
 
+    fn ts() -> jiff::Timestamp {
+        jiff::Timestamp::from_second(1_700_000_000).unwrap()
+    }
     #[test]
     fn missing_file_means_no_topics() {
         let dir = tempfile::tempdir().unwrap();
@@ -261,7 +264,7 @@ mod tests {
         let mut tasks = store.load_tasks().unwrap();
         assert!(!path.with_extension("tasks.json").exists());
         let id = tasks.create(root.path().to_path_buf(), "qwen", "Check", "Read README").unwrap();
-        tasks.begin(id, 1, None).unwrap();
+        tasks.begin(id, 1, None, ts()).unwrap();
         store.save_tasks(&tasks).unwrap();
         assert_eq!(FileTopics::new(path.clone()).load_tasks().unwrap(), tasks);
         assert!(!path.exists(), "task state is independent of topic bindings");

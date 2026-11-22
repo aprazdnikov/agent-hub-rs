@@ -2117,6 +2117,9 @@ mod tests {
     use crate::messenger::SendError;
     use crate::testing::{Call, FakeMessenger};
 
+    fn ts() -> jiff::Timestamp {
+        jiff::Timestamp::from_second(1_700_000_000).unwrap()
+    }
     const KEY: TopicKey = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
 
     enum Script {
@@ -6188,9 +6191,9 @@ mod tests {
             for (revision, step, result) in
                 [(1, None, "First result"), (3, Some("Next"), "Second result")]
             {
-                let run = book.begin(task.id, revision, step).unwrap();
+                let run = book.begin(task.id, revision, step, ts()).unwrap();
                 book.record(task.id, run, result).unwrap();
-                book.finish(task.id, run, hub_core::tasks::RunState::Completed).unwrap();
+                book.finish(task.id, run, hub_core::tasks::RunState::Completed, ts()).unwrap();
             }
         }
         world.restart().await;
@@ -6211,9 +6214,9 @@ mod tests {
         let target = if task.backend == "qwen" { BackendKind::Codex } else { BackendKind::Qwen };
         {
             let mut book = world.store.tasks.lock().unwrap();
-            let run = book.begin(task.id, 1, None).unwrap();
+            let run = book.begin(task.id, 1, None, ts()).unwrap();
             book.record(task.id, run, "Previous result").unwrap();
-            book.finish(task.id, run, hub_core::tasks::RunState::Completed).unwrap();
+            book.finish(task.id, run, hub_core::tasks::RunState::Completed, ts()).unwrap();
         }
         world.restart().await;
         let assigned = task_op(
@@ -6393,7 +6396,7 @@ mod tests {
         let mut world = world(FakeAgents::default());
         let task = create_managed(&world).await;
         // Simulate a durable intent left by a crash before an outcome was saved.
-        world.store.tasks.lock().unwrap().begin(task.id, 1, None).unwrap();
+        world.store.tasks.lock().unwrap().begin(task.id, 1, None, ts()).unwrap();
         world.restart().await;
         let tasks = task_op(&world, KEY, tasks::Request::Get(task.id)).await.unwrap();
         assert_eq!(
@@ -6570,9 +6573,9 @@ mod tests {
         let mut world = world;
         {
             let mut book = world.store.tasks.lock().unwrap();
-            let run = book.begin(task.id, 1, None).unwrap();
+            let run = book.begin(task.id, 1, None, ts()).unwrap();
             book.record(task.id, run, &"secret ".repeat(2000)).unwrap();
-            book.finish(task.id, run, hub_core::tasks::RunState::Completed).unwrap();
+            book.finish(task.id, run, hub_core::tasks::RunState::Completed, ts()).unwrap();
         }
         world.restart().await;
         task_op(&world, KEY, tasks::Request::List).await.unwrap();
@@ -6625,7 +6628,7 @@ mod tests {
                 if queued {
                     book.claim_queue(id, revision)?;
                 }
-                book.begin(id, revision, next.as_deref())
+                book.begin(id, revision, next.as_deref(), ts())
             })?;
             self.launches.fetch_add(1, Ordering::SeqCst);
             *live = Some(crate::execution::Live {
@@ -6651,7 +6654,7 @@ mod tests {
             live.active = false;
             live.interaction = None;
             self.tasks.access(hub_core::tasks::service::Access::Internal, |book, _| {
-                book.finish(live.id, 1, hub_core::tasks::RunState::Interrupted)
+                book.finish(live.id, 1, hub_core::tasks::RunState::Interrupted, ts())
             })?;
             Ok(())
         }
@@ -6968,7 +6971,7 @@ mod tests {
             .tasks
             .access(hub_core::tasks::service::Access::Internal, |book, _| {
                 book.record(task.id, 1, "OLD_RESULT_MUST_NOT_APPEAR")?;
-                book.finish(task.id, 1, hub_core::tasks::RunState::Completed)
+                book.finish(task.id, 1, hub_core::tasks::RunState::Completed, ts())
             })
             .unwrap();
         {

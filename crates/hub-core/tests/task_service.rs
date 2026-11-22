@@ -5,6 +5,10 @@ mod tests {
         service::{Access, TaskService, TaskStorage},
     };
     use std::sync::{Arc, Mutex};
+
+    fn ts() -> jiff::Timestamp {
+        jiff::Timestamp::from_second(1_700_000_000).unwrap()
+    }
     #[derive(Clone, Default)]
     struct Store {
         book: Arc<Mutex<TaskBook>>,
@@ -30,7 +34,7 @@ mod tests {
                 book.create(std::env::temp_dir(), "qwen", "Task", "Read")
             })
             .unwrap();
-        service.access(Access::Internal, |book, _| book.begin(id, 1, None)).unwrap();
+        service.access(Access::Internal, |book, _| book.begin(id, 1, None, ts())).unwrap();
         let other = service.clone();
         let writer = std::thread::spawn(move || {
             for n in 0..20 {
@@ -48,7 +52,7 @@ mod tests {
         }
         writer.join().unwrap();
         service
-            .access(Access::Internal, |book, _| book.finish(id, 1, RunState::Completed))
+            .access(Access::Internal, |book, _| book.finish(id, 1, RunState::Completed, ts()))
             .unwrap();
         let book = service.read().unwrap();
         assert_eq!(book.tasks().len(), 21);

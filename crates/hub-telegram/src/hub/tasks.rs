@@ -10,6 +10,7 @@ use hub_core::{
     questions::Button,
     tasks::{ProjectRules, RunState, Task, TaskBook, TaskFilter, TaskStatus},
 };
+use jiff::Timestamp;
 
 /// Inline actions for a specific revision of a completed task.
 #[must_use]
@@ -665,7 +666,7 @@ impl<A: Agents> Hub<A> {
             let prompt =
                 Prompt::new(book.get(id)?.preview_with_rules(next, &book.rules(project))?, vec![])
                     .ok_or("Пустое поручение")?;
-            let run = book.begin(id, revision, next)?;
+            let run = book.begin(id, revision, next, Timestamp::now())?;
             Ok((book.get(id)?.clone(), run, prompt))
         })?; // Durable attempt BEFORE launching the model.
         self.launch(key, First::Task(prompt, task.memory), None);
@@ -673,8 +674,9 @@ impl<A: Agents> Hub<A> {
             self.task_runs.insert(key, ManagedRun { task: id, run, generation: live.generation });
             Ok(vec![task])
         } else {
-            self.tasks
-                .access(Access::Internal, |book, _| book.finish(id, run, RunState::Interrupted))?;
+            self.tasks.access(Access::Internal, |book, _| {
+                book.finish(id, run, RunState::Interrupted, Timestamp::now())
+            })?;
             Err("Запуск не начат. Попытка отмечена прерванной; проверьте сообщение темы.".into())
         }
     }
@@ -710,9 +712,9 @@ impl<A: Agents> Hub<A> {
             return;
         }
         let Some(run) = self.task_runs.remove(&key) else { return };
-        if let Err(error) =
-            self.tasks.access(Access::Internal, |book, _| book.finish(run.task, run.run, state))
-        {
+        if let Err(error) = self.tasks.access(Access::Internal, |book, _| {
+            book.finish(run.task, run.run, state, Timestamp::now())
+        }) {
             self.say(Target::Topic(key), format!("Не удалось сохранить состояние задачи: {error}"));
         }
     }
