@@ -642,23 +642,6 @@ impl TasksView {
                 task.status.label(),
                 if task.archived { " · В архиве" } else { "" }
             ));
-            ui.group(|ui| {
-                self.git_controls(ui, task, send);
-                self.executor_controls(ui, task, backend, available.edit, send);
-                if task.active() {
-                    if !task.git.as_ref().is_some_and(|git| {
-                        git.state == hub_core::tasks::git::PreparationState::Preparing
-                    }) {
-                        ui.label(if self.local_context() {
-                            "Выполняется. Кнопка остановки находится над выбором проекта."
-                        } else {
-                            "Выполняется. Остановить можно в теме Telegram или во вкладке «Темы»."
-                        });
-                    }
-                } else {
-                    self.launch_controls(ui, task, backend, &available, &mut next, send);
-                }
-            });
             ui.add_space(8.0);
             if let Some(step) = self.result_view.show(ui, task, &next, available.edit) {
                 next = step;
@@ -676,6 +659,24 @@ impl TasksView {
                     send,
                 );
             }
+            ui.add_space(8.0);
+            ui.group(|ui| {
+                self.git_controls(ui, task, send);
+                self.executor_controls(ui, task, backend, available.edit, send);
+                if task.active() {
+                    if !task.git.as_ref().is_some_and(|git| {
+                        git.state == hub_core::tasks::git::PreparationState::Preparing
+                    }) {
+                        ui.label(if self.local_context() {
+                            "Выполняется. Кнопка остановки находится над выбором проекта."
+                        } else {
+                            "Выполняется. Остановить можно в теме Telegram или во вкладке «Темы»."
+                        });
+                    }
+                } else {
+                    self.launch_controls(ui, task, backend, &available, &mut next, send);
+                }
+            });
             ui.collapsing("Статус и архив", |ui| {
                 self.workflow_controls(ui, task, !available.edit, send);
             });
@@ -1441,10 +1442,10 @@ mod tests {
         input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
         let output = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
         let labels = [
+            "История попыток (1)",
             "1. Исполнитель",
             "2. Следующий шаг",
             "3. Проверка и запуск",
-            "История попыток (1)",
             "Статус и архив",
         ];
         let positions: Vec<_> = labels

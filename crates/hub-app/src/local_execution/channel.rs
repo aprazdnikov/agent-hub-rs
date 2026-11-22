@@ -4,7 +4,7 @@ use hub_core::domain::{
     Decision, Denied, FileDelivery, OutgoingFile, Question, QuestionAnswer, QuestionsOutcome,
     ToolRequest,
 };
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use tokio::sync::{oneshot, watch};
 use tokio_util::sync::CancellationToken;
@@ -17,6 +17,7 @@ struct Pending {
     reply: oneshot::Sender<Answer>,
 }
 pub struct Channel {
+    pub(super) files: OnceLock<Arc<super::files::FileTarget>>,
     pending: Mutex<Option<Pending>>,
     view: watch::Sender<Option<Interaction>>,
     cancel: CancellationToken,
@@ -24,7 +25,13 @@ pub struct Channel {
 }
 impl Channel {
     pub fn new(timeout: Duration, cancel: CancellationToken) -> Self {
-        Self { pending: Mutex::new(None), view: watch::Sender::new(None), cancel, timeout }
+        Self {
+            files: OnceLock::new(),
+            pending: Mutex::new(None),
+            view: watch::Sender::new(None),
+            cancel,
+            timeout,
+        }
     }
     pub fn subscribe(&self) -> watch::Receiver<Option<Interaction>> {
         self.view.subscribe()
@@ -137,11 +144,24 @@ impl UserChannel for Channel {
             }
         })
     }
-    fn send_file(&self, _file: OutgoingFile) -> BoxFuture<'_, FileDelivery> {
-        Box::pin(async {
-            FileDelivery::Denied(Denied::new(
-                "Передача файлов в настольный интерфейс пока не поддерживается. Укажите путь в ответе.",
-            ))
+    fn send_file(&self, file: OutgoingFile) -> BoxFuture<'_, FileDelivery> {
+        Box::pin(async move {
+            let Some(target) = self.files.get().cloned() else {
+                return FileDelivery::Denied(Denied::new("Нет активной попытки"));
+            };
+            let Some(dirs) = crate::dirs::AppDirs::locate() else {
+                return FileDelivery::Denied(Denied::new("Каталог данных недоступен"));
+            };
+            let cancel = self.cancel.clone();
+            match tokio::task::spawn_blocking(move || {
+                target.deliver(&dirs.task_files(), &file, &cancel)
+            })
+            .await
+            {
+                Ok(Ok(())) => FileDelivery::Delivered,
+                Ok(Err(error)) => FileDelivery::Denied(Denied::new(error)),
+                Err(error) => FileDelivery::Denied(Denied::new(error.to_string())),
+            }
         })
     }
 }

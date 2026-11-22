@@ -630,3 +630,37 @@ async fn queue_runs_two_isolated_jobs_and_routes_approvals_to_the_correct_attemp
 }
 
 mod live_codex;
+
+#[test]
+fn result_file_survives_project_removal_and_reopening_task_store() {
+    use hub_core::domain::OutgoingFile;
+    let project = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let root = data.path().join("files");
+    let topics = data.path().join("topics.json");
+    let mut store = crate::topics::FileTopics::new(topics.clone());
+    let mut book = TaskBook::default();
+    let id = book.create(project.path().into(), "codex", "Отчёт", "Сохранить").unwrap();
+    store.save_tasks(&book).unwrap();
+    let service = Arc::new(TaskService::new(Box::new(store)));
+    let run = service.access(Access::Internal, |book, _| book.begin(id, 1, None)).unwrap();
+    let target = files::FileTarget {
+        service: service.clone(),
+        task: id,
+        run,
+        cwd: AbsolutePath::new(project.path().into()).unwrap(),
+    };
+    let cancel = CancellationToken::new();
+    std::fs::write(project.path().join("report.txt"), "report").unwrap();
+    let file = OutgoingFile { path: "report.txt".into(), caption: "Итог".into() };
+    target.deliver(&root, &file, &cancel).unwrap();
+    cancel.cancel();
+    assert!(target.deliver(&root, &file, &cancel).is_err());
+    assert_eq!(std::fs::read_dir(&root).unwrap().count(), 1);
+    drop(project);
+    let stored = crate::topics::FileTopics::new(topics).load_tasks().unwrap();
+    let files = &stored.get(id).unwrap().runs[0].files;
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0].caption, "Итог");
+    assert_eq!(std::fs::read(root.join(&files[0].key).join(&files[0].name)).unwrap(), b"report");
+}

@@ -124,6 +124,30 @@ impl RunState {
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct ResultFile {
+    pub key: String,
+    pub name: String,
+    pub caption: String,
+    pub bytes: u64,
+}
+
+impl ResultFile {
+    fn valid(&self) -> bool {
+        self.key.len() == 32
+            && self.key.bytes().all(|c| c.is_ascii_hexdigit())
+            && !self.name.is_empty()
+            && self.name.len() <= 255
+            && self.name != "."
+            && self.name != ".."
+            && !self.name.contains(['/', '\\', ':'])
+            && !self.name.chars().any(char::is_control)
+            && self.caption.len() <= 4096
+            && self.bytes <= crate::attachments::MAX_SEND_BYTES
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Run {
     pub id: u32,
     pub step: String,
@@ -131,6 +155,8 @@ pub struct Run {
     pub result: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub diff: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub files: Vec<ResultFile>,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub diagnostic: String,
     #[serde(
@@ -147,7 +173,7 @@ pub struct Run {
 fn explicit_backend<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
 ) -> Result<Option<String>, D::Error> {
-    String::deserialize(deserializer).map(Some)
+    String::deserialize(deserializer).map(|backend| Some(backend.to_ascii_lowercase()))
 }
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize)]
 #[serde(from = "StoredTask")]
@@ -243,7 +269,7 @@ impl From<StoredTask> for Task {
             id: raw.id,
             revision: raw.revision,
             project: raw.project,
-            backend: raw.backend,
+            backend: raw.backend.to_ascii_lowercase(),
             title: raw.title,
             prompt: raw.prompt,
             runs: raw.runs,
@@ -494,6 +520,8 @@ impl TaskBook {
                 if usize::try_from(run.id).ok() != Some(index + 1)
                     || !text(&run.step, MAX_PROMPT)
                     || run.result.len() > MAX_RESULT
+                    || run.files.len() > 32
+                    || run.files.iter().any(|file| !file.valid())
                     || run.diff.len() > MAX_RESULT
                     || run.diagnostic.len() > 512
                     || run.backend.as_deref().is_some_and(|backend| {
@@ -548,7 +576,7 @@ impl TaskBook {
             id,
             revision: 1,
             project,
-            backend: backend.into(),
+            backend: backend.to_ascii_lowercase(),
             title: title.into(),
             prompt: prompt.into(),
             runs: Vec::new(),
@@ -598,9 +626,7 @@ impl TaskBook {
         Ok(())
     }
     pub fn assign(&mut self, id: u64, revision: u64, backend: &str) -> Result<(), String> {
-        if BackendKind::parse(backend).is_none() {
-            return Err("Неизвестный агент".into());
-        }
+        let backend = BackendKind::parse(backend).ok_or("Неизвестный агент")?.name();
         let task = self.editable(id, revision)?;
         if task.archived || matches!(task.status, TaskStatus::Accepted | TaskStatus::Deferred) {
             return Err(
@@ -670,6 +696,7 @@ impl TaskBook {
             state: RunState::Running,
             result: String::new(),
             diff: String::new(),
+            files: Vec::new(),
             diagnostic: String::new(),
             backend: Some(task.backend.clone()),
             rules: (rules.revision != 0).then_some(rules),
@@ -683,6 +710,14 @@ impl TaskBook {
             return Err("Событие относится к завершённому или другому запуску".into());
         }
         Ok(task)
+    }
+    pub fn record_file(&mut self, id: u64, run: u32, file: ResultFile) -> Result<(), String> {
+        let attempt = self.active(id, run)?.runs.last_mut().ok_or("Попытка не найдена")?;
+        if !file.valid() || attempt.files.len() >= 32 {
+            return Err("Некорректное вложение или превышен лимит в 32 файла на попытку".into());
+        }
+        attempt.files.push(file);
+        Ok(())
     }
     pub fn record_diff(&mut self, id: u64, run: u32, diff: &str) -> Result<(), String> {
         if diff.len() > MAX_RESULT {

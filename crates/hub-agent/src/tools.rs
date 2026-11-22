@@ -9,12 +9,11 @@ pub const SEND_FILE: &str = "send_file";
 pub const ASK_USER: &str = "ask_user";
 pub const TOOL_SUMMARY_LIMIT: usize = 600;
 
-pub const SEND_FILE_DESCRIPTION: &str = "Send a file to the user in their Telegram chat. The user \
-    only sees your text replies, so use this whenever they ask for a file or a file is the \
+pub const SEND_FILE_DESCRIPTION: &str = "Deliver a file to the user through the hub. Use this whenever they ask for a file or a file is the \
     natural result (a PDF report, an archive, an image, a CSV export). `path` is absolute or \
     relative to the working directory and must stay inside it; `caption` is optional text shown \
     under the file.";
-pub const ASK_USER_DESCRIPTION: &str = "Ask the user clarifying questions in their Telegram chat \
+pub const ASK_USER_DESCRIPTION: &str = "Ask the user clarifying questions through the hub \
     and wait for the answers. Use it only when an answer would materially change the work. Each \
     question has a short header and up to four options the user picks with a button; the user \
     may also reply with free text. Set multiSelect to let the user pick several options.";

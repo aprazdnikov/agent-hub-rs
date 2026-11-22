@@ -24,6 +24,37 @@ pub(in crate::gui) fn attention_count(snapshot: &Snapshot) -> usize {
                 .count()
         })
 }
+fn attention_row(ui: &mut egui::Ui, project: &Path, id: u64, title: &str, action: &str) -> bool {
+    let width = ui.available_width().min(820.0);
+    egui::Frame::group(ui.style())
+        .fill(ui.visuals().panel_fill)
+        .inner_margin(12)
+        .show(ui, |ui| {
+            ui.set_width((width - 26.0).max(0.0));
+            let details = |ui: &mut egui::Ui| {
+                let name = project.file_name().and_then(|v| v.to_str()).unwrap_or("Проект");
+                ui.small(format!("{name}   ·   #{id}"))
+                    .on_hover_text(project.display().to_string());
+                ui.add(egui::Label::new(egui::RichText::new(title).strong()).truncate())
+                    .on_hover_text(title);
+            };
+            if width < 460.0 {
+                details(ui);
+                ui.button(action).clicked()
+            } else {
+                ui.horizontal(|ui| {
+                    let title_width = ui.available_width() - 190.0;
+                    ui.vertical(|ui| {
+                        ui.set_width(title_width);
+                        details(ui);
+                    });
+                    ui.button(action).clicked()
+                })
+                .inner
+            }
+        })
+        .inner
+}
 impl TasksView {
     fn navigate(&mut self, project: &Path, id: Option<u64>, tab: Tab) {
         self.local_mode = Some(true);
@@ -50,10 +81,13 @@ impl TasksView {
                     Kind::Permission(tool) => format!("Разрешить {}", tool.tool),
                     Kind::Questions(_) => "Ответить агенту".to_owned(),
                 };
-                if ui
-                    .button(format!("{} · #{} · {reason}", live.project.display(), live.id))
-                    .clicked()
-                {
+                let title = snapshot
+                    .task_index
+                    .iter()
+                    .flatten()
+                    .find(|row| row.id == live.id)
+                    .map_or(live.status.as_str(), |row| row.title.as_str());
+                if attention_row(ui, &live.project, live.id, title, &reason) {
                     self.navigate(&live.project, Some(live.id), Tab::Changes);
                     self.result_view.keep_position();
                     self.reveal_interaction = true;
@@ -65,20 +99,17 @@ impl TasksView {
                 if pending(snapshot).any(|j| j.id == row.id) {
                     continue;
                 }
-                ui.group(|ui| {
-                    ui.strong(format!("#{}  {}", row.id, row.title));
-                    ui.weak(row.project.display().to_string());
-                    if ui.button(reason.label()).clicked() {
-                        let tab = match reason {
-                            Attention::CheckFailed
-                            | Attention::AgentFailed
-                            | Attention::Interrupted => Tab::Checks,
-                            Attention::Queue | Attention::Git | Attention::Review => Tab::Changes,
-                        };
-                        self.navigate(&row.project, Some(row.id), tab);
-                        opened = true;
-                    }
-                });
+                if attention_row(ui, &row.project, row.id, &row.title, reason.label()) {
+                    let tab = match reason {
+                        Attention::CheckFailed
+                        | Attention::AgentFailed
+                        | Attention::Interrupted => Tab::Checks,
+                        Attention::Review => Tab::Summary,
+                        Attention::Queue | Attention::Git => Tab::Changes,
+                    };
+                    self.navigate(&row.project, Some(row.id), tab);
+                    opened = true;
+                }
             }
             if snapshot.task_index.is_ok() && attention_count(snapshot) == 0 {
                 ui.label("Вопросов, запросов разрешения и результатов для проверки пока нет.");
@@ -169,7 +200,7 @@ impl TasksView {
                     .clicked()
                 {
                     self.focused = Some(task.id);
-                    self.result_view.select(Tab::Changes, Some(task.id));
+                    self.result_view.select(Tab::Summary, Some(task.id));
                 }
             }
         };

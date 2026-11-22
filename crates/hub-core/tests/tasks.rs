@@ -181,7 +181,8 @@ fn transfer_preserves_legacy_run_authorship_and_never_starts_a_model() {
     let mut raw = serde_json::to_value(&book).unwrap();
     raw["tasks"][0]["runs"][0].as_object_mut().unwrap().remove("backend");
     let mut book = TaskBook::decode(&serde_json::to_vec(&raw).unwrap()).unwrap();
-    book.assign(id, 3, "codex").unwrap();
+    book.assign(id, 3, "CoDeX").unwrap();
+    assert_eq!(book.get(id).unwrap().backend, "codex");
     book.assign(id, 4, "hermes").unwrap();
     let task = book.get(id).unwrap();
     assert_eq!(task.backend, "hermes");

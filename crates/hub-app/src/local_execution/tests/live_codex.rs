@@ -115,7 +115,7 @@ async fn live_codex_repairs_file_after_failed_check() {
     git(cwd, &["add", "state.txt"]);
     git(cwd, &["commit", "-qm", "fixture"]);
     let run = workflow(cwd,
-        "В первой попытке запиши в state.txt одну строку DRAFT. Если хаб пришлёт ошибку проверки, замени строку на READY. После записи заверши ответ. Проверку запускает хаб.",
+        "В первой попытке запиши в state.txt одну строку DRAFT. Если хаб пришлёт ошибку проверки, замени строку на READY и передай исправленный файл пользователю инструментом send_file. Проверку запускает хаб.",
         "git grep -n . -- state.txt && git grep -F READY -- state.txt",
         Sandbox::WorkspaceWrite,
     ).await;
@@ -125,4 +125,16 @@ async fn live_codex_repairs_file_after_failed_check() {
     assert!(checks[1].passed && checks[1].output.contains("state.txt:1:READY"));
     assert_eq!(std::fs::read_to_string(file).unwrap().trim_end(), "READY");
     assert!(run.diff.contains("-INITIAL") && run.diff.contains("+READY"), "{}", run.diff);
+    let attachment = run.files.iter().find(|f| f.name == "state.txt").expect("delivered file");
+    let root = crate::dirs::AppDirs::locate().unwrap().task_files();
+    assert_eq!(
+        std::fs::read_to_string(root.join(&attachment.key).join(&attachment.name))
+            .unwrap()
+            .trim_end(),
+        "READY"
+    );
+    for file in run.files {
+        std::fs::remove_file(root.join(&file.key).join(&file.name)).unwrap();
+        std::fs::remove_dir(root.join(file.key)).unwrap();
+    }
 }

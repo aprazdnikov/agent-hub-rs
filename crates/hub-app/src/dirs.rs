@@ -34,6 +34,11 @@ impl AppDirs {
     }
 
     #[must_use]
+    pub fn task_files(&self) -> PathBuf {
+        self.data.join("task-files")
+    }
+
+    #[must_use]
     pub fn logs(&self) -> PathBuf {
         self.data.join("logs")
     }

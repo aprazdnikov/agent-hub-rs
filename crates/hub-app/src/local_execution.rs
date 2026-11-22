@@ -1,5 +1,6 @@
 //! One desktop operation, independent of Telegram transport. No automatic replay.
 mod channel;
+mod files;
 mod shared;
 mod workflow;
 use channel::Channel;
@@ -444,6 +445,15 @@ impl Worker {
             }
         });
         let attempt = Attempt { service: self.service.clone(), id: task.id, run, finished: false };
+        self.channel
+            .files
+            .set(Arc::new(files::FileTarget {
+                service: self.service.clone(),
+                cwd: session.cwd.clone(),
+                task: task.id,
+                run,
+            }))
+            .map_err(|_| "Повторная привязка файлов попытки")?;
         drop(lease);
         if self.cancel.is_cancelled() {
             // begin() can block on persistence while a stop arrives. Dropping

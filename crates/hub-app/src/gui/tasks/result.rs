@@ -5,6 +5,7 @@ use hub_core::tasks::{Run, Task};
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Tab {
     #[default]
+    Summary,
     Changes,
     Checks,
     History,
@@ -17,6 +18,7 @@ pub(super) struct View {
     note: String,
     run: Option<u32>,
     scroll: bool,
+    file_error: Option<String>,
 }
 impl View {
     pub(super) fn keep_position(&mut self) {
@@ -37,12 +39,14 @@ impl View {
             *self = Self { task: Some(task.id), ..Default::default() };
         }
         if self.run != Some(run.id) {
+            self.file_error = None;
             self.anchor = None;
             self.note.clear();
             self.run = Some(run.id);
         }
         let response = ui
             .horizontal_wrapped(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Summary, "Результат");
                 ui.selectable_value(&mut self.tab, Tab::Changes, "Изменения");
                 ui.selectable_value(&mut self.tab, Tab::Checks, "Проверки");
                 ui.selectable_value(
@@ -57,6 +61,14 @@ impl View {
             self.scroll = false;
         }
         match self.tab {
+            Tab::Summary => {
+                ui.label(if run.result.is_empty() { run.state.label() } else { &run.result });
+                if !run.diagnostic.is_empty() {
+                    ui.colored_label(ui.visuals().error_fg_color, &run.diagnostic);
+                }
+                self.files(ui, run);
+                None
+            }
             Tab::Changes => self.changes(ui, task, run, next, editable),
             Tab::Checks => {
                 report(ui, run);
@@ -84,6 +96,7 @@ impl View {
                             } else {
                                 &attempt.result
                             });
+                            self.files(ui, attempt);
                             if !attempt.workflow_report.is_empty() {
                                 report(ui, attempt);
                             }
@@ -97,6 +110,49 @@ impl View {
                 }
                 None
             }
+        }
+    }
+    fn files(&mut self, ui: &mut egui::Ui, run: &Run) {
+        if run.files.is_empty() {
+            return;
+        }
+        ui.separator();
+        ui.strong(format!("Файлы ({})", run.files.len()));
+        for file in &run.files {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(&file.name);
+                ui.weak(format!("{} байт", file.bytes));
+                let openable = std::path::Path::new(&file.name)
+                    .extension()
+                    .and_then(|v| v.to_str())
+                    .is_some_and(|ext| {
+                        ["txt", "pdf", "png", "jpg", "jpeg", "webp"]
+                            .iter()
+                            .any(|v| ext.eq_ignore_ascii_case(v))
+                    });
+                let open = openable && ui.button("Открыть файл").clicked();
+                let reveal = ui.button("В папке").clicked();
+                if open || reveal {
+                    self.file_error = crate::dirs::AppDirs::locate()
+                        .ok_or_else(|| "Каталог данных недоступен".to_owned())
+                        .and_then(|dirs| {
+                            let folder = dirs.task_files().join(&file.key);
+                            let path = folder.join(&file.name);
+                            if !path.is_file() {
+                                return Err("Сохранённый файл отсутствует на диске".into());
+                            }
+                            super::super::folder::open(if open { &path } else { &folder })
+                                .map_err(|e| e.to_string())
+                        })
+                        .err();
+                }
+            });
+            if !file.caption.is_empty() {
+                ui.label(&file.caption);
+            }
+        }
+        if let Some(error) = &self.file_error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
         }
     }
     fn changes(

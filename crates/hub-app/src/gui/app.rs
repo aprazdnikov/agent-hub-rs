@@ -82,6 +82,29 @@ pub struct HubApp {
 }
 
 impl HubApp {
+    fn navigation(&mut self, ui: &mut egui::Ui, count: usize, wide: bool) {
+        let attention = if count == 0 {
+            "Требуют внимания".into()
+        } else {
+            format!("Требуют внимания ({count})")
+        };
+        for (tab, label) in [
+            (Tab::Attention, attention.as_str()),
+            (Tab::Tasks, "Задачи"),
+            (Tab::Topics, "Темы"),
+            (Tab::Memory, "Память"),
+            (Tab::Status, "Статус"),
+            (Tab::Log, "Лог"),
+            (Tab::Settings, "Настройки"),
+        ] {
+            if wide && tab == Tab::Status {
+                ui.add_space(12.0);
+                ui.separator();
+            }
+            ui.selectable_value(&mut self.tab, tab, label);
+        }
+    }
+
     #[must_use]
     pub fn new(setup: AppSetup) -> Self {
         let AppSetup {
@@ -333,6 +356,18 @@ impl eframe::App for HubApp {
                 save_sent = true;
             }
         };
+        let wide = ui.available_width() >= 1220.0;
+        let count = super::tasks::attention_count(&snapshot);
+        if wide {
+            egui::Panel::left("app_navigation").exact_size(170.0).resizable(false).show(ui, |ui| {
+                ui.add_space(14.0);
+                ui.label(egui::RichText::new("agent-hub").size(22.0).strong());
+                ui.add_space(14.0);
+                ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
+                    self.navigation(ui, count, true);
+                });
+            });
+        }
         egui::Panel::top("tabs")
             .frame(
                 egui::Frame::new()
@@ -340,21 +375,9 @@ impl eframe::App for HubApp {
                     .inner_margin(egui::Margin::symmetric(20, 12)),
             )
             .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| {
-                    if ui.available_width() >= 500.0 {
-                        ui.label(egui::RichText::new("agent-hub").size(20.0).strong());
-                        ui.add_space(20.0);
-                    }
-                    let count = super::tasks::attention_count(&snapshot);
-                    let label = if count == 0 { "Требуют внимания".into() } else { format!("Требуют внимания ({count})") };
-                    ui.selectable_value(&mut self.tab, Tab::Attention, label);
-                    ui.selectable_value(&mut self.tab, Tab::Status, "Статус");
-                    ui.selectable_value(&mut self.tab, Tab::Topics, "Темы");
-                    ui.selectable_value(&mut self.tab, Tab::Tasks, "Задачи");
-                    ui.selectable_value(&mut self.tab, Tab::Memory, "Память");
-                    ui.selectable_value(&mut self.tab, Tab::Log, "Лог");
-                    ui.selectable_value(&mut self.tab, Tab::Settings, "Настройки");
-                });
+                if !wide {
+                    ui.horizontal_wrapped(|ui| self.navigation(ui, count, false));
+                }
                 // Store failures matter most on «Настройки», where the app opens in exactly those cases.
                 if self.saving() {
                     let message = if snapshot.save_status == SaveStatus::Delayed {
