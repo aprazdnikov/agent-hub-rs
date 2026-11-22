@@ -11,33 +11,33 @@ pub fn configure(ctx: &egui::Context) {
         ctx.style_mut_of(theme, |style| {
             let (canvas, surface, text, muted, border, accent, selected) = match theme {
                 Theme::Light => (
-                    Color32::from_rgb(243, 245, 248),
+                    Color32::from_rgb(248, 249, 247),
                     Color32::WHITE,
-                    Color32::from_rgb(32, 43, 60),
-                    Color32::from_rgb(94, 109, 131),
-                    Color32::from_rgb(215, 224, 236),
-                    Color32::from_rgb(43, 84, 177),
-                    Color32::from_rgb(227, 236, 255),
+                    Color32::from_rgb(28, 37, 33),
+                    Color32::from_rgb(84, 100, 92),
+                    Color32::from_rgb(213, 221, 215),
+                    Color32::from_rgb(13, 100, 79),
+                    Color32::from_rgb(220, 238, 229),
                 ),
                 Theme::Dark => (
-                    Color32::from_rgb(27, 35, 48),
-                    Color32::from_rgb(34, 45, 60),
-                    Color32::from_rgb(225, 232, 244),
-                    Color32::from_rgb(164, 179, 202),
-                    Color32::from_rgb(63, 79, 102),
-                    Color32::from_rgb(156, 187, 255),
-                    Color32::from_rgb(46, 66, 99),
+                    Color32::from_rgb(23, 27, 25),
+                    Color32::from_rgb(31, 37, 34),
+                    Color32::from_rgb(230, 236, 231),
+                    Color32::from_rgb(169, 185, 175),
+                    Color32::from_rgb(65, 78, 70),
+                    Color32::from_rgb(142, 218, 185),
+                    Color32::from_rgb(43, 68, 55),
                 ),
             };
-            style.text_styles.insert(TextStyle::Heading, FontId::proportional(24.0));
+            style.text_styles.insert(TextStyle::Heading, FontId::proportional(26.0));
             style.text_styles.insert(TextStyle::Body, FontId::proportional(14.0));
             style.text_styles.insert(TextStyle::Button, FontId::proportional(14.0));
             style.text_styles.insert(TextStyle::Small, FontId::proportional(12.0));
             style.text_styles.insert(TextStyle::Monospace, FontId::monospace(13.0));
-            style.spacing.item_spacing = egui::vec2(10.0, 10.0);
+            style.spacing.item_spacing = egui::vec2(9.0, 8.0);
             style.spacing.button_padding = egui::vec2(12.0, 7.0);
             style.spacing.interact_size.y = 32.0;
-            style.spacing.combo_width = 200.0;
+            style.spacing.combo_width = 160.0;
             style.visuals.panel_fill = surface;
             style.visuals.window_fill = surface;
             style.visuals.extreme_bg_color = canvas;
@@ -113,6 +113,6 @@ mod tests {
                 egui::ThemePreference::System
             );
         }
-        assert_eq!(surfaces, [Color32::WHITE, Color32::from_rgb(34, 45, 60), Color32::WHITE]);
+        assert_eq!(surfaces, [Color32::WHITE, Color32::from_rgb(31, 37, 34), Color32::WHITE]);
     }
 }

@@ -368,7 +368,12 @@ impl eframe::App for HubApp {
                 });
             });
         }
-        egui::Panel::top("tabs")
+        if !wide
+            || self.saving()
+            || snapshot.notice.is_some()
+            || banner(&self.updates.borrow()).is_some()
+        {
+            egui::Panel::top("tabs")
             .frame(
                 egui::Frame::new()
                     .fill(ui.visuals().panel_fill)
@@ -392,6 +397,7 @@ impl eframe::App for HubApp {
                 }
                 self.update_banner(ui, active(&snapshot));
             });
+        }
         self.confirm_restart(ui.ctx(), active(&snapshot));
         self.confirm_pending_exit(ui.ctx());
         let margin = if self.tab == Tab::Settings { 0 } else { 24 };

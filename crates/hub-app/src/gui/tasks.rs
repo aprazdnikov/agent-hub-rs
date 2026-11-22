@@ -196,7 +196,9 @@ impl TasksView {
     pub fn show(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot, send: &mut impl FnMut(Command)) {
         self.project_navigation(ui, snapshot);
         egui::ScrollArea::vertical().id_salt("task_workspace").show(ui, |ui| {
-            self.show_project(ui, snapshot, send);
+            egui::Frame::new()
+                .inner_margin(egui::Margin::symmetric(12, 0))
+                .show(ui, |ui| self.show_project(ui, snapshot, send));
         });
     }
     fn show_project(
@@ -205,7 +207,10 @@ impl TasksView {
         snapshot: &Snapshot,
         send: &mut impl FnMut(Command),
     ) {
-        ui.heading("Задачи");
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("Задачи");
+            self.choose_mode(ui, snapshot);
+        });
         if self.reveal_interaction {
             ui.scroll_to_cursor(Some(egui::Align::Min));
             self.reveal_interaction = false;
@@ -237,7 +242,9 @@ impl TasksView {
             ui.label("Выберите и откройте каталог проекта либо тему Telegram.");
             return;
         };
-        ui.label(format!("{} · {}", backend.name(), project.display()));
+        if key.is_some() {
+            ui.weak(format!("{} · {}", backend.name(), project.display()));
+        }
         self.poll();
         if self.pending.is_none()
             && self.refreshed.is_none_or(|time| time.elapsed() > Duration::from_secs(3))
@@ -274,9 +281,6 @@ impl TasksView {
         self.tasks = snapshot_tasks;
     }
     fn toolbar(&mut self, ui: &mut egui::Ui, busy: bool, send: &mut impl FnMut(Command)) {
-        if ui.add_enabled(!busy, egui::Button::new("Обновить задачи")).clicked() {
-            self.request(Request::Search { filter: TaskFilter::All, query: String::new() }, send);
-        }
         // A background list refresh must not disable text editors: egui surrenders
         // their focus when disabled. Freeze the draft only while it is being saved.
         let creating = self.pending.as_ref().is_some_and(|(_, creating, _, _)| *creating);
@@ -309,21 +313,32 @@ impl TasksView {
                 }
             });
         });
-        ui.horizontal(|ui| {
-            ui.label("Поиск по названию и поручению");
-            ui.add(egui::TextEdit::singleline(&mut self.query).char_limit(256));
+        ui.horizontal_wrapped(|ui| {
+            ui.add(
+                egui::TextEdit::singleline(&mut self.query)
+                    .hint_text("Поиск по задачам")
+                    .desired_width(190.0)
+                    .char_limit(256),
+            )
+            .on_hover_text("Поиск по названию и поручению");
+            egui::ComboBox::from_id_salt("task_filter").selected_text(self.filter.label()).show_ui(
+                ui,
+                |ui| {
+                    for filter in [TaskFilter::Active, TaskFilter::All, TaskFilter::Archived]
+                        .into_iter()
+                        .chain(TaskStatus::ALL.map(TaskFilter::Status))
+                    {
+                        ui.selectable_value(&mut self.filter, filter, filter.label());
+                    }
+                },
+            );
+            if ui.add_enabled(!busy, egui::Button::new("Обновить").frame(false)).clicked() {
+                self.request(
+                    Request::Search { filter: TaskFilter::All, query: String::new() },
+                    send,
+                );
+            }
         });
-        egui::ComboBox::from_id_salt("task_filter").selected_text(self.filter.label()).show_ui(
-            ui,
-            |ui| {
-                for filter in [TaskFilter::Active, TaskFilter::All, TaskFilter::Archived]
-                    .into_iter()
-                    .chain(TaskStatus::ALL.map(TaskFilter::Status))
-                {
-                    ui.selectable_value(&mut self.filter, filter, filter.label());
-                }
-            },
-        );
         ui.separator();
     }
     fn workflow_controls(
@@ -635,20 +650,33 @@ impl TasksView {
         let available = self.availability(task, backend, topic_running);
         let mut next = self.next.get(&task.id).cloned().unwrap_or_default();
         ui.push_id(task.id, |ui| {
-            ui.heading(format!("#{} · {} · r{}", task.id, task.title, task.revision));
-            ui.label(format!("Агент: {}", task.backend));
-            ui.label(format!(
-                "{}{}",
-                task.status.label(),
-                if task.archived { " · В архиве" } else { "" }
-            ));
+            ui.horizontal_wrapped(|ui| {
+                ui.weak(format!("#{} · r{}", task.id, task.revision));
+                ui.label(format!("Агент · {}", task.backend));
+                ui.colored_label(ui.visuals().hyperlink_color, task.status.label());
+                if task.archived {
+                    ui.weak("В архиве");
+                }
+            });
+            ui.heading(&task.title);
             ui.add_space(8.0);
-            if let Some(step) = self.result_view.show(ui, task, &next, available.edit) {
+            let annotation = self.result_view.show(ui, task, &next, available.edit);
+            let reveal_next = annotation.is_some();
+            if let Some(step) = annotation {
                 next = step;
             }
+
             if task.status == TaskStatus::NeedsReview
                 && !task.archived
-                && ui.add_enabled(available.edit, egui::Button::new("Принять результат")).clicked()
+                && ui
+                    .add_enabled(
+                        available.edit,
+                        egui::Button::new(
+                            egui::RichText::new("Принять результат").color(ui.visuals().panel_fill),
+                        )
+                        .fill(ui.visuals().hyperlink_color),
+                    )
+                    .clicked()
             {
                 self.request(
                     Request::Status {
@@ -660,7 +688,8 @@ impl TasksView {
                 );
             }
             ui.add_space(8.0);
-            ui.group(|ui| {
+            let has_draft = !next.trim().is_empty();
+            let mut launch = |ui: &mut egui::Ui| {
                 self.git_controls(ui, task, send);
                 self.executor_controls(ui, task, backend, available.edit, send);
                 if task.active() {
@@ -676,11 +705,19 @@ impl TasksView {
                 } else {
                     self.launch_controls(ui, task, backend, &available, &mut next, send);
                 }
-            });
+            };
+            if task.runs.last().is_some_and(|run| !run.result.is_empty()) && !task.active() {
+                egui::CollapsingHeader::new("Подготовить следующий запуск")
+                    .id_salt(("continue", task.id, task.runs.last().map(|run| run.id)))
+                    .default_open(has_draft)
+                    .open(reveal_next.then_some(true))
+                    .show(ui, &mut launch);
+            } else {
+                ui.group(launch);
+            }
             ui.collapsing("Статус и архив", |ui| {
                 self.workflow_controls(ui, task, !available.edit, send);
             });
-            ui.small("Завершение запуска не означает приёмку результата пользователем.");
             ui.separator();
         });
         self.next.insert(task.id, next);
@@ -911,7 +948,7 @@ mod tests {
         };
         let project_x = x("Проекты");
         let tasks_x = x("#1  Первое\ncodex · Запланирована");
-        assert!(project_x < tasks_x && tasks_x < x("#1 · Первое · r1"));
+        assert!(project_x < tasks_x && tasks_x < x("#1 · r1"));
     }
     #[test]
     fn failed_permission_delivery_allows_retry_or_deny() {
@@ -1425,6 +1462,7 @@ mod tests {
         let mut book = hub_core::tasks::TaskBook::default();
         let id = book.create(std::env::temp_dir(), "codex", "Task", "Read").unwrap();
         book.begin(id, 1, None).unwrap();
+        book.record(id, 1, "Готовый результат").unwrap();
         book.finish(id, 1, RunState::Completed).unwrap();
         let mut view = TasksView {
             selected: Some(key),
@@ -1440,6 +1478,14 @@ mod tests {
         };
         let mut commands = Vec::new();
         input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let output = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert!(output.shapes.iter().any(
+            |s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == "Готовый результат")
+        ));
+        assert!(!output.shapes.iter().any(
+            |s| matches!(&s.shape, egui::Shape::Text(t) if t.galley.text() == "1. Исполнитель")
+        ));
+        click_text(&ctx, &mut view, &snapshot, "Подготовить следующий запуск", &mut commands);
         let output = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
         let labels = [
             "История попыток (1)",

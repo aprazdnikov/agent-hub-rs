@@ -25,12 +25,11 @@ pub(in crate::gui) fn attention_count(snapshot: &Snapshot) -> usize {
         })
 }
 fn attention_row(ui: &mut egui::Ui, project: &Path, id: u64, title: &str, action: &str) -> bool {
-    let width = ui.available_width().min(820.0);
-    egui::Frame::group(ui.style())
-        .fill(ui.visuals().panel_fill)
-        .inner_margin(12)
+    let width = ui.available_width().min(900.0);
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(0, 8))
         .show(ui, |ui| {
-            ui.set_width((width - 26.0).max(0.0));
+            ui.set_width(width);
             let details = |ui: &mut egui::Ui| {
                 let name = project.file_name().and_then(|v| v.to_str()).unwrap_or("Проект");
                 ui.small(format!("{name}   ·   #{id}"))
@@ -38,7 +37,7 @@ fn attention_row(ui: &mut egui::Ui, project: &Path, id: u64, title: &str, action
                 ui.add(egui::Label::new(egui::RichText::new(title).strong()).truncate())
                     .on_hover_text(title);
             };
-            if width < 460.0 {
+            let clicked = if width < 460.0 {
                 details(ui);
                 ui.button(action).clicked()
             } else {
@@ -51,7 +50,9 @@ fn attention_row(ui: &mut egui::Ui, project: &Path, id: u64, title: &str, action
                     ui.button(action).clicked()
                 })
                 .inner
-            }
+            };
+            ui.separator();
+            clicked
         })
         .inner
 }

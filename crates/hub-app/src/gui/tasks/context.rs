@@ -46,53 +46,66 @@ impl LocalProject {
             }
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(100));
         }
-        ui.label("Каталог проекта");
-        ui.horizontal(|ui| {
-            ui.add(
-                egui::TextEdit::singleline(&mut self.path)
-                    .id_salt("local_task_project")
-                    .hint_text("Абсолютный путь к проекту"),
-            );
-            if ui.add_enabled(self.picking.is_none(), egui::Button::new("Выбрать папку…")).clicked()
-            {
-                let (tx, rx) = mpsc::channel();
-                self.picking = Some(rx);
-                let context = ui.ctx().clone();
-                std::thread::spawn(move || {
-                    let _ = tx.send(rfd::FileDialog::new().pick_folder());
-                    context.request_repaint();
-                });
-            }
-            if ui.button("Открыть проект").clicked() {
-                self.open();
-            }
-        });
-        if let Some(error) = &self.error {
-            ui.colored_label(ui.visuals().error_fg_color, error);
-        }
-        let backend = self.backend.get_or_insert_with(|| {
+        let mut backend = *self.backend.get_or_insert_with(|| {
             snapshot.saved.as_ref().map_or(BackendKind::Qwen, |draft| draft.default_backend)
         });
-        ui.horizontal(|ui| {
-            ui.label("Агент для новых задач");
-            egui::ComboBox::from_id_salt("local_task_backend")
-                .selected_text(backend.name())
-                .show_ui(ui, |ui| {
-                    for candidate in BackendKind::ALL {
-                        ui.selectable_value(backend, candidate, candidate.name());
-                    }
-                });
+        let current = self.opened.clone().map(|path| {
+            let name = path.file_name().and_then(|v| v.to_str()).unwrap_or("Проект");
+            (format!("Проект · {name}"), path)
         });
-        ui.small("Запуск и управление доступны одновременно здесь и в Telegram. Вопросы и разрешения появятся над выбором проекта.");
-        self.opened.clone().map(|project| (None, project, *backend))
+        let mut controls = |ui: &mut egui::Ui| {
+            ui.label("Каталог проекта");
+            ui.horizontal_wrapped(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(&mut self.path)
+                        .id_salt("local_task_project")
+                        .hint_text("Абсолютный путь к проекту"),
+                );
+                if ui
+                    .add_enabled(self.picking.is_none(), egui::Button::new("Выбрать папку…"))
+                    .clicked()
+                {
+                    let (tx, rx) = mpsc::channel();
+                    self.picking = Some(rx);
+                    let context = ui.ctx().clone();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(rfd::FileDialog::new().pick_folder());
+                        context.request_repaint();
+                    });
+                }
+                if ui.button("Открыть проект").clicked() {
+                    self.open();
+                }
+            });
+            if let Some(error) = &self.error {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Агент для новых задач");
+                egui::ComboBox::from_id_salt("local_task_backend")
+                    .selected_text(backend.name())
+                    .show_ui(ui, |ui| {
+                        for candidate in BackendKind::ALL {
+                            ui.selectable_value(&mut backend, candidate, candidate.name());
+                        }
+                    });
+            });
+        };
+        if let Some((label, path)) = current {
+            egui::CollapsingHeader::new(label)
+                .id_salt("local_project_settings")
+                .show(ui, controls)
+                .header_response
+                .on_hover_text(path.display().to_string());
+        } else {
+            controls(ui);
+        }
+        self.backend = Some(backend);
+        self.opened.clone().map(|project| (None, project, backend))
     }
 }
 impl TasksView {
-    pub(super) fn choose_context(
-        &mut self,
-        ui: &mut egui::Ui,
-        snapshot: &Snapshot,
-    ) -> Option<Scope> {
+    pub(super) fn choose_mode(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
         let local =
             self.local_mode.get_or_insert(!matches!(snapshot.bot, BotStatus::Running { .. }));
         egui::ComboBox::from_id_salt("task_mode")
@@ -101,7 +114,13 @@ impl TasksView {
                 ui.selectable_value(local, true, "Локально");
                 ui.selectable_value(local, false, "В теме Telegram");
             });
-        if *local {
+    }
+    pub(super) fn choose_context(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: &Snapshot,
+    ) -> Option<Scope> {
+        if self.local_mode == Some(true) {
             return self.local_project.show(ui, snapshot);
         }
         if !matches!(snapshot.bot, BotStatus::Running { .. }) {
