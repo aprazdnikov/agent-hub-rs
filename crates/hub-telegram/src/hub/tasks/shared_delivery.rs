@@ -78,18 +78,6 @@ fn keyboard(live: &Live, complete: bool) -> Vec<Vec<Button>> {
     }
     rows
 }
-fn result_buttons(revision: u64) -> Vec<Vec<Button>> {
-    vec![
-        vec![
-            Button { text: "Принять".into(), data: format!("te:accept:{revision}") },
-            Button { text: "Открыть diff".into(), data: format!("te:diff:{revision}") },
-        ],
-        vec![Button {
-            text: "Вернуть с замечанием".into(),
-            data: format!("te:feedback:{revision}"),
-        }],
-    ]
-}
 pub(super) fn complete(live: &Live) -> bool {
     context(live).len() <= 32768
 }
@@ -185,7 +173,7 @@ impl Delivery {
             if last {
                 outgoing = outgoing.with_keyboard(
                     self.review_revision
-                        .map_or_else(|| keyboard(&self.live, complete), result_buttons),
+                        .map_or_else(|| keyboard(&self.live, complete), super::result_buttons),
                 );
             }
             message = tokio::time::timeout(

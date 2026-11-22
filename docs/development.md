@@ -27,6 +27,10 @@ cargo run -p hub-app --bin agent-hub
 Живые тесты с `qwen` (тратят токены, нужен настроенный `qwen`):
 `AGENT_HUB_LIVE_QWEN=1 cargo test -p hub-qwen --test live -- --ignored --test-threads=1`.
 
+Проверить полный цикл задачи с настоящим Codex можно командой `AGENT_HUB_LIVE_CODEX=1 cargo test -p hub-app --lib live_codex -- --ignored`. Два сценария расходуют токены и используют временные Git-репозитории. Второй проверяет правку файла, одну попытку исправления, сохранённый diff и ревью.
+
+Для проверки доставки в Telegram задайте `AGENT_HUB_LIVE_CHAT` и `AGENT_HUB_LIVE_TOPIC` и выполните `cargo test -p hub-app --test live_telegram -- --ignored --nocapture`. Тест берёт токен из системного хранилища, отправляет одну карточку в указанную тему настроенной группы и снимает кнопки редактированием сообщения. Для проверки обработки нажатий локально выполните `cargo test -p hub-telegram --lib result_card`.
+
 | Крейт | Что внутри |
 |---|---|
 | `hub-core` | Ядро без ввода-вывода: доменные типы, разбор настроек и команд, Markdown → Telegram HTML, реестры подтверждений и вопросов, формат `topics.json` |

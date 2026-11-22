@@ -7,8 +7,24 @@ use super::{Agents, First, Hub, Target, TopicKey};
 use hub_core::tasks::service::Access;
 use hub_core::{
     domain::{BackendKind, Prompt, TopicSession},
+    questions::Button,
     tasks::{ProjectRules, RunState, Task, TaskBook, TaskFilter, TaskStatus},
 };
+
+/// Inline actions for a specific revision of a completed task.
+#[must_use]
+pub fn result_buttons(revision: u64) -> Vec<Vec<Button>> {
+    vec![
+        vec![
+            Button { text: "Принять".into(), data: format!("te:accept:{revision}") },
+            Button { text: "Открыть diff".into(), data: format!("te:diff:{revision}") },
+        ],
+        vec![Button {
+            text: "Вернуть с замечанием".into(),
+            data: format!("te:feedback:{revision}"),
+        }],
+    ]
+}
 
 pub const HELP: &str = "/task — задачи проекта\n/task rules\n/task git РЕДАКЦИЯ REMOTE БАЗОВАЯ_ВЕТКА\n/task git РЕДАКЦИЯ off\n/task prepare ID РЕВИЗИЯ НОВАЯ_ВЕТКА\n/task git-stop\n/task rules-set РЕДАКЦИЯ on|off | ТЕКСТ\n/task create Название | Поручение\n/task list [all|planned|review|accepted|deferred|archived] [поиск]\n/task get ID\n/task follow ID — управление общей задачей\n/task unfollow\n/task assign ID РЕВИЗИЯ АГЕНТ\n/task preview ID [Следующий шаг]\n/task attempt ID ПОПЫТКА\n/task status ID РЕВИЗИЯ planned|review|accepted|deferred\n/task archive ID РЕВИЗИЯ\n/task restore ID РЕВИЗИЯ\n/task queue ID РЕВИЗИЯ [следующий шаг] — очередь\n/task worktree ID РЕВИЗИЯ [следующий шаг] — очередь в отдельной копии репозитория\n/task unqueue ID РЕВИЗИЯ — снять с очереди\n/task run ID РЕВИЗИЯ\n/task resume ID РЕВИЗИЯ Следующий шаг после проверки прежних эффектов\nПри создании агент и каталог берутся из текущей темы. Повторный запуск всегда требует явного следующего шага; автоматического повтора нет. Результат запуска не означает приёмку пользователем.";
 #[derive(Clone, Debug, Default)]

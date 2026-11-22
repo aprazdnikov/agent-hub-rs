@@ -6747,6 +6747,64 @@ mod tests {
         assert!(!world.texts().iter().any(|t| t.contains("OLD_RESULT_MUST_NOT_APPEAR")));
     }
 
+    async fn result_button(world: &World, prefix: &str) -> (MessageId, String) {
+        let button = || {
+            world.messenger.calls().into_iter().find_map(|call| {
+                let Call::Send { id, message, .. } = call else { return None };
+                message
+                    .keyboard
+                    .iter()
+                    .flatten()
+                    .find(|b| b.data.starts_with(prefix))
+                    .map(|b| (id, b.data.clone()))
+            })
+        };
+        eventually("result card", || button().is_some()).await;
+        button().unwrap()
+    }
+
+    #[tokio::test]
+    async fn result_card_delivers_diff_and_runs_one_revision_from_feedback() {
+        use crate::execution::Control;
+        let (world, execution, task) = shared_world().await;
+        world
+            .tasks
+            .access(hub_core::tasks::service::Access::Internal, |book, _| {
+                book.record_diff(task.id, 1, "+saved patch")
+            })
+            .unwrap();
+        execution.stop(execution.snapshot().unwrap().token).unwrap();
+        execution.live.lock().unwrap().as_mut().unwrap().run = Some(1);
+        world.send(text(Some(7), 2, &format!("/task follow {}", task.id))).await;
+        for (prefix, expected) in
+            [("te:diff:", "+saved patch"), ("te:feedback:", "Ответьте на карточку")]
+        {
+            let (message, data) = result_button(&world, prefix).await;
+            world
+                .send(HubMessage::Press(Press {
+                    thread: Some(KEY.thread),
+                    callback: prefix.into(),
+                    user: UserId(1),
+                    chat: Some(KEY.chat),
+                    message: Some(message),
+                    html: None,
+                    data,
+                }))
+                .await;
+            eventually("button handled", || world.texts().iter().any(|t| t.contains(expected)))
+                .await;
+        }
+        let (message, _) = result_button(&world, "te:feedback:").await;
+        world.send(shared_text_reply(message, 1)).await;
+        world.send(shared_text_reply(message, 1)).await;
+        task_op(&world, KEY, tasks::Request::Get(task.id)).await.unwrap();
+        let book = world.tasks.read().unwrap();
+        let runs = &book.get(task.id).unwrap().runs;
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[1].step, "answer");
+        assert_eq!(execution.launches.load(Ordering::SeqCst), 2);
+    }
+
     #[tokio::test]
     async fn result_card_accepts_once_and_only_for_subscriber() {
         use crate::execution::Control;
@@ -6756,19 +6814,7 @@ mod tests {
         execution.stop(live.token).unwrap();
         execution.live.lock().unwrap().as_mut().unwrap().run = Some(1);
         world.send(text(Some(7), 2, &format!("/task follow {}", task.id))).await;
-        let button = || {
-            world.messenger.calls().into_iter().find_map(|call| {
-                let Call::Send { id, message, .. } = call else { return None };
-                message
-                    .keyboard
-                    .iter()
-                    .flatten()
-                    .find(|b| b.data.starts_with("te:accept:"))
-                    .map(|b| (id, b.data.clone()))
-            })
-        };
-        eventually("result card", || button().is_some()).await;
-        let (message, data) = button().unwrap();
+        let (message, data) = result_button(&world, "te:accept:").await;
         for (name, user, expected) in [
             ("other", UserId(2), TaskStatus::NeedsReview),
             ("owner", UserId(1), TaskStatus::Accepted),
