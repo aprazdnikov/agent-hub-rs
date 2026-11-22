@@ -1102,35 +1102,16 @@ mod tests {
             &mut commands,
         );
         let many = composer_height(&mut view, &mut commands);
-        {
-            for n in [1usize, 2, 3, 4, 8, 9, 20] {
-                input_frame(
-                    &ctx,
-                    &mut view,
-                    &snapshot,
-                    vec![
-                        egui::Event::Key {
-                            key: egui::Key::A,
-                            physical_key: None,
-                            pressed: true,
-                            repeat: false,
-                            modifiers: egui::Modifiers::COMMAND,
-                        },
-                        egui::Event::Text(
-                            (1..=n).map(|k| format!("с{k}")).collect::<Vec<_>>().join("\n"),
-                        ),
-                    ],
-                    &mut commands,
-                );
-                eprintln!("rows={n} height={}", composer_height(&mut view, &mut commands));
-            }
-            eprintln!("one={one} three={three} many={many} body={body_line}");
-        }
         assert!(many > three, "eight lines is taller than three");
         assert!(
             many <= body_line * 8.0 + 22.0 + 2.0,
             "the composer stops growing at eight lines: {many} > {}",
             body_line * 8.0 + 22.0 + 2.0
+        );
+        assert!(
+            many >= body_line * 8.0 + 14.0,
+            "the cap is eight lines, not fewer: {many} < {}",
+            body_line * 8.0 + 14.0
         );
     }
 
