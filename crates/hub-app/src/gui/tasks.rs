@@ -1047,6 +1047,94 @@ mod tests {
     }
 
     #[test]
+    fn composer_field_grows_with_text_up_to_eight_lines() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let (_, _, snapshot, mut view) = review_fixture();
+        let mut commands = Vec::new();
+        let style = ctx.style_of(ctx.theme());
+        let panel_fill = style.visuals.panel_fill;
+        let body_font = style.text_styles.get(&egui::TextStyle::Body).cloned().expect("body font");
+        let composer_height = |view: &mut TasksView, commands: &mut Vec<Command>| {
+            let output = input_frame(&ctx, view, &snapshot, vec![], commands);
+            let mut frames = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect)
+                    if rect.fill == panel_fill
+                        && (rect.stroke.width - 1.0).abs() < 0.01
+                        && rect.corner_radius == egui::CornerRadius::same(12) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            });
+            let frame = frames.next().expect("composer frame");
+            assert!(frames.next().is_none(), "exactly one composer frame");
+            frame.height()
+        };
+        click_text(&ctx, &mut view, &snapshot, "Сообщение агенту", &mut commands);
+        let one = composer_height(&mut view, &mut commands);
+        let body_line = ctx.fonts_mut(|fonts| fonts.row_height(&body_font));
+        input_frame(
+            &ctx,
+            &mut view,
+            &snapshot,
+            vec![egui::Event::Text("первая\nвторая\nтретья".into())],
+            &mut commands,
+        );
+        let three = composer_height(&mut view, &mut commands);
+        assert!(three > one, "the field grows with the text: {one} -> {three}");
+        input_frame(
+            &ctx,
+            &mut view,
+            &snapshot,
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+                egui::Event::Text(
+                    (1..=20).map(|n| format!("строка {n}")).collect::<Vec<_>>().join("\n"),
+                ),
+            ],
+            &mut commands,
+        );
+        let many = composer_height(&mut view, &mut commands);
+        {
+            for n in [1usize, 2, 3, 4, 8, 9, 20] {
+                input_frame(
+                    &ctx,
+                    &mut view,
+                    &snapshot,
+                    vec![
+                        egui::Event::Key {
+                            key: egui::Key::A,
+                            physical_key: None,
+                            pressed: true,
+                            repeat: false,
+                            modifiers: egui::Modifiers::COMMAND,
+                        },
+                        egui::Event::Text(
+                            (1..=n).map(|k| format!("с{k}")).collect::<Vec<_>>().join("\n"),
+                        ),
+                    ],
+                    &mut commands,
+                );
+                eprintln!("rows={n} height={}", composer_height(&mut view, &mut commands));
+            }
+            eprintln!("one={one} three={three} many={many} body={body_line}");
+        }
+        assert!(many > three, "eight lines is taller than three");
+        assert!(
+            many <= body_line * 8.0 + 22.0 + 2.0,
+            "the composer stops growing at eight lines: {many} > {}",
+            body_line * 8.0 + 22.0 + 2.0
+        );
+    }
+
+    #[test]
     fn review_accepts_and_returns_to_the_inbox_only_after_confirmation() {
         let (mut book, id, snapshot, mut view) = review_fixture();
         let ctx = egui::Context::default();

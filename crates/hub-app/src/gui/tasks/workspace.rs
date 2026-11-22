@@ -99,6 +99,80 @@ fn shortcut(ui: &mut egui::Ui, editor: egui::Id) -> bool {
         && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter))
 }
 
+// Composer frame from chat.html: 1px border, radius 12, surface fill, mockup padding.
+const COMPOSER_FRAME_MARGIN: egui::Margin = egui::Margin { left: 12, right: 6, top: 6, bottom: 6 };
+const COMPOSER_FRAME_EXTRA: f32 = 14.0; // margins 6+6 plus the 1px border top and bottom
+const COMPOSER_FIELD_MARGIN: egui::Margin = egui::Margin::symmetric(4, 2);
+
+fn ui_font(ui: &egui::Ui, style: &egui::TextStyle) -> egui::FontId {
+    ui.style()
+        .text_styles
+        .get(style)
+        .cloned()
+        .unwrap_or_else(|| egui::FontId::proportional(ui.text_style_height(style)))
+}
+
+// Height of the composer field for a draft at a known width: the wrapped galley
+// between one and eight body lines plus the field's inner margins, matching the
+// ScrollArea clamp in `message_field`.
+fn composer_field_height(ui: &egui::Ui, draft: &str, width: f32) -> f32 {
+    let body_line = ui.text_style_height(&egui::TextStyle::Body);
+    let job = egui::text::LayoutJob::simple(
+        draft.to_owned(),
+        ui_font(ui, &egui::TextStyle::Body),
+        egui::Color32::PLACEHOLDER,
+        width.max(48.0),
+    );
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    (galley.size().y + 2.0 * f32::from(COMPOSER_FIELD_MARGIN.top))
+        .clamp(body_line + 8.0, body_line * 8.0 + 8.0)
+}
+
+fn button_label_width(ui: &egui::Ui, label: &str) -> f32 {
+    let job = egui::text::LayoutJob::simple(
+        label.to_owned(),
+        ui_font(ui, &egui::TextStyle::Button),
+        egui::Color32::PLACEHOLDER,
+        f32::INFINITY,
+    );
+    let text_width = ui.fonts_mut(|fonts| fonts.layout_job(job)).size().x;
+    text_width + 2.0 * ui.spacing().button_padding.x
+}
+
+// The bottom panel reserves the composer before it lays out, and the composer must
+// split its width before the buttons exist; both derive the same numbers here: the
+// field width after the visible action buttons and the height of the bottom row.
+fn composer_row(
+    ui: &egui::Ui,
+    available_width: f32,
+    draft: &str,
+    send_label: &str,
+    show_save: bool,
+    show_open: bool,
+) -> f32 {
+    let spacing_x = ui.spacing().item_spacing.x;
+    let button_height =
+        ui.spacing().interact_size.y.max(
+            ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y,
+        );
+    let mut zone = spacing_x + button_label_width(ui, send_label);
+    if show_save {
+        zone += spacing_x + button_label_width(ui, "Сохранить");
+    }
+    if show_open {
+        zone += spacing_x + button_label_width(ui, "Открыть результат");
+    }
+    let field_width = (available_width - zone).max(48.0);
+    let field_height = composer_field_height(ui, draft, field_width);
+    field_height.max(button_height)
+}
+
+struct ComposerGuards {
+    dirty: bool,
+    conflict: bool,
+    blocked: Option<&'static str>,
+}
+
 impl TasksView {
     pub(super) fn new_task(
         &mut self,
@@ -269,7 +343,6 @@ impl TasksView {
             .is_some_and(|live| live.active && live.interaction.is_some());
         let has_result =
             result::View::review_run(task).is_some() || task.status == TaskStatus::NeedsReview;
-        let body_line = ui.text_style_height(&egui::TextStyle::Body);
         let button_height = ui.spacing().interact_size.y.max(
             ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y,
         );
@@ -282,7 +355,16 @@ impl TasksView {
         let composer_height = if needs_answer {
             (ui.available_height() * 0.60).clamp(130.0, 380.0)
         } else {
-            body_line * 2.0 + button_height + 40.0
+            let row_height = composer_row(
+                ui,
+                // frame margins 12+6 plus the 1px border on both sides
+                ui.available_width() - 20.0,
+                next,
+                if task.runs.is_empty() { "Запустить" } else { "Отправить" },
+                task.runs.is_empty() && next != &task.prompt,
+                inline_result,
+            );
+            row_height + COMPOSER_FRAME_EXTRA + ui.spacing().interact_size.y + 12.0
         };
         egui::Panel::bottom(ui.id().with("composer"))
             .exact_size(composer_height + result_space)
@@ -379,6 +461,29 @@ impl TasksView {
         ui.separator();
     }
 
+    fn composer_guards(
+        &self,
+        task: &Task,
+        available: &Availability,
+        backend: BackendKind,
+        next: &str,
+    ) -> ComposerGuards {
+        let dirty = task.runs.is_empty() && next != task.prompt;
+        let conflict = dirty
+            && self
+                .prompt_drafts
+                .get(&(task.project.clone(), task.id))
+                .is_some_and(|draft| draft.original != task.prompt);
+        let blocked = if conflict {
+            Some("Сравните изменения поручения в чате.")
+        } else if task.queue.is_some() {
+            Some("Задача в очереди. Управление — в параметрах.")
+        } else {
+            self.launch_block(task, backend, available, next)
+        };
+        ComposerGuards { dirty, conflict, blocked }
+    }
+
     fn composer(
         &mut self,
         ui: &mut egui::Ui,
@@ -394,76 +499,86 @@ impl TasksView {
             && task.queue.is_none()
             && !task.archived
             && !matches!(task.status, TaskStatus::Accepted | TaskStatus::Deferred);
-        let submit = self.message_field(ui, task, next, !first || can_edit_prompt);
-        let dirty = first && next != &task.prompt;
-        let conflict = dirty
-            && self
-                .prompt_drafts
-                .get(&(task.project.clone(), task.id))
-                .is_some_and(|draft| draft.original != task.prompt);
-        let blocked = if conflict {
-            Some("Сравните изменения поручения в чате.")
-        } else if task.queue.is_some() {
-            Some("Задача в очереди. Управление — в параметрах.")
-        } else {
-            self.launch_block(task, backend, available, next)
-        };
         let button = if first { "Запустить" } else { "Отправить" };
-        let clicked = ui
-            .horizontal(|ui| {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let clicked = primary_button(ui, blocked.is_none(), button)
-                        .on_disabled_hover_text(blocked.unwrap_or_default())
-                        .clicked();
-                    if dirty
-                        && ui
-                            .add_enabled(
-                                can_edit_prompt
-                                    && !conflict
-                                    && !next.trim().is_empty()
-                                    && next.len() <= 16384,
-                                egui::Button::new("Сохранить"),
-                            )
-                            .clicked()
-                    {
-                        self.request(
-                            Request::EditPrompt {
-                                id: task.id,
-                                revision: task.revision,
-                                prompt: next.clone(),
-                            },
-                            send,
-                        );
-                    }
-                    if inline_result && ui.button("Открыть результат").clicked() {
-                        self.result_view.select(result::Tab::Summary, Some(task.id));
-                    }
-                    let note = match blocked {
-                        Some("Введите сообщение агенту.") | None if !first => {
-                            if cfg!(target_os = "macos") {
-                                "⌘+Enter для отправки"
-                            } else {
-                                "Ctrl+Enter для отправки"
-                            }
+        let before = self.composer_guards(task, available, backend, next);
+        let frame = egui::Frame::new()
+            .fill(ui.visuals().panel_fill)
+            .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+            .corner_radius(12.0)
+            .inner_margin(COMPOSER_FRAME_MARGIN);
+        let row_height =
+            composer_row(ui, ui.available_width(), next, button, before.dirty, inline_result);
+        let (send_clicked, save_clicked, submit) = frame
+            .show(ui, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), row_height),
+                    Layout::right_to_left(Align::Max),
+                    |ui| {
+                        let send_clicked = primary_button(ui, before.blocked.is_none(), button)
+                            .on_disabled_hover_text(before.blocked.unwrap_or_default())
+                            .clicked();
+                        let save_clicked = before.dirty
+                            && ui
+                                .add_enabled(
+                                    can_edit_prompt
+                                        && !before.conflict
+                                        && !next.trim().is_empty()
+                                        && next.len() <= 16384,
+                                    egui::Button::new("Сохранить"),
+                                )
+                                .clicked();
+                        if inline_result && ui.button("Открыть результат").clicked()
+                        {
+                            self.result_view.select(result::Tab::Summary, Some(task.id));
                         }
-                        other => other.unwrap_or_default(),
-                    };
-                    if !note.is_empty() {
-                        ui.add_sized(
-                            [ui.available_width(), ui.spacing().interact_size.y],
-                            egui::Label::new(RichText::new(note).small().weak())
-                                .halign(Align::Min)
-                                .wrap(),
-                        )
-                        .on_hover_text(note);
-                    }
-                    clicked
-                })
+                        let field = ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), row_height),
+                            egui::Layout {
+                                main_align: Align::Max,
+                                ..egui::Layout::top_down(Align::Min)
+                            },
+                            |ui| self.message_field(ui, task, next, !first || can_edit_prompt),
+                        );
+                        (send_clicked, save_clicked, field.inner)
+                    },
+                )
                 .inner
             })
             .inner;
-        if blocked.is_none()
-            && (clicked || submit)
+        let after = self.composer_guards(task, available, backend, next);
+        // A click can land in the same frame as the field changed the draft,
+        // so the fresh guards decide whether the save and the send actually fire.
+        if save_clicked
+            && after.dirty
+            && can_edit_prompt
+            && !after.conflict
+            && !next.trim().is_empty()
+            && next.len() <= 16384
+        {
+            self.request(
+                Request::EditPrompt { id: task.id, revision: task.revision, prompt: next.clone() },
+                send,
+            );
+        }
+        let note = match after.blocked {
+            Some("Введите сообщение агенту.") | None if !first => {
+                if cfg!(target_os = "macos") {
+                    "⌘+Enter для отправки"
+                } else {
+                    "Ctrl+Enter для отправки"
+                }
+            }
+            other => other.unwrap_or_default(),
+        };
+        if !note.is_empty() {
+            ui.add_sized(
+                [ui.available_width(), ui.spacing().interact_size.y],
+                egui::Label::new(RichText::new(note).small().weak()).halign(Align::Min).wrap(),
+            )
+            .on_hover_text(note);
+        }
+        if after.blocked.is_none()
+            && (send_clicked || submit)
             && let Some(scope) = self.scope.clone()
         {
             self.start_message(scope, task, next, send);
@@ -513,7 +628,7 @@ impl TasksView {
     ) -> bool {
         let editor = ui.make_persistent_id("task_message");
         let submit = shortcut(ui, editor);
-        let max_height = ui.text_style_height(&egui::TextStyle::Body) * 2.0 + 8.0;
+        let max_height = ui.text_style_height(&egui::TextStyle::Body) * 8.0 + 8.0;
         egui::ScrollArea::vertical()
             .id_salt("message_field")
             .min_scrolled_height(0.0)
@@ -531,9 +646,15 @@ impl TasksView {
                     egui::TextEdit::multiline(next)
                         .id(editor)
                         .desired_width(f32::INFINITY)
-                        .desired_rows(2)
+                        .desired_rows(1)
                         .char_limit(16384)
-                        .hint_text(hint),
+                        .hint_text(hint)
+                        // the composer frame owns the border, the field stays transparent
+                        .frame(
+                            egui::Frame::new()
+                                .fill(egui::Color32::TRANSPARENT)
+                                .inner_margin(COMPOSER_FIELD_MARGIN),
+                        ),
                 );
                 if let Some(r) = &mut self.reworking
                     && r.task == task.id
