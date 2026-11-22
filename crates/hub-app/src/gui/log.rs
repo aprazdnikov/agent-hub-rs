@@ -1,4 +1,4 @@
-//! The «Лог» tab.
+//! Application events and setup actions inside Diagnostics.
 
 use std::path::Path;
 
@@ -34,7 +34,8 @@ impl LogView {
         lines: &[LogLine],
         folder_path: &Path,
     ) -> Option<LogAction> {
-        super::theme::page_heading(ui, "Лог", "События приложения и диагностика подключения.");
+        ui.heading("Журнал приложения");
+        ui.add_space(12.0);
         ui.horizontal_wrapped(|ui| {
             egui::ComboBox::from_id_salt("level").selected_text(self.level.as_str()).show_ui(
                 ui,
@@ -63,12 +64,12 @@ impl LogView {
                             Some(rejected) => {
                                 ui.colored_label(ui.visuals().warn_fg_color, text);
                                 if let Some(chat) = rejected.chat
-                                    && ui.small_button("Использовать chat_id").clicked()
+                                    && ui.button("Использовать chat_id").clicked()
                                 {
                                     action = Some(LogAction::UseChat(chat));
                                 }
                                 if let Some(user) = rejected.user
-                                    && ui.small_button("Добавить user_id").clicked()
+                                    && ui.button("Добавить user_id").clicked()
                                 {
                                     action = Some(LogAction::AddUser(user));
                                 }

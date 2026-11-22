@@ -406,3 +406,26 @@ fn scoped_memory_survives_reload_and_respects_task_revision() {
     assert!(book.set_memory(id, 4, Some(true)).is_err());
     assert_eq!(book.get(id).unwrap().memory, None);
 }
+
+#[test]
+fn editing_a_saved_prompt_checks_revision_and_keeps_the_first_run_immutable() {
+    let mut book = TaskBook::default();
+    let id = book.create(std::env::temp_dir(), "qwen", "Название", "Первое").unwrap();
+    assert!(book.edit_prompt(id, 1, "  ").is_err());
+    assert!(book.edit_prompt(id, 1, &"я".repeat(8193)).is_err());
+    book.edit_prompt(id, 1, "Исправленное").unwrap();
+    assert!(book.edit_prompt(id, 1, "Устарело").is_err());
+    book.edit_prompt(id, 2, "Исправленное").unwrap();
+    book.enqueue(id, 2, None, false, None).unwrap();
+    assert!(book.edit_prompt(id, 3, "В очереди").is_err());
+    book.unqueue(id, 3).unwrap();
+    book.set_archived(id, 4, true).unwrap();
+    assert!(book.edit_prompt(id, 5, "В архиве").is_err());
+    book.set_archived(id, 5, false).unwrap();
+    let mut book = TaskBook::decode(&book.encode().unwrap()).unwrap();
+    let run = book.begin(id, 6, None).unwrap();
+    assert_eq!(book.get(id).unwrap().runs[0].step, "Исправленное");
+    book.finish(id, run, RunState::Completed).unwrap();
+    assert!(book.edit_prompt(id, 8, "После запуска").is_err());
+    assert_eq!(book.get(id).unwrap().prompt, "Исправленное");
+}

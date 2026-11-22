@@ -34,7 +34,7 @@ pub fn configure(ctx: &egui::Context) {
             style.text_styles.insert(TextStyle::Button, FontId::proportional(14.0));
             style.text_styles.insert(TextStyle::Small, FontId::proportional(12.0));
             style.text_styles.insert(TextStyle::Monospace, FontId::monospace(13.0));
-            style.spacing.item_spacing = egui::vec2(9.0, 8.0);
+            style.spacing.item_spacing = egui::vec2(8.0, 6.0);
             style.spacing.button_padding = egui::vec2(12.0, 7.0);
             style.spacing.interact_size.y = 32.0;
             style.spacing.combo_width = 160.0;
@@ -77,10 +77,23 @@ pub fn configure(ctx: &egui::Context) {
     }
 }
 
-pub fn page_heading(ui: &mut egui::Ui, title: &str, description: &str) {
-    ui.heading(title);
-    ui.label(egui::RichText::new(description).weak());
-    ui.add_space(20.0);
+/// Keep the full button hit area and its inner margin in every interaction state.
+pub(super) fn tab(ui: &mut egui::Ui, selected: bool, text: &str) -> egui::Response {
+    let response = ui.add(egui::Button::selectable(selected, text).frame_when_inactive(false));
+    if selected {
+        ui.painter().hline(
+            response.rect.x_range().shrink(4.0),
+            response.rect.bottom() + 1.0,
+            Stroke::new(2.0, ui.visuals().hyperlink_color),
+        );
+    }
+    response
+}
+
+pub(super) fn primary_button(ui: &mut egui::Ui, enabled: bool, text: &str) -> egui::Response {
+    let text = egui::RichText::new(text).color(ui.visuals().panel_fill);
+    let button = egui::Button::new(text).fill(ui.visuals().hyperlink_color);
+    ui.add_enabled(enabled, button)
 }
 
 pub fn surface(ui: &egui::Ui) -> egui::Frame {
@@ -90,6 +103,45 @@ pub fn surface(ui: &egui::Ui) -> egui::Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn navigation_label_stays_inside_its_hover_and_focus_ring() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut rect = egui::Rect::NOTHING;
+        for pass in 0..4 {
+            let events = if pass == 1 {
+                vec![egui::Event::PointerMoved(rect.center())]
+            } else if pass == 2 {
+                vec![egui::Event::PointerGone]
+            } else {
+                Vec::new()
+            };
+            let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
+                let response = tab(ui, false, "Темы Telegram");
+                rect = response.rect;
+                if pass == 1 {
+                    assert!(response.hovered());
+                    response.request_focus();
+                }
+                if pass == 3 {
+                    assert!(response.has_focus());
+                }
+            });
+            output.textures_delta.clear();
+            let label = output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == "Темы Telegram" => {
+                        Some(text.galley.rect.translate(text.pos.to_vec2()))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert!(rect.shrink2(egui::vec2(8.0, 4.0)).contains_rect(label));
+        }
+    }
 
     #[test]
     fn system_theme_changes_keep_custom_styles_and_system_preference() {

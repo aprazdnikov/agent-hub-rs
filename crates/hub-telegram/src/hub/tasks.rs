@@ -125,6 +125,11 @@ pub enum Request {
         title: String,
         prompt: String,
     },
+    EditPrompt {
+        id: u64,
+        revision: u64,
+        prompt: String,
+    },
     Start {
         id: u64,
         revision: u64,

@@ -298,17 +298,22 @@ pub enum TaskFilter {
     Status(TaskStatus),
 }
 impl TaskFilter {
+    /// Status and archive selection before applying a text query.
+    #[must_use]
+    pub fn includes(self, status: TaskStatus, archived: bool) -> bool {
+        match self {
+            Self::Active => !archived,
+            Self::All => true,
+            Self::Archived => archived,
+            Self::Status(required) => !archived && status == required,
+        }
+    }
     #[must_use]
     pub fn matches(self, task: &Task, query: &str) -> bool {
-        let included = match self {
-            Self::Active => !task.archived,
-            Self::All => true,
-            Self::Archived => task.archived,
-            Self::Status(status) => !task.archived && task.status == status,
-        };
         let query = query.trim().to_lowercase();
-        included
-            && (task.title.to_lowercase().contains(&query)
+        self.includes(task.status, task.archived)
+            && (query.is_empty()
+                || task.title.to_lowercase().contains(&query)
                 || task.prompt.to_lowercase().contains(&query))
     }
     #[must_use]
@@ -634,6 +639,24 @@ impl TaskBook {
         }
         task.revision.checked_add(1).ok_or("Лимит ревизий")?;
         Ok(task)
+    }
+    pub fn edit_prompt(&mut self, id: u64, revision: u64, prompt: &str) -> Result<(), String> {
+        let task = self.editable(id, revision)?;
+        if !task.runs.is_empty()
+            || task.archived
+            || task.queue.is_some()
+            || matches!(task.status, TaskStatus::Accepted | TaskStatus::Deferred)
+        {
+            return Err("Редактировать можно поручение открытой задачи до первого запуска и до постановки в очередь.".into());
+        }
+        if !text(prompt, MAX_PROMPT) {
+            return Err("Введите поручение объёмом до 16 КиБ.".into());
+        }
+        if task.prompt != prompt {
+            prompt.clone_into(&mut task.prompt);
+            task.revision += 1;
+        }
+        Ok(())
     }
     pub fn set_memory(
         &mut self,

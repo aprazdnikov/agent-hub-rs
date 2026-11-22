@@ -1,237 +1,383 @@
-use super::{Command, Snapshot, TasksView, result::Tab};
-use crate::desktop_tasks::Attention;
-use crate::local_execution::{Kind, Live};
+use super::{Command, Snapshot, TasksView, local, result::Tab};
+use crate::{
+    desktop_tasks::{Attention, TaskRow, excerpt},
+    gui::look::agent_title,
+    local_execution::{Interaction, Kind, Live},
+};
 use eframe::egui;
-use hub_core::tasks::Task;
-use std::{collections::BTreeSet, path::Path};
+use hub_core::domain::BackendKind;
+use std::{
+    borrow::Cow,
+    collections::BTreeMap,
+    path::{Path, PathBuf},
+};
+use uuid::Uuid;
 
-fn jobs(snapshot: &Snapshot) -> impl Iterator<Item = &Live> {
-    snapshot.local_jobs.iter().chain(
-        snapshot
-            .local
-            .iter()
-            .filter(|live| !snapshot.local_jobs.iter().any(|row| row.token == live.token)),
-    )
+#[derive(Default)]
+pub(super) struct Inbox {
+    project: Option<PathBuf>,
+    expanded: Option<(Uuid, Uuid)>,
 }
-fn pending(snapshot: &Snapshot) -> impl Iterator<Item = &Live> {
-    jobs(snapshot).filter(|j| j.active && j.interaction.is_some())
-}
-pub(in crate::gui) fn attention_count(snapshot: &Snapshot) -> usize {
-    pending(snapshot).count()
-        + snapshot.task_index.as_ref().map_or(0, |rows| {
-            rows.iter()
-                .filter(|row| row.reason.is_some() && !pending(snapshot).any(|j| j.id == row.id))
-                .count()
+
+pub(super) fn jobs(snapshot: &Snapshot) -> impl Iterator<Item = &Live> {
+    snapshot.local_jobs.iter().chain(snapshot.local.iter().filter(|live| {
+        !snapshot.local_jobs.iter().any(|row| {
+            row.token == live.token || (row.id == live.id && row.project == live.project)
         })
+    }))
 }
-fn attention_row(ui: &mut egui::Ui, project: &Path, id: u64, title: &str, action: &str) -> bool {
-    let width = ui.available_width().min(900.0);
-    egui::Frame::new()
-        .inner_margin(egui::Margin::symmetric(0, 8))
-        .show(ui, |ui| {
-            ui.set_width(width);
-            let details = |ui: &mut egui::Ui| {
-                let name = project.file_name().and_then(|v| v.to_str()).unwrap_or("Проект");
-                ui.small(format!("{name}   ·   #{id}"))
-                    .on_hover_text(project.display().to_string());
-                ui.add(egui::Label::new(egui::RichText::new(title).strong()).truncate())
-                    .on_hover_text(title);
-            };
-            let clicked = if width < 460.0 {
-                details(ui);
-                ui.button(action).clicked()
-            } else {
-                ui.horizontal(|ui| {
-                    let title_width = ui.available_width() - 190.0;
-                    ui.vertical(|ui| {
-                        ui.set_width(title_width);
-                        details(ui);
-                    });
-                    ui.button(action).clicked()
+
+pub(super) fn has_request(snapshot: &Snapshot, (token, id): (Uuid, Uuid)) -> bool {
+    jobs(snapshot).any(|job| {
+        job.active && job.token == token && job.interaction.as_ref().is_some_and(|r| r.id == id)
+    })
+}
+
+#[derive(Clone, Copy)]
+enum Item<'a> {
+    Request(&'a Live, &'a Interaction, Option<&'a TaskRow>),
+    Task(&'a TaskRow, Attention),
+}
+
+fn items(snapshot: &Snapshot) -> impl Iterator<Item = Item<'_>> {
+    let rows = snapshot.task_index.as_deref().unwrap_or_default();
+    let requests = jobs(snapshot).filter(|job| job.active).filter_map(|job| {
+        let request = job.interaction.as_ref()?;
+        let row = rows.iter().find(|row| row.id == job.id && row.project == job.project);
+        Some(Item::Request(job, request, row))
+    });
+    let tasks = rows.iter().filter_map(|row| {
+        let reason = row.reason?;
+        // A live attempt may be newer than the last read of the persisted task index.
+        let running =
+            jobs(snapshot).any(|j| j.active && j.id == row.id && j.project == row.project);
+        (!running).then_some(Item::Task(row, reason))
+    });
+    requests.chain(tasks)
+}
+
+pub(in crate::gui) fn attention_count(snapshot: &Snapshot) -> usize {
+    items(snapshot).count()
+}
+
+type Projects<'a> = BTreeMap<&'a Path, Cow<'a, str>>;
+
+fn project_name(path: &Path) -> Cow<'_, str> {
+    path.file_name().unwrap_or(path.as_os_str()).to_string_lossy()
+}
+
+fn project_label<'a>(path: &'a Path, projects: &Projects<'a>) -> Cow<'a, str> {
+    let name = projects.get(path).cloned().unwrap_or_else(|| project_name(path));
+    if projects.iter().any(|(other, label)| *other != path && label == &name) {
+        path.to_string_lossy()
+    } else {
+        name
+    }
+}
+
+impl Inbox {
+    fn heading(&mut self, ui: &mut egui::Ui, projects: &Projects<'_>) {
+        let width = ui.available_width().min(1040.0);
+        let filter = |ui: &mut egui::Ui| {
+            let selected =
+                self.project.as_deref().map_or(Cow::Borrowed("Все проекты"), |project| {
+                    project_label(project, projects)
+                });
+            egui::ComboBox::from_id_salt("inbox_project")
+                .width((width * 0.42).min(205.0))
+                .selected_text(selected.as_ref())
+                .truncate()
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.project, None, "Все проекты");
+                    for &project in projects.keys() {
+                        ui.selectable_value(
+                            &mut self.project,
+                            Some(project.to_path_buf()),
+                            project_label(project, projects).as_ref(),
+                        )
+                        .on_hover_text(project.display().to_string());
+                    }
+                });
+        };
+        ui.horizontal_wrapped(|ui| {
+            ui.heading("Входящие");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), filter);
+        });
+        ui.add_space(8.0);
+    }
+}
+
+impl<'a> Item<'a> {
+    fn project(self) -> &'a Path {
+        match self {
+            Self::Request(job, ..) => &job.project,
+            Self::Task(row, _) => &row.project,
+        }
+    }
+
+    fn show(
+        self,
+        ui: &mut egui::Ui,
+        project: &str,
+        inbox: &mut Inbox,
+        panel: &mut local::Panel,
+        send: &mut impl FnMut(Command),
+    ) -> Option<(&'a TaskRow, Tab)> {
+        match self {
+            Self::Request(live, request, row) => {
+                let key = (live.token, request.id);
+                ui.push_id(key, |ui| {
+                    let (action, reason) = match &request.kind {
+                        Kind::Questions(questions) => {
+                            let summary = questions.split_first().map_or_else(
+                                || live.status.clone(),
+                                |(first, rest)| {
+                                    let text = excerpt(first.text());
+                                    if rest.is_empty() {
+                                        text
+                                    } else {
+                                        format!("{text} · ещё {}", rest.len())
+                                    }
+                                },
+                            );
+                            ("Ответить", summary)
+                        }
+                        Kind::Permission(tool) => {
+                            let tool_name = hub_core::render::truncate(tool.tool.trim(), 40);
+                            let details = excerpt(&tool.summary);
+                            (
+                                "Посмотреть запрос",
+                                if details.is_empty() {
+                                    tool_name
+                                } else {
+                                    format!("{tool_name} · {details}")
+                                },
+                            )
+                        }
+                    };
+                    let title = row.map_or_else(
+                        || Cow::Owned(format!("Задача #{}", live.id)),
+                        |r| Cow::Borrowed(r.title.as_str()),
+                    );
+                    let expanded = inbox.expanded == Some(key);
+                    if row_header(
+                        ui,
+                        project,
+                        &live.project,
+                        row,
+                        &title,
+                        (!expanded).then_some((reason.as_str(), action)),
+                    ) {
+                        inbox.expanded = Some(key);
+                        ui.ctx().request_repaint();
+                    }
+                    if expanded {
+                        ui.add_space(4.0);
+                        panel.decision(ui, live, request, send);
+                        if ui.button("Свернуть").clicked() {
+                            inbox.expanded = None;
+                            ui.ctx().request_repaint();
+                        }
+                    }
+                });
+                None
+            }
+            Self::Task(row, reason) => {
+                let (action, tab) = match reason {
+                    Attention::Review => ("Проверить", Tab::Summary),
+                    Attention::CheckFailed => ("Открыть проверку", Tab::Checks),
+                    Attention::AgentFailed | Attention::Interrupted => {
+                        ("Разобрать запуск", Tab::Checks)
+                    }
+                    Attention::Git => ("Проверить Git", Tab::Parameters),
+                    Attention::Queue => ("Открыть очередь", Tab::Parameters),
+                };
+                let summary = if row.summary.is_empty() { reason.label() } else { &row.summary };
+                ui.push_id((&row.project, row.id), |ui| {
+                    row_header(
+                        ui,
+                        project,
+                        &row.project,
+                        Some(row),
+                        &row.title,
+                        Some((summary, action)),
+                    )
                 })
                 .inner
-            };
-            ui.separator();
-            clicked
-        })
-        .inner
-}
-impl TasksView {
-    fn navigate(&mut self, project: &Path, id: Option<u64>, tab: Tab) {
-        self.local_mode = Some(true);
-        self.local_project.choose(project);
-        self.focused = id;
-        self.query.clear();
-        self.filter = hub_core::tasks::TaskFilter::Active;
-        self.result_view.select(tab, id);
+                .then_some((row, tab))
+            }
+        }
     }
+}
+
+fn row_header(
+    ui: &mut egui::Ui,
+    project: &str,
+    path: &Path,
+    row: Option<&TaskRow>,
+    title: &str,
+    preview: Option<(&str, &str)>,
+) -> bool {
+    let details = |ui: &mut egui::Ui| {
+        ui.spacing_mut().item_spacing.y = 3.0;
+        let metadata = row.map_or_else(
+            || project.to_owned(),
+            |r| {
+                let agent = match BackendKind::parse(&r.backend) {
+                    Some(kind) => agent_title(kind),
+                    None => r.backend.as_str(),
+                };
+                format!("{project} · {agent}")
+            },
+        );
+        ui.add(egui::Label::new(egui::RichText::new(metadata).small().weak()).truncate())
+            .on_hover_text(path.display().to_string());
+        ui.add(egui::Label::new(egui::RichText::new(title).strong()).wrap());
+        if let Some((reason, _)) = preview {
+            ui.add(egui::Label::new(egui::RichText::new(reason).weak()).wrap());
+        }
+    };
+    let width = ui.available_width();
+    let Some((_, action)) = preview else {
+        ui.vertical(details);
+        return false;
+    };
+    if width < 440.0 {
+        ui.vertical(details);
+        return ui.button(action).clicked();
+    }
+    ui.allocate_ui_with_layout(
+        egui::vec2(width, ui.spacing().interact_size.y),
+        egui::Layout::right_to_left(egui::Align::Center),
+        |ui| {
+            let clicked = ui.button(action).clicked();
+            ui.vertical(|ui| {
+                ui.set_width(ui.available_width());
+                details(ui);
+            });
+            clicked
+        },
+    )
+    .inner
+}
+
+impl TasksView {
     pub(in crate::gui) fn show_attention(
         &mut self,
         ui: &mut egui::Ui,
         snapshot: &Snapshot,
+        send: &mut impl FnMut(Command),
     ) -> bool {
-        ui.heading("Требуют внимания");
-        if let Err(error) = &snapshot.task_index {
-            ui.colored_label(ui.visuals().error_fg_color, error);
+        self.local_panel.sync(ui, snapshot);
+        if self.inbox.expanded.is_some_and(|key| !has_request(snapshot, key)) {
+            self.inbox.expanded = None;
         }
-        let mut opened = false;
-        egui::ScrollArea::vertical().id_salt("attention_items").show(ui, |ui| {
-            for live in pending(snapshot) {
-                let Some(interaction) = &live.interaction else { continue };
-                let reason = match &interaction.kind {
-                    Kind::Permission(tool) => format!("Разрешить {}", tool.tool),
-                    Kind::Questions(_) => "Ответить агенту".to_owned(),
-                };
-                let title = snapshot
-                    .task_index
+        ui.set_max_width(ui.available_width().min(1040.0));
+        let projects: Projects<'_> = snapshot
+            .task_index
+            .iter()
+            .flatten()
+            .map(|r| r.project.as_path())
+            .chain(jobs(snapshot).map(|j| j.project.as_path()))
+            .chain(self.scope.iter().map(|scope| scope.1.as_path()))
+            .map(|path| (path, project_name(path)))
+            .chain(self.sidebar.projects().map(|(path, name)| (path, Cow::Borrowed(name))))
+            .collect();
+        self.inbox.heading(ui, &projects);
+        self.local_panel.feedback(ui, self.inbox.project.as_deref(), self.inbox.expanded);
+        if let Err(error) = &snapshot.task_index {
+            ui.colored_label(
+                ui.visuals().error_fg_color,
+                format!("Не удалось загрузить задачи. {error}"),
+            );
+        }
+        let visible: Vec<_> = items(snapshot)
+            .filter(|item| self.inbox.project.as_deref().is_none_or(|p| p == item.project()))
+            .collect();
+        let mut target = None;
+        let mut open_chat = false;
+        egui::ScrollArea::vertical().id_salt(("inbox_items", &self.inbox.project)).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            for (results, heading) in
+                [(false, "Ждут вашего ответа"), (true, "Результаты на проверку")]
+            {
+                let mut group = visible
                     .iter()
-                    .flatten()
-                    .find(|row| row.id == live.id)
-                    .map_or(live.status.as_str(), |row| row.title.as_str());
-                if attention_row(ui, &live.project, live.id, title, &reason) {
-                    self.navigate(&live.project, Some(live.id), Tab::Changes);
-                    self.result_view.keep_position();
-                    self.reveal_interaction = true;
-                    opened = true;
-                }
-            }
-            for row in snapshot.task_index.iter().flatten() {
-                let Some(reason) = row.reason else { continue };
-                if pending(snapshot).any(|j| j.id == row.id) {
+                    .copied()
+                    .filter(|item| matches!(item, Item::Task(_, Attention::Review)) == results)
+                    .peekable();
+                if group.peek().is_none() {
                     continue;
                 }
-                if attention_row(ui, &row.project, row.id, &row.title, reason.label()) {
-                    let tab = match reason {
-                        Attention::CheckFailed
-                        | Attention::AgentFailed
-                        | Attention::Interrupted => Tab::Checks,
-                        Attention::Review => Tab::Summary,
-                        Attention::Queue | Attention::Git => Tab::Changes,
-                    };
-                    self.navigate(&row.project, Some(row.id), tab);
-                    opened = true;
+                ui.label(egui::RichText::new(heading).strong().weak());
+                ui.separator();
+                for item in group {
+                    ui.add_space(3.0);
+                    let project = project_label(item.project(), &projects);
+                    if let Some(row) =
+                        item.show(ui, &project, &mut self.inbox, &mut self.local_panel, send)
+                    {
+                        target = Some(row);
+                    }
+                    ui.add_space(3.0);
+                    ui.separator();
                 }
+                ui.add_space(10.0);
             }
-            if snapshot.task_index.is_ok() && attention_count(snapshot) == 0 {
-                ui.label("Вопросов, запросов разрешения и результатов для проверки пока нет.");
-                if ui.button("Открыть задачи").clicked() {
-                    opened = true;
-                }
+            if visible.is_empty() && snapshot.task_index.is_ok() {
+                ui.label(if self.inbox.project.is_some() {
+                    "В этом проекте всё разобрано."
+                } else {
+                    "Всё разобрано."
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if self.inbox.project.is_some() && ui.button("Показать все проекты").clicked()
+                    {
+                        self.inbox.project = None;
+                    }
+                    open_chat = ui
+                        .button(if self.focused.is_some() {
+                            "Вернуться в чат"
+                        } else {
+                            "Открыть задачи"
+                        })
+                        .clicked();
+                });
             }
         });
-        opened
-    }
-    pub(in crate::gui) fn project_navigation(
-        &mut self,
-        ui: &mut egui::Ui,
-        snapshot: &Snapshot,
-        in_tasks: bool,
-    ) -> bool {
-        let projects: BTreeSet<_> =
-            snapshot.task_index.iter().flatten().map(|row| &row.project).collect();
-        if projects.is_empty() {
-            return false;
+        if let Some((row, tab)) = target {
+            self.navigate(&row.project, Some(row.id), tab);
+            self.review_from_inbox = true;
+            return true;
         }
-        let narrow = ui.available_width() < 820.0;
-        let mut opened = false;
-        egui::Panel::left("task_projects")
-            .default_size(if narrow { 120.0 } else { 180.0 })
-            .size_range(100.0..=if narrow { 150.0 } else { 300.0 })
-            .show(ui, |ui| {
-                ui.strong("Проекты");
-                ui.separator();
-                egui::ScrollArea::vertical().id_salt("projects_list").show(ui, |ui| {
-                    for path in projects {
-                        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("Проект");
-                        let selected =
-                            in_tasks && self.scope.as_ref().is_some_and(|scope| scope.1 == *path);
-                        if ui
-                            .add(egui::Button::selectable(selected, name).truncate())
-                            .on_hover_text(path.display().to_string())
-                            .clicked()
-                        {
-                            self.navigate(path, None, Tab::Summary);
-                            opened = true;
-                        }
-                    }
-                });
-            });
-        opened
-    }
-    pub(super) fn task_navigation(
-        &mut self,
-        ui: &mut egui::Ui,
-        tasks: &[&Task],
-        snapshot: &Snapshot,
-    ) {
-        if tasks.len() <= 1 {
-            return;
+        if open_chat {
+            self.leave_review();
+            self.page = super::Page::Task;
+            self.result_view.select(Tab::Chat, self.focused);
         }
-        let mut draw = |ui: &mut egui::Ui| {
-            for task in tasks {
-                let live = jobs(snapshot).find(|live| live.active && live.id == task.id);
-                let reason = live
-                    .and_then(|j| j.interaction.as_ref())
-                    .map(|request| match &request.kind {
-                        Kind::Permission(_) => "Ждёт разрешения",
-                        Kind::Questions(_) => "Ждёт ответа",
-                    })
-                    .or_else(|| {
-                        snapshot
-                            .task_index
-                            .as_ref()
-                            .ok()?
-                            .iter()
-                            .find(|row| row.id == task.id)?
-                            .reason
-                            .map(Attention::label)
-                    });
-                let state = reason.unwrap_or_else(|| {
-                    if live.is_some() || task.active() {
-                        "Выполняется"
-                    } else if task.queue.is_some() {
-                        "В очереди"
-                    } else {
-                        task.status.label()
-                    }
-                });
-                if ui
-                    .selectable_label(
-                        self.focused == Some(task.id),
-                        format!("#{}  {}\n{} · {}", task.id, task.title, task.backend, state),
-                    )
-                    .clicked()
-                {
-                    self.focused = Some(task.id);
-                    self.result_view.select(Tab::Chat, Some(task.id));
-                }
-            }
-        };
-        if ui.available_width() >= 720.0 {
-            egui::Panel::left("tasks_list").default_size(180.0).show(ui, |ui| {
-                egui::ScrollArea::vertical().id_salt("task_rows").show(ui, &mut draw);
-            });
-        } else {
-            egui::ComboBox::from_id_salt("which_task")
-                .selected_text("Выбрать задачу")
-                .show_ui(ui, draw);
-        }
+        open_chat
     }
+
+    pub(super) fn selected_live<'a>(&self, snapshot: &'a Snapshot) -> Option<&'a Live> {
+        let project = &self.scope.as_ref()?.1;
+        let id = self.focused?;
+        jobs(snapshot)
+            .filter(|live| &live.project == project && live.id == id)
+            .max_by_key(|live| (live.active, live.run))
+    }
+
     pub(super) fn local_panels(
         &mut self,
         ui: &mut egui::Ui,
         snapshot: &Snapshot,
         send: &mut impl FnMut(Command),
     ) {
-        let selected = jobs(snapshot).find(|live| self.focused == Some(live.id));
-        if let Some(live) =
-            selected.filter(|live| snapshot.local.as_ref().is_none_or(|l| l.token != live.token))
-        {
-            let mut focused = snapshot.clone();
-            focused.local = Some(live.clone());
-            self.local_panel.show(ui, &focused, send);
-        } else {
-            self.local_panel.show(ui, snapshot, send);
+        self.local_panel.sync(ui, snapshot);
+        if let Some(live) = self.selected_live(snapshot) {
+            self.local_panel.show_job(ui, live, send);
         }
     }
 }
+
+#[cfg(test)]
+mod tests;

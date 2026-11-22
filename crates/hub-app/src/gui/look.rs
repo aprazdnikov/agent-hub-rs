@@ -60,7 +60,9 @@ pub fn tooltip(snapshot: &Snapshot) -> String {
 #[must_use]
 pub fn status_text(status: &BotStatus) -> String {
     match status {
-        BotStatus::Unconfigured => "Не настроен: заполните вкладку «Настройки»".to_owned(),
+        BotStatus::Unconfigured => {
+            "Для подключения заполните раздел «Telegram и доступ»".to_owned()
+        }
         BotStatus::Stopped => "Остановлен".to_owned(),
         BotStatus::Starting => "Подключение…".to_owned(),
         BotStatus::Retrying { reason, at } => {

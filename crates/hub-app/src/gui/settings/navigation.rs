@@ -16,10 +16,11 @@ pub enum Section {
     Actions,
     Speech,
     Application,
+    Diagnostics,
 }
 
 impl Section {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Telegram,
         Self::Workspace,
         Self::Agents,
@@ -27,6 +28,7 @@ impl Section {
         Self::Actions,
         Self::Speech,
         Self::Application,
+        Self::Diagnostics,
     ];
 
     pub const fn title(self) -> &'static str {
@@ -38,6 +40,7 @@ impl Section {
             Self::Actions => "Действия",
             Self::Speech => "Голосовые сообщения",
             Self::Application => "Запуск и обновления",
+            Self::Diagnostics => "Диагностика",
         }
     }
 
@@ -52,6 +55,7 @@ impl Section {
             Self::Actions => "Команды для ручного запуска из Telegram.",
             Self::Speech => "Распознавание аудио для постановки задач агентам.",
             Self::Application => "Системная тема, автозапуск и проверка новых версий.",
+            Self::Diagnostics => "Состояние подключений и журнал приложения.",
         }
     }
 

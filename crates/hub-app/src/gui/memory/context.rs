@@ -45,7 +45,7 @@ impl ContextDraft {
                 ui.label("Откройте нужные записи и добавьте их ревизии. Пакет содержит полные тексты; источники не проверяются, разрешения не переносятся.");
                 let mut remove=None;
                 for (key,revision) in &self.selected {
-                    ui.horizontal(|ui| { ui.label(format!("{key}@{revision}")); if ui.small_button("Убрать").clicked(){remove=Some(key.clone());} });
+                    ui.horizontal(|ui| { ui.label(format!("{key}@{revision}")); if ui.button("Убрать").clicked(){remove=Some(key.clone());} });
                 }
                 if let Some(key)=remove { self.selected.remove(&key); }
                 for (label,value) in [("Цель",&mut self.brief.goal),("Ограничения",&mut self.brief.constraints),("Состояние",&mut self.brief.state),("Следующий шаг",&mut self.brief.next_step)] {

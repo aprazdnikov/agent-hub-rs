@@ -154,6 +154,11 @@ mod tests {
             service
                 .access(Access::Internal, |b, _| {
                     let run = b.begin(id, 1, None)?;
+                    if n == 0 {
+                        b.unavailable(id, run, "Нет подключения к исполнителю")?;
+                    } else {
+                        b.record(id, run, "Черновики сохраняются для каждой задачи.")?;
+                    }
                     b.finish(id, run, if n == 0 { RunState::Failed } else { RunState::Completed })
                 })
                 .unwrap();
@@ -162,6 +167,9 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].reason, Some(Attention::AgentFailed));
         assert_eq!(rows[1].reason, Some(Attention::Review));
+        assert_eq!(rows[0].summary, "Нет подключения к исполнителю");
+        assert_eq!(rows[1].summary, "Черновики сохраняются для каждой задачи.");
+        assert_eq!(rows[1].backend, "codex");
         let id = rows[1].id;
         service
             .access(Access::Edit, |b, _| {
@@ -169,5 +177,37 @@ mod tests {
             })
             .unwrap();
         assert!(index(&service, root.path().to_str(), root.path()).unwrap()[1].reason.is_none());
+    }
+
+    #[test]
+    fn project_with_only_archived_tasks_remains_searchable_without_an_inbox_item() {
+        use hub_app::desktop_tasks::index;
+        use hub_core::tasks::service::Access;
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("archive");
+        std::fs::create_dir(&project).unwrap();
+        let service = TaskService::new(Box::new(FileTopics::new(root.path().join("topics.json"))));
+        let prompt = "Сводка по НОЧНОЙ смене";
+        let created = request(
+            &service,
+            &project,
+            BackendKind::Codex,
+            Request::Create { title: "Сводка".into(), prompt: prompt.into() },
+            None,
+            root.path(),
+        )
+        .unwrap();
+        let id = created.tasks[0].id;
+        service
+            .access(Access::Edit, |book, _| {
+                book.set_status(id, 1, TaskStatus::NeedsReview)?;
+                book.set_archived(id, book.get(id)?.revision, true)
+            })
+            .unwrap();
+        let rows = index(&service, root.path().to_str(), root.path()).unwrap();
+        assert!(
+            matches!(rows.as_slice(), [row] if row.id == id && row.archived && row.status == TaskStatus::NeedsReview
+            && row.prompt.as_ref() == prompt && row.reason.is_none() && row.summary.is_empty())
+        );
     }
 }

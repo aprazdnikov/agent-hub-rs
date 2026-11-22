@@ -28,6 +28,7 @@ pub const RETRY_MAX: Duration = Duration::from_mins(5);
 const OUTBOX_REFRESH: Duration = Duration::from_secs(5);
 
 pub enum Command {
+    RefreshTaskIndex,
     LocalStop(uuid::Uuid),
     LocalAnswer {
         token: uuid::Uuid,
@@ -453,16 +454,7 @@ impl<C: Connector> Supervisor<C> {
             Event::LocalTick => {
                 self.pump_queue();
                 if Instant::now() >= self.task_index_next {
-                    self.task_index_next = Instant::now() + Duration::from_secs(3);
-                    if let Some(service) = self.connector.task_service() {
-                        let root =
-                            self.state.saved.as_ref().map(|draft| draft.workspace_root.as_str());
-                        let index = crate::desktop_tasks::index(&service, root, &self.home);
-                        if self.state.task_index != index {
-                            self.state.task_index = index;
-                            self.publish();
-                        }
-                    }
+                    self.refresh_task_index();
                 }
                 let local = self.local.as_ref().ok().and_then(|local| local.snapshot());
                 let jobs = self.local.as_ref().map(|r| r.snapshots()).unwrap_or_default();
@@ -541,6 +533,18 @@ impl<C: Connector> Supervisor<C> {
                 Err(_) => OutboxStatus::Unavailable,
             };
             self.publish();
+        }
+    }
+
+    fn refresh_task_index(&mut self) {
+        self.task_index_next = Instant::now() + Duration::from_secs(3);
+        if let Some(service) = self.connector.task_service() {
+            let root = self.state.saved.as_ref().map(|draft| draft.workspace_root.as_str());
+            let index = crate::desktop_tasks::index(&service, root, &self.home);
+            if self.state.task_index != index {
+                self.state.task_index = index;
+                self.publish();
+            }
         }
     }
 
@@ -642,6 +646,7 @@ impl<C: Connector> Supervisor<C> {
 
     async fn handle(&mut self, command: Command) {
         match command {
+            Command::RefreshTaskIndex => self.refresh_task_index(),
             Command::LocalStop(token) => {
                 let result =
                     self.local.as_ref().map_err(Clone::clone).and_then(|local| local.stop(token));

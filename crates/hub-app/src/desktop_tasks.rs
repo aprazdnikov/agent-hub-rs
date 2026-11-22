@@ -1,7 +1,10 @@
 //! Local task management without credentials or a Telegram topic.
-use hub_core::{domain::BackendKind, tasks::service::TaskService};
+use hub_core::{
+    domain::BackendKind,
+    tasks::{RunState, Task, TaskStatus, git::PreparationState, service::TaskService},
+};
 use hub_telegram::hub::tasks::{Request, Snapshot, manage::manage};
-use std::path::Path;
+use std::{path::Path, sync::Arc};
 
 pub fn request(
     service: &TaskService,
@@ -26,13 +29,19 @@ pub fn request(
     manage(service, project.as_path(), backend, request)
 }
 
-/// Compact metadata for navigation across projects, without chat transcripts or patch output.
+/// Cross-project navigation metadata and a short excerpt for items that need attention.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskRow {
     pub id: u64,
     pub project: std::path::PathBuf,
     pub title: String,
+    /// The cross-project search reads the original prompt. GUI snapshots share its allocation.
+    pub prompt: Arc<str>,
+    pub backend: String,
+    pub status: TaskStatus,
+    pub archived: bool,
     pub reason: Option<Attention>,
+    pub summary: String,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Attention {
@@ -56,12 +65,84 @@ impl Attention {
         }
     }
 }
+impl From<&Task> for TaskRow {
+    fn from(task: &Task) -> Self {
+        let attention = attention(task);
+        Self {
+            id: task.id,
+            project: task.project.clone(),
+            title: task.title.clone(),
+            prompt: Arc::from(task.prompt.as_str()),
+            backend: task.backend.clone(),
+            status: task.status,
+            archived: task.archived,
+            reason: attention.map(|(reason, _)| reason),
+            summary: attention.map_or_else(String::new, |(_, text)| excerpt(text)),
+        }
+    }
+}
+
+pub(crate) fn excerpt(text: &str) -> String {
+    hub_core::render::truncate(text.trim(), 180).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn attention(task: &Task) -> Option<(Attention, &str)> {
+    if task.archived
+        || task.active()
+        || matches!(task.status, TaskStatus::Accepted | TaskStatus::Deferred)
+    {
+        return None;
+    }
+    if let Some(queue) = &task.queue {
+        return queue.error.as_deref().map(|error| (Attention::Queue, error));
+    }
+    if let Some(git) = &task.git
+        && matches!(git.state, PreparationState::Failed | PreparationState::Interrupted)
+    {
+        return Some((
+            Attention::Git,
+            if git.message.is_empty() { git.state.label() } else { &git.message },
+        ));
+    }
+    if task.status != TaskStatus::NeedsReview {
+        return None;
+    }
+    let Some(run) = task.runs.last() else {
+        return Some((Attention::Review, "Задача отмечена для проверки."));
+    };
+    if run.state == RunState::Interrupted {
+        return Some((
+            Attention::Interrupted,
+            first_text(&[&run.diagnostic, &run.result, run.state.label()]),
+        ));
+    }
+    if let Some(check) = run.workflow_report.checks.last().filter(|check| !check.passed) {
+        return Some((
+            Attention::CheckFailed,
+            first_text(&[&check.output, &run.diagnostic, "Проверка завершилась с ошибкой."]),
+        ));
+    }
+    if run.state == RunState::Failed {
+        return Some((
+            Attention::AgentFailed,
+            first_text(&[&run.diagnostic, &run.result, run.state.label()]),
+        ));
+    }
+    Some((
+        Attention::Review,
+        first_text(&[&run.result, &run.workflow_report.review, &run.diagnostic, run.state.label()]),
+    ))
+}
+
+fn first_text<'a>(choices: &[&'a str]) -> &'a str {
+    choices.iter().copied().find(|text| !text.trim().is_empty()).unwrap_or_default()
+}
+
 pub fn index(
     service: &TaskService,
     root: Option<&str>,
     home: &Path,
 ) -> Result<Vec<TaskRow>, String> {
-    use hub_core::tasks::{RunState, TaskStatus, git::PreparationState};
     let root = root
         .filter(|raw| !raw.trim().is_empty())
         .map(|raw| hub_core::workspace::expand_home(raw, home))
@@ -71,43 +152,9 @@ pub fn index(
         book.tasks()
             .iter()
             .filter(|task| {
-                !task.archived
-                    && root.as_ref().is_none_or(|root| task.project.starts_with(root.as_path()))
+                root.as_ref().is_none_or(|root| task.project.starts_with(root.as_path()))
             })
-            .map(|task| {
-                let last = task.runs.last();
-                let reason = if task.active()
-                    || matches!(task.status, TaskStatus::Accepted | TaskStatus::Deferred)
-                {
-                    None
-                } else if task.queue.as_ref().is_some_and(|q| q.error.is_some()) {
-                    Some(Attention::Queue)
-                } else if task.queue.is_some() {
-                    None
-                } else if task.git.as_ref().is_some_and(|g| {
-                    matches!(g.state, PreparationState::Failed | PreparationState::Interrupted)
-                }) {
-                    Some(Attention::Git)
-                } else if task.status != TaskStatus::NeedsReview {
-                    None
-                } else if last.is_some_and(|r| r.state == RunState::Interrupted) {
-                    Some(Attention::Interrupted)
-                } else if last
-                    .is_some_and(|r| r.workflow_report.checks.last().is_some_and(|c| !c.passed))
-                {
-                    Some(Attention::CheckFailed)
-                } else if last.is_some_and(|r| r.state == RunState::Failed) {
-                    Some(Attention::AgentFailed)
-                } else {
-                    Some(Attention::Review)
-                };
-                TaskRow {
-                    id: task.id,
-                    project: task.project.clone(),
-                    title: task.title.clone(),
-                    reason,
-                }
-            })
+            .map(TaskRow::from)
             .collect()
     })
 }

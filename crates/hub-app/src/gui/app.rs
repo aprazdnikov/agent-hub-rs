@@ -1,4 +1,4 @@
-//! The window: four tabs over the latest snapshot; closing it hides it into the tray.
+//! The desktop workspace, its inbox, and application settings.
 
 use std::path::PathBuf;
 use std::sync::mpsc as std_mpsc;
@@ -11,6 +11,8 @@ use crate::gui::log::LogView;
 use crate::gui::look::{Banner, BannerAction, active, banner};
 use crate::gui::settings::SettingsForm;
 use crate::gui::status;
+use crate::gui::tasks::SidebarAction;
+use crate::gui::theme;
 use crate::gui::topics::TopicsView;
 use crate::gui::tray::{Tray, TrayAction};
 use crate::logging::LogBuffer;
@@ -22,10 +24,15 @@ enum Tab {
     Attention,
     Tasks,
     Memory,
-    Status,
     Topics,
-    Log,
     Settings,
+}
+
+#[derive(Default, PartialEq, Eq, Clone, Copy)]
+enum DiagnosticPage {
+    #[default]
+    Status,
+    Log,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -70,6 +77,7 @@ pub struct HubApp {
     updates: watch::Receiver<UpdateState>,
     update_commands: mpsc::Sender<UpdateCommand>,
     tab: Tab,
+    diagnostic_page: DiagnosticPage,
     exit: ExitChoice,
     restart: Confirm,
     pending_exit: Option<Exit>,
@@ -84,21 +92,34 @@ pub struct HubApp {
 impl HubApp {
     fn navigation(&mut self, ui: &mut egui::Ui, count: usize) {
         let attention = if count == 0 {
-            "Требуют внимания".into()
+            "Входящие".into()
         } else {
-            format!("Требуют внимания ({count})")
+            format!("Входящие ({count})")
         };
-        for (tab, label) in [
-            (Tab::Attention, attention.as_str()),
-            (Tab::Tasks, "Задачи"),
-            (Tab::Topics, "Темы"),
-            (Tab::Memory, "Память"),
-            (Tab::Status, "Статус"),
-            (Tab::Log, "Лог"),
-            (Tab::Settings, "Настройки"),
-        ] {
-            ui.selectable_value(&mut self.tab, tab, label);
-        }
+        let wide = ui.available_width() >= 510.0;
+        ui.horizontal_wrapped(|ui| {
+            for (tab, label) in [
+                (Tab::Attention, attention.as_str()),
+                (Tab::Tasks, "Задачи"),
+                (Tab::Topics, "Темы Telegram"),
+            ] {
+                if theme::tab(ui, self.tab == tab, label).clicked() {
+                    self.tasks.leave_review();
+                    self.tab = tab;
+                }
+            }
+            let mut settings = |ui: &mut egui::Ui| {
+                if theme::tab(ui, self.tab == Tab::Settings, "Настройки").clicked() {
+                    self.tasks.leave_review();
+                    self.tab = Tab::Settings;
+                }
+            };
+            if wide {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), settings);
+            } else {
+                settings(ui);
+            }
+        });
     }
 
     #[must_use]
@@ -117,15 +138,6 @@ impl HubApp {
             update_commands,
             exit,
         } = setup;
-        let tab = match snapshot.borrow().bot {
-            BotStatus::Unconfigured if snapshot.borrow().local_only => Tab::Attention,
-            BotStatus::Unconfigured => Tab::Settings,
-            BotStatus::Stopped
-            | BotStatus::Starting
-            | BotStatus::Retrying { .. }
-            | BotStatus::Running { .. }
-            | BotStatus::Failed(_) => Tab::Attention,
-        };
         let mut form = SettingsForm::with_autostart(autostart);
         form.set_scale_path(ui_settings);
         Self {
@@ -138,7 +150,8 @@ impl HubApp {
             logs_dir,
             updates,
             update_commands,
-            tab,
+            tab: Tab::Attention,
+            diagnostic_page: DiagnosticPage::default(),
             exit,
             restart: Confirm::Hidden,
             pending_exit: None,
@@ -237,10 +250,11 @@ impl HubApp {
                     }
                 }
                 Some(BannerAction::Release) => {
-                    ui.hyperlink_to(
-                        "Открыть релизы",
-                        "https://github.com/aprazdnikov/agent-hub-rs/releases/latest",
-                    );
+                    if ui.button("Открыть релизы").clicked() {
+                        ui.ctx().open_url(egui::OpenUrl::new_tab(
+                            "https://github.com/aprazdnikov/agent-hub-rs/releases/latest",
+                        ));
+                    }
                 }
                 None => {
                     ui.spinner();
@@ -268,6 +282,33 @@ impl HubApp {
         if modal.should_close() {
             self.restart = Confirm::Hidden;
         }
+    }
+
+    fn settings(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot, send: &mut impl FnMut(Command)) {
+        self.form.show(ui, &self.home, active(snapshot), send);
+        if !self.form.diagnostics_open() {
+            return;
+        }
+        egui::CentralPanel::default().frame(egui::Frame::new().inner_margin(16)).show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for (page, label) in
+                    [(DiagnosticPage::Status, "Состояние"), (DiagnosticPage::Log, "Журнал")]
+                {
+                    if theme::tab(ui, self.diagnostic_page == page, label).clicked() {
+                        self.diagnostic_page = page;
+                    }
+                }
+            });
+            ui.add_space(12.0);
+            match self.diagnostic_page {
+                DiagnosticPage::Status => status::show(ui, snapshot, self.form.has_unsaved(), send),
+                DiagnosticPage::Log => {
+                    if let Some(action) = self.log.show(ui, &self.logs.lines(), &self.logs_dir) {
+                        self.form.apply(action);
+                    }
+                }
+            }
+        });
     }
 
     fn tray_actions(&mut self, ctx: &egui::Context, snapshot: &Snapshot) {
@@ -314,6 +355,9 @@ impl eframe::App for HubApp {
         }
         self.form.poll(ctx);
         self.topics.poll(ctx);
+        self.tasks.update(&mut |command| {
+            Self::send(&self.commands, command);
+        });
         let snapshot = self.snapshot.borrow().clone();
         self.tray_actions(ctx, &snapshot);
         if let Some((tray, _)) = &mut self.tray {
@@ -353,15 +397,18 @@ impl eframe::App for HubApp {
             }
         };
         let count = super::tasks::attention_count(&snapshot);
+        if self.tasks.take_inbox_return() && self.tab == Tab::Tasks {
+            self.tab = Tab::Attention;
+            send(Command::RefreshTaskIndex);
+        }
         egui::Panel::top("tabs")
             .frame(
                 egui::Frame::new()
                     .fill(ui.visuals().panel_fill)
-                    .inner_margin(egui::Margin::symmetric(20, 12)),
+                    .inner_margin(egui::Margin::symmetric(14, 7)),
             )
             .show(ui, |ui| {
-                ui.horizontal_wrapped(|ui| self.navigation(ui, count));
-                // Store failures matter most on «Настройки», where the app opens in exactly those cases.
+                self.navigation(ui, count);
                 if self.saving() {
                     let message = if snapshot.save_status == SaveStatus::Delayed {
                         "Сохранение задерживается. Повтор недоступен; при выходе результат может остаться неизвестным."
@@ -375,35 +422,44 @@ impl eframe::App for HubApp {
                 }
                 self.update_banner(ui, active(&snapshot));
             });
-        if self.tasks.project_navigation(ui, &snapshot, self.tab == Tab::Tasks) {
-            self.tab = Tab::Tasks;
+        if self.tab != Tab::Settings
+            && let Some(action) =
+                self.tasks.project_navigation(ui, &snapshot, self.tab == Tab::Tasks)
+        {
+            self.tab = match action {
+                SidebarAction::Tasks => Tab::Tasks,
+                SidebarAction::Memory(project) => {
+                    self.tasks.leave_review();
+                    self.memory.open_project(project);
+                    Tab::Memory
+                }
+            };
         }
         self.confirm_restart(ui.ctx(), active(&snapshot));
         self.confirm_pending_exit(ui.ctx());
-        let margin = if self.tab == Tab::Settings { 0 } else { 24 };
+        let margin = if self.tab == Tab::Settings { 0 } else { 20 };
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(ui.visuals().extreme_bg_color).inner_margin(margin))
             .show(ui, |ui| match self.tab {
                 Tab::Attention => {
-                    if self.tasks.show_attention(ui, &snapshot) {
+                    if self.tasks.show_attention(ui, &snapshot, &mut send) {
                         self.tab = Tab::Tasks;
                     }
+                    if snapshot.saved.is_none() {
+                        ui.add_space(8.0);
+                        if ui.button("Настроить приложение").clicked() {
+                            self.tab = Tab::Settings;
+                        }
+                    }
                 }
-                Tab::Status => status::show(ui, &snapshot, self.form.has_unsaved(), &mut send),
                 Tab::Topics => self.topics.show(ui, &snapshot, &mut send),
                 Tab::Tasks => self.tasks.show(ui, &snapshot, &mut send),
                 Tab::Memory => {
-                    egui::ScrollArea::both().id_salt("memory_outer").show(ui, |ui| {
-                        self.memory.show(ui, &snapshot, &self.home, &mut send);
+                    egui::ScrollArea::vertical().id_salt("memory_outer").show(ui, |ui| {
+                        self.memory.show(ui, &self.home);
                     });
                 }
-                Tab::Log => {
-                    if let Some(action) = self.log.show(ui, &self.logs.lines(), &self.logs_dir) {
-                        self.form.apply(action);
-                        self.tab = Tab::Settings;
-                    }
-                }
-                Tab::Settings => self.form.show(ui, &self.home, active(&snapshot), &mut send),
+                Tab::Settings => self.settings(ui, &snapshot, &mut send),
             });
         if save_sent {
             self.save_requested = Some(snapshot.save_revision);
@@ -415,14 +471,13 @@ impl eframe::App for HubApp {
 mod tests {
     use super::*;
 
-    #[test]
-    fn quit_and_restart_wait_for_confirmation_when_save_is_queued() {
+    fn app() -> HubApp {
         let (commands, _inbox) = mpsc::channel(4);
         let (_snapshot, watched) = watch::channel(Snapshot::default());
         let (_updates_tx, updates) = watch::channel(UpdateState::Idle);
         let (update_commands, _update_inbox) = mpsc::channel(1);
         let exit = Arc::new(Mutex::new(Exit::Staying));
-        let mut app = HubApp::new(AppSetup {
+        HubApp::new(AppSetup {
             autostart: Err("unavailable".to_owned()),
             initial_window: crate::autostart::Window::Visible,
             commands,
@@ -434,8 +489,20 @@ mod tests {
             ui_settings: std::env::temp_dir().join("agent-hub-ui-test.toml"),
             updates,
             update_commands,
-            exit: Arc::clone(&exit),
-        });
+            exit,
+        })
+    }
+
+    #[test]
+    fn first_launch_opens_inbox_with_settings_reachable_from_navigation() {
+        let app = app();
+        assert_eq!(app.tab, Tab::Attention);
+    }
+
+    #[test]
+    fn quit_and_restart_wait_for_confirmation_when_save_is_queued() {
+        let mut app = app();
+        let exit = Arc::clone(&app.exit);
         app.save_requested = Some(0);
         let ctx = egui::Context::default();
         app.leave(&ctx, Exit::Quitting);

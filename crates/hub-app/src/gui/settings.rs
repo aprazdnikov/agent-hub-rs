@@ -267,6 +267,10 @@ impl SettingsForm {
         }
     }
 
+    pub(super) fn diagnostics_open(&self) -> bool {
+        self.section == Section::Diagnostics
+    }
+
     /// Parses the draft once: the field errors and, when it parses, the settings.
     fn check(&self, home: &Path) -> (Vec<FieldError>, Option<Settings>) {
         match self.draft.parse(home) {
@@ -284,8 +288,11 @@ impl SettingsForm {
     ) {
         let (errors, parsed) = self.check(home);
         let compact = ui.available_height() < 280.0;
-        self.save_bar(ui, &errors, sessions, send);
         navigation::show(ui, &mut self.section, &errors);
+        if self.diagnostics_open() {
+            return;
+        }
+        self.save_bar(ui, &errors, sessions, send);
         egui::CentralPanel::default()
             .frame(egui::Frame::new().inner_margin(if compact {
                 egui::Margin::same(8)
@@ -337,6 +344,8 @@ impl SettingsForm {
             Section::Actions => self.actions(ui, errors),
             Section::Speech => self.speech(ui, errors),
             Section::Application => self.application(ui),
+            // System diagnostics use the live supervisor snapshot, outside the settings draft.
+            Section::Diagnostics => {}
             Section::Agents => match self.agent_page {
                 AgentPage::General => {
                     self.agent(ui);

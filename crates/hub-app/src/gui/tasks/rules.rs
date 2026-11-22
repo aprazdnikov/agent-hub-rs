@@ -61,17 +61,19 @@ impl Editor {
         blocked: bool,
     ) -> Option<Request> {
         let mut request = None;
-        ui.collapsing("Правила проекта", |ui| {
-            ui.label(format!("Сохранённая редакция: {} · текстовые инструкции: {}", self.saved.revision,
-                if self.saved.enabled { "Включены" } else { "Выключены" }));
-            ui.small("Общие для всех задач этого каталога. Подготовка Git выполняется приложением отдельно, до первого запуска.");
-            ui.add_enabled_ui(!saving, |ui| {
+        ui.label(format!(
+            "Сохранённая редакция: {} · текстовые инструкции: {}",
+            self.saved.revision,
+            if self.saved.enabled { "Включены" } else { "Выключены" }
+        ));
+        ui.small("Общие для всех задач этого каталога. Подготовка Git выполняется приложением отдельно, до первого запуска.");
+        ui.add_enabled_ui(!saving, |ui| {
                 ui.checkbox(&mut self.draft.enabled, "Добавлять правила к каждому запуску");
                 ui.add(egui::TextEdit::multiline(&mut self.draft.text)
                     .id_salt(("project_rules_text", project)).desired_rows(4).desired_width(f32::INFINITY)
                     .hint_text("Например: перед новой задачей обновлять базовую ветку Dev и создавать рабочую ветку от неё.").char_limit(16384));
             });
-            ui.add_enabled_ui(!saving, |ui| {
+        ui.add_enabled_ui(!saving, |ui| {
                 let mut enabled = self.draft.git.is_some();
                 if ui.checkbox(&mut enabled, "Требовать подготовку Git перед новой задачей").changed() {
                     self.draft.git = enabled.then(|| hub_core::tasks::git::GitPolicy { remote: "origin".into(), base: String::new() });
@@ -84,25 +86,52 @@ impl Editor {
                     ui.small("Перед новой задачей: чистый каталог → fetch → fast-forward базы → новая ветка. Без stash, reset и push.");
                 }
             });
-            ui.add_enabled_ui(!saving, |ui| self.workflow_settings(ui, project));
-            if self.draft.revision != self.saved.revision {
-                ui.label("Правила изменены в другой сессии. Ваш черновик сохранён на экране; скопируйте нужный текст и загрузите актуальную редакцию.");
-            } else if self.dirty() {
-                ui.label("Есть несохранённые изменения. Сохраните или загрузите сохранённую редакцию перед запуском.");
+        ui.add_enabled_ui(!saving, |ui| self.workflow_settings(ui, project));
+        if self.draft.revision != self.saved.revision {
+            ui.label("Правила изменены в другой сессии. Ваш черновик сохранён на экране; скопируйте нужный текст и загрузите актуальную редакцию.");
+        } else if self.dirty() {
+            ui.label("Есть несохранённые изменения. Сохраните или загрузите сохранённую редакцию перед запуском.");
+        }
+        if let Err(error) = self.draft.validate() {
+            ui.label(error);
+        }
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    !blocked
+                        && self.dirty()
+                        && self.draft.revision == self.saved.revision
+                        && self.draft.validate().is_ok(),
+                    egui::Button::new("Сохранить правила"),
+                )
+                .clicked()
+            {
+                request = Some(
+                    if self.draft.git == self.saved.git
+                        && self.draft.workflow == self.saved.workflow
+                    {
+                        Request::SaveRules {
+                            revision: self.draft.revision,
+                            enabled: self.draft.enabled,
+                            text: self.draft.text.clone(),
+                        }
+                    } else {
+                        Request::SaveProjectRules {
+                            revision: self.draft.revision,
+                            rules: self.draft.clone(),
+                        }
+                    },
+                );
             }
-            if let Err(error) = self.draft.validate() {
-                ui.label(error);
+            if ui
+                .add_enabled(
+                    !saving && self.dirty(),
+                    egui::Button::new("Загрузить сохранённую редакцию"),
+                )
+                .clicked()
+            {
+                self.accept(self.saved.clone());
             }
-            ui.horizontal(|ui| {
-                if ui.add_enabled(!blocked && self.dirty() && self.draft.revision == self.saved.revision && self.draft.validate().is_ok(), egui::Button::new("Сохранить правила")).clicked() {
-                    request = Some(if self.draft.git == self.saved.git && self.draft.workflow == self.saved.workflow {
-                        Request::SaveRules { revision: self.draft.revision, enabled: self.draft.enabled, text: self.draft.text.clone() }
-                    } else { Request::SaveProjectRules { revision: self.draft.revision, rules: self.draft.clone() } });
-                }
-                if ui.add_enabled(!saving && self.dirty(), egui::Button::new("Загрузить сохранённую редакцию")).clicked() {
-                    self.accept(self.saved.clone());
-                }
-            });
         });
         request
     }

@@ -92,6 +92,11 @@ fn apply(
             let id = book.create(project.to_path_buf(), backend.name(), &title, &prompt)?;
             Ok(vec![book.get(id)?.clone()])
         }
+        Request::EditPrompt { id, revision, prompt } => {
+            task(book, project, id)?;
+            book.edit_prompt(id, revision, &prompt)?;
+            Ok(vec![book.get(id)?.clone()])
+        }
         Request::Status { id, revision, status } => {
             task(book, project, id)?;
             book.set_status(id, revision, status)?;

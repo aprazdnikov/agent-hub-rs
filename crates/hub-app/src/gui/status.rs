@@ -1,4 +1,4 @@
-//! The «Статус» tab.
+//! Connection status and the saved-settings diagnostic checks.
 
 use eframe::egui;
 
@@ -9,7 +9,8 @@ use crate::supervisor::{BotStatus, Command, DiagnosticStatus, OutboxStatus, Snap
 
 pub fn show(ui: &mut egui::Ui, snapshot: &Snapshot, unsaved: bool, send: &mut impl FnMut(Command)) {
     egui::ScrollArea::vertical().show(ui, |ui| {
-        super::theme::page_heading(ui, "Статус", "Подключение к Telegram и готовность агентов.");
+        ui.heading("Состояние подключений");
+        ui.add_space(12.0);
         super::theme::surface(ui).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.strong("Telegram-бот");

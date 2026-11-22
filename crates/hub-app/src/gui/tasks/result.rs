@@ -2,10 +2,11 @@
 use eframe::egui;
 use hub_core::tasks::{Run, Task};
 
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Tab {
     #[default]
     Chat,
+    Parameters,
     Summary,
     Changes,
     Checks,
@@ -18,15 +19,26 @@ pub(super) struct View {
     anchor: Option<String>,
     note: String,
     run: Option<u32>,
-    scroll: bool,
     file_error: Option<String>,
 }
 impl View {
-    pub(super) fn keep_position(&mut self) {
-        self.scroll = false;
-    }
     pub(super) fn select(&mut self, tab: Tab, task: Option<u64>) {
-        *self = Self { task, tab, scroll: true, ..Default::default() };
+        *self = Self { task, tab, ..Default::default() };
+    }
+    pub(super) fn tab(&mut self, task: &Task) -> Tab {
+        if self.task != Some(task.id) {
+            self.select(Tab::Chat, Some(task.id));
+        }
+        self.tab
+    }
+    pub(super) fn review_run(task: &Task) -> Option<&Run> {
+        task.runs.iter().rev().find(|run| {
+            run.state != hub_core::tasks::RunState::Running
+                || !run.result.is_empty()
+                || !run.files.is_empty()
+                || !run.diff.is_empty()
+                || !run.workflow_report.is_empty()
+        })
     }
     pub(super) fn show(
         &mut self,
@@ -35,9 +47,10 @@ impl View {
         next: &str,
         editable: bool,
     ) -> Option<String> {
-        let run = task.runs.last()?;
-        if self.task != Some(task.id) {
-            *self = Self { task: Some(task.id), ..Default::default() };
+        let run = Self::review_run(task)?;
+        let section = self.tab;
+        if matches!(section, Tab::Checks | Tab::Changes | Tab::History) {
+            self.tab = Tab::Summary;
         }
         if self.run != Some(run.id) {
             self.file_error = None;
@@ -45,42 +58,39 @@ impl View {
             self.note.clear();
             self.run = Some(run.id);
         }
-        let response = ui
-            .horizontal_wrapped(|ui| {
-                ui.selectable_value(&mut self.tab, Tab::Chat, "Чат");
-                ui.selectable_value(&mut self.tab, Tab::Summary, "Результат");
-                ui.selectable_value(&mut self.tab, Tab::Changes, "Изменения");
-                ui.selectable_value(&mut self.tab, Tab::Checks, "Проверки");
-                ui.selectable_value(
-                    &mut self.tab,
-                    Tab::History,
-                    format!("История попыток ({})", task.runs.len()),
-                );
-            })
-            .response;
-        if self.scroll {
-            response.scroll_to_me(Some(egui::Align::Min));
-            self.scroll = false;
+        ui.add(
+            egui::Label::new(if run.result.is_empty() { run.state.label() } else { &run.result })
+                .wrap()
+                .selectable(true),
+        );
+        if !run.diagnostic.is_empty() {
+            ui.colored_label(ui.visuals().error_fg_color, &run.diagnostic);
         }
-        match self.tab {
-            Tab::Chat => {
-                self.chat(ui, task);
-                None
-            }
-            Tab::Summary => {
-                ui.label(if run.result.is_empty() { run.state.label() } else { &run.result });
-                if !run.diagnostic.is_empty() {
-                    ui.colored_label(ui.visuals().error_fg_color, &run.diagnostic);
-                }
-                self.files(ui, run);
-                None
-            }
-            Tab::Changes => self.changes(ui, task, run, next, editable),
-            Tab::Checks => {
-                report(ui, run);
-                None
-            }
-            Tab::History => {
+        ui.add_space(6.0);
+        let annotation = egui::CollapsingHeader::new("Изменения")
+            .id_salt(("result_diff", &task.project, task.id, run.id))
+            .open((section == Tab::Changes).then_some(true))
+            .show(ui, |ui| self.changes(ui, task, run, next, editable))
+            .body_returned
+            .flatten();
+        let checks = &run.workflow_report.checks;
+        let count = checks.iter().filter(|check| check.passed).count();
+        let checks_label = if checks.is_empty() {
+            "Проверки".to_owned()
+        } else {
+            format!("Проверки · пройдено {count} из {}", checks.len())
+        };
+        egui::CollapsingHeader::new(checks_label)
+            .id_salt(("result_checks", &task.project, task.id, run.id))
+            .open((section == Tab::Checks).then_some(true))
+            .show(ui, |ui| report(ui, run));
+        if !run.files.is_empty() {
+            ui.collapsing(format!("Файлы ({})", run.files.len()), |ui| self.files(ui, run));
+        }
+        egui::CollapsingHeader::new(format!("История попыток ({})", task.runs.len()))
+            .id_salt(("result_history", &task.project, task.id))
+            .open((section == Tab::History).then_some(true))
+            .show(ui, |ui| {
                 for attempt in task.runs.iter().rev() {
                     ui.collapsing(
                         format!(
@@ -114,41 +124,35 @@ impl View {
                         },
                     );
                 }
-                None
-            }
-        }
-    }
-    fn chat(&mut self, ui: &mut egui::Ui, task: &Task) {
-        egui::ScrollArea::vertical()
-            .id_salt(("task_chat", &task.project, task.id))
-            .max_height(260.0)
-            .stick_to_bottom(true)
-            .show(ui, |ui| {
-                for turn in &task.runs {
-                    ui.strong("Вы");
-                    ui.add(egui::Label::new(&turn.step).selectable(true));
-                    ui.strong(format!(
-                        "{} · {}",
-                        turn.backend.as_deref().unwrap_or(&task.backend),
-                        turn.state.label()
-                    ));
-                    if !turn.result.is_empty() {
-                        ui.add(egui::Label::new(&turn.result).selectable(true));
-                    }
-                    if !turn.diagnostic.is_empty() {
-                        ui.colored_label(ui.visuals().error_fg_color, &turn.diagnostic);
-                    }
-                    self.files(ui, turn);
-                    ui.add_space(6.0);
-                }
             });
+        annotation
+    }
+    pub(super) fn transcript(ui: &mut egui::Ui, task: &Task) {
+        for turn in &task.runs {
+            ui.strong("Вы");
+            ui.add(egui::Label::new(&turn.step).wrap().selectable(true));
+            ui.add_space(5.0);
+            ui.strong(format!(
+                "{} · {}",
+                turn.backend.as_deref().unwrap_or(&task.backend),
+                turn.state.label()
+            ));
+            if !turn.result.is_empty() {
+                ui.add(egui::Label::new(&turn.result).wrap().selectable(true));
+            }
+            if !turn.diagnostic.is_empty() {
+                ui.colored_label(ui.visuals().error_fg_color, &turn.diagnostic);
+            }
+            if !turn.files.is_empty() {
+                ui.small(format!("Файлов в результате · {}", turn.files.len()));
+            }
+            ui.add_space(12.0);
+        }
     }
     fn files(&mut self, ui: &mut egui::Ui, run: &Run) {
         if run.files.is_empty() {
             return;
         }
-        ui.separator();
-        ui.strong(format!("Файлы ({})", run.files.len()));
         for file in &run.files {
             ui.horizontal_wrapped(|ui| {
                 ui.label(&file.name);

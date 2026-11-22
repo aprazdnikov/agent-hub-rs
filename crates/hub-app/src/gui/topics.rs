@@ -11,6 +11,8 @@ use crate::supervisor::{Command, Snapshot};
 
 #[derive(Default)]
 pub struct TopicsView {
+    expanded: Option<TopicKey>,
+    filters_open: bool,
     resetting: Option<TopicKey>,
     deleting: Option<(TopicKey, String)>,
     deletion_result: Option<(TopicKey, tokio::sync::oneshot::Receiver<Result<(), String>>)>,
@@ -73,7 +75,8 @@ impl TopicsView {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot, send: &mut impl FnMut(Command)) {
-        super::theme::page_heading(ui, "Темы", "Сессии агентов в вашей Telegram-группе.");
+        ui.heading("Темы Telegram");
+        ui.add_space(8.0);
         if !snapshot.topics.is_empty() {
             ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
         }
@@ -107,7 +110,9 @@ impl TopicsView {
         if let Some(error) = &self.memory_error {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
-        self.filters(ui);
+        if !snapshot.topics.is_empty() {
+            self.filters(ui);
+        }
         if let Some(error) = self.opener.error() {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
@@ -116,24 +121,20 @@ impl TopicsView {
         }
         let topics: Vec<_> =
             snapshot.topics.iter().filter(|topic| self.filter.matches(topic)).collect();
-        ui.label(format!("Темы: {} из {}", topics.len(), snapshot.topics.len()));
         if snapshot.topics.is_empty() {
-            ui.label("Тем пока нет: они появляются, когда бот запущен и в группе есть сообщения.");
-        } else if topics.is_empty() {
-            ui.label("Темы не найдены. Измените поиск или сбросьте фильтры.");
+            ui.label("Темы появятся, когда бот получит сообщение в группе с темами.");
         } else {
-            egui::ScrollArea::both().show(ui, |ui| {
-                egui::Grid::new("topics").num_columns(6).striped(true).show(ui, |ui| {
-                    for header in ["Тема", "Бэкенд", "Каталог", "Сессия", "Статус", ""]
-                    {
-                        ui.strong(header);
-                    }
-                    ui.end_row();
-                    for topic in topics {
-                        self.row(ui, topic, send);
-                        ui.end_row();
-                    }
-                });
+            if topics.len() != snapshot.topics.len() {
+                ui.weak(format!("Темы: {} из {}", topics.len(), snapshot.topics.len()));
+            }
+            if topics.is_empty() {
+                ui.label("Темы не найдены. Измените поиск или сбросьте фильтры.");
+            }
+            egui::ScrollArea::vertical().id_salt("telegram_topic_rows").show(ui, |ui| {
+                for topic in topics {
+                    ui.push_id(topic.key, |ui| self.row(ui, topic, send));
+                    ui.separator();
+                }
             });
         }
         self.confirm(ui.ctx(), send);
@@ -147,6 +148,22 @@ impl TopicsView {
                     .hint_text("Поиск по названию или каталогу")
                     .desired_width(250.0),
             );
+            if ui.selectable_label(self.filters_open, "Фильтры").clicked() {
+                self.filters_open = !self.filters_open;
+            }
+            if (self.filter.backend.is_some()
+                || self.filter.phase.is_some()
+                || self.filter.state.is_some()
+                || !self.filter.query.is_empty())
+                && ui.button("Сбросить фильтры").clicked()
+            {
+                self.filter = TopicFilter::default();
+            }
+        });
+        if !self.filters_open {
+            return;
+        }
+        ui.horizontal_wrapped(|ui| {
             egui::ComboBox::from_id_salt("topic-backend")
                 .selected_text(self.filter.backend.map_or("Все бэкенды", BackendKind::name))
                 .show_ui(ui, |ui| {
@@ -174,111 +191,101 @@ impl TopicsView {
                         "свободна",
                     );
                 });
-            if ui.button("Сбросить фильтры").clicked() {
-                self.filter = TopicFilter::default();
-            }
+            egui::ComboBox::from_id_salt("topic-phase")
+                .selected_text(self.filter.phase.map_or("Все этапы", Phase::label))
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(&mut self.filter.phase, None, "Все этапы");
+                    for phase in Phase::ALL {
+                        ui.selectable_value(&mut self.filter.phase, Some(phase), phase.label());
+                    }
+                });
         });
-        egui::ComboBox::from_id_salt("topic-phase")
-            .selected_text(self.filter.phase.map_or("Все этапы", Phase::label))
-            .show_ui(ui, |ui| {
-                ui.selectable_value(&mut self.filter.phase, None, "Все этапы");
-                for phase in Phase::ALL {
-                    ui.selectable_value(&mut self.filter.phase, Some(phase), phase.label());
-                }
-            });
-        ui.separator();
     }
 
     fn row(&mut self, ui: &mut egui::Ui, topic: &TopicView, send: &mut impl FnMut(Command)) {
-        ui.push_id((topic.key, "name"), |ui| {
-            ui.vertical(|ui| {
-                ui.set_width(155.0);
-                let title = name(topic);
-                ui.add(egui::Label::new(&title).truncate()).on_hover_text(&title);
-                ui.horizontal(|ui| {
-                    let url = topic_url(topic.key);
-                    let telegram = ui.add_enabled(url.is_some(), egui::Button::new("Telegram"));
-                    let copy = ui.add_enabled(url.is_some(), egui::Button::new("Ссылка"));
-                    if let Some(url) = url {
-                        if telegram.on_hover_text("Открыть тему в Telegram").clicked() {
-                            self.opener.start(Destination::Topic(topic.key), ui.ctx());
-                        }
-                        if copy.on_hover_text("Скопировать ссылку на тему").clicked()
-                        {
-                            ui.ctx().copy_text(url);
-                        }
-                    } else {
-                        telegram.on_disabled_hover_text("Для этой темы нельзя построить ссылку");
-                        copy.on_disabled_hover_text("Для этой темы нельзя построить ссылку");
-                    }
-                });
-            })
+        let path = topic.session.cwd.as_path();
+        let project = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
+        let running = topic.state == TopicState::Running;
+        let phase = topic.progress.phase();
+        let state = if running && phase != Phase::Unknown {
+            phase.label()
+        } else {
+            state_text(topic.state)
+        };
+        let open = self.expanded == Some(topic.key);
+        let url = topic_url(topic.key);
+        ui.horizontal_wrapped(|ui| {
+            let title = name(topic);
+            ui.strong(&title);
+            let telegram = ui.add_enabled(url.is_some(), egui::Button::new("Telegram"));
+            if telegram.on_hover_text("Открыть тему в Telegram").clicked() {
+                self.opener.start(Destination::Topic(topic.key), ui.ctx());
+            }
+            if ui.selectable_label(open, "Параметры").clicked() {
+                self.expanded = if open { None } else { Some(topic.key) };
+            }
         });
-        ui.push_id((topic.key, "parameters"), |ui| {
-            ui.vertical(|ui| {
-                ui.set_width(210.0);
-                ui.label(topic.session.backend.name());
-                ui.add_enabled_ui(self.memory_reply.is_none(), |ui| {
-                    let value = super::memory::scope(ui, topic.session.preferences.memory);
-                    if value != topic.session.preferences.memory {
-                        let (reply, received) = tokio::sync::oneshot::channel();
-                        self.memory_reply = Some(received);
-                        self.memory_error = None;
-                        send(Command::TopicMemory { key: topic.key, value, reply });
-                    }
-                });
-                for line in topic.parameters.lines() {
-                    ui.add(egui::Label::new(line).truncate()).on_hover_text(&topic.parameters);
+        ui.weak(format!("{project} · {} · {state}", topic.session.backend.name()))
+            .on_hover_text(path.display().to_string());
+        if self.expanded != Some(topic.key) {
+            return;
+        }
+        ui.indent("topic_parameters", |ui| {
+            ui.add_enabled_ui(self.memory_reply.is_none(), |ui| {
+                let value =
+                    super::memory::scope(ui, "Память темы", topic.session.preferences.memory);
+                if value != topic.session.preferences.memory {
+                    let (reply, received) = tokio::sync::oneshot::channel();
+                    self.memory_reply = Some(received);
+                    self.memory_error = None;
+                    send(Command::TopicMemory { key: topic.key, value, reply });
                 }
             });
-        });
-        ui.push_id((topic.key, "path"), |ui| {
-            ui.vertical(|ui| {
-                ui.set_width(190.0);
-                let path = topic.session.cwd.as_path();
-                let text = path.display().to_string();
-                ui.add(egui::Label::new(&text).truncate()).on_hover_text(&text);
-                if ui.button("Открыть").on_hover_text("Открыть каталог проекта").clicked()
-                {
+            if running {
+                ui.weak(match topic.memory_enabled {
+                    Some(true) => "Память текущего запуска включена",
+                    Some(false) => "Память текущего запуска выключена",
+                    None => "Состояние памяти текущего запуска неизвестно",
+                });
+            }
+            for line in topic.parameters.lines() {
+                ui.label(line);
+            }
+            if phase != Phase::Unknown {
+                for line in topic.progress.describe(std::time::Instant::now()).lines() {
+                    ui.small(line);
+                }
+            }
+            ui.horizontal_wrapped(|ui| {
+                ui.label(path.display().to_string());
+                if ui.button("Открыть папку").clicked() {
                     self.opener.start(Destination::Folder(path.to_owned()), ui.ctx());
                 }
-            })
-        });
-        match &topic.session.session {
-            Some(id) => {
-                if ui
-                    .add(egui::Label::new(short_session(id.as_str())).sense(egui::Sense::click()))
-                    .on_hover_text("Скопировать полный session_id")
-                    .clicked()
+                if let Some(url) = url
+                    && ui.button("Скопировать ссылку").clicked()
+                {
+                    ui.ctx().copy_text(url);
+                }
+                if let Some(id) = &topic.session.session
+                    && ui
+                        .add(
+                            egui::Button::new(short_session(id.as_str()))
+                                .frame_when_inactive(false),
+                        )
+                        .on_hover_text("Скопировать полный session_id")
+                        .clicked()
                 {
                     ui.ctx().copy_text(id.as_str().to_owned());
                 }
-            }
-            None => {
-                ui.label("—");
-            }
-        }
-        let running = topic.state == TopicState::Running;
-        ui.push_id((topic.key, "progress"), |ui| {
-            ui.vertical(|ui| {
-                ui.set_width(230.0);
-                ui.small(state_text(topic.state));
-                let summary = topic.progress.describe(std::time::Instant::now());
-                for line in summary.lines() {
-                    ui.add(egui::Label::new(line).truncate()).on_hover_text(&summary);
-                }
             });
-        });
-        ui.push_id((topic.key, "controls"), |ui| {
-            ui.vertical(|ui| {
-                ui.horizontal(|ui| {
-                    if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
-                        send(Command::StopTopic(topic.key));
-                    }
-                    if ui.add_enabled(!running, egui::Button::new("Reset")).clicked() {
-                        self.resetting = Some(topic.key);
-                    }
-                });
+            ui.horizontal_wrapped(|ui| {
+                if ui.add_enabled(running, egui::Button::new("Остановить")).clicked() {
+                    send(Command::StopTopic(topic.key));
+                }
+                if ui.add_enabled(!running, egui::Button::new("Сбросить сессию")).clicked()
+                {
+                    self.resetting = Some(topic.key);
+                }
                 if ui
                     .add_enabled(
                         !running && topic.key.thread.0 > 1 && self.deletion_result.is_none(),
@@ -288,7 +295,7 @@ impl TopicsView {
                 {
                     self.deleting = Some((topic.key, name(topic)));
                 }
-            })
+            });
         });
     }
 
@@ -454,15 +461,17 @@ mod tests {
         stopped.progress.finish(true, now);
         let snapshot = Snapshot { topics: vec![waiting, stopped], ..Snapshot::default() };
         let mut commands = Vec::new();
+        click(&ctx, &mut view, &snapshot, "Фильтры", &mut commands);
         click(&ctx, &mut view, &snapshot, "Все этапы", &mut commands);
         click(&ctx, &mut view, &snapshot, "Ожидает разрешения", &mut commands);
+        click(&ctx, &mut view, &snapshot, "Параметры", &mut commands);
         let shown = labels(&draw(&ctx, &mut view, &snapshot));
         assert!(shown.iter().any(|text| text == "Темы: 1 из 2"));
         assert!(!shown.iter().any(|text| text == "Stopped"));
         assert!(shown.iter().any(|text| text.starts_with("Длительность запуска:")));
-        click(&ctx, &mut view, &snapshot, "Reset", &mut commands);
+        click(&ctx, &mut view, &snapshot, "Сбросить сессию", &mut commands);
         assert!(view.resetting.is_none(), "a waiting task is still busy");
-        click(&ctx, &mut view, &snapshot, "Stop", &mut commands);
+        click(&ctx, &mut view, &snapshot, "Остановить", &mut commands);
         assert!(matches!(commands.as_slice(), [Command::StopTopic(key)] if key.thread.0 == 7));
     }
 
@@ -474,15 +483,16 @@ mod tests {
             topics: vec![topic(42, "Бэкенд", BackendKind::Claude, TopicState::Waiting)],
             ..Snapshot::default()
         };
-        draw(&ctx, &mut view, &snapshot);
+        click(&ctx, &mut view, &snapshot, "Фильтры", &mut Vec::new());
+        click(&ctx, &mut view, &snapshot, "Параметры", &mut Vec::new());
         let shown = labels(&draw(&ctx, &mut view, &snapshot));
         for label in [
             "Поиск по названию или каталогу",
             "Все бэкенды",
             "Все состояния",
             "Telegram",
-            "Ссылка",
-            "Открыть",
+            "Скопировать ссылку",
+            "Открыть папку",
         ] {
             assert!(shown.iter().any(|text| text == label), "missing {label}: {shown:?}");
         }
@@ -537,21 +547,20 @@ mod tests {
         let shown = labels(&draw(&ctx, &mut view, &snapshot));
         assert!(shown.iter().any(|text| text == "Темы: 1 из 2"));
         assert!(!shown.iter().any(|text| text == "Фронтенд"));
-        let copied = click(&ctx, &mut view, &snapshot, "Ссылка", &mut commands);
+        click(&ctx, &mut view, &snapshot, "Параметры", &mut commands);
+        let copied = click(&ctx, &mut view, &snapshot, "Скопировать ссылку", &mut commands);
         assert!(copied.platform_output.commands.iter().any(|command| matches!(command,
             egui::OutputCommand::CopyText(text) if text == "https://t.me/c/1234567890/42")));
-        click(&ctx, &mut view, &snapshot, "Stop", &mut commands);
+        click(&ctx, &mut view, &snapshot, "Остановить", &mut commands);
         assert!(matches!(commands.as_slice(), [Command::StopTopic(key)] if key.thread.0 == 42));
         commands.clear();
         snapshot.topics.last_mut().unwrap().state = TopicState::Waiting;
-        click(&ctx, &mut view, &snapshot, "Reset", &mut commands);
+        click(&ctx, &mut view, &snapshot, "Сбросить сессию", &mut commands);
         assert!(commands.is_empty(), "reset requires confirmation");
         click(&ctx, &mut view, &snapshot, "Сбросить", &mut commands);
         assert!(matches!(commands.as_slice(), [Command::ResetTopic(key)] if key.thread.0 == 42));
         click(&ctx, &mut view, &snapshot, "Сбросить фильтры", &mut commands);
-        assert!(
-            labels(&draw(&ctx, &mut view, &snapshot)).iter().any(|text| text == "Темы: 2 из 2")
-        );
+        assert!(labels(&draw(&ctx, &mut view, &snapshot)).iter().any(|text| text == "Фронтенд"));
     }
 
     #[test]
@@ -563,6 +572,7 @@ mod tests {
             ..Snapshot::default()
         };
         let mut commands = Vec::new();
+        click(&ctx, &mut view, &snapshot, "Параметры", &mut commands);
         click(&ctx, &mut view, &snapshot, "Удалить тему", &mut commands);
         click(&ctx, &mut view, &snapshot, "Отмена", &mut commands);
         assert!(commands.is_empty());
@@ -590,6 +600,7 @@ mod tests {
             ..Snapshot::default()
         };
         let mut commands = Vec::new();
+        click(&ctx, &mut view, &snapshot, "Фильтры", &mut commands);
         click(&ctx, &mut view, &snapshot, "Все бэкенды", &mut commands);
         click(&ctx, &mut view, &snapshot, "claude", &mut commands);
         let shown = labels(&draw(&ctx, &mut view, &snapshot));
@@ -612,7 +623,8 @@ mod tests {
         let ctx = egui::Context::default();
         let mut view = TopicsView::default();
         let snapshot = Snapshot { topics: vec![deleted], ..Snapshot::default() };
-        click(&ctx, &mut view, &snapshot, "Открыть", &mut Vec::new());
+        click(&ctx, &mut view, &snapshot, "Параметры", &mut Vec::new());
+        click(&ctx, &mut view, &snapshot, "Открыть папку", &mut Vec::new());
         let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
             let shown = labels(&draw(&ctx, &mut view, &snapshot));
@@ -628,33 +640,18 @@ mod tests {
     }
 
     #[test]
-    fn topic_cells_stay_under_their_grid_headers() {
+    fn topic_details_show_launch_parameters_only_for_the_expanded_topic() {
         let ctx = egui::Context::default();
         let mut view = TopicsView::default();
         let mut configured = topic(42, "Alpha", BackendKind::Claude, TopicState::Waiting);
-        configured.parameters = "Параметры текущего запуска:\nМодель: model · тема\nРежим: plan · проект\nСледующий запуск:\nМодель: other · общие настройки".to_owned();
+        configured.parameters = "Модель: model · тема\nРежим: plan · проект".to_owned();
         let snapshot = Snapshot { topics: vec![configured], ..Snapshot::default() };
         draw(&ctx, &mut view, &snapshot);
-        let output = draw(&ctx, &mut view, &snapshot);
-        let x = |label| {
-            output
-                .shapes
-                .iter()
-                .find_map(|shape| {
-                    if let egui::Shape::Text(text) = &shape.shape
-                        && text.galley.text() == label
-                    {
-                        Some(text.pos.x)
-                    } else {
-                        None
-                    }
-                })
-                .unwrap()
-        };
-        assert!(x("claude") >= x("Бэкенд"), "backend cell is left of its header");
-        assert!(x("claude") < x("Каталог"), "backend cell exceeds its column");
-        for label in ["Модель: model · тема", "Режим: plan · проект"] {
-            assert!(x(label) >= x("Бэкенд") && x(label) < x("Каталог"));
-        }
+        let closed = labels(&draw(&ctx, &mut view, &snapshot));
+        assert!(!closed.iter().any(|line| line.contains("Модель: model")));
+        click(&ctx, &mut view, &snapshot, "Параметры", &mut Vec::new());
+        let open = labels(&draw(&ctx, &mut view, &snapshot));
+        assert!(open.iter().any(|line| line == "Модель: model · тема"));
+        assert!(open.iter().any(|line| line == "Режим: plan · проект"));
     }
 }
