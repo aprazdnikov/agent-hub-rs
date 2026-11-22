@@ -12,6 +12,11 @@ use crate::supervisor::{Command, Snapshot};
 #[derive(Default)]
 pub struct TopicsView {
     resetting: Option<TopicKey>,
+    deleting: Option<(TopicKey, String)>,
+    deletion_result: Option<(TopicKey, tokio::sync::oneshot::Receiver<Result<(), String>>)>,
+    deletion_notice: Option<Result<String, String>>,
+    memory_reply: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
+    memory_error: Option<String>,
     filter: TopicFilter,
     opener: Opener,
 }
@@ -49,6 +54,22 @@ fn state_text(state: TopicState) -> &'static str {
 impl TopicsView {
     pub fn poll(&mut self, ctx: &egui::Context) {
         self.opener.poll(ctx);
+        if let Some((key, receipt)) = self.deletion_result.as_mut() {
+            use tokio::sync::oneshot::error::TryRecvError;
+            let result = match receipt.try_recv() {
+                Ok(result) => result,
+                Err(TryRecvError::Empty) => {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                    return;
+                }
+                Err(TryRecvError::Closed) => {
+                    Err("Связь с ботом прервана. Проверьте тему в Telegram.".into())
+                }
+            };
+            self.deletion_notice =
+                Some(result.map(|()| format!("Тема #{} удалена из Telegram.", key.thread.0)));
+            self.deletion_result = None;
+        }
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot, send: &mut impl FnMut(Command)) {
@@ -56,7 +77,36 @@ impl TopicsView {
         if !snapshot.topics.is_empty() {
             ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
         }
-        self.opener.poll(ui.ctx());
+        self.poll(ui.ctx());
+        if self.deletion_result.is_some() {
+            ui.label("Удаление темы…");
+        }
+        match &self.deletion_notice {
+            Some(Ok(message)) => {
+                ui.label(message);
+            }
+            Some(Err(message)) => {
+                ui.colored_label(ui.visuals().error_fg_color, message);
+            }
+            None => {}
+        }
+        if let Some(reply) = &mut self.memory_reply {
+            use tokio::sync::oneshot::error::TryRecvError;
+            match reply.try_recv() {
+                Ok(result) => {
+                    self.memory_error = result.err();
+                    self.memory_reply = None;
+                }
+                Err(TryRecvError::Closed) => {
+                    self.memory_error = Some("Связь с ботом прервана.".into());
+                    self.memory_reply = None;
+                }
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+        if let Some(error) = &self.memory_error {
+            ui.colored_label(ui.visuals().error_fg_color, error);
+        }
         self.filters(ui);
         if let Some(error) = self.opener.error() {
             ui.colored_label(ui.visuals().error_fg_color, error);
@@ -87,6 +137,7 @@ impl TopicsView {
             });
         }
         self.confirm(ui.ctx(), send);
+        self.confirm_delete(ui.ctx(), send);
     }
 
     fn filters(&mut self, ui: &mut egui::Ui) {
@@ -167,6 +218,15 @@ impl TopicsView {
             ui.vertical(|ui| {
                 ui.set_width(210.0);
                 ui.label(topic.session.backend.name());
+                ui.add_enabled_ui(self.memory_reply.is_none(), |ui| {
+                    let value = super::memory::scope(ui, topic.session.preferences.memory);
+                    if value != topic.session.preferences.memory {
+                        let (reply, received) = tokio::sync::oneshot::channel();
+                        self.memory_reply = Some(received);
+                        self.memory_error = None;
+                        send(Command::TopicMemory { key: topic.key, value, reply });
+                    }
+                });
                 for line in topic.parameters.lines() {
                     ui.add(egui::Label::new(line).truncate()).on_hover_text(&topic.parameters);
                 }
@@ -210,15 +270,49 @@ impl TopicsView {
             });
         });
         ui.push_id((topic.key, "controls"), |ui| {
-            ui.horizontal(|ui| {
-                if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
-                    send(Command::StopTopic(topic.key));
-                }
-                if ui.add_enabled(!running, egui::Button::new("Reset")).clicked() {
-                    self.resetting = Some(topic.key);
+            ui.vertical(|ui| {
+                ui.horizontal(|ui| {
+                    if ui.add_enabled(running, egui::Button::new("Stop")).clicked() {
+                        send(Command::StopTopic(topic.key));
+                    }
+                    if ui.add_enabled(!running, egui::Button::new("Reset")).clicked() {
+                        self.resetting = Some(topic.key);
+                    }
+                });
+                if ui
+                    .add_enabled(
+                        !running && topic.key.thread.0 > 1 && self.deletion_result.is_none(),
+                        egui::Button::new("Удалить тему"),
+                    )
+                    .clicked()
+                {
+                    self.deleting = Some((topic.key, name(topic)));
                 }
             })
         });
+    }
+
+    fn confirm_delete(&mut self, ctx: &egui::Context, send: &mut impl FnMut(Command)) {
+        let Some((key, name)) = self.deleting.clone() else { return };
+        let modal = egui::Modal::new(egui::Id::new("delete-topic")).show(ctx, |ui| {
+            ui.heading("Удалить тему из Telegram?");
+            ui.label(format!("Тема «{name}» (#{}) и все её сообщения будут удалены для всей группы. Отменить это действие невозможно.", key.thread.0));
+            ui.horizontal(|ui| {
+                if ui.button("Отмена").clicked() {
+                    self.deleting = None;
+                }
+                if ui.button("Удалить из Telegram").clicked() {
+                    let (reply, receipt) = tokio::sync::oneshot::channel();
+                    self.deletion_result = Some((key, receipt));
+                    self.deletion_notice = None;
+                    self.deleting = None;
+                    send(Command::DeleteTopic { key, reply });
+                }
+            });
+        });
+        if modal.should_close() {
+            self.deleting = None;
+        }
     }
 
     fn confirm(&mut self, ctx: &egui::Context, send: &mut impl FnMut(Command)) {
@@ -457,6 +551,33 @@ mod tests {
         click(&ctx, &mut view, &snapshot, "Сбросить фильтры", &mut commands);
         assert!(
             labels(&draw(&ctx, &mut view, &snapshot)).iter().any(|text| text == "Темы: 2 из 2")
+        );
+    }
+
+    #[test]
+    fn topic_deletion_requires_confirmation_and_reports_result() {
+        let ctx = egui::Context::default();
+        let mut view = TopicsView::default();
+        let mut snapshot = Snapshot {
+            topics: vec![topic(42, "Проект", BackendKind::Claude, TopicState::Waiting)],
+            ..Snapshot::default()
+        };
+        let mut commands = Vec::new();
+        click(&ctx, &mut view, &snapshot, "Удалить тему", &mut commands);
+        click(&ctx, &mut view, &snapshot, "Отмена", &mut commands);
+        assert!(commands.is_empty());
+        click(&ctx, &mut view, &snapshot, "Удалить тему", &mut commands);
+        click(&ctx, &mut view, &snapshot, "Удалить из Telegram", &mut commands);
+        let Some(Command::DeleteTopic { key, reply }) = commands.pop() else {
+            panic!("missing confirmed deletion")
+        };
+        assert_eq!(key, snapshot.topics[0].key);
+        snapshot.topics.clear();
+        reply.send(Ok(())).unwrap();
+        assert!(
+            labels(&draw(&ctx, &mut view, &snapshot))
+                .iter()
+                .any(|text| text.contains("Тема #42 удалена"))
         );
     }
 

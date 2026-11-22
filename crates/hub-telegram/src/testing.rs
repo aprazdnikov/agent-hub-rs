@@ -31,6 +31,7 @@ impl crate::actions::ActionRunner for FakeActionRunner {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Call {
+    DeleteTopic(TopicKey),
     CreateTopic { chat: ChatId, name: String, thread: ThreadId },
     Send { target: Target, message: Outgoing, id: MessageId },
     Edit { chat: ChatId, message: MessageId, text: String, format: Format },
@@ -48,6 +49,7 @@ pub(crate) struct FakeMessenger {
     card_attempts: Mutex<Vec<Outgoing>>,
     topic_attempts: Mutex<Vec<(ChatId, String)>>,
     topics: Mutex<VecDeque<Result<ThreadId, SendError>>>,
+    pub(crate) deletion: Mutex<Option<Result<(), SendError>>>,
     sends: Mutex<VecDeque<Result<(), SendError>>>,
     edits: Mutex<VecDeque<Result<(), SendError>>>,
     edit_delay: Mutex<Option<oneshot::Receiver<()>>>,
@@ -140,6 +142,12 @@ impl FakeMessenger {
 }
 
 impl Messenger for FakeMessenger {
+    fn delete_topic(&self, key: TopicKey) -> BoxFuture<'_, Result<(), SendError>> {
+        self.record(Call::DeleteTopic(key));
+        let result = self.deletion.lock().unwrap().take().unwrap_or(Ok(()));
+        Box::pin(async { result })
+    }
+
     fn create_topic(
         &self,
         chat: ChatId,

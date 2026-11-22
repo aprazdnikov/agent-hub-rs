@@ -172,7 +172,7 @@ impl MemoryView {
             if ui
                 .add_enabled(
                     self.saving.is_none() && snapshot.save_status == SaveStatus::Idle,
-                    egui::Checkbox::new(&mut enabled, "Подключать память к агентам — все проекты"),
+                    egui::Checkbox::new(&mut enabled, "Подключать память к агентам по умолчанию"),
                 )
                 .changed()
             {
@@ -407,6 +407,18 @@ impl MemoryView {
             self.load(home, request);
         }
     }
+}
+
+pub(super) fn scope(ui: &mut egui::Ui, current: Option<bool>) -> Option<bool> {
+    let mut selected = current;
+    egui::ComboBox::from_label("Память проекта")
+        .selected_text(hub_core::options::memory_label(current))
+        .show_ui(ui, |ui| {
+            for mode in [None, Some(true), Some(false)] {
+                ui.selectable_value(&mut selected, mode, hub_core::options::memory_label(mode));
+            }
+        });
+    selected
 }
 
 #[cfg(test)]

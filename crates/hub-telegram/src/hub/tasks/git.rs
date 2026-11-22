@@ -12,7 +12,7 @@ enum Intent {
 
 pub(in crate::hub) struct Job {
     ticket: uuid::Uuid,
-    key: TopicKey,
+    pub(in crate::hub) key: TopicKey,
     session: TopicSession,
     settings: std::sync::Arc<hub_core::settings::Settings>,
     id: u64,

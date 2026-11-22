@@ -11,6 +11,11 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 use uuid::Uuid;
 
 impl Followers {
+    pub(in crate::hub) fn update_memory(&mut self, key: TopicKey, value: Option<bool>) {
+        if let Some(follow) = self.entries.get_mut(&key) {
+            follow.session.preferences.memory = value;
+        }
+    }
     pub(in crate::hub) fn invalidate(&mut self, key: TopicKey) {
         self.entries.remove(&key);
     }
@@ -25,7 +30,7 @@ struct Follow {
     session: TopicSession,
     last: Option<Live>,
     card: Option<MessageId>,
-    feedback: Option<u64>,
+    review_revision: Option<u64>,
     failures: u8,
     retry_at: Option<tokio::time::Instant>,
     delivery: Option<tokio::task::JoinHandle<Option<MessageId>>>,
@@ -119,6 +124,7 @@ impl<A: Agents> Hub<A> {
             if session.backend != backend {
                 return Err("Выберите тему с назначенным агентом задачи".into());
             }
+            settings.memory.enabled = session.preferences.memory.unwrap_or(settings.memory.enabled);
             session.preferences.resolve(backend, &settings)?.apply(&mut settings);
         }
         execution.dispatch(project, request, Arc::new(ExecutionSettings::from(&settings)))?;
@@ -149,6 +155,9 @@ impl<A: Agents> Hub<A> {
                 origin.user.map(UserId),
             )
         });
+        if origin.is_some_and(|(key, _)| self.deleting.contains_key(&key)) {
+            return;
+        }
         // One interactive card per topic. Start the next queued job here only after the
         // preceding job's terminal card has been delivered.
         if let Some((key, Some(_))) = origin
@@ -244,6 +253,14 @@ impl<A: Agents> Hub<A> {
     }
     fn follow_valid(&self, key: TopicKey, follow: &Follow) -> bool {
         self.shutdown.is_none()
+            && !self.topic_unavailable(key)
+            && self
+                .tasks
+                .inspect(|book| {
+                    book.get(follow.id)
+                        .is_ok_and(|task| task.project == follow.session.cwd.as_path())
+                })
+                .unwrap_or(false)
             && crate::telegram::allowed(
                 &self.settings.borrow().telegram,
                 Some(key.chat),
@@ -298,7 +315,7 @@ impl<A: Agents> Hub<A> {
                 last: None,
                 card: None,
                 delivery: None,
-                feedback: None,
+                review_revision: None,
                 failures: 0,
                 retry_at: None,
             };
@@ -362,7 +379,6 @@ impl<A: Agents> Hub<A> {
                 follow.failures = 0;
                 follow.retry_at = None;
             }
-            follow.feedback = None;
             let (result, review_revision) = if live.active {
                 (None, None)
             } else {
@@ -380,6 +396,7 @@ impl<A: Agents> Hub<A> {
                     })
                     .unwrap_or_default()
             };
+            follow.review_revision = review_revision;
             let delivery = super::shared_delivery::Delivery {
                 key: *key,
                 user: follow.user,
@@ -387,6 +404,7 @@ impl<A: Agents> Hub<A> {
                 live: live.clone(),
                 result,
                 review_revision,
+                tasks: self.tasks.clone(),
                 execution: execution.clone(),
                 settings: self.settings.clone(),
                 sender: self.sender.clone(),
@@ -535,9 +553,6 @@ impl<A: Agents> Hub<A> {
                 Ok("Отправляю изменения".into())
             }
             "feedback" => {
-                if let Some(follow) = self.follows.entries.get_mut(&key) {
-                    follow.feedback = Some(revision);
-                }
                 self.say(Target::Topic(key), format!("Ответьте на карточку результата задачи #{} текстом замечания. Это запустит следующую попытку.", live.id));
                 Ok("Ожидается замечание".into())
             }
@@ -571,16 +586,16 @@ impl<A: Agents> Hub<A> {
             {
                 return Err("Вопрос или доступ устарели".into());
             }
-            if let Some(revision) = follow.feedback {
+            if let Some(revision) = follow.review_revision {
                 let crate::inbound::Content::Text(next) = &inbound.content else {
                     return Err("Ответьте текстом".into());
                 };
                 let id = follow.id;
                 self.task_snapshot(key, Request::Start { id, revision, next: Some(next.clone()) })?;
                 if let Some(follow) = self.follows.entries.get_mut(&key) {
-                    follow.feedback = None;
+                    follow.review_revision = None;
                 }
-                return Ok("Замечание передано, запущена следующая попытка".into());
+                return Ok("Сообщение передано, запущена следующая попытка".into());
             }
             let execution = self.execution.as_ref().ok_or("Исполнитель недоступен")?;
             let live = execution

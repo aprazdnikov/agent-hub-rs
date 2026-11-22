@@ -42,6 +42,7 @@ struct Ticket {
 }
 
 struct Running {
+    target: Target,
     action: Action,
     run: String,
     cancel: CancellationToken,
@@ -71,6 +72,10 @@ impl Actions {
     #[must_use]
     pub fn is_idle(&self) -> bool {
         self.running.is_empty()
+    }
+
+    pub(crate) fn busy_in(&self, target: Target) -> bool {
+        self.running.values().any(|run| run.target == target)
     }
 
     pub fn shutdown(&self) {
@@ -231,6 +236,7 @@ impl Actions {
         self.running.insert(
             action.id().to_owned(),
             Running {
+                target,
                 action: action.clone(),
                 run: run.clone(),
                 cancel: cancel.clone(),

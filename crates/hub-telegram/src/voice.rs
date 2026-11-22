@@ -118,6 +118,13 @@ impl Voices {
         Self { drafts: HashMap::new(), transcriber, sender, mailbox }
     }
 
+    pub(crate) fn busy_in(&self, key: TopicKey) -> bool {
+        self.drafts.values().any(|draft| {
+            draft.key == key
+                && matches!(draft.phase, Phase::Recognizing | Phase::Publishing | Phase::Prompting)
+        })
+    }
+
     pub fn is_empty(&self) -> bool {
         self.drafts.is_empty()
     }

@@ -383,6 +383,32 @@ fn thread(key: TopicKey) -> tg::ThreadId {
 }
 
 impl Messenger for TelegramMessenger {
+    fn delete_topic(&self, key: TopicKey) -> BoxFuture<'_, Result<(), SendError>> {
+        Box::pin(async move {
+            match self.topics.delete_forum_topic(tg::ChatId(key.chat.0), thread(key)).await {
+                Ok(_) => Ok(()),
+                // The remote deletion may have succeeded before a timeout or local write failure.
+                Err(RequestError::Api(ApiError::Unknown(reason)))
+                    if reason.eq_ignore_ascii_case("Bad Request: message thread not found")
+                        || reason.eq_ignore_ascii_case("Bad Request: TOPIC_DELETED")
+                        || reason.eq_ignore_ascii_case("Bad Request: TOPIC_NOT_FOUND")
+                        || reason.eq_ignore_ascii_case("Bad Request: MESSAGE_THREAD_NOT_FOUND") =>
+                {
+                    Ok(())
+                }
+                Err(RequestError::RetryAfter(seconds)) => {
+                    Err(SendError::RetryAfter(seconds.duration()))
+                }
+                Err(RequestError::Api(_)) => Err(SendError::Rejected(
+                    "Проверьте, что бот — администратор с правом удалять сообщения.".into(),
+                )),
+                Err(_) => Err(SendError::Failed(
+                    "Результат удаления неизвестен. Проверьте тему в Telegram.".into(),
+                )),
+            }
+        })
+    }
+
     fn create_topic(
         &self,
         chat: ChatId,
@@ -709,6 +735,35 @@ mod tests {
         #[case] response: serde_json::Value,
         #[case] expected: Result<ThreadId, SendError>,
     ) {
+        let (messenger, requests, server) = topic_api(response).await;
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            messenger.create_topic(ChatId(-100), "Передача → Codex".to_owned()),
+        )
+        .await
+        .unwrap();
+        server.abort();
+        assert_eq!(
+            (result, requests.lock().unwrap().clone()),
+            (
+                expected,
+                vec![(
+                    "/bot1:test/createforumtopic".to_owned(),
+                    json!({
+                        "chat_id": -100, "name": "Передача → Codex"
+                    })
+                )]
+            )
+        );
+    }
+
+    async fn topic_api(
+        response: serde_json::Value,
+    ) -> (
+        TelegramMessenger,
+        Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
         use http_body_util::{BodyExt, Full};
         use hyper::body::Bytes;
         use hyper_util::rt::TokioIo;
@@ -744,24 +799,29 @@ mod tests {
         let bot =
             topic_bot("1:test").unwrap().set_api_url(format!("http://{address}/").parse().unwrap());
         let messenger = TelegramMessenger { files: bot.clone(), topics: bot.clone(), bot };
-        let result = tokio::time::timeout(
-            Duration::from_secs(2),
-            messenger.create_topic(ChatId(-100), "Передача → Codex".to_owned()),
-        )
-        .await
-        .unwrap();
+        (messenger, requests, server)
+    }
+
+    #[rstest::rstest]
+    #[case(json!({"ok":true,"result":true}), true)]
+    #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: message thread not found"}), true)]
+    #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: CHAT_ADMIN_REQUIRED"}), false)]
+    #[tokio::test]
+    async fn topic_deletion_uses_bot_api_once(
+        #[case] response: serde_json::Value,
+        #[case] success: bool,
+    ) {
+        let (messenger, requests, server) = topic_api(response).await;
+        let result =
+            messenger.delete_topic(TopicKey { chat: ChatId(-100), thread: ThreadId(42) }).await;
         server.abort();
+        assert_eq!(result.is_ok(), success, "{result:?}");
         assert_eq!(
-            (result, requests.lock().unwrap().clone()),
-            (
-                expected,
-                vec![(
-                    "/bot1:test/createforumtopic".to_owned(),
-                    json!({
-                        "chat_id": -100, "name": "Передача → Codex"
-                    })
-                )]
-            )
+            *requests.lock().unwrap(),
+            vec![(
+                "/bot1:test/deleteforumtopic".to_owned(),
+                json!({"chat_id":-100,"message_thread_id":42})
+            )]
         );
     }
 

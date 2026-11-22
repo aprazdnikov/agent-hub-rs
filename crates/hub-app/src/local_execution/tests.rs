@@ -402,9 +402,13 @@ async fn completed_task_snapshot_survives_next_task_start() {
 
 #[derive(Default)]
 struct ScriptedWorkflow {
+    memory: Option<PathBuf>,
     calls: std::sync::Mutex<Vec<(BackendKind, String)>>,
 }
 impl Executor for ScriptedWorkflow {
+    fn memory_base(&self) -> Option<PathBuf> {
+        self.memory.clone()
+    }
     fn run<'a>(
         &'a self,
         session: &'a TopicSession,
@@ -451,6 +455,7 @@ async fn host_workflow_repairs_once_preserves_evidence_and_requires_human_accept
         let command = format!("type {file}");
         let mut book = TaskBook::default();
         let id = book.create(project.path().into(), "qwen", "Title", "Fix").unwrap();
+        book.set_memory(id, 1, Some(fixable)).unwrap();
         book.configure_rules(
             project.path().into(),
             0,
@@ -465,14 +470,23 @@ async fn host_workflow_repairs_once_preserves_evidence_and_requires_human_accept
         )
         .unwrap();
         let service = Arc::new(TaskService::new(Box::new(Store(book))));
-        let executor = Arc::new(ScriptedWorkflow::default());
+        let memory = tempfile::tempdir().unwrap();
+        let executor = Arc::new(ScriptedWorkflow {
+            memory: Some(memory.path().join("memory")),
+            ..Default::default()
+        });
         let mut runtime =
             Runtime::new(service.clone(), executor.clone(), Arc::new(crate::git::LocalGitRunner));
         runtime
             .dispatch(
                 project.path(),
-                Request::StartChecked { id, revision: 1, next: None, rules_revision: 1 },
-                Arc::new(hub_core::settings::Draft::default().execution(project.path()).unwrap()),
+                Request::StartChecked { id, revision: 2, next: None, rules_revision: 1 },
+                {
+                    let mut settings =
+                        hub_core::settings::Draft::default().execution(project.path()).unwrap();
+                    settings.memory.enabled = !fixable;
+                    Arc::new(settings)
+                },
             )
             .unwrap();
         tokio::time::timeout(Duration::from_secs(10), async {
@@ -492,6 +506,16 @@ async fn host_workflow_repairs_once_preserves_evidence_and_requires_human_accept
         );
         assert_eq!(run.result, "Implementation");
         let calls = executor.calls.lock().unwrap();
+        let reader =
+            hub_memory::MemoryReader::new(&memory.path().join("memory"), project.path()).unwrap();
+        let page = reader.inspect("", 0, 20).unwrap();
+        assert_eq!(page.key_count, usize::from(fixable));
+        if fixable {
+            let entry = reader.get(&format!("hub-task-{id}-run-1"), None).unwrap();
+            assert_eq!(entry.author, "agent-hub");
+            assert_eq!(entry.sources, [format!("/task attempt {id} 1")]);
+            assert!(reader.recall().unwrap().contains("1/2"));
+        }
         assert_eq!(calls.len(), if fixable { 3 } else { 2 });
         assert!(calls[1].1.contains(file));
         if fixable {

@@ -19,7 +19,7 @@ pub mod lifecycle;
 mod portable;
 
 pub const PREFIX: &str = "memory:";
-pub const POLICY: &str = "Для всех проектов и агентов этого приложения. Применяется при следующем запуске процесса, включая продолжение сессии. Работающие процессы сохраняют прежнее подключение. Ручные CLI не затрагиваются; данные не удаляются.";
+pub const POLICY: &str = "Общее значение по умолчанию. Для отдельной темы или задачи можно выбрать другую настройку. Применяется при следующем запуске процесса, включая продолжение сессии. Работающие процессы сохраняют прежнее подключение. Ручные CLI не затрагиваются; данные не удаляются.";
 
 pub trait MemoryControl: Send + Sync {
     fn set_enabled(&self, enabled: bool) -> BoxFuture<'static, Result<(), String>>;
@@ -175,6 +175,10 @@ pub struct Browser {
     cancel: tokio_util::sync::CancellationToken,
 }
 impl Browser {
+    pub(crate) fn busy_in(&self, key: TopicKey) -> bool {
+        self.active.as_ref().is_some_and(|binding| binding.key == key)
+    }
+
     #[must_use]
     pub fn new(
         sender: Sender,
@@ -438,16 +442,16 @@ impl Browser {
         keyboard.push(vec![
             self.button(
                 if settings.memory.enabled {
-                    "Отключить для всех проектов"
+                    "Отключить по умолчанию"
                 } else {
-                    "Включить для всех проектов"
+                    "Включить по умолчанию"
                 }
                 .into(),
                 Binding { request: Request::Confirm(!settings.memory.enabled), ..binding.clone() },
             ),
         ]);
         format!(
-            "Память\nПроект: {}\nХранилище: {}\nКлючей: {}/500 · байт: {}/8388608\nНайдено: {}\nНастройка подключения: {}\n{}\n{}\nПоиск: /memory search ТЕКСТ\nОткрыть: /memory get КЛЮЧ [РЕВИЗИЯ]",
+            "Память\nПроект: {}\nХранилище: {}\nКлючей: {}/500 · байт: {}/8388608\nНайдено: {}\nПодключение по умолчанию: {}\n{}\n{}\nНастройка темы: /memory topic on|off|inherit\nПоиск: /memory search ТЕКСТ\nОткрыть: /memory get КЛЮЧ [РЕВИЗИЯ]",
             page.project.display(),
             page.directory.display(),
             page.key_count,
@@ -517,7 +521,7 @@ impl Browser {
                 }
                 if let Request::Confirm(enabled) = binding.request {
                     keyboard.push(vec![self.button(
-                        "Подтвердить для всех проектов".into(),
+                        "Подтвердить по умолчанию".into(),
                         Binding { request: Request::Set(enabled), ..binding.clone() },
                     )]);
                 }
@@ -741,7 +745,7 @@ mod tests {
         tokio::task::yield_now().await;
         let text =
             messenger.send_attempts().into_iter().map(|m| m.text).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("Настройка подключения: выключено"));
+        assert!(text.contains("Подключение по умолчанию: выключено"));
         assert!(text.contains("Подключение текущего процесса: включено"));
     }
 

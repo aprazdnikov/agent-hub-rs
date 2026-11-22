@@ -237,6 +237,34 @@ fn task_preview_is_read_only_and_preserves_multiline_step_and_previous_result() 
 }
 
 #[test]
+fn continuation_includes_recent_turns_in_order_and_keeps_large_latest_reply_intact() {
+    let mut book = TaskBook::default();
+    let id = book.create(std::env::temp_dir(), "qwen", "Chat", "First").unwrap();
+    for (next, result) in [(None, "One"), (Some("Second"), "Two"), (Some("Third"), "Three")] {
+        let revision = book.get(id).unwrap().revision;
+        let run = book.begin(id, revision, next).unwrap();
+        book.record(id, run, result).unwrap();
+        book.finish(id, run, RunState::Completed).unwrap();
+    }
+    let task = book.get(id).unwrap();
+    let context = task.preview(Some("Next")).unwrap();
+    assert!(context.find("qwen: One").unwrap() < context.find("Пользователь: Second").unwrap());
+    assert!(context.find("qwen: Two").unwrap() < context.find("Пользователь: Third").unwrap());
+    let revision = task.revision;
+    let run = book.begin(id, revision, Some("Fourth")).unwrap();
+    let large = "я".repeat(32768);
+    book.record(id, run, &large).unwrap();
+    book.finish(id, run, RunState::Completed).unwrap();
+    assert!(book.get(id).unwrap().preview(Some("Next")).unwrap().contains(&large));
+    let run = book.begin(id, book.get(id).unwrap().revision, Some("Fifth")).unwrap();
+    book.record(id, run, "Five").unwrap();
+    book.finish(id, run, RunState::Completed).unwrap();
+    let context = book.get(id).unwrap().preview(Some("Next")).unwrap();
+    assert!(context.contains("Более ранние сообщения") && context.contains("qwen: Five"));
+    assert!(!context.contains("qwen: One") && !context.contains(&large));
+}
+
+#[test]
 fn project_rules_are_revisioned_isolated_and_snapshotted_per_run() {
     let project = std::env::temp_dir();
     let mut book = TaskBook::default();
@@ -361,4 +389,20 @@ fn full_book_with_two_isolated_runs_can_finish_both_in_order() {
     let mut book = TaskBook::decode(&book.encode().unwrap()).unwrap();
     assert!(book.recover());
     assert!(book.encode().is_ok());
+}
+
+#[test]
+fn scoped_memory_survives_reload_and_respects_task_revision() {
+    use hub_core::tasks::TaskBook;
+    let mut book = TaskBook::default();
+    let id = book.create(std::env::temp_dir(), "qwen", "Title", "Task").unwrap();
+    assert_eq!(book.get(id).unwrap().memory, None);
+    book.set_memory(id, 1, Some(false)).unwrap();
+    assert!(book.set_memory(id, 1, Some(true)).is_err());
+    let mut book = TaskBook::decode(&book.encode().unwrap()).unwrap();
+    assert_eq!(book.get(id).unwrap().memory, Some(false));
+    book.set_memory(id, 2, None).unwrap();
+    book.enqueue(id, 3, None, false, None).unwrap();
+    assert!(book.set_memory(id, 4, Some(true)).is_err());
+    assert_eq!(book.get(id).unwrap().memory, None);
 }

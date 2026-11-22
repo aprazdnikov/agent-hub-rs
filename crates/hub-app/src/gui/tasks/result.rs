@@ -5,6 +5,7 @@ use hub_core::tasks::{Run, Task};
 #[derive(Default, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Tab {
     #[default]
+    Chat,
     Summary,
     Changes,
     Checks,
@@ -46,6 +47,7 @@ impl View {
         }
         let response = ui
             .horizontal_wrapped(|ui| {
+                ui.selectable_value(&mut self.tab, Tab::Chat, "Чат");
                 ui.selectable_value(&mut self.tab, Tab::Summary, "Результат");
                 ui.selectable_value(&mut self.tab, Tab::Changes, "Изменения");
                 ui.selectable_value(&mut self.tab, Tab::Checks, "Проверки");
@@ -61,6 +63,10 @@ impl View {
             self.scroll = false;
         }
         match self.tab {
+            Tab::Chat => {
+                self.chat(ui, task);
+                None
+            }
             Tab::Summary => {
                 ui.label(if run.result.is_empty() { run.state.label() } else { &run.result });
                 if !run.diagnostic.is_empty() {
@@ -111,6 +117,31 @@ impl View {
                 None
             }
         }
+    }
+    fn chat(&mut self, ui: &mut egui::Ui, task: &Task) {
+        egui::ScrollArea::vertical()
+            .id_salt(("task_chat", &task.project, task.id))
+            .max_height(260.0)
+            .stick_to_bottom(true)
+            .show(ui, |ui| {
+                for turn in &task.runs {
+                    ui.strong("Вы");
+                    ui.add(egui::Label::new(&turn.step).selectable(true));
+                    ui.strong(format!(
+                        "{} · {}",
+                        turn.backend.as_deref().unwrap_or(&task.backend),
+                        turn.state.label()
+                    ));
+                    if !turn.result.is_empty() {
+                        ui.add(egui::Label::new(&turn.result).selectable(true));
+                    }
+                    if !turn.diagnostic.is_empty() {
+                        ui.colored_label(ui.visuals().error_fg_color, &turn.diagnostic);
+                    }
+                    self.files(ui, turn);
+                    ui.add_space(6.0);
+                }
+            });
     }
     fn files(&mut self, ui: &mut egui::Ui, run: &Run) {
         if run.files.is_empty() {

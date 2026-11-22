@@ -511,6 +511,12 @@ impl MemoryReader {
             .get(key, revision)
     }
 
+    /// Compact, JSON-escaped excerpts from the newest active entries only.
+    pub fn recall(&self) -> Result<String, Error> {
+        let hits = self.inspect("", 0, 4)?.entries;
+        serde_json::to_string(&hits).map_err(|_| Error::Corrupt("cannot encode memory excerpts"))
+    }
+
     pub fn inspect(&self, query: &str, offset: usize, limit: usize) -> Result<MemoryPage, Error> {
         self.inspect_filtered(query, offset, limit, StatusFilter::Active)
     }

@@ -262,6 +262,12 @@ impl Prompt {
     }
 
     #[must_use]
+    pub fn with_prefix(mut self, prefix: &str) -> Self {
+        self.text.insert_str(0, prefix);
+        self
+    }
+
+    #[must_use]
     pub fn images(&self) -> &[Image] {
         &self.images
     }

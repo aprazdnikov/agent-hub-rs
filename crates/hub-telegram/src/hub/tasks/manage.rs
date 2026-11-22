@@ -47,6 +47,11 @@ fn apply(
     request: Request,
 ) -> Result<Vec<Task>, String> {
     match request {
+        Request::Memory { id, revision, enabled } => {
+            task(book, project, id)?;
+            book.set_memory(id, revision, enabled)?;
+            Ok(vec![book.get(id)?.clone()])
+        }
         Request::Queue { id, revision, isolated, next, origin } => {
             task(book, project, id)?;
             book.enqueue(id, revision, next, isolated, origin)?;
@@ -91,6 +96,11 @@ fn apply(
             task(book, project, id)?;
             book.set_status(id, revision, status)?;
             Ok(vec![book.get(id)?.clone()])
+        }
+        Request::Delete { id, revision } => {
+            task(book, project, id)?;
+            book.delete(id, revision)?;
+            Ok(Vec::new())
         }
         Request::Archive { id, revision, archived } => {
             task(book, project, id)?;

@@ -41,10 +41,7 @@ impl Options {
         }
         let store_dir = match store_dir {
             Some(path) => PathBuf::from(path),
-            None => directories::BaseDirs::new()
-                .ok_or("could not determine memory home directory")?
-                .home_dir()
-                .join(".agent-hub/memory"),
+            None => crate::default_base().ok_or("could not determine memory home directory")?,
         };
         if !store_dir.is_absolute() {
             return Err("--store-dir must be an absolute directory".into());

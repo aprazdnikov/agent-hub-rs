@@ -344,7 +344,7 @@ impl SettingsForm {
                     self.timeouts(ui, errors);
                     ui.checkbox(
                         &mut self.draft.memory.enabled,
-                        "Подключать память к агентам (все проекты)",
+                        "Подключать память к агентам по умолчанию",
                     );
                     ui.small(hub_telegram::memory::POLICY);
                 }

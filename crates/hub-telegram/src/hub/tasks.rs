@@ -26,7 +26,7 @@ pub fn result_buttons(revision: u64) -> Vec<Vec<Button>> {
     ]
 }
 
-pub const HELP: &str = "/task — задачи проекта\n/task rules\n/task git РЕДАКЦИЯ REMOTE БАЗОВАЯ_ВЕТКА\n/task git РЕДАКЦИЯ off\n/task prepare ID РЕВИЗИЯ НОВАЯ_ВЕТКА\n/task git-stop\n/task rules-set РЕДАКЦИЯ on|off | ТЕКСТ\n/task create Название | Поручение\n/task list [all|planned|review|accepted|deferred|archived] [поиск]\n/task get ID\n/task follow ID — управление общей задачей\n/task unfollow\n/task assign ID РЕВИЗИЯ АГЕНТ\n/task preview ID [Следующий шаг]\n/task attempt ID ПОПЫТКА\n/task status ID РЕВИЗИЯ planned|review|accepted|deferred\n/task archive ID РЕВИЗИЯ\n/task restore ID РЕВИЗИЯ\n/task queue ID РЕВИЗИЯ [следующий шаг] — очередь\n/task worktree ID РЕВИЗИЯ [следующий шаг] — очередь в отдельной копии репозитория\n/task unqueue ID РЕВИЗИЯ — снять с очереди\n/task run ID РЕВИЗИЯ\n/task resume ID РЕВИЗИЯ Следующий шаг после проверки прежних эффектов\nПри создании агент и каталог берутся из текущей темы. Повторный запуск всегда требует явного следующего шага; автоматического повтора нет. Результат запуска не означает приёмку пользователем.";
+pub const HELP: &str = "/task — задачи проекта\n/task rules\n/task git РЕДАКЦИЯ REMOTE БАЗОВАЯ_ВЕТКА\n/task git РЕДАКЦИЯ off\n/task prepare ID РЕВИЗИЯ НОВАЯ_ВЕТКА\n/task git-stop\n/task rules-set РЕДАКЦИЯ on|off | ТЕКСТ\n/task create Название | Поручение\n/task list [all|planned|review|accepted|deferred|archived] [поиск]\n/task get ID\n/task follow ID — управление общей задачей\n/task unfollow\n/task memory ID РЕВИЗИЯ on|off|inherit\n/task assign ID РЕВИЗИЯ АГЕНТ\n/task preview ID [Следующий шаг]\n/task attempt ID ПОПЫТКА\n/task status ID РЕВИЗИЯ planned|review|accepted|deferred\n/task archive ID РЕВИЗИЯ\n/task restore ID РЕВИЗИЯ\n/task delete ID РЕВИЗИЯ confirm — удалить задачу и историю\n/task queue ID РЕВИЗИЯ [следующий шаг] — очередь\n/task worktree ID РЕВИЗИЯ [следующий шаг] — очередь в отдельной копии репозитория\n/task unqueue ID РЕВИЗИЯ — снять с очереди\n/task run ID РЕВИЗИЯ\n/task resume ID РЕВИЗИЯ Следующий шаг после проверки прежних эффектов\nПри создании агент и каталог берутся из текущей темы. Повторный запуск всегда требует явного следующего шага; автоматического повтора нет. Результат запуска не означает приёмку пользователем.";
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     pub tasks: Vec<Task>,
@@ -35,6 +35,11 @@ pub struct Snapshot {
 }
 #[derive(Clone, Debug)]
 pub enum Request {
+    Memory {
+        id: u64,
+        revision: u64,
+        enabled: Option<bool>,
+    },
     Queue {
         id: u64,
         revision: u64,
@@ -92,6 +97,10 @@ pub enum Request {
         id: u64,
         revision: u64,
         status: TaskStatus,
+    },
+    Delete {
+        id: u64,
+        revision: u64,
     },
     Archive {
         id: u64,
@@ -196,25 +205,48 @@ fn parse_queue(command: &str, tail: &str) -> Result<Request, String> {
         })
     }
 }
+fn parse_search(tail: &str) -> Result<Request, String> {
+    let (filter, query) = word(tail).ok_or(HELP)?;
+    let (filter, query) = match filter {
+        "all" => (TaskFilter::All, query),
+        "archived" => (TaskFilter::Archived, query),
+        "planned" | "review" | "accepted" | "deferred" => {
+            (TaskFilter::Status(TaskStatus::parse(filter)?), query)
+        }
+        _ => (TaskFilter::Active, tail.trim_start()),
+    };
+    Ok(Request::Search { filter, query: query.into() })
+}
+fn parse_delete(tail: &str) -> Result<Request, String> {
+    let (id, tail) = word(tail).ok_or(HELP)?;
+    let (revision, confirmation) = word(tail).ok_or(HELP)?;
+    let id = id.parse().map_err(|_| HELP)?;
+    let revision = revision.parse().map_err(|_| HELP)?;
+    if confirmation.trim() != "confirm" {
+        return Err(format!(
+            "Удаление задачи #{id}, переписки и сохранённых вложений необратимо. Для подтверждения: /task delete {id} {revision} confirm"
+        ));
+    }
+    Ok(Request::Delete { id, revision })
+}
+fn parse_memory(tail: &str) -> Result<Request, String> {
+    let (id, rest) = word(tail).ok_or(HELP)?;
+    let (revision, mode) = word(rest).ok_or(HELP)?;
+    Ok(Request::Memory {
+        id: id.parse().map_err(|_| HELP)?,
+        revision: revision.parse().map_err(|_| HELP)?,
+        enabled: hub_core::options::parse_memory(mode.trim())?,
+    })
+}
 pub fn parse(raw: &str) -> Result<Request, String> {
     let Some((command, tail)) = word(raw) else { return Ok(Request::List) };
     match command {
         "git" | "prepare" | "git-stop" => parse_git(command, tail),
         "rules" if tail.trim().is_empty() => Ok(Request::Rules),
+        "memory" => parse_memory(tail),
         "rules-set" => parse_rules(tail),
         "list" if tail.trim().is_empty() => Ok(Request::List),
-        "list" => {
-            let (filter, query) = word(tail).ok_or(HELP)?;
-            let (filter, query) = match filter {
-                "all" => (TaskFilter::All, query),
-                "archived" => (TaskFilter::Archived, query),
-                "planned" | "review" | "accepted" | "deferred" => {
-                    (TaskFilter::Status(TaskStatus::parse(filter)?), query)
-                }
-                _ => (TaskFilter::Active, tail.trim_start()),
-            };
-            Ok(Request::Search { filter, query: query.into() })
-        }
+        "list" => parse_search(tail),
         "status" | "archive" | "restore" | "attempt" => {
             let (id, tail) = word(tail).ok_or(HELP)?;
             let (number, rest) = word(tail).ok_or(HELP)?;
@@ -239,6 +271,7 @@ pub fn parse(raw: &str) -> Result<Request, String> {
                 })
             }
         }
+        "delete" => parse_delete(tail),
         "assign" => {
             let (id, rest) = word(tail).ok_or(HELP)?;
             let (revision, backend) = word(rest).ok_or(HELP)?;
@@ -302,6 +335,7 @@ pub fn describe(task: &Task) -> String {
             )
         })
     });
+    let memory = hub_core::options::memory_label(task.memory);
     let archive = if task.archived { " · В архиве" } else { "" };
     let history = task
         .runs
@@ -329,7 +363,7 @@ pub fn describe(task: &Task) -> String {
     let diagnostic = task.runs.last().map_or("", |run| run.diagnostic.as_str());
     let git = task.git.as_ref().map_or(String::new(), hub_core::tasks::git::Preparation::describe);
     format!(
-        "Задача #{} · r{} · {} · {status}{archive}\n{queue}\n{git}\n{}\nПроект: {}\nПоручение: {}\n{}\n\nПоследний результат:\n{}\n{diagnostic}\n{report}\n\nДля первого запуска: /task run {} {}\nДля продолжения: /task resume {} {} СЛЕДУЮЩИЙ ШАГ\nЗавершение запуска не означает приёмку задачи.",
+        "Задача #{} · r{} · {} · {status}{archive}\n{queue}\n{git}\n{}\nПроект: {}\nПамять задачи: {memory}\nПоручение: {}\n{}\n\nПоследний результат:\n{}\n{diagnostic}\n{report}\n\nДля первого запуска: /task run {} {}\nДля продолжения: /task resume {} {} СЛЕДУЮЩИЙ ШАГ\nЗавершение запуска не означает приёмку задачи.",
         task.id,
         task.revision,
         task.backend,
@@ -629,7 +663,7 @@ impl<A: Agents> Hub<A> {
             let run = book.begin(id, revision, next)?;
             Ok((book.get(id)?.clone(), run, prompt))
         })?; // Durable attempt BEFORE launching the model.
-        self.launch(key, First::Prompt(prompt), None);
+        self.launch(key, First::Task(prompt, task.memory), None);
         if let Some(live) = self.running.get(&key) {
             self.task_runs.insert(key, ManagedRun { task: id, run, generation: live.generation });
             Ok(vec![task])
@@ -768,6 +802,7 @@ fn render_reply(request: Result<Request, String>, result: Result<Snapshot, Strin
                 rules.text
             )
         }
+        Ok(_) if matches!(request, Ok(Request::Delete { .. })) => "Задача удалена.".into(),
         Ok(Snapshot { tasks, .. }) if tasks.is_empty() => {
             format!("Задачи по выбранным условиям не найдены.\n{HELP}")
         }

@@ -80,7 +80,7 @@ impl TaskStorage for FileTopics {
     }
     fn save_tasks(&mut self, book: &hub_core::tasks::TaskBook) -> Result<(), String> {
         // Refuse to replace a corrupt/unknown sidecar, including external edits since startup.
-        self.load_tasks()?;
+        let previous = self.load_tasks()?;
         let path = self.path.with_extension("tasks.json");
         write_atomic(&path, &book.encode()?)
             .map_err(|e| format!("Не удалось сохранить задачи: {e}"))?;
@@ -88,7 +88,49 @@ impl TaskStorage for FileTopics {
         fs::File::open(path.parent().ok_or("Нет каталога задач")?)
             .and_then(|directory| directory.sync_all())
             .map_err(|e| format!("Запись задач могла сохраниться, но её долговечность не подтверждена: {e}. Перезапустите бота перед повтором."))?;
+        if previous.tasks().len() > book.tasks().len() {
+            let root = self.path.with_file_name("task-files");
+            purge_deleted_files(&root, &previous, book);
+        }
         Ok(())
+    }
+}
+
+fn purge_deleted_files(
+    root: &Path,
+    previous: &hub_core::tasks::TaskBook,
+    current: &hub_core::tasks::TaskBook,
+) {
+    let retained: std::collections::HashSet<_> = current
+        .tasks()
+        .iter()
+        .flat_map(|task| &task.runs)
+        .flat_map(|run| &run.files)
+        .map(|file| &file.key)
+        .collect();
+    for file in previous
+        .tasks()
+        .iter()
+        .filter(|task| current.get(task.id).is_err())
+        .flat_map(|task| &task.runs)
+        .flat_map(|run| &run.files)
+        .filter(|file| !retained.contains(&file.key))
+    {
+        let directory = root.join(&file.key);
+        let cleanup = || -> io::Result<()> {
+            for dir in [root, directory.as_path()] {
+                if !fs::symlink_metadata(dir)?.is_dir() {
+                    return Err(io::Error::other("Каталог вложения был заменён"));
+                }
+            }
+            fs::remove_file(directory.join(&file.name))?;
+            fs::remove_dir(&directory)
+        };
+        if let Err(error) = cleanup()
+            && error.kind() != io::ErrorKind::NotFound
+        {
+            tracing::warn!(%error, path = %directory.display(), "Не удалось удалить сохранённое вложение удалённой задачи");
+        }
     }
 }
 

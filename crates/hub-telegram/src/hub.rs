@@ -53,7 +53,9 @@ use crate::transfer::{
     Done, Reservation, Restoration, RestoreJob, SaveJob, holders, local_minute, supervise, utc_now,
 };
 
+mod deletion;
 pub mod tasks;
+pub use deletion::DeletionDone;
 
 pub(crate) const INBOX: usize = 32;
 const MAILBOX: usize = 256;
@@ -165,8 +167,18 @@ pub enum HubMessage {
         generation: u64,
         inbox: Option<mpsc::Receiver<Prompt>>,
     },
+    TopicMemory {
+        key: TopicKey,
+        value: Option<bool>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Stop(TopicKey),
     Reset(TopicKey),
+    DeleteTopic {
+        key: TopicKey,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    DeletionDone(DeletionDone),
     /// A `/save` or `/restore` reached a decision point or finished its file work.
     Snapshot(SnapshotDone),
     /// A live session reported subscription limits.
@@ -267,6 +279,9 @@ struct Hub<A> {
     shutdown: Option<(oneshot::Sender<()>, Instant)>,
     /// Topics with a `/save` or `/restore` in flight: no turn or session change starts there.
     snapshotting: HashSet<TopicKey>,
+    telegram_identity: hub_core::settings::TelegramSettings,
+    deleting: HashMap<TopicKey, oneshot::Sender<Result<(), String>>>,
+    deleted: HashSet<TopicKey>,
     /// Names being written now, so two topics cannot race for one name.
     naming: HashSet<SnapshotName>,
     /// Agent sessions a snapshot job works on, and the topic that asked: no second job and
@@ -305,7 +320,9 @@ pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
     if execution.is_none() {
         let _ = tasks.recover();
     }
+    let telegram_identity = settings.borrow().telegram.clone();
     let hub = Hub {
+        telegram_identity,
         execution,
         follows: tasks::shared::Followers::default(),
         task_deliveries: tasks::Deliveries::default(),
@@ -354,6 +371,8 @@ pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
         views,
         shutdown: None,
         snapshotting: HashSet::new(),
+        deleting: HashMap::new(),
+        deleted: HashSet::new(),
         naming: HashSet::new(),
         reserved: HashMap::new(),
         quotas: QuotaCache::default(),
@@ -400,6 +419,7 @@ impl<A: Agents> Hub<A> {
                 && self.actions.is_idle()
                 && self.git_job.is_none()
                 && self.handoffs.is_idle()
+                && self.deleting.is_empty()
             {
                 break;
             }
@@ -411,6 +431,11 @@ impl<A: Agents> Hub<A> {
     }
 
     fn press(&mut self, pressed: Press) {
+        if let (Some(chat), Some(thread)) = (pressed.chat, pressed.thread)
+            && self.topic_unavailable(TopicKey { chat, thread })
+        {
+            return;
+        }
         if pressed.data.starts_with(tasks::shared::PREFIX) {
             self.shared_press(pressed);
             return;
@@ -502,9 +527,10 @@ impl<A: Agents> Hub<A> {
                 self.unavailable_task(key, generation, &reason);
             }
             HubMessage::Tasks { key, project, backend, request, reply } => {
-                let result = if self.topics.get(&key).is_some_and(|session| {
-                    session.cwd.as_path() == project && session.backend == backend
-                }) {
+                let result = if !self.topic_unavailable(key)
+                    && self.topics.get(&key).is_some_and(|session| {
+                        session.cwd.as_path() == project && session.backend == backend
+                    }) {
                     self.task_snapshot(key, request)
                 } else {
                     Err("Проект или агент темы изменились. Обновите список.".into())
@@ -553,20 +579,30 @@ impl<A: Agents> Hub<A> {
                 }
             }
             HubMessage::Bind { key, generation, session } => {
-                if generation.is_none_or(|id| {
-                    self.running.get(&key).is_some_and(|live| live.generation == id)
-                }) {
+                if !self.topic_unavailable(key)
+                    && generation.is_none_or(|id| {
+                        self.running.get(&key).is_some_and(|live| live.generation == id)
+                    })
+                {
                     self.bind(key, session);
                 }
             }
             HubMessage::Ended { key, generation, inbox } => self.ended(key, generation, inbox),
+            HubMessage::TopicMemory { key, value, reply } => {
+                let _ = reply.send(self.set_topic_memory(key, value));
+            }
             HubMessage::Stop(key) => {
                 if self.shared_stop(key) {
                     return;
                 }
                 self.stop(key);
             }
+            HubMessage::DeleteTopic { key, reply } => self.delete_topic(key, reply),
+            HubMessage::DeletionDone(done) => self.finish_deletion(done),
             HubMessage::Reset(key) => {
+                if self.topic_unavailable(key) {
+                    return;
+                }
                 // Like `/reset`: not during a turn or a snapshot of this topic.
                 if !self.running.contains_key(&key)
                     && !self.handoff_busy(key)
@@ -626,6 +662,9 @@ impl<A: Agents> Hub<A> {
     }
 
     fn inbound(&mut self, inbound: Inbound) {
+        if inbound.key().is_some_and(|key| self.topic_unavailable(key)) {
+            return;
+        }
         self.handoffs.refresh(&self.settings.borrow(), &self.topics);
         if let Some(key) = inbound.key()
             && !matches!(
@@ -794,7 +833,45 @@ impl<A: Agents> Hub<A> {
         tokio::spawn(projects::send_card(self.sender.clone(), key, card));
     }
 
+    fn set_topic_memory(&mut self, key: TopicKey, memory: Option<bool>) -> Result<(), String> {
+        if self.topic_unavailable(key) || self.shutdown.is_some() {
+            return Err("Тема недоступна".into());
+        }
+        if key.chat != self.settings.borrow().telegram.chat {
+            return Err("Тема другой группы".into());
+        }
+        let mut next = self.topics.clone();
+        let session = next.get_mut(&key).ok_or("Сначала выберите проект: /projects")?;
+        session.preferences.memory = memory;
+        self.store
+            .save(&next)
+            .map_err(|e| format!("Не удалось сохранить настройку памяти: {e}"))?;
+        self.follows.update_memory(key, memory);
+        self.topics = next;
+        Ok(())
+    }
+
     fn memory_menu(&mut self, key: TopicKey, user: Option<UserId>, args: &str) {
+        if args.split_whitespace().next() == Some("topic") {
+            if !crate::telegram::allowed(&self.settings.borrow().telegram, Some(key.chat), user) {
+                return;
+            }
+            let mode = args.strip_prefix("topic").unwrap_or("").trim();
+            let result = if mode.is_empty() {
+                self.topics
+                    .get(&key)
+                    .map(|session| session.preferences.memory)
+                    .ok_or_else(|| "Сначала выберите проект: /projects".to_owned())
+            } else {
+                hub_core::options::parse_memory(mode).and_then(|value| {
+                    self.set_topic_memory(key, value)?;
+                    Ok(value)
+                })
+            };
+            let text = result.map_or_else(|err| err, |value| format!("Память темы: {}. Изменения действуют со следующего запуска.\n/memory topic on|off|inherit", hub_core::options::memory_label(value)));
+            self.say(Target::Topic(key), text);
+            return;
+        }
         if args.split_whitespace().next() == Some("procedure") {
             let text = if matches!(crate::memory::parse(args), Ok(crate::memory::Request::Admin(action)) if matches!(*action, crate::memory::lifecycle::Action::Procedure))
             {
@@ -1023,6 +1100,7 @@ impl<A: Agents> Hub<A> {
             || self.handoff_refusal(source).is_some()
             || claimed
             || self.running.contains_key(&destination)
+            || self.topic_unavailable(destination)
             || destination == source
             || destination.thread.0 <= 0
         {
@@ -1110,6 +1188,9 @@ impl<A: Agents> Hub<A> {
     }
 
     fn deliver(&mut self, key: TopicKey, prompt: Prompt) {
+        if self.topic_unavailable(key) {
+            return;
+        }
         if self.task_runs.contains_key(&key) {
             self.say(Target::Topic(key), "В теме выполняется сохранённая задача. Для нового поручения дождитесь завершения или используйте /stop; продолжение задаётся через /task resume.".into());
             return;
@@ -1196,6 +1277,9 @@ impl<A: Agents> Hub<A> {
             }
         };
         parameters.apply(&mut settings);
+        let task_memory = if let First::Task(_, memory) = &first { *memory } else { None };
+        settings.memory.enabled =
+            task_memory.or(session.preferences.memory).unwrap_or(settings.memory.enabled);
         let settings = Arc::new(settings);
         let (inbox, receiver) = reuse.unwrap_or_else(|| mpsc::channel(INBOX));
         self.generation += 1;
@@ -1307,7 +1391,9 @@ impl<A: Agents> Hub<A> {
         let running = self.topics.iter().any(|(topic, session)| {
             session.backend == *backend
                 && session.session.as_ref() == Some(id)
-                && (self.running.contains_key(topic) || self.handoff_busy(*topic))
+                && (self.running.contains_key(topic)
+                    || self.handoff_busy(*topic)
+                    || self.topic_unavailable(*topic))
         });
         if self.reserved.contains_key(reservation) {
             Some(texts::SESSION_RESERVED)
@@ -1548,7 +1634,9 @@ impl<A: Agents> Hub<A> {
         let involved = || std::iter::once(&key).chain(&holders);
         let refusal = if involved().any(|topic| self.running.contains_key(topic)) {
             Some(texts::SESSION_BUSY_ELSEWHERE)
-        } else if involved().any(|topic| self.snapshotting.contains(topic)) {
+        } else if involved()
+            .any(|topic| self.snapshotting.contains(topic) || self.topic_unavailable(*topic))
+        {
             Some(texts::SESSION_RESERVED)
         } else {
             None
@@ -1614,7 +1702,10 @@ impl<A: Agents> Hub<A> {
         self.topics = next;
     }
 
-    fn put(&mut self, key: TopicKey, session: TopicSession) {
+    fn put(&mut self, key: TopicKey, mut session: TopicSession) {
+        if let Some(current) = self.topics.get(&key) {
+            session.preferences.memory = current.preferences.memory;
+        }
         self.invalidate_handoff(key);
         self.voices.invalidate(key);
         if !self.running.contains_key(&key) {
@@ -1810,6 +1901,8 @@ impl<A: Agents> Hub<A> {
                 }
                 let mut session = TopicSession::fresh(ticket.project.backend(), cwd);
                 session.preferences = ticket.project.preferences();
+                session.preferences.memory =
+                    self.topics.get(&key).and_then(|topic| topic.preferences.memory);
                 let mut next = self.topics.clone();
                 next.insert(key, session.clone());
                 if let Err(error) = self.store.save(&next) {
@@ -2528,6 +2621,121 @@ mod tests {
             usage: Usage::Claude { turns: 1, cost: None },
             background: 0,
         })
+    }
+
+    async fn delete_topic(world: &World, key: TopicKey) -> Result<(), String> {
+        let (reply, result) = oneshot::channel();
+        world.send(HubMessage::DeleteTopic { key, reply }).await;
+        result.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn topic_deletion_rejects_live_work_and_retries_cleanup() {
+        let world = world(FakeAgents::scripted(vec![Script::UntilStopped]));
+        world.send(text(Some(7), 1, "Работа")).await;
+        eventually("running", || world.running()).await;
+        assert!(delete_topic(&world, KEY).await.is_err());
+        assert!(!world.messenger.calls().iter().any(|call| matches!(call, Call::DeleteTopic(_))));
+        world.send(HubMessage::Stop(KEY)).await;
+        eventually("stopped", || !world.running()).await;
+        *world.messenger.deletion.lock().unwrap() =
+            Some(Err(crate::messenger::SendError::Rejected("нет прав".into())));
+        assert!(delete_topic(&world, KEY).await.unwrap_err().contains("нет прав"));
+        assert!(world.store.last().unwrap().contains_key(&KEY));
+        world.store.fail.store(true, Ordering::SeqCst);
+        assert!(delete_topic(&world, KEY).await.unwrap_err().contains("удалена в Telegram"));
+        world.store.fail.store(false, Ordering::SeqCst);
+        delete_topic(&world, KEY).await.unwrap();
+        assert!(world.store.last().unwrap().is_empty());
+        assert_eq!(
+            world
+                .messenger
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, Call::DeleteTopic(_)))
+                .count(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn topic_deletion_protects_queue_and_undelivered_answers() {
+        use hub_core::tasks::{queue::Origin, service::Access};
+        let world = world(FakeAgents::default());
+        world.send(inbound(Some(7), 1, Content::TopicCreated { name: "Очередь".into() })).await;
+        let id = world
+            .tasks
+            .access(Access::Edit, |book, _| {
+                let id = book
+                    .create(world.root.path().to_owned(), "claude", "Задача", "Проверь")
+                    .unwrap();
+                book.enqueue(
+                    id,
+                    book.get(id)?.revision,
+                    None,
+                    false,
+                    Some(Origin { chat: KEY.chat.0, thread: KEY.thread.0, user: Some(1) }),
+                )?;
+                Ok(id)
+            })
+            .unwrap();
+        assert!(delete_topic(&world, KEY).await.unwrap_err().contains("очереди"));
+        world
+            .tasks
+            .access(Access::Edit, |book, _| book.unqueue(id, book.get(id)?.revision))
+            .unwrap();
+        let record = hub_core::results::SavedResult::new(
+            KEY,
+            "c".repeat(32),
+            world.results.now() + 60,
+            &world.store.last().unwrap()[&KEY].clone().with_session(SessionId::parse("saved")),
+            "Ответ".into(),
+        )
+        .unwrap();
+        world.results.save(hub_core::outbox::Pending::new(record, "").unwrap()).await.unwrap();
+        assert!(delete_topic(&world, KEY).await.unwrap_err().contains("/outbox"));
+        assert!(!world.messenger.calls().iter().any(|call| matches!(call, Call::DeleteTopic(_))));
+    }
+
+    #[tokio::test]
+    async fn topic_deletion_is_scoped_and_durable() {
+        let mut world = world(FakeAgents::default());
+        world.send(inbound(Some(7), 1, Content::TopicCreated { name: "Старая".into() })).await;
+        world.send(inbound(Some(8), 2, Content::TopicCreated { name: "Соседняя".into() })).await;
+        for key in [TopicKey { thread: ThreadId(1), ..KEY }, TopicKey { chat: ChatId(-999), ..KEY }]
+        {
+            world
+                .send(HubMessage::Bind {
+                    key,
+                    generation: None,
+                    session: SessionId::parse("existing").unwrap(),
+                })
+                .await;
+            assert!(delete_topic(&world, key).await.is_err());
+            assert!(world.store.last().unwrap().contains_key(&key));
+        }
+        delete_topic(&world, KEY).await.unwrap();
+        world.restart().await;
+        eventually("surviving topics", || world.handle.views.borrow().len() == 3).await;
+        assert!(
+            world
+                .handle
+                .views
+                .borrow()
+                .iter()
+                .any(|topic| topic.title.as_deref() == Some("Соседняя"))
+        );
+        assert!(!world.handle.views.borrow().iter().any(|topic| topic.key == KEY));
+        assert!(!world.store.titles.lock().unwrap().contains_key(&KEY));
+        assert_eq!(
+            world
+                .messenger
+                .calls()
+                .iter()
+                .filter(|call| matches!(call, Call::DeleteTopic(key) if *key == KEY))
+                .count(),
+            1
+        );
     }
 
     #[tokio::test]
@@ -6137,6 +6345,37 @@ mod tests {
         assert_eq!(world.agents.prompts().len(), 1, "restart must not launch an agent");
     }
     #[tokio::test]
+    async fn scoped_memory_topic_default_and_task_override_reach_the_agent() {
+        let world =
+            world(FakeAgents::scripted(vec![Script::Say(vec![finished()]), Script::UntilStopped]));
+        let task = create_managed(&world).await;
+        world.send(text(Some(7), 2, "/memory topic off")).await;
+        eventually("topic override persisted", || {
+            world
+                .store
+                .last()
+                .and_then(|topics| topics.get(&KEY).and_then(|s| s.preferences.memory))
+                == Some(false)
+        })
+        .await;
+        world.send(text(Some(7), 3, "Read")).await;
+        eventually("topic run ended", || !world.agents.prompts().is_empty() && !world.running())
+            .await;
+        assert!(!world.agents.parameters.lock().unwrap()[0].memory.enabled);
+        let change = tasks::parse(&format!("memory {} {} on", task.id, task.revision)).unwrap();
+        let changed = task_op(&world, KEY, change).await.unwrap().remove(0);
+        task_op(
+            &world,
+            KEY,
+            tasks::Request::Start { id: task.id, revision: changed.revision, next: None },
+        )
+        .await
+        .unwrap();
+        eventually("task run launched", || world.agents.prompts().len() == 2).await;
+        assert!(world.agents.parameters.lock().unwrap()[1].memory.enabled);
+    }
+
+    #[tokio::test]
     async fn managed_task_storage_failure_prevents_model_launch() {
         let world = world(FakeAgents::default());
         let task = create_managed(&world).await;
@@ -6803,6 +7042,24 @@ mod tests {
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[1].step, "answer");
         assert_eq!(execution.launches.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn reply_to_result_card_continues_task_without_a_button_once() {
+        use crate::execution::Control;
+        let (world, execution, task) = shared_world().await;
+        execution.stop(execution.snapshot().unwrap().token).unwrap();
+        execution.live.lock().unwrap().as_mut().unwrap().run = Some(1);
+        world.send(text(Some(7), 2, &format!("/task follow {}", task.id))).await;
+        let (message, _) = result_button(&world, "te:feedback:").await;
+        world.send(shared_text_reply(message, 2)).await;
+        world.send(shared_text_reply(message, 1)).await;
+        world.send(shared_text_reply(message, 1)).await;
+        task_op(&world, KEY, tasks::Request::Get(task.id)).await.unwrap();
+        let book = world.tasks.read().unwrap();
+        let runs = &book.get(task.id).unwrap().runs;
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[1].step, "answer");
     }
 
     #[tokio::test]

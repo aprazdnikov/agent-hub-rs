@@ -27,6 +27,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub trait Executor: Send + Sync + 'static {
+    fn memory_base(&self) -> Option<PathBuf> {
+        None
+    }
     fn run<'a>(
         &'a self,
         session: &'a TopicSession,
@@ -39,6 +42,9 @@ pub struct CliExecutor {
     pub memory_program: PathBuf,
 }
 impl Executor for CliExecutor {
+    fn memory_base(&self) -> Option<PathBuf> {
+        hub_memory::default_base()
+    }
     fn run<'a>(
         &'a self,
         session: &'a TopicSession,
@@ -236,6 +242,10 @@ impl Runtime {
             Ok(book.get(id)?.clone())
         })?;
         self.isolated = task.isolated && matches!(action, Action::Start(_));
+        let mut settings = settings;
+        let frozen = Arc::make_mut(&mut settings);
+        frozen.memory.enabled = task.memory.unwrap_or(frozen.memory.enabled);
+        frozen.memory_project = Some(session.cwd.clone());
         let token = Uuid::new_v4();
         let cancel = CancellationToken::new();
         let channel = Arc::new(Channel::new(settings.timeouts.approval, cancel.clone()));
@@ -473,6 +483,22 @@ impl Worker {
     ) -> Result<String, String> {
         self.status("Агент выполняет задачу");
         let cwd = session.cwd.as_path();
+        let memory = if settings.memory.enabled
+            && let Some(base) = self.executor.memory_base()
+        {
+            let project = settings.memory_project.as_ref().unwrap_or(&session.cwd).clone();
+            Some(
+                tokio::task::spawn_blocking(move || {
+                    hub_memory::Store::open(&base, project.as_path(), "agent-hub")
+                        .map_err(|e| e.to_string())
+                })
+                .await
+                .map_err(|e| e.to_string())
+                .and_then(|store| store),
+            )
+        } else {
+            None
+        };
         let baseline = crate::task_diff::baseline(cwd).await;
         let mut state = self
             .run(session, prompt.clone(), settings.clone(), &attempt, Output::Implementation)
@@ -500,9 +526,37 @@ impl Worker {
         {
             tracing::warn!(%error, "Не удалось сохранить изменения попытки");
         }
-        self.service
-            .access(Access::Internal, |book, _| book.finish(attempt.id, attempt.run, state))?;
+        let checkpoint = self.service.access(Access::Internal, |book, _| {
+            book.finish(attempt.id, attempt.run, state)?;
+            let task = book.get(attempt.id)?;
+            let run = task.runs.last().ok_or("Нет попытки задачи")?;
+            let passed = run.workflow_report.checks.iter().filter(|check| check.passed).count();
+            let checks = run.workflow_report.checks.len();
+            let review = if run.workflow_report.review.is_empty() { "нет" } else { "сохранено" };
+            Ok(hub_memory::WriteRequest {
+                key: format!("hub-task-{}-run-{}", task.id, run.id),
+                expected_revision: 0,
+                kind: hub_memory::EntryKind::Progress,
+                title: format!("Задача #{} · попытка {}", task.id, run.id),
+                body: format!("{} · {}. Состояние: {}. Проверки пройдены: {passed}/{checks}. Ревью: {review}.", task.title, session.backend.name(), state.label()),
+                sources: vec![format!("/task attempt {} {}", task.id, run.id)],
+            })
+        })?;
         attempt.finished = true;
+        if let Some(memory) = memory {
+            let saved = tokio::task::spawn_blocking(move || {
+                memory?.write(checkpoint).map_err(|error| error.to_string())
+            })
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|entry| entry);
+            if let Err(error) = saved {
+                return Ok(format!(
+                    "{} · Не удалось сохранить итог в память: {error}",
+                    state.label()
+                ));
+            }
+        }
         Ok(state.label().into())
     }
     async fn run(

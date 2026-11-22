@@ -107,6 +107,7 @@ impl Options {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Preferences {
+    pub memory: Option<bool>,
     pub overrides: Options,
     project: Option<ProjectOptions>,
 }
@@ -119,6 +120,8 @@ struct ProjectOptions {
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PreferencesDraft {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    memory: Option<bool>,
     #[serde(default)]
     overrides: OptionsDraft,
     project: Option<ProjectDraft>,
@@ -155,10 +158,27 @@ pub struct Effective {
     pub model_source: Source,
     pub mode_source: Source,
 }
+pub fn parse_memory(mode: &str) -> Result<Option<bool>, String> {
+    match mode {
+        "inherit" => Ok(None),
+        "on" => Ok(Some(true)),
+        "off" => Ok(Some(false)),
+        _ => Err("Выберите on, off или inherit.".into()),
+    }
+}
+#[must_use]
+pub fn memory_label(value: Option<bool>) -> &'static str {
+    match value {
+        None => "Наследовать",
+        Some(true) => "Включена",
+        Some(false) => "Выключена",
+    }
+}
 impl Preferences {
     #[must_use]
     pub fn for_project(id: &str, name: &str, options: Options) -> Self {
         Self {
+            memory: None,
             overrides: Options::default(),
             project: Some(ProjectOptions { id: id.to_owned(), name: name.to_owned(), options }),
         }
@@ -190,7 +210,7 @@ impl Preferences {
                 })
             })
             .transpose()?;
-        Ok(Self { overrides, project })
+        Ok(Self { memory: draft.memory, overrides, project })
     }
     #[must_use]
     pub fn to_draft(&self) -> Option<PreferencesDraft> {
@@ -198,6 +218,7 @@ impl Preferences {
             return None;
         }
         Some(PreferencesDraft {
+            memory: self.memory,
             overrides: self.overrides.to_draft(),
             project: self.project.as_ref().map(|p| ProjectDraft {
                 id: p.id.clone(),

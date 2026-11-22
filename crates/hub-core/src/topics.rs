@@ -185,6 +185,17 @@ mod tests {
     }
 
     #[test]
+    fn scoped_topic_memory_survives_restart() {
+        let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
+        for value in [Some(true), Some(false), None] {
+            let mut topic = session("project", None);
+            topic.preferences.memory = value;
+            let topics = Topics::from([(key, topic)]);
+            assert_eq!(parse_state(&dump_state(&topics).unwrap()).unwrap(), topics);
+        }
+    }
+
+    #[test]
     fn topic_options_use_v2_only_when_present_and_survive_restart() {
         use crate::options::{Options, OptionsDraft, Preferences};
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };

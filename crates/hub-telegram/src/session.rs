@@ -33,6 +33,7 @@ const EVENTS: usize = 256;
 pub(crate) enum First {
     Turn(Turn),
     Prompt(Prompt),
+    Task(Prompt, Option<bool>),
 }
 
 pub(crate) struct Run<A> {
@@ -104,7 +105,7 @@ impl<A: Agents> Run<A> {
             return inbox;
         }
         let prompt = match first {
-            First::Prompt(prompt) => prompt,
+            First::Prompt(prompt) | First::Task(prompt, _) => prompt,
             First::Turn(turn) => match download(&sender, &session.cwd, turn).await {
                 Ok(prompt) => prompt,
                 Err(error) => {

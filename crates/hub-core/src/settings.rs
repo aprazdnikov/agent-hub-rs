@@ -736,6 +736,7 @@ impl Draft {
             return Err(errors);
         };
         Ok(ExecutionSettings {
+            memory_project: None,
             memory: self.memory,
             claude: ClaudeSettings { cli, model, permission_mode: self.permission_mode, budget },
             codex,
@@ -2313,6 +2314,8 @@ mod execution_tests {
 /// Frozen backend configuration shared by desktop and Telegram execution.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExecutionSettings {
+    /// Owning task project, including when the process runs in a temporary worktree.
+    pub memory_project: Option<crate::domain::AbsolutePath>,
     pub memory: MemorySettings,
     pub claude: ClaudeSettings,
     pub codex: CodexSettings,
@@ -2324,6 +2327,7 @@ pub struct ExecutionSettings {
 impl From<&Settings> for ExecutionSettings {
     fn from(settings: &Settings) -> Self {
         Self {
+            memory_project: None,
             memory: settings.memory,
             claude: settings.claude.clone(),
             codex: settings.codex.clone(),

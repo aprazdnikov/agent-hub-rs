@@ -46,6 +46,71 @@ mod tests {
         assert!(snapshot.tasks[0].runs.is_empty());
     }
     #[test]
+    fn delete_checks_scope_revision_activity_and_removes_only_delivered_copy() {
+        use hub_core::tasks::{ResultFile, RunState, service::Access};
+        use hub_telegram::hub::tasks::parse;
+        let data = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let topics = data.path().join("topics.json");
+        let service = TaskService::new(Box::new(FileTopics::new(topics.clone())));
+        let apply = |path, op| request(&service, path, BackendKind::Qwen, op, None, project.path());
+        let id = apply(
+            project.path(),
+            Request::Create { title: "Report".into(), prompt: "Inspect".into() },
+        )
+        .unwrap()
+        .tasks[0]
+            .id;
+        let delete = |revision| Request::Delete { id, revision };
+        assert!(parse("delete 1 1").is_err());
+        assert!(parse("delete 1 1 confirm").is_ok());
+        assert!(apply(data.path(), delete(1)).is_err());
+        assert!(apply(project.path(), delete(2)).is_err());
+        let key = "aa".repeat(16);
+        let name = "report.txt";
+        let dir = data.path().join("task-files").join(&key);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(name), "copy").unwrap();
+        std::fs::write(project.path().join(name), "original").unwrap();
+        service
+            .access(Access::Internal, |book, _| {
+                book.begin(id, 1, None)?;
+                book.record_file(
+                    id,
+                    1,
+                    ResultFile { key, name: name.into(), caption: String::new(), bytes: 4 },
+                )
+            })
+            .unwrap();
+        assert!(apply(project.path(), delete(2)).is_err());
+        service
+            .access(Access::Internal, |book, _| book.finish(id, 1, RunState::Completed))
+            .unwrap();
+        service
+            .access(Access::Internal, |book, _| {
+                book.enqueue(id, 3, Some("More".into()), false, None)
+            })
+            .unwrap();
+        assert!(apply(project.path(), delete(4)).is_err());
+        apply(project.path(), Request::Unqueue { id, revision: 4 }).unwrap();
+        apply(project.path(), delete(5)).unwrap();
+        assert!(!dir.exists());
+        assert!(project.path().join(name).is_file());
+        let restored = TaskService::new(Box::new(FileTopics::new(topics)));
+        assert!(restored.read().unwrap().get(id).is_err());
+        assert!(
+            restored
+                .access(Access::Edit, |book, _| book.create(
+                    project.path().into(),
+                    "qwen",
+                    "Another",
+                    "Inspect"
+                ))
+                .unwrap()
+                > id
+        );
+    }
+    #[test]
     fn configured_root_is_enforced_even_without_telegram_credentials() {
         let root = tempfile::tempdir().unwrap();
         let outside = tempfile::tempdir().unwrap();

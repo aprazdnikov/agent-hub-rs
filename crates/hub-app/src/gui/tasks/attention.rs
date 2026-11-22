@@ -203,7 +203,7 @@ impl TasksView {
                     .clicked()
                 {
                     self.focused = Some(task.id);
-                    self.result_view.select(Tab::Summary, Some(task.id));
+                    self.result_view.select(Tab::Chat, Some(task.id));
                 }
             }
         };

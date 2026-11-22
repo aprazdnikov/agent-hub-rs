@@ -57,8 +57,17 @@ pub enum Command {
     Start,
     Stop,
     Diagnose,
+    TopicMemory {
+        key: TopicKey,
+        value: Option<bool>,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     StopTopic(TopicKey),
     ResetTopic(TopicKey),
+    DeleteTopic {
+        key: TopicKey,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
     Quit(oneshot::Sender<()>),
 }
 
@@ -665,28 +674,7 @@ impl<C: Connector> Supervisor<C> {
                 }
             }
             Command::SetMemory { enabled, revision, reply } => {
-                if self.saving.is_some()
-                    || self.store.is_none()
-                    || revision != self.state.save_revision
-                {
-                    let _ = reply.send(Err(
-                        "Настройки изменились или сохраняются. Обновите и повторите".into(),
-                    ));
-                } else if let Some(mut draft) = self.state.saved.clone() {
-                    draft.memory.enabled = enabled;
-                    self.save(draft);
-                    if self.saving.is_some() {
-                        self.memory_reply = Some(reply);
-                    } else {
-                        let _ = reply.send(Err(self
-                            .state
-                            .notice
-                            .clone()
-                            .unwrap_or_else(|| "Сохранение не начато".into())));
-                    }
-                } else {
-                    let _ = reply.send(Err("Сначала сохраните настройки приложения".into()));
-                }
+                self.set_memory_default(enabled, revision, reply);
             }
             Command::Save(draft) => self.save(*draft),
             Command::Start => {
@@ -712,12 +700,57 @@ impl<C: Connector> Supervisor<C> {
                     self.publish();
                 }
             }
+            Command::TopicMemory { key, value, reply } => {
+                if let Some(mailbox) = self.mailbox() {
+                    let _ = mailbox.send(HubMessage::TopicMemory { key, value, reply }).await;
+                } else {
+                    let _ = reply.send(Err("Для настройки темы запустите бота.".into()));
+                }
+            }
             Command::StopTopic(key) => tell(self.mailbox(), HubMessage::Stop(key)).await,
+            Command::DeleteTopic { key, reply } => {
+                if let Some(mailbox) = self.mailbox() {
+                    if let Err(error) = mailbox.try_send(HubMessage::DeleteTopic { key, reply })
+                        && let HubMessage::DeleteTopic { reply, .. } = error.into_inner()
+                    {
+                        let _ =
+                            reply.send(Err("Бот занят или остановлен. Повторите удаление.".into()));
+                    }
+                } else {
+                    let _ = reply.send(Err("Для удаления темы запустите бота.".into()));
+                }
+            }
             Command::ResetTopic(key) => tell(self.mailbox(), HubMessage::Reset(key)).await,
             Command::Quit(done) => {
                 // `run` handles Quit before dispatching here.
                 let _ = done.send(());
             }
+        }
+    }
+
+    fn set_memory_default(
+        &mut self,
+        enabled: bool,
+        revision: u64,
+        reply: oneshot::Sender<Result<(), String>>,
+    ) {
+        if self.saving.is_some() || self.store.is_none() || revision != self.state.save_revision {
+            let _ = reply
+                .send(Err("Настройки изменились или сохраняются. Обновите и повторите".into()));
+        } else if let Some(mut draft) = self.state.saved.clone() {
+            draft.memory.enabled = enabled;
+            self.save(draft);
+            if self.saving.is_some() {
+                self.memory_reply = Some(reply);
+            } else {
+                let _ = reply.send(Err(self
+                    .state
+                    .notice
+                    .clone()
+                    .unwrap_or_else(|| "Сохранение не начато".into())));
+            }
+        } else {
+            let _ = reply.send(Err("Сначала сохраните настройки приложения".into()));
         }
     }
 
@@ -1127,10 +1160,13 @@ mod tests {
                             HubMessage::Reset(key) => {
                                 format!("reset {}/{}", key.chat.0, key.thread.0)
                             }
-                            HubMessage::TaskResultUnavailable { .. }
+                            HubMessage::DeleteTopic { .. }
+                            | HubMessage::DeletionDone(_)
+                            | HubMessage::TaskResultUnavailable { .. }
                             | HubMessage::Tasks { .. }
                             | HubMessage::SharedTasks { .. }
                             | HubMessage::GitDone(_)
+                            | HubMessage::TopicMemory { .. }
                             | HubMessage::MemoryDone(_)
                             | HubMessage::HandoffDone(_)
                             | HubMessage::VoiceDone(_)

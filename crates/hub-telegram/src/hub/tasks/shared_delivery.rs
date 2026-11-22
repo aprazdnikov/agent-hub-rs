@@ -18,6 +18,7 @@ pub(super) struct Delivery {
     pub live: Live,
     pub result: Option<String>,
     pub review_revision: Option<u64>,
+    pub tasks: Arc<hub_core::tasks::service::TaskService>,
     pub execution: Arc<dyn Control>,
     pub settings: watch::Receiver<Arc<Settings>>,
     pub sender: Sender,
@@ -86,6 +87,15 @@ pub(super) fn offered(live: &Live, data: &str) -> bool {
 }
 impl Delivery {
     fn valid(&self) -> bool {
+        if !self
+            .tasks
+            .inspect(|book| {
+                book.get(self.live.id).is_ok_and(|task| task.project == self.live.project)
+            })
+            .unwrap_or(false)
+        {
+            return false;
+        }
         let root = crate::paths::workspace_root(&self.settings.borrow().workspace_root);
         let project = crate::paths::workspace_root(&self.live.project);
         root.as_ref().ok().zip(project.as_ref().ok()).is_some_and(|(root, project)| {
@@ -140,6 +150,9 @@ impl Delivery {
         }
         if let Some(result) = &self.result {
             let _ = write!(text, "\nРезультат:\n{result}");
+        }
+        if self.review_revision.is_some() {
+            text.push_str("\n\nОтветьте на эту карточку, чтобы продолжить чат задачи.");
         }
         if !self.live.active && self.review_revision.is_none() {
             let _ = write!(

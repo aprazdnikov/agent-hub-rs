@@ -7,6 +7,12 @@ mod stdio;
 mod store;
 
 pub use cli::run_cli;
+
+#[must_use]
+pub fn default_base() -> Option<std::path::PathBuf> {
+    directories::BaseDirs::new().map(|dirs| dirs.home_dir().join(".agent-hub/memory"))
+}
+
 pub use model::{Entry, EntryKind, Error, SearchHit, WriteRequest};
 pub use stdio::serve;
 pub use store::{MemoryPage, MemoryReader, Store};

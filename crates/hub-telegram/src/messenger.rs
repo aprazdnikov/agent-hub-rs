@@ -85,6 +85,7 @@ pub enum SendError {
 }
 
 pub trait Messenger: Send + Sync {
+    fn delete_topic(&self, key: TopicKey) -> BoxFuture<'_, Result<(), SendError>>;
     /// Creates one forum topic without automatic retries. An uncertain result may leave a topic.
     fn create_topic(
         &self,

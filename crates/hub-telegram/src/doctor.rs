@@ -70,6 +70,10 @@ impl Doctors {
         Self { runner, tickets: HashMap::new(), running: HashMap::new() }
     }
 
+    pub(crate) fn busy(&self, key: TopicKey) -> bool {
+        self.running.contains_key(&key)
+    }
+
     fn button(&mut self, text: &str, ticket: Ticket) -> Button {
         self.tickets.retain(|_, saved| saved.created.elapsed() < TTL);
         if self.tickets.len() >= MAX_TICKETS {
