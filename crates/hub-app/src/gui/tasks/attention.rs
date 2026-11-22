@@ -13,6 +13,7 @@ use std::{
     borrow::Cow,
     collections::BTreeMap,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 use uuid::Uuid;
 
@@ -22,13 +23,41 @@ pub(super) struct Inbox {
     details: Option<(Uuid, Uuid)>,
 }
 
-/// Spec «Входящие»: collapsed permission summary shows up to 3 lines.
+/// Spec «Входящие»: collapsed permission summary shows up to 3 visual rows.
 const SUMMARY_LINES: usize = 3;
+
+/// Visual rows a monospace permission summary takes at the width `decision`
+/// renders it — a single long command line wraps into several rows, so the
+/// collapse decision must count rows, not logical lines.
+fn summary_rows(ui: &egui::Ui, summary: &str) -> usize {
+    let mut job = egui::WidgetText::from(egui::RichText::new(summary).monospace()).into_layout_job(
+        ui.style(),
+        egui::FontSelection::Default,
+        egui::Align::Min,
+    );
+    Arc::make_mut(&mut job).wrap.max_width = ui.available_width();
+    ui.fonts_mut(|fonts| fonts.layout_job(Arc::unwrap_or_clone(job))).rows.len()
+}
 
 fn clamp_lines(summary: &str) -> String {
     let mut lines = summary.lines();
     let head = lines.by_ref().take(SUMMARY_LINES).collect::<Vec<_>>().join("\n");
     if lines.next().is_some() { format!("{head}…") } else { head }
+}
+
+/// Request as rendered: collapsed permission cards show the logically clamped
+/// summary so the visual `max_rows` clamp never hides a revealed tail from tests.
+fn shown_request(request: &Interaction, collapsed: bool) -> Cow<'_, Interaction> {
+    match &request.kind {
+        Kind::Permission(tool) if collapsed => Cow::Owned(Interaction {
+            id: request.id,
+            kind: Kind::Permission(ToolRequest {
+                tool: tool.tool.clone(),
+                summary: clamp_lines(&tool.summary),
+            }),
+        }),
+        Kind::Permission(_) | Kind::Questions(_) => Cow::Borrowed(request),
+    }
 }
 
 pub(super) fn jobs(snapshot: &Snapshot) -> impl Iterator<Item = &Live> {
@@ -152,20 +181,11 @@ impl<'a> Item<'a> {
                         || Cow::Owned(format!("Задача #{}", live.id)),
                         |r| Cow::Borrowed(r.title.as_str()),
                     );
-                    let collapsible = matches!(&request.kind, Kind::Permission(tool)
-                        if tool.summary.lines().count() > SUMMARY_LINES);
-                    let collapsed = collapsible && inbox.details != Some(key);
-                    let shown = match &request.kind {
-                        Kind::Permission(tool) if collapsed => Cow::Owned(Interaction {
-                            id: request.id,
-                            kind: Kind::Permission(ToolRequest {
-                                tool: tool.tool.clone(),
-                                summary: clamp_lines(&tool.summary),
-                            }),
-                        }),
-                        _ => Cow::Borrowed(request),
-                    };
                     theme::card(ui).show(ui, |ui| {
+                        let collapsible = matches!(&request.kind, Kind::Permission(tool)
+                            if summary_rows(ui, &tool.summary) > SUMMARY_LINES);
+                        let collapsed = collapsible && inbox.details != Some(key);
+                        let shown = shown_request(request, collapsed);
                         card_header(
                             ui,
                             Header {
@@ -179,7 +199,7 @@ impl<'a> Item<'a> {
                             },
                         );
                         ui.add_space(6.0);
-                        panel.decision(ui, live, &shown, send);
+                        panel.decision(ui, live, &shown, collapsed.then_some(SUMMARY_LINES), send);
                         if collapsible
                             && ui
                                 .link(if collapsed {

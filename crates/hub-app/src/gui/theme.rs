@@ -151,11 +151,27 @@ pub(super) fn chip(ui: &mut egui::Ui, tone: Tone, text: &str) -> egui::Response 
     egui::Frame::new()
         .fill(bg)
         .corner_radius(egui::CornerRadius::same(255))
-        .inner_margin(egui::Margin::symmetric(9, 2))
+        .inner_margin(CHIP_MARGIN)
         .show(ui, |ui| {
             ui.add(egui::Label::new(egui::RichText::new(text).small().color(fg)).selectable(false))
         })
         .inner
+}
+
+const CHIP_MARGIN: egui::Margin = egui::Margin::symmetric(9, 2);
+
+/// Width a [`chip`] takes for this text, so a neighbour can truncate instead of
+/// pushing the chip out of the row. Must stay in sync with [`chip`].
+#[must_use]
+pub(super) fn chip_width(ui: &egui::Ui, text: &str) -> f32 {
+    let job = egui::WidgetText::from(egui::RichText::new(text).small()).into_layout_job(
+        ui.style(),
+        egui::FontSelection::Default,
+        egui::Align::Min,
+    );
+    let text_width =
+        ui.fonts_mut(|fonts| fonts.layout_job(std::sync::Arc::unwrap_or_clone(job))).size().x;
+    text_width + 2.0 * f32::from(CHIP_MARGIN.left)
 }
 
 pub(super) fn card(ui: &egui::Ui) -> egui::Frame {

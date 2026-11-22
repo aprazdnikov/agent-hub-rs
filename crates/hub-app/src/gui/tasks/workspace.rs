@@ -5,7 +5,7 @@ use super::{
 };
 use crate::gui::{
     look::{agent_title, topic_url},
-    theme::{Tone, chip, primary_button, tone_colors},
+    theme::{Tone, chip, chip_width, primary_button, tone_colors},
 };
 use eframe::egui;
 use egui::{Align, Layout, RichText};
@@ -68,6 +68,30 @@ fn task_state(task: &Task) -> &'static str {
     }
 }
 
+// Chip tone for the header state, mirroring `task_state` branch order so the color
+// describes exactly the text it shows (spec «Шапка задачи», макет chat.html).
+fn task_state_tone(task: &Task) -> Tone {
+    if task.archived {
+        Tone::Neutral
+    } else if task.active() {
+        Tone::Accent
+    } else if task.queue.is_some()
+        || matches!(task.status, TaskStatus::Accepted | TaskStatus::Deferred)
+    {
+        Tone::Neutral
+    } else if task
+        .runs
+        .last()
+        .is_some_and(|run| matches!(run.state, RunState::Failed | RunState::Interrupted))
+    {
+        Tone::Error
+    } else if task.status == TaskStatus::NeedsReview {
+        Tone::Warning
+    } else {
+        Tone::Neutral
+    }
+}
+
 fn topic_running(scope: &Scope, snapshot: &Snapshot) -> bool {
     snapshot.topics.iter().any(|topic| {
         Some(topic.key) == scope.0 && topic.state == hub_telegram::hub::TopicState::Running
@@ -115,6 +139,17 @@ fn ui_font(ui: &egui::Ui, style: &egui::TextStyle) -> egui::FontId {
         .get(style)
         .cloned()
         .unwrap_or_else(|| egui::FontId::proportional(ui.text_style_height(style)))
+}
+
+// Natural galley size of the heading title, so the header can truncate the title
+// to the width left by the state chip instead of pushing the chip out (spec line 65).
+fn heading_size(ui: &egui::Ui, text: &str) -> egui::Vec2 {
+    let job = egui::WidgetText::from(RichText::new(text).heading().strong()).into_layout_job(
+        ui.style(),
+        egui::FontSelection::Default,
+        Align::Min,
+    );
+    ui.fonts_mut(|fonts| fonts.layout_job(std::sync::Arc::unwrap_or_clone(job))).size()
 }
 
 // Height of the composer field for a draft at a known width: the wrapped galley
@@ -448,10 +483,24 @@ impl TasksView {
                 }
                 ui.vertical(|ui| {
                     ui.set_width(ui.available_width());
-                    ui.add(
-                        egui::Label::new(RichText::new(&task.title).heading().strong()).truncate(),
-                    )
-                    .on_hover_text(&task.title);
+                    ui.horizontal(|ui| {
+                        let state = task_state(task);
+                        let size = heading_size(ui, &task.title);
+                        let reserve = chip_width(ui, state) + ui.spacing().item_spacing.x;
+                        let title_width = (ui.available_width() - reserve).max(48.0).min(size.x);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(title_width, size.y),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(RichText::new(&task.title).heading().strong())
+                                        .truncate(),
+                                )
+                                .on_hover_text(&task.title);
+                            },
+                        );
+                        chip(ui, task_state_tone(task), state);
+                    });
                 });
             });
         });

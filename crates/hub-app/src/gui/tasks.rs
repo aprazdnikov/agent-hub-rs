@@ -2704,6 +2704,74 @@ mod tests {
         assert!(matches!(command, Command::LocalStop(actual) if actual == token));
     }
 
+    #[test]
+    fn chat_decision_panel_renders_inside_a_card() {
+        let project = test_project();
+        let mut book = hub_core::tasks::TaskBook::default();
+        let id =
+            book.create(project.clone(), "qwen", "Решение в чате", "Прочитать README").unwrap();
+        book.begin(id, 1, None, ts()).unwrap();
+        let snapshot = Snapshot {
+            local: Some(crate::local_execution::Live {
+                token: uuid::Uuid::new_v4(),
+                project: project.clone(),
+                id,
+                run: Some(1),
+                active: true,
+                status: "Ожидает решения".into(),
+                interaction: Some(crate::local_execution::Interaction {
+                    id: uuid::Uuid::new_v4(),
+                    kind: crate::local_execution::Kind::Permission(hub_core::domain::ToolRequest {
+                        tool: "Bash".into(),
+                        summary: "cargo check".into(),
+                    }),
+                }),
+            }),
+            task_index: Ok(book.tasks().iter().map(crate::desktop_tasks::TaskRow::from).collect()),
+            ..Default::default()
+        };
+        let mut view = TasksView {
+            local_mode: Some(true),
+            scope: Some((None, project, BackendKind::Qwen)),
+            tasks: book.tasks().to_vec(),
+            focused: Some(id),
+            refreshed: Some(Instant::now()),
+            ..Default::default()
+        };
+        view.local_project.choose(&test_project());
+        let ctx = egui::Context::default();
+        crate::gui::configure_theme(&ctx);
+        let mut commands = Vec::new();
+        input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let surface = ctx.style_of(ctx.theme()).visuals.panel_fill;
+        let card = out
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect)
+                    if rect.fill == surface
+                        && (rect.stroke.width - 1.0).abs() < 0.01
+                        && rect.corner_radius == egui::CornerRadius::same(10) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("the chat decision panel draws the card frame");
+        for label in ["Остановить локальную работу", "Разрешить один раз"]
+        {
+            let rect = all_text_rects(&out, label)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("missing {label}"));
+            assert!(
+                card.contains_rect(rect),
+                "{label} must sit inside the decision card: {rect:?} in {card:?}"
+            );
+        }
+    }
+
     fn telegram_running_fixture() -> (u64, Snapshot, TasksView) {
         let project = test_project();
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
@@ -2739,6 +2807,18 @@ mod tests {
         assert!(!texts.contains(&"Остановить"), "bridge sessions are not stopped from the task");
         assert!(texts.contains(&"Открыть тему"), "telegram scope offers the topic link");
         assert!(texts.contains(&"Выполняется"), "running state is shown as a chip");
+    }
+
+    #[test]
+    fn chat_header_shows_task_state_chip() {
+        let (_, _, snapshot, mut view) = review_fixture();
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert!(
+            labels(&out).contains(&"Нужна проверка"),
+            "chat header shows the task state chip next to the title"
+        );
     }
 
     #[test]

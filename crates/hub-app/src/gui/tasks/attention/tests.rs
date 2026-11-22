@@ -394,6 +394,34 @@ fn permission_summary_collapses_by_lines_not_characters() {
 }
 
 #[test]
+fn single_line_permission_summary_collapses_by_visual_rows() {
+    let long = "npm publish --access public --tag latest ".repeat(12);
+    let mut screen =
+        Screen::new(Snapshot { local: Some(permission(1, &long)), ..Default::default() });
+    assert!(
+        screen.contains("Подробнее"),
+        "a single-line command of 504 chars has one logical line but must still be collapsible"
+    );
+    let monospace = screen
+        .ctx
+        .style_of(screen.ctx.theme())
+        .text_styles
+        .get(&egui::TextStyle::Monospace)
+        .cloned()
+        .expect("monospace style");
+    let row = screen.ctx.fonts_mut(|fonts| fonts.row_height(&monospace));
+    let collapsed = screen.rect(&long, 0).height();
+    assert!(
+        collapsed <= 3.0 * row + 1.0,
+        "collapsed summary must not exceed three visual rows: {collapsed} > {}",
+        3.0 * row + 1.0
+    );
+    screen.click("Подробнее", 0);
+    let expanded = screen.rect(&long, 0).height();
+    assert!(expanded > 4.0 * row, "reveal shows the whole command: {expanded}");
+}
+
+#[test]
 fn answered_live_request_shows_status_only_inline() {
     let live = question("Hub", 1);
     let mut screen = Screen::new(Snapshot { local: Some(live.clone()), ..Default::default() });
