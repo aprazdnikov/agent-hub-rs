@@ -100,6 +100,88 @@ pub fn surface(ui: &egui::Ui) -> egui::Frame {
     egui::Frame::group(ui.style()).fill(ui.visuals().panel_fill).inner_margin(20).corner_radius(10)
 }
 
+/// Semantic color pair for status surfaces; resolved per active theme.
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(test), expect(dead_code, reason = "ahead of use in later GUI-refresh tasks"))]
+pub(super) enum Tone {
+    Accent,
+    Warning,
+    Error,
+    Neutral,
+}
+
+/// warning bg `58,49,32` / fg `229,192,123` in dark, `251,240,220` / `138,90,0` in light.
+pub(super) fn warning(ui: &egui::Ui) -> (Color32, Color32) {
+    if ui.visuals().dark_mode {
+        (Color32::from_rgb(58, 49, 32), Color32::from_rgb(229, 192, 123))
+    } else {
+        (Color32::from_rgb(251, 240, 220), Color32::from_rgb(138, 90, 0))
+    }
+}
+
+/// review ring `229,192,123` in dark, `183,121,31` in light.
+#[cfg_attr(not(test), expect(dead_code, reason = "ahead of use in later GUI-refresh tasks"))]
+pub(super) fn review_color(ui: &egui::Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_rgb(229, 192, 123)
+    } else {
+        Color32::from_rgb(183, 121, 31)
+    }
+}
+
+/// (bg, fg) for a status tone; error fg duplicates `tasks/result.rs` diff colors until Task 8 migrates it.
+pub(super) fn tone_colors(ui: &egui::Ui, tone: Tone) -> (Color32, Color32) {
+    let visuals = ui.visuals();
+    match tone {
+        Tone::Accent => (visuals.selection.bg_fill, visuals.hyperlink_color),
+        Tone::Warning => warning(ui),
+        Tone::Error => (
+            visuals.extreme_bg_color,
+            if visuals.dark_mode {
+                Color32::from_rgb(253, 166, 160)
+            } else {
+                Color32::from_rgb(148, 49, 47)
+            },
+        ),
+        Tone::Neutral => (visuals.extreme_bg_color, visuals.weak_text_color()),
+    }
+}
+
+/// Status capsule: small text on the tone background.
+#[cfg_attr(not(test), expect(dead_code, reason = "ahead of use in later GUI-refresh tasks"))]
+pub(super) fn chip(ui: &mut egui::Ui, tone: Tone, text: &str) -> egui::Response {
+    let (bg, fg) = tone_colors(ui, tone);
+    egui::Frame::new()
+        .fill(bg)
+        .corner_radius(egui::CornerRadius::same(255))
+        .inner_margin(egui::Margin::symmetric(9, 2))
+        .show(ui, |ui| {
+            ui.add(egui::Label::new(egui::RichText::new(text).small().color(fg)).selectable(false))
+        })
+        .inner
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "ahead of use in later GUI-refresh tasks"))]
+pub(super) fn card(ui: &egui::Ui) -> egui::Frame {
+    egui::Frame::new()
+        .fill(ui.visuals().panel_fill)
+        .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+        .corner_radius(10)
+        .inner_margin(egui::Margin::symmetric(14, 12))
+}
+
+#[cfg_attr(not(test), expect(dead_code, reason = "ahead of use in later GUI-refresh tasks"))]
+pub(super) fn bubble(ui: &egui::Ui, user: bool) -> egui::Frame {
+    let frame = egui::Frame::new().corner_radius(12).inner_margin(egui::Margin::symmetric(12, 9));
+    if user {
+        frame.fill(ui.visuals().selection.bg_fill)
+    } else {
+        frame
+            .fill(ui.visuals().panel_fill)
+            .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +223,43 @@ mod tests {
                 .unwrap();
             assert!(rect.shrink2(egui::vec2(8.0, 4.0)).contains_rect(label));
         }
+    }
+
+    #[test]
+    fn status_tokens_have_dark_variants_and_chips_render() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut warning_pairs = Vec::new();
+        let mut error_fgs = Vec::new();
+        let mut review_colors = Vec::new();
+        for theme in [Theme::Light, Theme::Dark] {
+            let mut output = ctx.run_ui(
+                egui::RawInput { system_theme: Some(theme), ..Default::default() },
+                |ui| {
+                    let (bg, fg) = tone_colors(ui, Tone::Warning);
+                    assert_ne!(bg, fg);
+                    warning_pairs.push((bg, fg));
+                    assert_ne!(tone_colors(ui, Tone::Accent).0, tone_colors(ui, Tone::Accent).1);
+                    assert_ne!(tone_colors(ui, Tone::Neutral).0, tone_colors(ui, Tone::Neutral).1);
+                    error_fgs.push(tone_colors(ui, Tone::Error).1);
+                    review_colors.push(review_color(ui));
+                    assert!(chip(ui, Tone::Warning, "Нужна проверка").rect.width() > 0.0);
+                    card(ui).show(ui, |ui| {
+                        ui.label("карточка");
+                    });
+                    bubble(ui, true).show(ui, |ui| {
+                        ui.label("вы");
+                    });
+                    bubble(ui, false).show(ui, |ui| {
+                        ui.label("агент");
+                    });
+                },
+            );
+            output.textures_delta.clear();
+        }
+        assert_ne!(warning_pairs[0], warning_pairs[1], "warning token needs a dark variant");
+        assert_ne!(error_fgs[0], error_fgs[1], "error token needs a dark variant");
+        assert_ne!(review_colors[0], review_colors[1], "review ring needs a dark variant");
     }
 
     #[test]
