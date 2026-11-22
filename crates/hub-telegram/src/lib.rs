@@ -34,3 +34,7 @@ mod handoff;
 mod handoff_summary;
 
 pub mod memory;
+
+pub mod git;
+
+pub mod execution;

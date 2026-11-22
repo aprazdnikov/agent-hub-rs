@@ -15,7 +15,7 @@ use hub_codex::archive::CodexArchive;
 use hub_codex::backend::CodexBackend;
 use hub_core::domain::{AgentEvent, BackendKind, Prompt, TopicSession};
 use hub_core::quota::QuotaReport;
-use hub_core::settings::Settings;
+use hub_core::settings::{ExecutionSettings, Settings};
 use hub_hermes::archive::HermesArchive;
 use hub_hermes::backend::HermesBackend;
 use hub_opencode::backend::OpencodeBackend;
@@ -55,7 +55,7 @@ impl HubAgents {
         prompt: Prompt,
         inbox: mpsc::Receiver<Prompt>,
         conversation: Conversation,
-        settings: Arc<Settings>,
+        settings: Arc<ExecutionSettings>,
         memory: Option<MemoryMcp>,
     ) -> BoxFuture<'_, mpsc::Receiver<Prompt>> {
         // Hub froze and resolved these settings before downloads or process startup.
@@ -121,6 +121,26 @@ impl HubAgents {
     }
 }
 
+/// Run a desktop turn through the same backends without Telegram credentials.
+pub fn execute_local<'a>(
+    session: &'a TopicSession,
+    prompt: Prompt,
+    inbox: mpsc::Receiver<Prompt>,
+    conversation: Conversation,
+    settings: Arc<ExecutionSettings>,
+    memory_program: &Path,
+) -> BoxFuture<'a, mpsc::Receiver<Prompt>> {
+    let memory = if settings.memory.enabled {
+        MemoryMcp::new(memory_program, &session.cwd, session.backend).map(Some)
+    } else {
+        Ok(None)
+    };
+    match memory {
+        Ok(memory) => HubAgents::execute(session, prompt, inbox, conversation, settings, memory),
+        Err(error) => Box::pin(async move { refuse(&conversation, error, inbox).await }),
+    }
+}
+
 impl Agents for HubAgents {
     fn run<'a>(
         &'a self,
@@ -131,7 +151,14 @@ impl Agents for HubAgents {
         settings: Arc<Settings>,
     ) -> BoxFuture<'a, mpsc::Receiver<Prompt>> {
         match if settings.memory.enabled { self.memory(session) } else { Ok(None) } {
-            Ok(memory) => Self::execute(session, prompt, inbox, conversation, settings, memory),
+            Ok(memory) => Self::execute(
+                session,
+                prompt,
+                inbox,
+                conversation,
+                Arc::new(ExecutionSettings::from(settings.as_ref())),
+                memory,
+            ),
             Err(error) => Box::pin(async move { refuse(&conversation, error, inbox).await }),
         }
     }
@@ -144,7 +171,14 @@ impl Agents for HubAgents {
         conversation: Conversation,
         settings: Arc<Settings>,
     ) -> BoxFuture<'a, mpsc::Receiver<Prompt>> {
-        Self::execute(session, prompt, inbox, conversation, settings, None)
+        Self::execute(
+            session,
+            prompt,
+            inbox,
+            conversation,
+            Arc::new(ExecutionSettings::from(settings.as_ref())),
+            None,
+        )
     }
 
     fn archive<'a>(

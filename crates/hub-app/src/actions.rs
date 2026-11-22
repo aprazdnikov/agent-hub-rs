@@ -57,6 +57,17 @@ pub struct ProcessResult {
 /// pipes to close. Dropping this future immediately requests tree
 /// termination; Tokio handles child reaping on a best-effort basis.
 pub async fn run(command: &str, cwd: &Path, cancel: CancellationToken) -> ProcessResult {
+    match shell_command(command, cwd) {
+        Ok(command) => run_program(command, cancel).await,
+        Err(error) => ProcessResult {
+            status: failure("Не удалось запустить действие", &error),
+            stdout: String::new(),
+            stderr: String::new(),
+        },
+    }
+}
+/// Runs an argument-based command without interpreting shell syntax.
+pub async fn run_program(command: Command, cancel: CancellationToken) -> ProcessResult {
     if cancel.is_cancelled() {
         return ProcessResult {
             status: ProcessStatus::Stopped,
@@ -65,7 +76,7 @@ pub async fn run(command: &str, cwd: &Path, cancel: CancellationToken) -> Proces
         };
     }
 
-    let process = match spawn(command, cwd) {
+    let process = match spawn_program(command) {
         Ok(process) => process,
         Err(error) => {
             return ProcessResult {
@@ -106,7 +117,14 @@ pub async fn run(command: &str, cwd: &Path, cancel: CancellationToken) -> Proces
     ProcessResult { status, stdout: stdout.text, stderr: stderr.text }
 }
 
-fn spawn(command: &str, cwd: &Path) -> io::Result<Box<dyn ChildWrapper>> {
+#[cfg_attr(
+    unix,
+    expect(
+        clippy::unnecessary_wraps,
+        reason = "Windows command construction requires SystemRoot and can fail"
+    )
+)]
+fn shell_command(command: &str, cwd: &Path) -> io::Result<Command> {
     #[cfg(unix)]
     let mut command = {
         let mut shell = Command::new("/bin/sh");
@@ -116,6 +134,10 @@ fn spawn(command: &str, cwd: &Path) -> io::Result<Box<dyn ChildWrapper>> {
     #[cfg(windows)]
     let mut command = shell(command)?;
     command.current_dir(cwd).stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    Ok(command)
+}
+fn spawn_program(mut command: Command) -> io::Result<Box<dyn ChildWrapper>> {
+    command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped());
     let mut command = CommandWrap::from(command);
     command.wrap(KillOnDrop);
     #[cfg(unix)]

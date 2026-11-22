@@ -83,3 +83,225 @@ fn full_valid_legacy_book_can_publish_recovery() {
     assert!(book.recover());
     assert!(book.encode().is_ok(), "valid full history must remain recoverable");
 }
+
+#[test]
+fn legacy_tasks_gain_review_state_without_losing_history() {
+    use hub_core::tasks::TaskStatus;
+    let mut book = TaskBook::default();
+    let id = book.create(std::env::temp_dir(), "qwen", "Проверка", "Прочитать файл").unwrap();
+    let run = book.begin(id, 1, None).unwrap();
+    book.record(id, run, "Полный результат").unwrap();
+    book.finish(id, run, RunState::Completed).unwrap();
+    let mut raw = serde_json::to_value(&book).unwrap();
+    for task in raw["tasks"].as_array_mut().unwrap() {
+        task.as_object_mut().unwrap().remove("status");
+        task.as_object_mut().unwrap().remove("archived");
+    }
+    let restored = TaskBook::decode(&serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert_eq!(restored.get(id).unwrap().status, TaskStatus::NeedsReview);
+    assert_eq!(restored.get(id).unwrap().runs, book.get(id).unwrap().runs);
+    assert_eq!(TaskBook::decode(&restored.encode().unwrap()).unwrap(), restored);
+}
+
+#[test]
+fn acceptance_archive_and_reopen_are_explicit_revision_checked_actions() {
+    use hub_core::tasks::TaskStatus;
+    let mut book = TaskBook::default();
+    let id = book.create(std::env::temp_dir(), "qwen", "Task", "Read").unwrap();
+    assert_eq!(book.get(id).unwrap().status, TaskStatus::Planned);
+    let run = book.begin(id, 1, None).unwrap();
+    assert!(book.set_status(id, 2, TaskStatus::Accepted).is_err());
+    assert!(book.set_archived(id, 2, true).is_err());
+    book.finish(id, run, RunState::Completed).unwrap();
+    assert_eq!(book.get(id).unwrap().status, TaskStatus::NeedsReview);
+    assert!(book.set_status(id, 2, TaskStatus::Accepted).is_err());
+    book.set_status(id, 3, TaskStatus::Accepted).unwrap();
+    assert!(book.begin(id, 4, Some("Next")).is_err());
+    book.set_status(id, 4, TaskStatus::Planned).unwrap();
+    book.set_archived(id, 5, true).unwrap();
+    assert!(book.begin(id, 6, Some("Next")).is_err());
+    book.set_archived(id, 6, false).unwrap();
+    book.begin(id, 7, Some("Next")).unwrap();
+    assert!(book.recover());
+    assert_eq!(book.get(id).unwrap().status, TaskStatus::NeedsReview);
+}
+
+#[test]
+fn workflow_filters_use_russian_case_and_hide_archives_by_default() {
+    use hub_core::tasks::{TaskFilter, TaskStatus};
+    let mut book = TaskBook::default();
+    let id = book.create(std::env::temp_dir(), "qwen", "Проверка", "Прочитать README").unwrap();
+    let task = book.get(id).unwrap();
+    assert!(TaskFilter::Active.matches(task, "ПРОВЕРКА"));
+    assert!(TaskFilter::Status(TaskStatus::Planned).matches(task, "прочитать"));
+    assert!(!TaskFilter::Status(TaskStatus::Accepted).matches(task, ""));
+    book.set_archived(id, 1, true).unwrap();
+    let task = book.get(id).unwrap();
+    assert!(!TaskFilter::Active.matches(task, ""));
+    assert!(TaskFilter::Archived.matches(task, "README"));
+    assert!(TaskFilter::All.matches(task, ""));
+}
+
+#[test]
+fn compact_full_legacy_file_with_100_tasks_can_recover() {
+    let mut raw = serde_json::json!({"version":1,"next_id":101,"tasks":(1..=100).map(|id|serde_json::json!({
+        "id":id,"revision":64,"project":std::env::temp_dir(),"backend":"qwen","title":"Task","prompt":"Inspect",
+        "runs": if id <= 5 {(1..=32).map(|run|serde_json::json!({"id":run,"step":"Inspect","state":if id==5&&run==32{"running"}else{"completed"},"result":""})).collect::<Vec<_>>()} else {vec![]}
+    })).collect::<Vec<_>>()});
+    let mut remaining = hub_core::tasks::MAX_FILE_BYTES - serde_json::to_vec(&raw).unwrap().len();
+    for task in raw["tasks"].as_array_mut().unwrap() {
+        for run in task["runs"].as_array_mut().unwrap() {
+            let length = remaining.min(65536);
+            run["result"] = serde_json::Value::String("x".repeat(length));
+            remaining -= length;
+        }
+    }
+    assert_eq!(remaining, 0);
+    let mut book = TaskBook::decode(&serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert!(book.recover());
+    assert!(book.encode().is_ok());
+}
+
+#[test]
+fn explicit_null_status_is_corruption_not_a_legacy_default() {
+    let mut book = TaskBook::default();
+    book.create(std::env::temp_dir(), "qwen", "Task", "Read").unwrap();
+    let mut raw = serde_json::to_value(book).unwrap();
+    raw["tasks"][0]["status"] = serde_json::Value::Null;
+    assert!(TaskBook::decode(&serde_json::to_vec(&raw).unwrap()).is_err());
+}
+
+#[test]
+fn transfer_preserves_legacy_run_authorship_and_never_starts_a_model() {
+    let mut book = TaskBook::default();
+    let id = book.create(std::env::temp_dir(), "qwen", "Task", "Read").unwrap();
+    let run = book.begin(id, 1, None).unwrap();
+    book.record(id, run, "Old answer").unwrap();
+    book.finish(id, run, RunState::Completed).unwrap();
+    let mut raw = serde_json::to_value(&book).unwrap();
+    raw["tasks"][0]["runs"][0].as_object_mut().unwrap().remove("backend");
+    let mut book = TaskBook::decode(&serde_json::to_vec(&raw).unwrap()).unwrap();
+    book.assign(id, 3, "codex").unwrap();
+    book.assign(id, 4, "hermes").unwrap();
+    let task = book.get(id).unwrap();
+    assert_eq!(task.backend, "hermes");
+    assert_eq!(task.runs.len(), 1);
+    assert_eq!(task.runs[0].backend.as_deref(), Some("qwen"));
+    assert_eq!(task.runs[0].result, "Old answer");
+    let run = book.begin(id, 5, Some("Verify prior effects")).unwrap();
+    assert_eq!(book.get(id).unwrap().runs[1].backend.as_deref(), Some("hermes"));
+    book.finish(id, run, RunState::Completed).unwrap();
+    assert_eq!(TaskBook::decode(&book.encode().unwrap()).unwrap(), book);
+}
+
+#[test]
+fn transfer_requires_editable_task_current_revision_and_known_agent() {
+    use hub_core::tasks::TaskStatus;
+    let mut book = TaskBook::default();
+    let id = book.create(std::env::temp_dir(), "qwen", "Task", "Read").unwrap();
+    let before = book.clone();
+    assert!(book.assign(id, 0, "codex").is_err());
+    assert!(book.assign(id, 1, "invalid").is_err());
+    assert_eq!(book, before);
+    book.begin(id, 1, None).unwrap();
+    assert!(book.assign(id, 2, "codex").is_err());
+    book.finish(id, 1, RunState::Completed).unwrap();
+    book.set_archived(id, 3, true).unwrap();
+    assert!(book.assign(id, 4, "codex").is_err());
+    book.set_archived(id, 4, false).unwrap();
+    for status in [TaskStatus::Accepted, TaskStatus::Deferred] {
+        let revision = book.get(id).unwrap().revision;
+        book.set_status(id, revision, status).unwrap();
+        assert!(book.assign(id, revision + 1, "codex").is_err());
+        book.set_status(id, revision + 1, TaskStatus::Planned).unwrap();
+    }
+}
+
+#[test]
+fn task_preview_is_read_only_and_preserves_multiline_step_and_previous_result() {
+    let mut book = TaskBook::default();
+    let id = book.create(std::env::temp_dir(), "qwen", "Task", "Read\n  code").unwrap();
+    let before = book.clone();
+    let preview = book.get(id).unwrap().preview(None).unwrap();
+    assert!(preview.contains("Read\n  code"));
+    assert_eq!(book, before);
+    book.begin(id, 1, None).unwrap();
+    book.record(id, 1, "Answer\n  exact").unwrap();
+    book.finish(id, 1, RunState::Completed).unwrap();
+    let task = book.get(id).unwrap();
+    assert!(task.preview(None).is_err());
+    assert!(task.preview(Some(" ")).is_err());
+    let text = task.preview(Some("Check\n  next")).unwrap();
+    assert!(text.contains("Check\n  next") && text.contains("Answer\n  exact"));
+}
+
+#[test]
+fn project_rules_are_revisioned_isolated_and_snapshotted_per_run() {
+    let project = std::env::temp_dir();
+    let mut book = TaskBook::default();
+    let id = book.create(project.clone(), "qwen", "Test", "Inspect").unwrap();
+    assert_eq!(book.rules(&project).revision, 0);
+    book.set_rules(project.clone(), 0, true, "Сначала обнови Dev").unwrap();
+    assert!(book.rules(&project).enabled);
+    assert_eq!(book.rules(&project.join("other")).revision, 0);
+    let before = book.encode().unwrap();
+    assert!(book.set_rules(project.clone(), 0, false, "stale").is_err());
+    assert_eq!(before, book.encode().unwrap());
+    let preview = book.get(id).unwrap().preview_with_rules(None, &book.rules(&project)).unwrap();
+    assert!(preview.contains("Сначала обнови Dev"));
+    assert!(preview.contains("редакция 1"));
+    let run = book.begin(id, 1, None).unwrap();
+    book.set_rules(project.clone(), 1, false, "Новое правило").unwrap();
+    assert_eq!(book.get(id).unwrap().runs[0].rules.as_ref().unwrap().text, "Сначала обнови Dev");
+    book.finish(id, run, RunState::Completed).unwrap();
+    let preview =
+        book.get(id).unwrap().preview_with_rules(Some("Next"), &book.rules(&project)).unwrap();
+    assert!(!preview.contains("Новое правило"));
+    assert!(preview.contains("выключены"));
+    let restored = TaskBook::decode(&book.encode().unwrap()).unwrap();
+    assert_eq!(book, restored);
+}
+
+#[test]
+fn invalid_project_rules_do_not_mutate_the_book() {
+    let mut book = TaskBook::default();
+    let before = book.encode().unwrap();
+    for (path, enabled, text) in [
+        (std::env::temp_dir(), true, " ".to_owned()),
+        (std::env::temp_dir(), false, "x".repeat(16385)),
+        (PathBuf::from("relative"), true, "Rule".to_owned()),
+    ] {
+        assert!(book.set_rules(path, 0, enabled, &text).is_err());
+        assert_eq!(before, book.encode().unwrap());
+    }
+}
+
+#[test]
+fn git_preparation_requires_durable_success_and_recovers_without_replay() {
+    use hub_core::tasks::git::{GitPolicy, PreparationState};
+    let project = std::env::temp_dir();
+    let mut book = TaskBook::default();
+    let id = book.create(project.clone(), "qwen", "Task", "Do").unwrap();
+    let mut rules = book.rules(&project);
+    rules.git = Some(GitPolicy { remote: "origin".into(), base: "Dev".into() });
+    book.configure_rules(project, 0, rules).unwrap();
+    assert!(book.begin(id, 1, None).is_err());
+    book.prepare_git(id, 1, "feat/test").unwrap();
+    assert!(book.get(id).unwrap().active());
+    let mut recovered = TaskBook::decode(&book.encode().unwrap()).unwrap();
+    assert!(recovered.recover());
+    assert_eq!(
+        recovered.get(id).unwrap().git.as_ref().unwrap().state,
+        PreparationState::Interrupted
+    );
+    assert!(!recovered.recover());
+    assert!(recovered.begin(id, 3, None).is_err());
+    book.finish_git(id, 2, Ok("a".repeat(40))).unwrap();
+    assert_eq!(book.get(id).unwrap().revision, 3);
+    assert!(book.finish_git(id, 2, Ok("b".repeat(40))).is_err());
+    book.note_git(id, 3, "Выбрана другая ветка").unwrap();
+    book.begin(id, 4, None).unwrap();
+    assert!(book.get(id).unwrap().git.as_ref().unwrap().message.is_empty());
+    assert!(book.prepare_git(id, 5, "feat/other").is_err());
+    assert!(TaskBook::decode(&book.encode().unwrap()).is_ok());
+}

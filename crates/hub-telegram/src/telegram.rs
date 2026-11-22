@@ -48,6 +48,9 @@ pub fn convert(message: &Message) -> Inbound {
         user: message.from.as_ref().map(|user| UserId(user.id.0)),
         message: MessageId(message.id.0),
         reply_to: message.reply_to_message().map(|reply| MessageId(reply.id.0)),
+        task_reply: message.reply_to_message().is_some_and(|reply| {
+            reply.text().is_some_and(|text| text.starts_with("🧭 Общая задача #"))
+        }),
         voice_reply: message.reply_to_message().is_some_and(|reply| {
             reply.from.as_ref().is_some_and(|author| author.is_bot)
                 && reply.text().is_some_and(|text| text.starts_with(VOICE_EDIT_PROMPT))

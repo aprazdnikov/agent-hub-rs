@@ -1767,6 +1767,7 @@ dependencies = [
  "directories",
  "eframe",
  "futures",
+ "hub-agent",
  "hub-claude",
  "hub-codex",
  "hub-core",

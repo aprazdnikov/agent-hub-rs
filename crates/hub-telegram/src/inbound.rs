@@ -45,6 +45,7 @@ pub struct Inbound {
     pub voice_reply: bool,
     /// A reply to the bot's handoff-correction prompt, including an expired prompt.
     pub handoff_reply: bool,
+    pub task_reply: bool,
     pub album: Option<String>,
     pub content: Content,
 }
@@ -139,6 +140,7 @@ mod tests {
             reply_to: None,
             voice_reply: false,
             handoff_reply: false,
+            task_reply: false,
             album: Some("g".to_owned()),
             content: Content::Media { caption: caption.to_owned(), attachment },
         }

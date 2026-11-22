@@ -17,6 +17,7 @@ use tokio::time::{Instant, sleep_until};
 
 use crate::config::{Loaded, SettingsStore, project_errors};
 use crate::error::StoreError;
+use crate::local_execution::Control;
 use crate::logging::Repaint;
 
 /// The hub itself gives up on sessions after 10 s; the rest covers the dispatcher.
@@ -27,12 +28,25 @@ pub const RETRY_MAX: Duration = Duration::from_mins(5);
 const OUTBOX_REFRESH: Duration = Duration::from_secs(5);
 
 pub enum Command {
+    LocalStop(uuid::Uuid),
+    LocalAnswer {
+        token: uuid::Uuid,
+        id: uuid::Uuid,
+        answer: crate::local_execution::Answer,
+        reply: oneshot::Sender<Result<(), String>>,
+    },
+    LocalTasks {
+        project: PathBuf,
+        backend: BackendKind,
+        request: hub_telegram::hub::tasks::Request,
+        reply: oneshot::Sender<Result<hub_telegram::hub::tasks::Snapshot, String>>,
+    },
     Tasks {
         key: TopicKey,
         project: PathBuf,
         backend: BackendKind,
         request: hub_telegram::hub::tasks::Request,
-        reply: oneshot::Sender<Result<Vec<hub_core::tasks::Task>, String>>,
+        reply: oneshot::Sender<Result<hub_telegram::hub::tasks::Snapshot, String>>,
     },
     SetMemory {
         enabled: bool,
@@ -84,6 +98,7 @@ pub struct AgentStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
     pub bot: BotStatus,
+    pub local: Option<crate::local_execution::Live>,
     pub chat_access: Option<hub_telegram::telegram::ChatAccess>,
     pub outbox: OutboxStatus,
     pub diagnostics: DiagnosticStatus,
@@ -100,6 +115,7 @@ impl Default for Snapshot {
     fn default() -> Self {
         Self {
             bot: BotStatus::Unconfigured,
+            local: None,
             chat_access: None,
             outbox: OutboxStatus::Unknown,
             diagnostics: DiagnosticStatus::Idle,
@@ -177,6 +193,22 @@ pub trait Connector: Send + 'static {
     /// Whether the start may succeed later on its own, e.g. the network is not up yet.
     fn transient(error: &Self::Error) -> bool;
 
+    fn task_service(&self) -> Option<Arc<hub_core::tasks::service::TaskService>> {
+        None
+    }
+
+    fn attach_execution(
+        &self,
+        _execution: Arc<dyn hub_telegram::execution::Control>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn local_executor(&self) -> Result<Arc<dyn crate::local_execution::Executor>, String> {
+        let memory_program = std::env::current_exe().map_err(|error| error.to_string())?;
+        Ok(Arc::new(crate::local_execution::CliExecutor { memory_program }))
+    }
+
     fn diagnose(&self, settings: Arc<Settings>) -> BoxFuture<'static, crate::diagnostics::Report> {
         Box::pin(crate::diagnostics::run(settings))
     }
@@ -213,6 +245,7 @@ pub struct Supervisor<C: Connector> {
     save_slow_at: Option<Instant>,
     stop_during_save: bool,
     home: PathBuf,
+    settings_load_error: Option<String>,
     settings: Option<watch::Sender<Arc<Settings>>>,
     bot: Option<Bot>,
     connecting: Option<BoxFuture<'static, Result<Started, C::Error>>>,
@@ -221,9 +254,24 @@ pub struct Supervisor<C: Connector> {
     diagnostic_read: Option<BoxFuture<'static, crate::diagnostics::Report>>,
     outbox_read: Option<BoxFuture<'static, (ChatId, Result<usize, String>)>>,
     outbox_next: Instant,
+    local: Result<Arc<crate::local_execution::SharedRuntime>, String>,
     state: Snapshot,
     snapshot: watch::Sender<Snapshot>,
     repaint: Repaint,
+}
+
+fn make_execution<C: Connector>(
+    connector: &C,
+    service: Arc<hub_core::tasks::service::TaskService>,
+) -> Result<Arc<crate::local_execution::SharedRuntime>, String> {
+    let runtime =
+        Arc::new(crate::local_execution::SharedRuntime::new(crate::local_execution::Runtime::new(
+            service,
+            connector.local_executor()?,
+            Arc::new(crate::git::LocalGitRunner),
+        )));
+    connector.attach_execution(runtime.clone())?;
+    Ok(runtime)
 }
 
 struct SaveJob {
@@ -240,6 +288,7 @@ struct Retry {
 }
 
 enum Event<E> {
+    LocalTick,
     Command(Option<Command>),
     Views { alive: bool },
     Retry,
@@ -256,6 +305,7 @@ impl<C: Connector> Supervisor<C> {
     pub fn new(setup: SupervisorSetup<C>) -> Self {
         let SupervisorSetup { connector, store, save_guard, home, loaded, snapshot, repaint } =
             setup;
+        let settings_load_error = loaded.as_ref().err().map(ToString::to_string);
         let mut state = Snapshot::default();
         let settings = match loaded {
             Ok(Loaded::Missing) => None,
@@ -275,8 +325,13 @@ impl<C: Connector> Supervisor<C> {
         };
         // Published now, so the window opens on the right tab before the core starts running.
         snapshot.send_replace(state.clone());
+        let local = connector
+            .task_service()
+            .ok_or_else(|| "Локальный сервис задач недоступен".to_owned())
+            .and_then(|service| make_execution(&connector, service));
         Self {
             connector,
+            local,
             store: Some(store),
             save_guard,
             saving: None,
@@ -284,6 +339,7 @@ impl<C: Connector> Supervisor<C> {
             save_slow_at: None,
             stop_during_save: false,
             home,
+            settings_load_error,
             settings,
             bot: None,
             connecting: None,
@@ -346,6 +402,7 @@ impl<C: Connector> Supervisor<C> {
             let event = tokio::select! {
                 biased;
                 command = commands.recv() => Event::Command(command),
+                () = tokio::time::sleep(Duration::from_millis(200)), if self.local.is_ok() => Event::LocalTick,
                 alive = changed => Event::Views { alive },
                 () = sleep_until(retry.unwrap_or_else(Instant::now)), if retry.is_some() && can_retry => Event::Retry,
                 result = startup => Event::Started(result),
@@ -360,41 +417,61 @@ impl<C: Connector> Supervisor<C> {
             self.views = views;
             self.outbox_read = outbox_read;
             self.diagnostic_read = diagnostic_read;
-            match event {
-                Event::Command(Some(Command::Quit(done))) => {
-                    self.stop().await;
-                    // The window may have stopped waiting; there is nobody else to tell.
-                    let _ = done.send(());
-                    return;
-                }
-                Event::Command(None) => {
-                    self.stop().await;
-                    return;
-                }
-                Event::Command(Some(command)) => {
-                    if matches!(command, Command::Start | Command::Stop) {
-                        self.retry = None;
-                    }
-                    self.handle(command).await;
-                }
-                Event::Retry => {
-                    if self.bot.is_none() {
-                        self.start();
-                    }
-                }
-                Event::Saved(result) => self.finish_save(*result).await,
-                Event::SaveDelayed => self.save_delayed(),
-                Event::Started(result) => {
-                    self.connecting = None;
-                    self.finish_start(result);
-                }
-                Event::ReadOutbox => self.read_outbox(),
-                Event::DiagnosticDone(report) => self.finish_diagnostic(report),
-                Event::OutboxRead(chat, result) => self.finish_outbox_read(chat, &result),
-                Event::Views { alive: true } => self.refresh_topics(),
-                Event::Views { alive: false } => self.hub_stopped().await,
+            if !self.apply_event(event).await {
+                return;
             }
         }
+    }
+
+    async fn apply_event(&mut self, event: Event<C::Error>) -> bool {
+        match event {
+            Event::LocalTick => {
+                let local = self.local.as_ref().ok().and_then(|local| local.snapshot());
+                if local != self.state.local {
+                    self.state.local = local;
+                    self.publish();
+                }
+            }
+            Event::Command(Some(Command::Quit(done))) => {
+                if let Ok(local) = &mut self.local {
+                    local.shutdown().await;
+                }
+                self.stop().await;
+                // The window may have stopped waiting; there is nobody else to tell.
+                let _ = done.send(());
+                return false;
+            }
+            Event::Command(None) => {
+                if let Ok(local) = &mut self.local {
+                    local.shutdown().await;
+                }
+                self.stop().await;
+                return false;
+            }
+            Event::Command(Some(command)) => {
+                if matches!(command, Command::Start | Command::Stop) {
+                    self.retry = None;
+                }
+                self.handle(command).await;
+            }
+            Event::Retry => {
+                if self.bot.is_none() {
+                    self.start();
+                }
+            }
+            Event::Saved(result) => self.finish_save(*result).await,
+            Event::SaveDelayed => self.save_delayed(),
+            Event::Started(result) => {
+                self.connecting = None;
+                self.finish_start(result);
+            }
+            Event::ReadOutbox => self.read_outbox(),
+            Event::DiagnosticDone(report) => self.finish_diagnostic(report),
+            Event::OutboxRead(chat, result) => self.finish_outbox_read(chat, &result),
+            Event::Views { alive: true } => self.refresh_topics(),
+            Event::Views { alive: false } => self.hub_stopped().await,
+        }
+        true
     }
 
     fn save_delayed(&mut self) {
@@ -427,8 +504,90 @@ impl<C: Connector> Supervisor<C> {
         }
     }
 
+    fn local_request(
+        &mut self,
+        project: &std::path::Path,
+        backend: BackendKind,
+        request: hub_telegram::hub::tasks::Request,
+    ) -> Result<hub_telegram::hub::tasks::Snapshot, String> {
+        use hub_telegram::hub::tasks::Request;
+        let service = self.connector.task_service().ok_or("Локальный сервис задач недоступен")?;
+        let root = self.state.saved.as_ref().map(|draft| draft.workspace_root.as_str());
+        let id = match &request {
+            Request::StartChecked { id, .. } | Request::PrepareGitChecked { id, .. } => Some(*id),
+            _ => None,
+        };
+        if let Some(id) = id {
+            if self.connecting.is_some() {
+                return Err(
+                    "Дождитесь подключения бота или остановите подключение перед запуском.".into(),
+                );
+            }
+            if self.saving.is_some() {
+                return Err("Дождитесь сохранения настроек".into());
+            }
+            let snapshot = crate::desktop_tasks::request(
+                &service,
+                project,
+                backend,
+                Request::Get(id),
+                root,
+                &self.home,
+            )?;
+            let project = snapshot.tasks.first().ok_or("Задача не найдена")?.project.clone();
+            let settings = self
+                .state
+                .saved
+                .clone()
+                .unwrap_or_default()
+                .execution(&self.home)
+                .map_err(|errors| {
+                    errors.iter().map(|error| error.message.as_str()).collect::<Vec<_>>().join("; ")
+                })?;
+            if self.local.is_err() {
+                self.local = make_execution(&self.connector, service.clone());
+            }
+            self.local.as_mut().map_err(|error| error.clone())?.dispatch(
+                &project,
+                request,
+                Arc::new(settings),
+            )?;
+            self.retry = None;
+            if matches!(self.state.bot, BotStatus::Retrying { .. }) {
+                self.state.bot = BotStatus::Stopped;
+            }
+            return crate::desktop_tasks::request(
+                &service,
+                &project,
+                backend,
+                Request::Get(id),
+                root,
+                &self.home,
+            );
+        }
+        crate::desktop_tasks::request(&service, project, backend, request, root, &self.home)
+    }
+
     async fn handle(&mut self, command: Command) {
         match command {
+            Command::LocalStop(token) => {
+                let result =
+                    self.local.as_ref().map_err(Clone::clone).and_then(|local| local.stop(token));
+                if let Err(error) = result {
+                    self.notice(Some(error));
+                }
+            }
+            Command::LocalAnswer { token, id, answer, reply } => {
+                let result = self
+                    .local
+                    .as_ref()
+                    .map_err(Clone::clone)
+                    .and_then(|local| local.respond(token, id, answer));
+                let _ = reply.send(result);
+            }
+            Command::LocalTasks { project, backend, request, reply } => {
+                self.handle_local_tasks(project, backend, request, reply);
+            }
             Command::Tasks { key, project, backend, request, reply } => {
                 if let Some(mailbox) = self.mailbox() {
                     let message = HubMessage::Tasks { key, project, backend, request, reply };
@@ -497,6 +656,37 @@ impl<C: Connector> Supervisor<C> {
                 let _ = done.send(());
             }
         }
+    }
+
+    fn handle_local_tasks(
+        &mut self,
+        project: std::path::PathBuf,
+        backend: hub_core::domain::BackendKind,
+        request: hub_telegram::hub::tasks::Request,
+        reply: tokio::sync::oneshot::Sender<Result<hub_telegram::hub::tasks::Snapshot, String>>,
+    ) {
+        if let Some(error) = &self.settings_load_error {
+            let _ = reply.send(Err(format!("Не удалось прочитать настройки: {error}. Исправьте и сохраните настройки либо перезапустите приложение после исправления файла.")));
+            return;
+        }
+        if matches!(
+            request,
+            hub_telegram::hub::tasks::Request::StartChecked { .. }
+                | hub_telegram::hub::tasks::Request::PrepareGitChecked { .. }
+        ) && let Some(mailbox) = self.mailbox()
+        {
+            let message = HubMessage::SharedTasks { project, request, reply };
+            if let Err(error) = mailbox.try_send(message)
+                && let HubMessage::SharedTasks { reply, .. } = error.into_inner()
+            {
+                let _ = reply.send(Err("Бот занят или остановлен. Повторите запрос.".into()));
+            }
+            return;
+        }
+        let result = self.local_request(&project, backend, request);
+        self.state.local = self.local.as_ref().ok().and_then(|local| local.snapshot());
+        self.publish();
+        let _ = reply.send(result);
     }
 
     fn save(&mut self, draft: Draft) {
@@ -571,6 +761,7 @@ impl<C: Connector> Supervisor<C> {
         }
         self.cancel_diagnostic();
         tracing::info!("settings saved");
+        self.settings_load_error = None;
         self.retry = None;
         self.state.saved = Some(draft);
         self.state.notice = None;
@@ -750,6 +941,7 @@ mod tests {
 
     #[derive(Default)]
     struct Probe {
+        tasks: StdMutex<Option<Arc<hub_core::tasks::service::TaskService>>>,
         connects: AtomicUsize,
         stops: AtomicUsize,
         messages: StdMutex<Vec<String>>,
@@ -760,6 +952,21 @@ mod tests {
         diagnostics: StdMutex<VecDeque<oneshot::Receiver<crate::diagnostics::Report>>>,
     }
 
+    struct BlockingLocal;
+    impl crate::local_execution::Executor for BlockingLocal {
+        fn run<'a>(
+            &'a self,
+            _: &'a hub_core::domain::TopicSession,
+            _: hub_core::domain::Prompt,
+            conversation: hub_agent::conversation::Conversation,
+            _: Arc<hub_core::settings::ExecutionSettings>,
+        ) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                conversation.cancel.cancelled().await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+            })
+        }
+    }
     struct FakeConnector {
         probe: Arc<Probe>,
         outcomes: StdMutex<VecDeque<Outcome>>,
@@ -767,6 +974,14 @@ mod tests {
 
     impl Connector for FakeConnector {
         type Error = String;
+
+        fn task_service(&self) -> Option<Arc<hub_core::tasks::service::TaskService>> {
+            self.probe.tasks.lock().unwrap().clone()
+        }
+
+        fn local_executor(&self) -> Result<Arc<dyn crate::local_execution::Executor>, String> {
+            Ok(Arc::new(BlockingLocal))
+        }
 
         fn diagnose(
             &self,
@@ -836,6 +1051,8 @@ mod tests {
                             }
                             HubMessage::TaskResultUnavailable { .. }
                             | HubMessage::Tasks { .. }
+                            | HubMessage::SharedTasks { .. }
+                            | HubMessage::GitDone(_)
                             | HubMessage::MemoryDone(_)
                             | HubMessage::HandoffDone(_)
                             | HubMessage::VoiceDone(_)
@@ -971,6 +1188,210 @@ mod tests {
         fn stops(&self) -> usize {
             self.probe.stops.load(Ordering::SeqCst)
         }
+    }
+
+    #[tokio::test]
+    async fn first_settings_save_connects_telegram_without_stopping_shared_work() {
+        use hub_core::tasks::service::{Access, TaskService};
+        use hub_telegram::hub::tasks::Request;
+        let mut harness = harness(Ok(Loaded::Missing), &[], false);
+        let root = tempfile::tempdir().unwrap();
+        let project = home().join("projects");
+        let service = Arc::new(TaskService::new(Box::new(crate::topics::FileTopics::new(
+            root.path().join("topics.json"),
+        ))));
+        let id = service
+            .access(Access::Edit, |book, _| book.create(project.clone(), "qwen", "Read", "Inspect"))
+            .unwrap();
+        *harness.probe.tasks.lock().unwrap() = Some(service);
+        let (reply, result) = oneshot::channel();
+        harness
+            .send(Command::LocalTasks {
+                project,
+                backend: BackendKind::Qwen,
+                request: Request::StartChecked { id, revision: 1, next: None, rules_revision: 0 },
+                reply,
+            })
+            .await;
+        result.await.unwrap().unwrap();
+        harness.until("local started", |s| s.local.as_ref().is_some_and(|l| l.active)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        harness.send(Command::Save(Box::new(draft("-100", "")))).await;
+        harness.until("saved", |s| s.saved.is_some()).await;
+        harness.until("bot connected", running).await;
+        assert!(harness.snapshot.borrow().local.as_ref().unwrap().active);
+        assert_eq!(harness.connects(), 1);
+        let token = harness.snapshot.borrow().local.as_ref().unwrap().token;
+        harness.send(Command::LocalStop(token)).await;
+        harness.until("local ended", |s| s.local.as_ref().is_some_and(|l| !l.active)).await;
+    }
+
+    #[tokio::test]
+    async fn local_execution_without_credentials_stops_on_quit_and_keeps_history() {
+        use hub_core::tasks::{
+            RunState, TaskBook,
+            service::{Access, TaskService},
+        };
+        use hub_telegram::hub::tasks::Request;
+        let mut harness = harness(Ok(Loaded::Missing), &[], false);
+        let root = tempfile::tempdir().unwrap();
+        let service = Arc::new(TaskService::new(Box::new(crate::topics::FileTopics::new(
+            root.path().join("topics.json"),
+        ))));
+        let id = service
+            .access(Access::Edit, |book: &mut TaskBook, _| {
+                book.create(root.path().to_path_buf(), "qwen", "Read", "Inspect")
+            })
+            .unwrap();
+        *harness.probe.tasks.lock().unwrap() = Some(service.clone());
+        let (reply, result) = oneshot::channel();
+        harness
+            .send(Command::LocalTasks {
+                project: root.path().to_path_buf(),
+                backend: BackendKind::Qwen,
+                request: Request::StartChecked { id, revision: 1, next: None, rules_revision: 0 },
+                reply,
+            })
+            .await;
+        result.await.unwrap().unwrap();
+        harness.until("local running", |s| s.local.as_ref().is_some_and(|live| live.active)).await;
+        assert_eq!(harness.connects(), 0);
+        let (done, quit) = oneshot::channel();
+        harness.send(Command::Quit(done)).await;
+        tokio::time::timeout(Duration::from_secs(2), quit).await.unwrap().unwrap();
+        let book = service.read().unwrap();
+        // If quit beat the worker's durable begin there is no attempt; otherwise interrupted.
+        assert!(book.get(id).unwrap().runs.iter().all(|run| run.state == RunState::Interrupted));
+        assert_eq!(harness.connects(), 0);
+    }
+
+    #[tokio::test]
+    async fn local_execution_keeps_running_when_bot_starts_and_stops() {
+        use hub_core::tasks::service::{Access, TaskService};
+        use hub_telegram::hub::tasks::Request;
+        let mut harness = harness(Ok(Loaded::Ready(settings("-100", ""))), &[], false);
+        harness.until("running", running).await;
+        harness.send(Command::Stop).await;
+        harness.until("stopped", |s| s.bot == BotStatus::Stopped).await;
+        let project = home().join("projects");
+        let root = tempfile::tempdir().unwrap();
+        let service = Arc::new(TaskService::new(Box::new(crate::topics::FileTopics::new(
+            root.path().join("topics.json"),
+        ))));
+        let id = service
+            .access(Access::Edit, |book, _| book.create(project.clone(), "qwen", "Read", "Inspect"))
+            .unwrap();
+        *harness.probe.tasks.lock().unwrap() = Some(service);
+        let (reply, result) = oneshot::channel();
+        harness
+            .send(Command::LocalTasks {
+                project,
+                backend: BackendKind::Qwen,
+                request: Request::StartChecked { id, revision: 1, next: None, rules_revision: 0 },
+                reply,
+            })
+            .await;
+        result.await.unwrap().unwrap();
+        harness.until("local running", |s| s.local.as_ref().is_some_and(|l| l.active)).await;
+        harness.send(Command::Start).await;
+        harness.until("bot connected", running).await;
+        assert!(harness.snapshot.borrow().local.as_ref().unwrap().active);
+        assert_eq!(harness.connects(), 2);
+        harness.send(Command::Stop).await;
+        harness.until("bot stopped", |s| s.bot == BotStatus::Stopped).await;
+        assert!(harness.snapshot.borrow().local.as_ref().unwrap().active);
+        let token = harness.snapshot.borrow().local.as_ref().unwrap().token;
+        harness.send(Command::LocalStop(token)).await;
+        harness.until("local ended", |s| s.local.as_ref().is_some_and(|l| !l.active)).await;
+    }
+
+    #[tokio::test]
+    async fn local_management_refuses_unknown_settings_until_explicit_save() {
+        let mut harness = harness(
+            Err(StoreError::Corrupt { path: "settings.toml".into(), reason: "invalid".into() }),
+            &[],
+            false,
+        );
+        let root = tempfile::tempdir().unwrap();
+        let service = Arc::new(hub_core::tasks::service::TaskService::new(Box::new(
+            crate::topics::FileTopics::new(root.path().join("topics.json")),
+        )));
+        *harness.probe.tasks.lock().unwrap() = Some(service.clone());
+        let (reply, result) = oneshot::channel();
+        harness
+            .commands
+            .send(Command::LocalTasks {
+                project: root.path().to_path_buf(),
+                backend: BackendKind::Qwen,
+                request: hub_telegram::hub::tasks::Request::Create {
+                    title: "Local".into(),
+                    prompt: "Read".into(),
+                },
+                reply,
+            })
+            .await
+            .unwrap();
+        assert!(result.await.unwrap().is_err());
+        assert!(service.read().unwrap().tasks().is_empty());
+        harness.send(Command::Save(Box::new(draft("-100", "")))).await;
+        harness.until("running", running).await;
+        let (reply, result) = oneshot::channel();
+        harness
+            .commands
+            .send(Command::LocalTasks {
+                project: home().join("projects"),
+                backend: BackendKind::Qwen,
+                request: hub_telegram::hub::tasks::Request::List,
+                reply,
+            })
+            .await
+            .unwrap();
+        assert!(result.await.unwrap().is_ok());
+    }
+
+    #[tokio::test]
+    async fn local_management_works_without_settings_credentials_or_bot_connection() {
+        let harness = harness(Ok(Loaded::Missing), &[], false);
+        let root = tempfile::tempdir().unwrap();
+        let service = Arc::new(hub_core::tasks::service::TaskService::new(Box::new(
+            crate::topics::FileTopics::new(root.path().join("topics.json")),
+        )));
+        *harness.probe.tasks.lock().unwrap() = Some(service.clone());
+        let (reply, result) = oneshot::channel();
+        harness
+            .commands
+            .send(Command::LocalTasks {
+                project: root.path().to_path_buf(),
+                backend: BackendKind::Qwen,
+                request: hub_telegram::hub::tasks::Request::Create {
+                    title: "Local".into(),
+                    prompt: "Read".into(),
+                },
+                reply,
+            })
+            .await
+            .unwrap();
+        let snapshot = result.await.unwrap().unwrap();
+        assert_eq!(snapshot.tasks[0].backend, "qwen");
+        assert_eq!(harness.connects(), 0);
+        let (reply, result) = oneshot::channel();
+        harness
+            .commands
+            .send(Command::LocalTasks {
+                project: root.path().to_path_buf(),
+                backend: BackendKind::Qwen,
+                request: hub_telegram::hub::tasks::Request::Start {
+                    id: snapshot.tasks[0].id,
+                    revision: 1,
+                    next: None,
+                },
+                reply,
+            })
+            .await
+            .unwrap();
+        assert!(result.await.unwrap().is_err());
+        assert!(service.read().unwrap().tasks()[0].runs.is_empty());
+        assert_eq!(harness.connects(), 0);
     }
 
     fn running(snapshot: &Snapshot) -> bool {

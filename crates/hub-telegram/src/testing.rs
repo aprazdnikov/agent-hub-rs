@@ -78,6 +78,10 @@ impl FakeMessenger {
         Self { sends: Mutex::new(sends.into()), ..Self::default() }
     }
 
+    pub(crate) fn send_result(&self, result: Result<(), SendError>) {
+        self.sends.lock().unwrap().push_back(result);
+    }
+
     /// Outcomes of the next edits, in order; afterwards every edit succeeds. A failed edit
     /// is not recorded.
     pub(crate) fn with_edits(edits: Vec<Result<(), SendError>>) -> Self {

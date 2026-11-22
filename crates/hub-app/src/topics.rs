@@ -5,6 +5,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use hub_core::projects::RecentProjects;
+use hub_core::tasks::service::TaskStorage;
 use hub_core::topics::{Titles, Topics, dump_state, dump_titles, parse_state, parse_titles};
 use hub_telegram::hub::TopicStore;
 
@@ -55,7 +56,7 @@ impl FileTopics {
     }
 }
 
-impl TopicStore for FileTopics {
+impl TaskStorage for FileTopics {
     fn load_tasks(&mut self) -> Result<hub_core::tasks::TaskBook, String> {
         use std::io::Read;
         let path = self.path.with_extension("tasks.json");
@@ -89,7 +90,9 @@ impl TopicStore for FileTopics {
             .map_err(|e| format!("Запись задач могла сохраниться, но её долговечность не подтверждена: {e}. Перезапустите бота перед повтором."))?;
         Ok(())
     }
+}
 
+impl TopicStore for FileTopics {
     fn save_recent_projects(&mut self, recent: &RecentProjects) -> Result<(), String> {
         let path = self.path.with_extension("projects.json");
         let text = recent.dump().map_err(|error| error.to_string())?;

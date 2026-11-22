@@ -676,6 +676,60 @@ impl CodexDraft {
 
 impl Draft {
     /// Parses every field and reports all errors at once, in form order.
+    pub fn execution(&self, home: &Path) -> Result<ExecutionSettings, Vec<FieldError>> {
+        let mut errors = Vec::new();
+        let cli = check(&mut errors, Field::Cli, parse_cli(&self.cli, home));
+        let model = check(&mut errors, Field::Model, parse_model(&self.model));
+        let budget = check(&mut errors, Field::Budget, parse_budget(&self.budget));
+        let codex = self.codex.parse(home, &mut errors);
+        let qwen_cli =
+            check(&mut errors, Field::Qwen(QwenField::Cli), parse_cli(&self.qwen.cli, home));
+        let qwen_model =
+            check(&mut errors, Field::Qwen(QwenField::Model), parse_model(&self.qwen.model));
+        let endpoint = parse_endpoint(&self.qwen.base_url, &self.qwen.api_key)
+            .map_err(|error| errors.push(error))
+            .ok();
+        let hermes = self.hermes.parse(home, &mut errors);
+        let opencode = self.opencode.parse(home, &mut errors);
+        let approval =
+            check(&mut errors, Field::ApprovalTimeout, parse_seconds(&self.approval_timeout));
+        let background =
+            check(&mut errors, Field::BackgroundTimeout, parse_seconds(&self.background_timeout));
+        let (
+            Some(cli),
+            Some(model),
+            Some(budget),
+            Some(codex),
+            Some(qwen_cli),
+            Some(qwen_model),
+            Some(endpoint),
+            Some(hermes),
+            Some(opencode),
+            Some(approval),
+            Some(background),
+        ) = (
+            cli, model, budget, codex, qwen_cli, qwen_model, endpoint, hermes, opencode, approval,
+            background,
+        )
+        else {
+            return Err(errors);
+        };
+        Ok(ExecutionSettings {
+            memory: self.memory,
+            claude: ClaudeSettings { cli, model, permission_mode: self.permission_mode, budget },
+            codex,
+            qwen: QwenSettings {
+                cli: qwen_cli,
+                model: qwen_model,
+                approval: self.qwen.approval,
+                endpoint,
+            },
+            hermes,
+            opencode,
+            timeouts: Timeouts { approval, background },
+        })
+    }
+
     pub fn parse(&self, home: &Path) -> Result<Settings, Vec<FieldError>> {
         let mut errors = Vec::new();
         let actions = check(&mut errors, Field::Actions, actions::parse(&self.actions, home));
@@ -2218,5 +2272,43 @@ pub struct MemorySettings {
 impl Default for MemorySettings {
     fn default() -> Self {
         Self { enabled: true }
+    }
+}
+
+#[cfg(test)]
+mod execution_tests {
+    use super::*;
+    #[test]
+    fn desktop_configuration_needs_no_telegram_credentials() {
+        let draft = Draft::default();
+        assert!(draft.parse(&std::env::temp_dir()).is_err());
+        assert!(draft.execution(&std::env::temp_dir()).is_ok());
+        let invalid = Draft { approval_timeout: "invalid".into(), ..draft };
+        assert!(invalid.execution(&std::env::temp_dir()).is_err());
+    }
+}
+
+/// Frozen backend configuration shared by desktop and Telegram execution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExecutionSettings {
+    pub memory: MemorySettings,
+    pub claude: ClaudeSettings,
+    pub codex: CodexSettings,
+    pub qwen: QwenSettings,
+    pub hermes: HermesSettings,
+    pub opencode: OpencodeSettings,
+    pub timeouts: Timeouts,
+}
+impl From<&Settings> for ExecutionSettings {
+    fn from(settings: &Settings) -> Self {
+        Self {
+            memory: settings.memory,
+            claude: settings.claude.clone(),
+            codex: settings.codex.clone(),
+            qwen: settings.qwen.clone(),
+            hermes: settings.hermes.clone(),
+            opencode: settings.opencode.clone(),
+            timeouts: settings.timeouts,
+        }
     }
 }

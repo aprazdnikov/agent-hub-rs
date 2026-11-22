@@ -22,3 +22,9 @@ pub mod updates;
 pub mod results;
 
 pub mod memory;
+
+pub mod git;
+
+pub mod desktop_tasks;
+
+pub mod local_execution;

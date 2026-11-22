@@ -212,8 +212,10 @@ pub fn statuses(
 }
 
 pub struct TelegramConnector {
+    execution: std::sync::Mutex<Option<Arc<dyn hub_telegram::execution::Control>>>,
     home: PathBuf,
     topics: PathBuf,
+    tasks: Arc<hub_core::tasks::service::TaskService>,
     results: Arc<crate::results::FileResults>,
     memory_program: Option<PathBuf>,
     memory_control: Option<Arc<dyn hub_telegram::memory::MemoryControl>>,
@@ -223,7 +225,18 @@ impl TelegramConnector {
     #[must_use]
     pub fn new(home: PathBuf, topics: PathBuf) -> Self {
         let results = Arc::new(crate::results::FileResults::new(&topics));
-        Self { home, topics, results, memory_program: None, memory_control: None }
+        let tasks = Arc::new(hub_core::tasks::service::TaskService::new(Box::new(
+            FileTopics::new(topics.clone()),
+        )));
+        Self {
+            execution: std::sync::Mutex::new(None),
+            home,
+            topics,
+            tasks,
+            results,
+            memory_program: None,
+            memory_control: None,
+        }
     }
 
     #[must_use]
@@ -245,6 +258,17 @@ impl TelegramConnector {
 
 impl Connector for TelegramConnector {
     type Error = StartError;
+
+    fn attach_execution(
+        &self,
+        execution: Arc<dyn hub_telegram::execution::Control>,
+    ) -> Result<(), String> {
+        *self.execution.lock().map_err(|_| "Исполнитель недоступен")? = Some(execution);
+        Ok(())
+    }
+    fn task_service(&self) -> Option<Arc<hub_core::tasks::service::TaskService>> {
+        Some(self.tasks.clone())
+    }
 
     fn outbox_count(
         &self,
@@ -273,7 +297,9 @@ impl Connector for TelegramConnector {
     ) -> BoxFuture<'static, Result<Started, StartError>> {
         let home = self.home.clone();
         let topic_path = self.topics.clone();
+        let tasks = self.tasks.clone();
         let results = Arc::clone(&self.results);
+        let execution = self.execution.lock().ok().and_then(|execution| execution.clone());
         let memory_program = self.memory_program.clone();
         let memory_control = self.memory_control.clone();
         Box::pin(async move {
@@ -320,9 +346,12 @@ impl Connector for TelegramConnector {
             }
             let HubHandle { mailbox, views, registries: _registries, task } =
                 hub::spawn(HubSetup {
+                    execution,
+                    tasks,
                     memory_control,
                     transcriber: Arc::new(crate::speech::SpeechTranscriber),
                     action_runner: Arc::new(LocalActionRunner),
+                    git_runner: Arc::new(crate::git::LocalGitRunner),
                     results,
                     doctor_runner: Arc::new(crate::doctor::LocalDoctor::new(home.clone())),
                     agents: Arc::new(

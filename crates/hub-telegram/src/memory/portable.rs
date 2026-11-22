@@ -152,6 +152,7 @@ mod tests {
             reply_to: None,
             voice_reply: false,
             handoff_reply: false,
+            task_reply: false,
             album: None,
             content: Content::Media {
                 caption: String::new(),

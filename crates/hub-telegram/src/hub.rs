@@ -97,13 +97,6 @@ pub trait Agents: Send + Sync + 'static {
 }
 
 pub trait TopicStore: Send + 'static {
-    fn load_tasks(&mut self) -> Result<hub_core::tasks::TaskBook, String> {
-        Ok(hub_core::tasks::TaskBook::default())
-    }
-    fn save_tasks(&mut self, _book: &hub_core::tasks::TaskBook) -> Result<(), String> {
-        Err("Хранилище задач недоступно".into())
-    }
-
     fn save(&mut self, topics: &Topics) -> Result<(), String>;
     fn save_titles(&mut self, titles: &Titles) -> Result<(), String>;
     fn save_recent_projects(&mut self, recent: &RecentProjects) -> Result<(), String>;
@@ -127,6 +120,12 @@ pub struct TopicView {
 }
 
 pub enum HubMessage {
+    SharedTasks {
+        project: PathBuf,
+        request: tasks::Request,
+        reply: oneshot::Sender<Result<tasks::Snapshot, String>>,
+    },
+    GitDone(tasks::git::Done),
     TaskResultUnavailable {
         key: TopicKey,
         generation: u64,
@@ -137,7 +136,7 @@ pub enum HubMessage {
         project: PathBuf,
         backend: BackendKind,
         request: tasks::Request,
-        reply: oneshot::Sender<Result<Vec<hub_core::tasks::Task>, String>>,
+        reply: oneshot::Sender<Result<tasks::Snapshot, String>>,
     },
     MemoryDone(crate::memory::Done),
     HandoffDone(crate::handoff::Done),
@@ -192,10 +191,13 @@ struct Polled {
 }
 
 pub struct HubSetup<A> {
+    pub execution: Option<Arc<dyn crate::execution::Control>>,
     pub memory_control: Option<Arc<dyn crate::memory::MemoryControl>>,
     pub transcriber: Arc<dyn crate::transcription::Transcriber>,
     pub results: Arc<dyn ResultStore>,
+    pub tasks: Arc<hub_core::tasks::service::TaskService>,
     pub action_runner: Arc<dyn ActionRunner>,
+    pub git_runner: Arc<dyn crate::git::GitRunner>,
     pub doctor_runner: Arc<dyn DoctorRunner>,
     pub agents: Arc<A>,
     pub messenger: Arc<dyn Messenger>,
@@ -227,9 +229,13 @@ struct Live {
 }
 
 struct Hub<A> {
+    execution: Option<Arc<dyn crate::execution::Control>>,
+    follows: tasks::shared::Followers,
     task_deliveries: tasks::Deliveries,
-    task_book: Result<hub_core::tasks::TaskBook, String>,
+    tasks: Arc<hub_core::tasks::service::TaskService>,
     task_runs: HashMap<TopicKey, tasks::ManagedRun>,
+    git_runner: Arc<dyn crate::git::GitRunner>,
+    git_job: Option<tasks::git::Job>,
     memory: crate::memory::Browser,
     handoffs: crate::handoff::Handoffs<A>,
     /// Fresh service-event bindings observed during a pending topic creation.
@@ -275,34 +281,38 @@ struct Hub<A> {
 #[must_use]
 pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
     let HubSetup {
+        execution,
         memory_control,
+        tasks,
         transcriber,
         results,
         agents,
         action_runner,
+        git_runner,
         doctor_runner,
         messenger,
         settings,
         topics,
         titles,
         recent_projects,
-        mut store,
+        store,
         home,
         bot,
     } = setup;
     let (mailbox, inbox) = mpsc::channel(MAILBOX);
     let (views, watched) = watch::channel(Vec::new());
     let registries = Shared::default();
-    let task_book = store.load_tasks().and_then(|mut book| {
-        if book.recover() {
-            store.save_tasks(&book)?;
-        }
-        Ok(book)
-    });
+    if execution.is_none() {
+        let _ = tasks.recover();
+    }
     let hub = Hub {
+        execution,
+        follows: tasks::shared::Followers::default(),
         task_deliveries: tasks::Deliveries::default(),
-        task_book,
+        tasks,
         task_runs: HashMap::new(),
+        git_runner,
+        git_job: None,
         memory: crate::memory::Browser::new(
             Sender::new(messenger.clone()),
             mailbox.clone(),
@@ -362,7 +372,8 @@ impl<A: Agents> Hub<A> {
             let deadline = self.shutdown.as_ref().map(|(_, at)| *at);
             let message = tokio::select! {
                 message = mailbox.recv() => message,
-                _ = refresh.tick(), if !self.running.is_empty() || !self.voices.is_empty() || !self.handoffs.is_empty() => {
+                _ = refresh.tick(), if !self.running.is_empty() || !self.voices.is_empty() || !self.handoffs.is_empty() || self.execution.is_some() => {
+                    self.refresh_shared();
                     self.handoffs.refresh(&self.settings.borrow(), &self.topics);
                     if !self.handoffs.creating() { self.handoff_topics.clear(); }
                     self.voices.refresh(&self.settings.borrow(), &self.topics);
@@ -372,6 +383,7 @@ impl<A: Agents> Hub<A> {
                 }
                 changed = self.settings.changed() => {
                     if changed.is_err() { break; }
+                    self.cancel_git_if_settings_changed();
                     self.handoffs.refresh(&self.settings.borrow(), &self.topics);
                     self.voices.refresh(&self.settings.borrow(), &self.topics);
                     self.memory.refresh(&self.settings.borrow(),&self.topics);
@@ -385,6 +397,7 @@ impl<A: Agents> Hub<A> {
             if self.shutdown.is_some()
                 && self.running.is_empty()
                 && self.actions.is_idle()
+                && self.git_job.is_none()
                 && self.handoffs.is_idle()
             {
                 break;
@@ -397,6 +410,10 @@ impl<A: Agents> Hub<A> {
     }
 
     fn press(&mut self, pressed: Press) {
+        if pressed.data.starts_with(tasks::shared::PREFIX) {
+            self.shared_press(pressed);
+            return;
+        }
         if pressed.data.starts_with(crate::handoff::PREFIX) {
             if self.shutdown.is_none() {
                 let refusal =
@@ -458,7 +475,7 @@ impl<A: Agents> Hub<A> {
                 self.project_press(pressed);
             }
         } else if pressed.data.starts_with(actions::PREFIX) {
-            if self.shutdown.is_none() {
+            if self.shutdown.is_none() && !self.git_busy() {
                 self.actions.press(
                     pressed,
                     &self.settings.borrow(),
@@ -476,6 +493,10 @@ impl<A: Agents> Hub<A> {
     fn handle(&mut self, message: HubMessage) {
         self.memory.refresh(&self.settings.borrow(), &self.topics);
         match message {
+            HubMessage::SharedTasks { project, request, reply } => {
+                let _ = reply.send(self.shared_task(&project, request, None));
+            }
+            HubMessage::GitDone(done) => self.git_done(done),
             HubMessage::TaskResultUnavailable { key, generation, reason } => {
                 self.unavailable_task(key, generation, &reason);
             }
@@ -483,7 +504,7 @@ impl<A: Agents> Hub<A> {
                 let result = if self.topics.get(&key).is_some_and(|session| {
                     session.cwd.as_path() == project && session.backend == backend
                 }) {
-                    self.task_request(key, request)
+                    self.task_snapshot(key, request)
                 } else {
                     Err("Проект или агент темы изменились. Обновите список.".into())
                 };
@@ -539,6 +560,9 @@ impl<A: Agents> Hub<A> {
             }
             HubMessage::Ended { key, generation, inbox } => self.ended(key, generation, inbox),
             HubMessage::Stop(key) => {
+                if self.shared_stop(key) {
+                    return;
+                }
                 self.stop(key);
             }
             HubMessage::Reset(key) => {
@@ -552,25 +576,31 @@ impl<A: Agents> Hub<A> {
                 }
             }
             HubMessage::Snapshot(SnapshotDone(done)) => self.snapshot_done(done),
-            HubMessage::Shutdown(done) => {
-                self.handoffs.shutdown();
-                self.voices.shutdown();
-                self.cards.shutdown();
-                self.actions.shutdown();
-                self.doctors.shutdown();
-                self.results.shutdown();
-                self.task_deliveries.shutdown();
-                self.outbox.shutdown();
-                self.options.shutdown();
-                for live in self.running.values() {
-                    live.progress.stopping();
-                    live.cancel.cancel();
-                }
-                self.shutdown = Some((done, Instant::now() + SHUTDOWN_TIMEOUT));
-            }
+            HubMessage::Shutdown(done) => self.begin_shutdown(done),
         }
         self.memory.refresh(&self.settings.borrow(), &self.topics);
         self.publish();
+    }
+
+    fn begin_shutdown(&mut self, done: oneshot::Sender<()>) {
+        self.follows = tasks::shared::Followers::default();
+        if let Some(job) = &self.git_job {
+            job.cancel.cancel();
+        }
+        self.handoffs.shutdown();
+        self.voices.shutdown();
+        self.cards.shutdown();
+        self.actions.shutdown();
+        self.doctors.shutdown();
+        self.results.shutdown();
+        self.task_deliveries.shutdown();
+        self.outbox.shutdown();
+        self.options.shutdown();
+        for live in self.running.values() {
+            live.progress.stopping();
+            live.cancel.cancel();
+        }
+        self.shutdown = Some((done, Instant::now() + SHUTDOWN_TIMEOUT));
     }
 
     fn save_result(&mut self, saved: SaveResult) {
@@ -615,7 +645,10 @@ impl<A: Agents> Hub<A> {
             self.outside_topic(inbound);
             return;
         };
-        if self.task_inbound(&inbound, key) || self.memory_attachment(&inbound, key) {
+        if self.shared_reply(&inbound, key)
+            || self.task_inbound(&inbound, key)
+            || self.memory_attachment(&inbound, key)
+        {
             return;
         }
         if inbound.album.is_some() && matches!(inbound.content, Content::Media { .. }) {
@@ -623,28 +656,7 @@ impl<A: Agents> Hub<A> {
             return;
         }
         match &inbound.content {
-            Content::TopicCreated { name } => {
-                // Delayed service events must not reset a session or undo a later rename.
-                if self.topics.contains_key(&key) {
-                    if !self.titles.contains_key(&key) {
-                        self.rename(key, name.clone());
-                    }
-                    return;
-                }
-                self.rename(key, name.clone());
-                match self.root() {
-                    Ok(root) => {
-                        let default = self.settings.borrow().default_backend;
-                        let session = TopicSession::fresh(default, root);
-                        self.put(key, session.clone());
-                        if self.handoffs.creating() && self.handoff_topics.len() < 128 {
-                            self.handoff_topics.insert(key, session.clone());
-                        }
-                        self.say(Target::Topic(key), texts::describe(texts::NEW_SESSION, &session));
-                    }
-                    Err(error) => self.say(Target::Topic(key), texts::warning(&error)),
-                }
-            }
+            Content::TopicCreated { name } => self.topic_created(key, name),
             Content::TopicRenamed { name } => self.rename(key, name.clone()),
             Content::Text(text) => match parse_input(text, &self.bot) {
                 Input::Command { command: Command::Handoff, args } => {
@@ -671,6 +683,15 @@ impl<A: Agents> Hub<A> {
                         self.mailbox.clone(),
                     );
                 }
+                Input::Command { command: Command::Stop, .. } => {
+                    if crate::telegram::allowed(
+                        &self.settings.borrow().telegram,
+                        Some(inbound.chat),
+                        inbound.user,
+                    ) {
+                        self.stop_command(key);
+                    }
+                }
                 Input::Command { command, args } => {
                     self.command(key, inbound.chat, inbound.message, command, &args);
                 }
@@ -695,6 +716,29 @@ impl<A: Agents> Hub<A> {
             }
             Content::VideoNote => self.say(Target::Topic(key), texts::VIDEO_UNSUPPORTED.to_owned()),
             Content::Ignored => {}
+        }
+    }
+
+    fn topic_created(&mut self, key: TopicKey, name: &str) {
+        // Delayed service events must not reset a session or undo a later rename.
+        if self.topics.contains_key(&key) {
+            if !self.titles.contains_key(&key) {
+                self.rename(key, name.to_owned());
+            }
+            return;
+        }
+        self.rename(key, name.to_owned());
+        match self.root() {
+            Ok(root) => {
+                let default = self.settings.borrow().default_backend;
+                let session = TopicSession::fresh(default, root);
+                self.put(key, session.clone());
+                if self.handoffs.creating() && self.handoff_topics.len() < 128 {
+                    self.handoff_topics.insert(key, session.clone());
+                }
+                self.say(Target::Topic(key), texts::describe(texts::NEW_SESSION, &session));
+            }
+            Err(error) => self.say(Target::Topic(key), texts::warning(&error)),
         }
     }
 
@@ -849,11 +893,7 @@ impl<A: Agents> Hub<A> {
                 }
             }
             Command::Backend => self.backend(key, args),
-            Command::Stop => {
-                if !self.stop(key) {
-                    self.say(Target::Topic(key), texts::NOTHING_TO_STOP.to_owned());
-                }
-            }
+            Command::Stop => self.stop_command(key),
             Command::Status => match self.topics.get(&key) {
                 None => self.say(Target::Topic(key), texts::NO_SESSION.to_owned()),
                 Some(session) => {
@@ -877,6 +917,14 @@ impl<A: Agents> Hub<A> {
             Command::Saves => self.saves(key),
             Command::Restore => self.restore(key, args),
             Command::Limits => self.limits(Target::Topic(key), chat),
+        }
+    }
+
+    fn stop_command(&mut self, key: TopicKey) {
+        if self.shared_stop(key) {
+            self.say(Target::Topic(key), "Остановка общей задачи запрошена.".into());
+        } else if !self.stop(key) {
+            self.say(Target::Topic(key), texts::NOTHING_TO_STOP.to_owned());
         }
     }
 
@@ -912,6 +960,9 @@ impl<A: Agents> Hub<A> {
     }
 
     fn handoff_refusal(&self, key: TopicKey) -> Option<&'static str> {
+        if self.git_busy() {
+            return Some("Дождитесь завершения общей задачи или операции Git.");
+        }
         if self.running.contains_key(&key) || self.handoffs.busy(key) {
             return Some(texts::ALREADY_RUNNING);
         }
@@ -984,7 +1035,7 @@ impl<A: Agents> Hub<A> {
             self.handoffs.notice(source, format!("Новая {} создана, но привязка не сохранена. Задача не запущена; исходная сессия сохранена. Повторите /handoff после устранения ошибки хранения.", crate::handoff::topic_reference(destination)));
             return;
         }
-        self.topics = next;
+        self.replace_topics(next);
         self.rename(destination, format!("Передача в {}", recipient.name()));
         self.handoffs.notice(source, format!("Сводка передана в {}. Исходная тема сохранена. Обе темы используют общие файлы проекта.", crate::handoff::topic_reference(destination)));
         self.start_turn(destination, Turn::text(summary.receiver_text(original.backend)));
@@ -1020,6 +1071,13 @@ impl<A: Agents> Hub<A> {
             return;
         }
 
+        if self.git_busy() {
+            self.say(
+                Target::Topic(key),
+                "Общая задача или операция Git ещё выполняется. Дождитесь завершения.".into(),
+            );
+            return;
+        }
         if self.handoff_busy(key) {
             self.say(Target::Topic(key), "Готовится передача задачи. Дождитесь завершения или отмените подготовку через /stop.".to_owned());
             return;
@@ -1087,6 +1145,13 @@ impl<A: Agents> Hub<A> {
         first: First,
         reuse: Option<(mpsc::Sender<Prompt>, mpsc::Receiver<Prompt>)>,
     ) {
+        if self.git_busy() {
+            self.say(
+                Target::Topic(key),
+                "Дождитесь завершения общей задачи или операции Git.".into(),
+            );
+            return;
+        }
         if self.handoff_busy(key) {
             self.say(
                 Target::Topic(key),
@@ -1202,6 +1267,9 @@ impl<A: Agents> Hub<A> {
     }
 
     fn stop(&mut self, key: TopicKey) -> bool {
+        if self.cancel_git(key) {
+            return true;
+        }
         if self.handoffs.stop(key) {
             return true;
         }
@@ -1251,7 +1319,9 @@ impl<A: Agents> Hub<A> {
 
     /// `/save` and `/restore` refuse during a turn and while another snapshot job runs here.
     fn refuse_snapshot(&self, key: TopicKey) -> bool {
-        let text = if self.running.contains_key(&key) || self.handoff_busy(key) {
+        let text = if self.git_busy() {
+            "Дождитесь завершения общей задачи или операции Git."
+        } else if self.running.contains_key(&key) || self.handoff_busy(key) {
             texts::FINISH_TURN_FIRST
         } else if self.snapshotting.contains(&key) {
             texts::SNAPSHOT_BUSY
@@ -1507,7 +1577,7 @@ impl<A: Agents> Hub<A> {
             self.say(Target::Topic(key), texts::RESTORE_NOT_PERSISTED.to_owned());
             return;
         }
-        self.topics = next;
+        self.replace_topics(next);
         self.last_progress.remove(&key);
         self.projects.invalidate(key);
         self.options.invalidate(key);
@@ -1534,6 +1604,15 @@ impl<A: Agents> Hub<A> {
         Ok(session)
     }
 
+    fn replace_topics(&mut self, next: Topics) {
+        for (key, session) in &self.topics {
+            if next.get(key) != Some(session) {
+                self.follows.invalidate(*key);
+            }
+        }
+        self.topics = next;
+    }
+
     fn put(&mut self, key: TopicKey, session: TopicSession) {
         self.invalidate_handoff(key);
         self.voices.invalidate(key);
@@ -1542,6 +1621,9 @@ impl<A: Agents> Hub<A> {
         }
         self.projects.invalidate(key);
         self.options.invalidate(key);
+        if self.topics.get(&key) != Some(&session) {
+            self.follows.invalidate(key);
+        }
         self.topics.insert(key, session);
         if let Err(error) = self.store.save(&self.topics) {
             tracing::error!(%error, "topics could not be saved");
@@ -1654,7 +1736,7 @@ impl<A: Agents> Hub<A> {
                                     self.last_progress.remove(&key);
                                 }
                                 self.invalidate_handoff(key);
-                                self.topics = next;
+                                self.replace_topics(next);
                                 self.options.invalidate(key);
                                 self.projects.invalidate(key);
                                 Outgoing::plain(format!(
@@ -1735,7 +1817,7 @@ impl<A: Agents> Hub<A> {
                     return;
                 }
                 self.invalidate_handoff(key);
-                self.topics = next;
+                self.replace_topics(next);
                 self.last_progress.remove(&key);
                 self.projects.invalidate(key);
                 self.options.invalidate(key);
@@ -2110,7 +2192,7 @@ mod tests {
         }
     }
 
-    impl TopicStore for MemoryStore {
+    impl hub_core::tasks::service::TaskStorage for MemoryStore {
         fn load_tasks(&mut self) -> Result<hub_core::tasks::TaskBook, String> {
             Ok(self.tasks.lock().unwrap().clone())
         }
@@ -2121,7 +2203,8 @@ mod tests {
             *self.tasks.lock().unwrap() = book.clone();
             Ok(())
         }
-
+    }
+    impl TopicStore for MemoryStore {
         fn save_recent_projects(&mut self, recent: &RecentProjects) -> Result<(), String> {
             if self.fail.load(Ordering::SeqCst) || self.fail_recent.load(Ordering::SeqCst) {
                 return Err("диск полон".to_owned());
@@ -2137,7 +2220,6 @@ mod tests {
             *self.titles.lock().unwrap() = titles.clone();
             Ok(())
         }
-
         fn save(&mut self, topics: &Topics) -> Result<(), String> {
             if self.fail.load(Ordering::SeqCst) {
                 return Err("диск полон".to_owned());
@@ -2256,7 +2338,33 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct TestGit {
+        requests: Arc<StdMutex<Vec<crate::git::Request>>>,
+        hold: Arc<AtomicBool>,
+    }
+    impl crate::git::GitRunner for TestGit {
+        fn run(
+            &self,
+            request: crate::git::Request,
+            cancel: CancellationToken,
+        ) -> BoxFuture<'static, Result<String, String>> {
+            let requests = self.requests.clone();
+            let hold = self.hold.clone();
+            Box::pin(async move {
+                requests.lock().unwrap().push(request);
+                while hold.load(Ordering::SeqCst) {
+                    tokio::select! {
+                        () = cancel.cancelled() => return Err("Проверка остановлена".into()),
+                        () = tokio::time::sleep(Duration::from_millis(5)) => {},
+                    }
+                }
+                Ok("a".repeat(40))
+            })
+        }
+    }
     struct World {
+        execution: Option<Arc<dyn crate::execution::Control>>,
         handle: HubHandle,
         messenger: Arc<FakeMessenger>,
         agents: Arc<FakeAgents>,
@@ -2264,6 +2372,8 @@ mod tests {
         results: Arc<crate::testing::MemoryResults>,
         settings: watch::Sender<Arc<Settings>>,
         transcriber: Arc<TestTranscriber>,
+        git: Arc<TestGit>,
+        tasks: Arc<hub_core::tasks::service::TaskService>,
         root: tempfile::TempDir,
     }
 
@@ -2273,9 +2383,17 @@ mod tests {
             self.send(HubMessage::Shutdown(done)).await;
             stopped.await.unwrap();
             (&mut self.handle.task).await.unwrap();
+            if self.execution.is_none() {
+                self.tasks = Arc::new(hub_core::tasks::service::TaskService::new(Box::new(
+                    self.store.clone(),
+                )));
+            }
             self.handle = spawn(HubSetup {
+                execution: self.execution.clone(),
+                tasks: self.tasks.clone(),
                 memory_control: None,
                 results: self.results.clone(),
+                git_runner: self.git.clone(),
                 action_runner: Arc::new(crate::testing::FakeActionRunner),
                 doctor_runner: Arc::new(crate::testing::FakeDoctorRunner),
                 transcriber: self.transcriber.clone(),
@@ -2338,10 +2456,15 @@ mod tests {
         let store = MemoryStore::default();
         let results = Arc::new(crate::testing::MemoryResults::default());
         let transcriber = Arc::new(TestTranscriber::default());
+        let git = Arc::new(TestGit::default());
+        let tasks = Arc::new(hub_core::tasks::service::TaskService::new(Box::new(store.clone())));
         let handle = spawn(HubSetup {
+            execution: None,
+            tasks: tasks.clone(),
             memory_control: None,
             transcriber: transcriber.clone(),
             results: results.clone(),
+            git_runner: git.clone(),
             action_runner: Arc::new(crate::testing::FakeActionRunner),
             doctor_runner: Arc::new(crate::testing::FakeDoctorRunner),
             agents: Arc::clone(&agents),
@@ -2355,6 +2478,7 @@ mod tests {
             bot: "agent_hub_bot".to_owned(),
         });
         World {
+            execution: None,
             handle,
             messenger,
             agents,
@@ -2363,6 +2487,8 @@ mod tests {
             settings: settings_tx,
             root,
             transcriber,
+            git,
+            tasks,
         }
     }
 
@@ -2376,6 +2502,7 @@ mod tests {
             reply_to: None,
             voice_reply: false,
             handoff_reply: false,
+            task_reply: false,
             content,
         })
     }
@@ -4377,6 +4504,7 @@ mod tests {
                 reply_to: Some(reply_to),
                 voice_reply: false,
                 handoff_reply: true,
+                task_reply: false,
                 album: None,
                 content: Content::Text(text.to_owned()),
             })
@@ -4409,6 +4537,7 @@ mod tests {
                 reply_to: Some(MessageId(44)),
                 voice_reply: false,
                 handoff_reply: true,
+                task_reply: false,
                 album: None,
                 content: Content::Text("старый ответ".to_owned()),
             }))
@@ -4563,6 +4692,7 @@ mod tests {
             reply_to: Some(prompt),
             voice_reply: true,
             handoff_reply: false,
+            task_reply: false,
             content: Content::Text(text.to_owned()),
         })
     }
@@ -4874,6 +5004,7 @@ mod tests {
                     reply_to: None,
                     voice_reply: false,
                     handoff_reply: false,
+                    task_reply: false,
                     content: Content::Media {
                         caption: caption.to_owned(),
                         attachment: Attachment::Photo(FileRef {
@@ -5346,7 +5477,621 @@ mod tests {
                 reply,
             })
             .await;
-        result.await.unwrap()
+        result.await.unwrap().map(|snapshot| snapshot.tasks)
+    }
+    #[tokio::test]
+    async fn desktop_and_telegram_share_tasks_while_a_result_is_recorded() {
+        let (events, received) = mpsc::channel(8);
+        let world = world(FakeAgents::scripted(vec![Script::Stream(received)]));
+        let first = create_managed(&world).await;
+        task_op(&world, KEY, tasks::Request::Start { id: first.id, revision: 1, next: None })
+            .await
+            .unwrap();
+        let desktop = tasks::manage::manage(
+            &world.tasks,
+            &first.project,
+            BackendKind::Qwen,
+            tasks::Request::Create { title: "Created locally".into(), prompt: "Read".into() },
+        )
+        .unwrap();
+        let id = desktop.tasks[0].id;
+        assert_eq!(
+            task_op(&world, KEY, tasks::Request::Get(id)).await.unwrap()[0].title,
+            "Created locally"
+        );
+        events.send(AgentEvent::AssistantText("Saved model result".into())).await.unwrap();
+        events.send(finished()).await.unwrap();
+        drop(events);
+        eventually("managed result", || {
+            world.store.tasks.lock().unwrap().get(first.id).unwrap().runs[0].state
+                == hub_core::tasks::RunState::Completed
+        })
+        .await;
+        let desktop = tasks::manage::manage(
+            &world.tasks,
+            &first.project,
+            BackendKind::Qwen,
+            tasks::Request::List,
+        )
+        .unwrap();
+        assert_eq!(desktop.tasks.len(), 2);
+        assert!(
+            desktop.tasks.iter().find(|task| task.id == first.id).unwrap().runs[0]
+                .result
+                .contains("Saved model result")
+        );
+    }
+    #[tokio::test]
+    async fn desktop_edits_are_blocked_during_git_and_stale_rules_do_not_prepare() {
+        let world = world(FakeAgents::default());
+        let task = create_managed(&world).await;
+        task_op(
+            &world,
+            KEY,
+            tasks::Request::SaveGitPolicy {
+                revision: 0,
+                policy: Some(hub_core::tasks::git::GitPolicy {
+                    remote: "origin".into(),
+                    base: "Dev".into(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            task_op(
+                &world,
+                KEY,
+                tasks::Request::PrepareGitChecked {
+                    id: task.id,
+                    revision: 1,
+                    branch: "feat/new".into(),
+                    rules_revision: 0
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert!(world.git.requests.lock().unwrap().is_empty());
+        world.git.hold.store(true, Ordering::SeqCst);
+        task_op(
+            &world,
+            KEY,
+            tasks::Request::PrepareGitChecked {
+                id: task.id,
+                revision: 1,
+                branch: "feat/new".into(),
+                rules_revision: 1,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            tasks::manage::manage(
+                &world.tasks,
+                &task.project,
+                BackendKind::Qwen,
+                tasks::Request::SaveRules { revision: 1, enabled: true, text: "New".into() }
+            )
+            .is_err()
+        );
+        assert!(
+            tasks::manage::manage(
+                &world.tasks,
+                &task.project,
+                BackendKind::Qwen,
+                tasks::Request::List
+            )
+            .unwrap()
+            .git_busy
+        );
+        task_op(&world, KEY, tasks::Request::CancelGit).await.unwrap();
+    }
+    #[tokio::test]
+    async fn git_preparation_is_durable_before_execution_and_start_is_separate() {
+        let mut world = world(FakeAgents::scripted(vec![Script::Say(vec![finished()])]));
+        let task = create_managed(&world).await;
+        task_op(
+            &world,
+            KEY,
+            tasks::Request::SaveGitPolicy {
+                revision: 0,
+                policy: Some(hub_core::tasks::git::GitPolicy {
+                    remote: "origin".into(),
+                    base: "Dev".into(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        world.git.hold.store(true, Ordering::SeqCst);
+        let prepared = task_op(
+            &world,
+            KEY,
+            tasks::Request::PrepareGit { id: task.id, revision: 1, branch: "feat/test".into() },
+        )
+        .await
+        .unwrap();
+        assert!(prepared[0].active());
+        eventually("git worker", || world.git.requests.lock().unwrap().len() == 1).await;
+        assert_eq!(world.store.tasks.lock().unwrap().get(task.id).unwrap().revision, 2);
+        assert!(
+            task_op(&world, KEY, tasks::Request::Start { id: task.id, revision: 2, next: None })
+                .await
+                .is_err()
+        );
+        world.send(text(Some(7), 10, "Do not launch during preparation")).await;
+        assert!(world.agents.prompts().is_empty());
+        world.git.hold.store(false, Ordering::SeqCst);
+        eventually("git ready", || {
+            world.store.tasks.lock().unwrap().get(task.id).unwrap().revision == 3
+        })
+        .await;
+        assert!(world.agents.prompts().is_empty());
+        world.git.hold.store(true, Ordering::SeqCst);
+        task_op(
+            &world,
+            KEY,
+            tasks::Request::StartChecked {
+                id: task.id,
+                revision: 3,
+                next: None,
+                rules_revision: 1,
+            },
+        )
+        .await
+        .unwrap();
+        eventually("git check", || world.git.requests.lock().unwrap().len() == 2).await;
+        task_op(&world, KEY, tasks::Request::CancelGit).await.unwrap();
+        eventually("git stopped", || {
+            world.store.tasks.lock().unwrap().get(task.id).unwrap().revision == 4
+        })
+        .await;
+        assert!(world.agents.prompts().is_empty());
+        world.git.hold.store(false, Ordering::SeqCst);
+        task_op(
+            &world,
+            KEY,
+            tasks::Request::StartChecked {
+                id: task.id,
+                revision: 4,
+                next: None,
+                rules_revision: 1,
+            },
+        )
+        .await
+        .unwrap();
+        eventually("model after verification", || world.agents.prompts().len() == 1).await;
+        assert!(world.git.requests.lock().unwrap()[2].verify_only);
+        world.restart().await;
+        assert_eq!(world.git.requests.lock().unwrap().len(), 3);
+    }
+    #[tokio::test]
+    async fn git_refuses_old_topic_outside_changed_workspace_root() {
+        let world = world(FakeAgents::default());
+        let task = create_managed(&world).await;
+        task_op(
+            &world,
+            KEY,
+            tasks::Request::SaveGitPolicy {
+                revision: 0,
+                policy: Some(hub_core::tasks::git::GitPolicy {
+                    remote: "origin".into(),
+                    base: "Dev".into(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        let narrower = world.root.path().join("narrower");
+        std::fs::create_dir(&narrower).unwrap();
+        world
+            .settings
+            .send_modify(|settings| Arc::make_mut(settings).workspace_root = narrower.clone());
+        assert!(
+            task_op(
+                &world,
+                KEY,
+                tasks::Request::PrepareGit { id: task.id, revision: 1, branch: "feat/test".into() }
+            )
+            .await
+            .is_err()
+        );
+        assert!(world.git.requests.lock().unwrap().is_empty());
+        assert_eq!(world.store.tasks.lock().unwrap().get(task.id).unwrap().revision, 1);
+    }
+    #[tokio::test]
+    async fn git_busy_refuses_handoff_and_snapshot_entry_points() {
+        let world = world(FakeAgents::default());
+        let task = create_managed(&world).await;
+        task_op(
+            &world,
+            KEY,
+            tasks::Request::SaveGitPolicy {
+                revision: 0,
+                policy: Some(hub_core::tasks::git::GitPolicy {
+                    remote: "origin".into(),
+                    base: "Dev".into(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        world.git.hold.store(true, Ordering::SeqCst);
+        task_op(
+            &world,
+            KEY,
+            tasks::Request::PrepareGit { id: task.id, revision: 1, branch: "feat/test".into() },
+        )
+        .await
+        .unwrap();
+        for (index, command) in
+            ["/handoff", "/save blocked", "/restore blocked"].into_iter().enumerate()
+        {
+            let count = world.texts().len();
+            world.send(text(Some(7), 50 + i32::try_from(index).unwrap(), command)).await;
+            eventually("busy refusal", || world.texts().len() > count).await;
+            assert!(
+                world.texts().last().unwrap().contains("Git"),
+                "{}",
+                world.texts().last().unwrap()
+            );
+        }
+        assert!(world.agents.prompts().is_empty());
+        task_op(&world, KEY, tasks::Request::CancelGit).await.unwrap();
+    }
+    #[tokio::test]
+    async fn git_shutdown_records_stop_and_restart_never_repeats_preparation() {
+        let mut world = world(FakeAgents::default());
+        let task = create_managed(&world).await;
+        task_op(
+            &world,
+            KEY,
+            tasks::Request::SaveGitPolicy {
+                revision: 0,
+                policy: Some(hub_core::tasks::git::GitPolicy {
+                    remote: "origin".into(),
+                    base: "Dev".into(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        world.git.hold.store(true, Ordering::SeqCst);
+        task_op(
+            &world,
+            KEY,
+            tasks::Request::PrepareGit { id: task.id, revision: 1, branch: "feat/test".into() },
+        )
+        .await
+        .unwrap();
+        eventually("preparation started", || world.git.requests.lock().unwrap().len() == 1).await;
+        world.restart().await;
+        let task = task_op(&world, KEY, tasks::Request::Get(task.id)).await.unwrap().remove(0);
+        assert!(!task.active());
+        assert_ne!(task.git.unwrap().state, hub_core::tasks::git::PreparationState::Ready);
+        assert_eq!(world.git.requests.lock().unwrap().len(), 1);
+        assert!(world.agents.prompts().is_empty());
+    }
+    #[tokio::test]
+    async fn git_intent_write_failure_never_starts_git() {
+        let world = world(FakeAgents::default());
+        let task = create_managed(&world).await;
+        task_op(
+            &world,
+            KEY,
+            tasks::Request::SaveGitPolicy {
+                revision: 0,
+                policy: Some(hub_core::tasks::git::GitPolicy {
+                    remote: "origin".into(),
+                    base: "Dev".into(),
+                }),
+            },
+        )
+        .await
+        .unwrap();
+        world.store.fail.store(true, Ordering::SeqCst);
+        assert!(
+            task_op(
+                &world,
+                KEY,
+                tasks::Request::PrepareGit { id: task.id, revision: 1, branch: "feat/test".into() }
+            )
+            .await
+            .is_err()
+        );
+        assert!(world.git.requests.lock().unwrap().is_empty());
+    }
+    #[tokio::test]
+    async fn project_rules_survive_restart_and_checked_start_uses_exact_preview() {
+        let mut world = world(FakeAgents::scripted(vec![Script::Say(vec![finished()])]));
+        let task = create_managed(&world).await;
+        task_op(
+            &world,
+            KEY,
+            tasks::Request::SaveRules {
+                revision: 0,
+                enabled: true,
+                text: "Сначала обнови Dev".into(),
+            },
+        )
+        .await
+        .unwrap();
+        world.restart().await;
+        let rules = world.store.tasks.lock().unwrap().rules(&task.project);
+        assert_eq!(rules.revision, 1);
+        assert!(
+            task_op(
+                &world,
+                KEY,
+                tasks::Request::SaveRules { revision: 0, enabled: false, text: "stale".into() }
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            task_op(
+                &world,
+                KEY,
+                tasks::Request::StartChecked {
+                    id: task.id,
+                    revision: 1,
+                    next: None,
+                    rules_revision: 0
+                }
+            )
+            .await
+            .is_err()
+        );
+        assert!(world.agents.prompts().is_empty());
+        assert!(world.store.tasks.lock().unwrap().get(task.id).unwrap().runs.is_empty());
+        task_op(
+            &world,
+            KEY,
+            tasks::Request::StartChecked {
+                id: task.id,
+                revision: 1,
+                next: None,
+                rules_revision: 1,
+            },
+        )
+        .await
+        .unwrap();
+        eventually("rules prompt", || !world.agents.prompts().is_empty()).await;
+        assert_eq!(world.agents.prompts(), vec![task.preview_with_rules(None, &rules).unwrap()]);
+        task_op(
+            &world,
+            KEY,
+            tasks::Request::SaveRules { revision: 1, enabled: false, text: "Later".into() },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            world.store.tasks.lock().unwrap().get(task.id).unwrap().runs[0].rules,
+            Some(rules)
+        );
+    }
+    #[tokio::test]
+    async fn failed_rules_save_does_not_acknowledge_or_launch() {
+        let world = world(FakeAgents::default());
+        let task = create_managed(&world).await;
+        world.store.fail.store(true, Ordering::SeqCst);
+        assert!(
+            task_op(
+                &world,
+                KEY,
+                tasks::Request::SaveRules { revision: 0, enabled: true, text: "Rule".into() }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(world.store.tasks.lock().unwrap().rules(&task.project).revision, 0);
+        assert!(
+            task_op(&world, KEY, tasks::Request::Start { id: task.id, revision: 1, next: None })
+                .await
+                .is_err()
+        );
+        assert!(world.agents.prompts().is_empty());
+    }
+    #[tokio::test]
+    async fn managed_task_workflow_persists_and_rejects_stale_or_foreign_mutations() {
+        use hub_core::tasks::{TaskFilter, TaskStatus};
+        let mut world = world(FakeAgents::default());
+        let task = create_managed(&world).await;
+        task_op(
+            &world,
+            KEY,
+            tasks::Request::Status { id: task.id, revision: 1, status: TaskStatus::Deferred },
+        )
+        .await
+        .unwrap();
+        assert!(
+            task_op(
+                &world,
+                KEY,
+                tasks::Request::Archive { id: task.id, revision: 1, archived: true }
+            )
+            .await
+            .is_err()
+        );
+        task_op(&world, KEY, tasks::Request::Archive { id: task.id, revision: 2, archived: true })
+            .await
+            .unwrap();
+        assert!(task_op(&world, KEY, tasks::Request::List).await.unwrap().is_empty());
+        world.restart().await;
+        let found = task_op(
+            &world,
+            KEY,
+            tasks::Request::Search { filter: TaskFilter::Archived, query: "README".into() },
+        )
+        .await
+        .unwrap();
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].status, TaskStatus::Deferred);
+        world.send(text(Some(8), 3, "/new qwen project")).await;
+        let other = TopicKey { chat: KEY.chat, thread: ThreadId(8) };
+        eventually("second topic", || world.handle.views.borrow().len() == 2).await;
+        for request in [
+            tasks::Request::Status { id: task.id, revision: 3, status: TaskStatus::Planned },
+            tasks::Request::Archive { id: task.id, revision: 3, archived: false },
+            tasks::Request::Attempt { id: task.id, run: 1 },
+        ] {
+            assert!(task_op(&world, other, request).await.is_err());
+        }
+        assert!(
+            task_op(
+                &world,
+                other,
+                tasks::Request::Search { filter: TaskFilter::All, query: String::new() }
+            )
+            .await
+            .unwrap()
+            .is_empty()
+        );
+        assert!(world.agents.prompts().is_empty());
+    }
+    #[tokio::test]
+    async fn managed_task_workflow_storage_failure_is_not_acknowledged() {
+        use hub_core::tasks::TaskStatus;
+        let world = world(FakeAgents::default());
+        let task = create_managed(&world).await;
+        world.store.fail.store(true, Ordering::SeqCst);
+        assert!(
+            task_op(
+                &world,
+                KEY,
+                tasks::Request::Status { id: task.id, revision: 1, status: TaskStatus::Accepted }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            world.store.tasks.lock().unwrap().get(task.id).unwrap().status,
+            TaskStatus::Planned
+        );
+    }
+    #[tokio::test]
+    async fn managed_task_old_attempt_is_read_without_mutating_history() {
+        let mut world = world(FakeAgents::default());
+        let task = create_managed(&world).await;
+        {
+            let mut book = world.store.tasks.lock().unwrap();
+            for (revision, step, result) in
+                [(1, None, "First result"), (3, Some("Next"), "Second result")]
+            {
+                let run = book.begin(task.id, revision, step).unwrap();
+                book.record(task.id, run, result).unwrap();
+                book.finish(task.id, run, hub_core::tasks::RunState::Completed).unwrap();
+            }
+        }
+        world.restart().await;
+        let before = world.store.tasks.lock().unwrap().encode().unwrap();
+        let tasks =
+            task_op(&world, KEY, tasks::Request::Attempt { id: task.id, run: 1 }).await.unwrap();
+        let text = tasks::describe_attempt(&tasks[0], 1).unwrap();
+        assert!(text.contains("First result") && !text.contains("Second result"));
+        assert!(
+            task_op(&world, KEY, tasks::Request::Attempt { id: task.id, run: 3 }).await.is_err()
+        );
+        assert_eq!(world.store.tasks.lock().unwrap().encode().unwrap(), before);
+    }
+    #[tokio::test]
+    async fn managed_task_transfer_is_durable_and_preview_matches_next_agent_prompt() {
+        let mut world = world(FakeAgents::scripted(vec![Script::Say(vec![finished()])]));
+        let task = create_managed(&world).await;
+        let target = if task.backend == "qwen" { BackendKind::Codex } else { BackendKind::Qwen };
+        {
+            let mut book = world.store.tasks.lock().unwrap();
+            let run = book.begin(task.id, 1, None).unwrap();
+            book.record(task.id, run, "Previous result").unwrap();
+            book.finish(task.id, run, hub_core::tasks::RunState::Completed).unwrap();
+        }
+        world.restart().await;
+        let assigned = task_op(
+            &world,
+            KEY,
+            tasks::Request::Assign { id: task.id, revision: 3, backend: target },
+        )
+        .await
+        .unwrap();
+        assert_eq!(assigned[0].backend, target.name());
+        assert!(world.agents.prompts().is_empty());
+        assert!(
+            task_op(
+                &world,
+                KEY,
+                tasks::Request::Assign { id: task.id, revision: 3, backend: target }
+            )
+            .await
+            .is_err()
+        );
+        world.restart().await;
+        let step = "Check previous effects\n  then continue";
+        let before = world.store.tasks.lock().unwrap().encode().unwrap();
+        let preview =
+            task_op(&world, KEY, tasks::Request::Preview { id: task.id, next: Some(step.into()) })
+                .await
+                .unwrap();
+        let expected = preview[0].preview(Some(step)).unwrap();
+        assert_eq!(world.store.tasks.lock().unwrap().encode().unwrap(), before);
+        assert_eq!(preview[0].runs[0].backend.as_deref(), Some(task.backend.as_str()));
+        assert!(
+            task_op(
+                &world,
+                KEY,
+                tasks::Request::Start { id: task.id, revision: 4, next: Some(step.into()) }
+            )
+            .await
+            .is_err()
+        );
+        world.send(text(Some(8), 10, &format!("/new {}", target.name()))).await;
+        let receiving = TopicKey { chat: KEY.chat, thread: ThreadId(8) };
+        task_op(
+            &world,
+            receiving,
+            tasks::Request::Start { id: task.id, revision: 4, next: Some(step.into()) },
+        )
+        .await
+        .unwrap();
+        eventually("prompt delivered", || !world.agents.prompts().is_empty()).await;
+        assert_eq!(world.agents.prompts(), vec![expected]);
+        assert_eq!(
+            world.store.tasks.lock().unwrap().get(task.id).unwrap().runs[1].backend.as_deref(),
+            Some(target.name())
+        );
+    }
+    #[tokio::test]
+    async fn managed_task_transfer_and_preview_reject_foreign_project_and_failed_write() {
+        let world = world(FakeAgents::default());
+        let task = create_managed(&world).await;
+        world.send(text(Some(8), 2, "/new qwen project")).await;
+        let other = TopicKey { chat: KEY.chat, thread: ThreadId(8) };
+        assert!(
+            task_op(
+                &world,
+                other,
+                tasks::Request::Assign { id: task.id, revision: 1, backend: BackendKind::Hermes }
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            task_op(&world, other, tasks::Request::Preview { id: task.id, next: None })
+                .await
+                .is_err()
+        );
+        world.store.fail.store(true, Ordering::SeqCst);
+        assert!(
+            task_op(
+                &world,
+                KEY,
+                tasks::Request::Assign { id: task.id, revision: 1, backend: BackendKind::Hermes }
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(world.store.tasks.lock().unwrap().get(task.id).unwrap().backend, task.backend);
+        assert!(world.agents.prompts().is_empty());
     }
     async fn create_managed(world: &World) -> hub_core::tasks::Task {
         world.send(text(Some(7), 1, "/new")).await;
@@ -5605,5 +6350,450 @@ mod tests {
             before + 1,
             "no later chunk after revocation"
         );
+    }
+    struct SharedTestControl {
+        live: StdMutex<Option<crate::execution::Live>>,
+        tasks: Arc<hub_core::tasks::service::TaskService>,
+        launches: AtomicUsize,
+        replies: AtomicUsize,
+    }
+    impl crate::execution::Control for SharedTestControl {
+        fn busy(&self) -> bool {
+            self.live.lock().unwrap().as_ref().is_some_and(|l| l.active)
+        }
+        fn snapshot(&self) -> Option<crate::execution::Live> {
+            self.live.lock().unwrap().clone()
+        }
+        fn dispatch(
+            &self,
+            project: &Path,
+            request: tasks::Request,
+            _: Arc<hub_core::settings::ExecutionSettings>,
+        ) -> Result<(), String> {
+            let mut live = self.live.lock().unwrap();
+            if live.as_ref().is_some_and(|l| l.active) {
+                return Err("busy".into());
+            }
+            let tasks::Request::StartChecked { id, revision, next, .. } = request else {
+                return Err("unsupported".into());
+            };
+            self.tasks.access(hub_core::tasks::service::Access::Internal, |book, _| {
+                book.begin(id, revision, next.as_deref())
+            })?;
+            self.launches.fetch_add(1, Ordering::SeqCst);
+            *live = Some(crate::execution::Live {
+                run: None,
+                token: uuid::Uuid::new_v4(),
+                project: project.into(),
+                id,
+                active: true,
+                status: "Waiting".into(),
+                interaction: Some(crate::execution::Interaction {
+                    id: uuid::Uuid::new_v4(),
+                    kind: crate::execution::Kind::Permission(hub_core::domain::ToolRequest {
+                        tool: "Read".into(),
+                        summary: "README".into(),
+                    }),
+                }),
+            });
+            Ok(())
+        }
+        fn stop(&self, token: uuid::Uuid) -> Result<(), String> {
+            let mut state = self.live.lock().unwrap();
+            let live = state.as_mut().filter(|l| l.token == token && l.active).ok_or("stale")?;
+            live.active = false;
+            live.interaction = None;
+            self.tasks.access(hub_core::tasks::service::Access::Internal, |book, _| {
+                book.finish(live.id, 1, hub_core::tasks::RunState::Interrupted)
+            })?;
+            Ok(())
+        }
+        fn respond(
+            &self,
+            token: uuid::Uuid,
+            id: uuid::Uuid,
+            _: crate::execution::Answer,
+        ) -> Result<(), String> {
+            let mut state = self.live.lock().unwrap();
+            let live = state.as_mut().filter(|l| l.token == token && l.active).ok_or("stale")?;
+            if live.interaction.as_ref().map(|r| r.id) != Some(id) {
+                return Err("stale".into());
+            }
+            live.interaction = None;
+            self.replies.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+    async fn shared_world() -> (World, Arc<SharedTestControl>, hub_core::tasks::Task) {
+        use crate::execution::Control;
+        let mut world = world(FakeAgents::default());
+        let task = create_managed(&world).await;
+        let execution = Arc::new(SharedTestControl {
+            live: StdMutex::new(None),
+            tasks: world.tasks.clone(),
+            launches: AtomicUsize::new(0),
+            replies: AtomicUsize::new(0),
+        });
+        execution
+            .dispatch(
+                &task.project,
+                tasks::Request::StartChecked {
+                    id: task.id,
+                    revision: 1,
+                    next: None,
+                    rules_revision: 0,
+                },
+                Arc::new(hub_core::settings::ExecutionSettings::from(
+                    world.settings.borrow().as_ref(),
+                )),
+            )
+            .unwrap();
+        world.execution = Some(execution.clone());
+        world.restart().await;
+        (world, execution, task)
+    }
+    async fn shared_card(world: &World) -> (MessageId, String) {
+        eventually("shared approval",||world.messenger.calls().iter().any(|c|matches!(c,Call::Send{message,..} if message.keyboard.iter().flatten().any(|b|b.data.starts_with("te:a:"))))).await;
+        world
+            .messenger
+            .calls()
+            .iter()
+            .rev()
+            .find_map(|c| {
+                if let Call::Send { id, message, .. } = c {
+                    message
+                        .keyboard
+                        .iter()
+                        .flatten()
+                        .find(|b| b.data.starts_with("te:a:"))
+                        .map(|b| (*id, b.data.clone()))
+                } else {
+                    None
+                }
+            })
+            .unwrap()
+    }
+    #[tokio::test]
+    async fn shared_task_survives_bot_restart_and_gui_answer_invalidates_telegram_button() {
+        use crate::execution::{Answer, Control};
+        let (mut world, execution, task) = shared_world().await;
+        assert_eq!(
+            world.tasks.read().unwrap().get(task.id).unwrap().runs[0].state,
+            hub_core::tasks::RunState::Running
+        );
+        world.send(text(Some(7), 2, &format!("/task follow {}", task.id))).await;
+        let (message, data) = shared_card(&world).await;
+        let live = execution.snapshot().unwrap();
+        execution.respond(live.token, live.interaction.unwrap().id, Answer::Allow).unwrap();
+        world
+            .send(HubMessage::Press(Press {
+                thread: Some(KEY.thread),
+                callback: "stale-shared".into(),
+                user: UserId(1),
+                chat: Some(KEY.chat),
+                message: Some(message),
+                html: None,
+                data,
+            }))
+            .await;
+        eventually("stale refused", || {
+            world
+                .messenger
+                .calls()
+                .iter()
+                .any(|c| matches!(c,Call::Answer{callback,text:Some(_)}if callback=="stale-shared"))
+        })
+        .await;
+        assert_eq!(execution.replies.load(Ordering::SeqCst), 1);
+        eventually("buttons removed",||world.messenger.calls().iter().any(|c|matches!(c,Call::EditKeyboard{message:id,keyboard,..}if *id==message && keyboard.is_empty()))).await;
+        world.restart().await;
+        assert!(execution.busy());
+        assert_eq!(execution.launches.load(Ordering::SeqCst), 1);
+        world.send(text(Some(7), 3, "/stop")).await;
+        eventually("shared stopped", || !execution.busy()).await;
+    }
+    #[tokio::test]
+    async fn shared_buttons_reject_foreign_topic_user_and_duplicate_response() {
+        let (world, execution, task) = shared_world().await;
+        world.send(text(Some(7), 2, &format!("/task follow {}", task.id))).await;
+        let (message, data) = shared_card(&world).await;
+        for (name, user, thread) in [
+            ("foreign-user", UserId(2), KEY.thread),
+            ("foreign-topic", UserId(1), ThreadId(99)),
+            ("allowed", UserId(1), KEY.thread),
+            ("duplicate", UserId(1), KEY.thread),
+        ] {
+            world
+                .send(HubMessage::Press(Press {
+                    thread: Some(thread),
+                    callback: name.into(),
+                    user,
+                    chat: Some(KEY.chat),
+                    message: Some(message),
+                    html: None,
+                    data: data.clone(),
+                }))
+                .await;
+        }
+        eventually("responses", || {
+            world
+                .messenger
+                .calls()
+                .iter()
+                .any(|c| matches!(c,Call::Answer{callback,..}if callback=="duplicate"))
+        })
+        .await;
+        assert_eq!(execution.replies.load(Ordering::SeqCst), 1);
+        assert_eq!(execution.launches.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn shared_execution_blocks_ordinary_launch_and_continues_via_task_resume() {
+        use crate::execution::Control;
+        let (world, execution, task) = shared_world().await;
+        world.send(text(Some(7), 2, "do other work")).await;
+        task_op(&world, KEY, tasks::Request::Get(task.id)).await.unwrap();
+        assert!(world.agents.prompts().is_empty());
+        let live = execution.snapshot().unwrap();
+        execution.stop(live.token).unwrap();
+        let revision = world.tasks.read().unwrap().get(task.id).unwrap().revision;
+        task_op(
+            &world,
+            KEY,
+            tasks::Request::Start { id: task.id, revision, next: Some("Continue".into()) },
+        )
+        .await
+        .unwrap();
+        assert_eq!(execution.launches.load(Ordering::SeqCst), 2);
+        assert_eq!(world.tasks.read().unwrap().get(task.id).unwrap().runs.len(), 2);
+        assert!(world.agents.prompts().is_empty());
+    }
+    async fn shared_question_card(world: &World) -> MessageId {
+        eventually("question card", || {
+            world.messenger.calls().iter().any(|c| {
+                matches!(c,
+                    Call::Send {message,..} if message.text.starts_with(tasks::shared::CARD)
+                        && message.keyboard.iter().flatten().any(|b| b.data.starts_with("te:d:"))
+                )
+            })
+        })
+        .await;
+        let id = world
+            .messenger
+            .calls()
+            .iter()
+            .rev()
+            .find_map(|c| match c {
+                Call::Send { id, message, .. }
+                    if message.text.starts_with(tasks::shared::CARD)
+                        && !message.keyboard.is_empty() =>
+                {
+                    Some(*id)
+                }
+                _ => None,
+            })
+            .unwrap();
+        // Collect the completed send receipt before replying.
+        tokio::time::sleep(Duration::from_millis(280)).await;
+        id
+    }
+    fn shared_text_reply(card: MessageId, user: u64) -> HubMessage {
+        let mut message = text(Some(7), 42, "answer");
+        if let HubMessage::Inbound(ref mut inbound) = message {
+            inbound.reply_to = Some(card);
+            inbound.task_reply = true;
+            inbound.user = Some(UserId(user));
+        }
+        message
+    }
+    #[tokio::test]
+    async fn shared_card_belongs_to_subscriber_even_when_other_user_is_allowed() {
+        let (world, execution, task) = shared_world().await;
+        let mut draft = Draft::from_settings(&world.settings.borrow());
+        draft.users = "1,2".into();
+        world.settings.send_replace(Arc::new(draft.parse(&std::env::temp_dir()).unwrap()));
+        world.send(text(Some(7), 2, &format!("/task follow {}", task.id))).await;
+        let (message, data) = shared_card(&world).await;
+        world
+            .send(HubMessage::Press(Press {
+                thread: Some(KEY.thread),
+                callback: "other-allowed".into(),
+                user: UserId(2),
+                chat: Some(KEY.chat),
+                message: Some(message),
+                html: None,
+                data,
+            }))
+            .await;
+        task_op(&world, KEY, tasks::Request::Get(task.id)).await.unwrap();
+        assert_eq!(execution.replies.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn shared_question_reply_is_scoped_and_consumed_once() {
+        let (world, execution, task) = shared_world().await;
+        let mut draft = Draft::from_settings(&world.settings.borrow());
+        draft.users = "1,2".into();
+        world.settings.send_replace(Arc::new(draft.parse(&std::env::temp_dir()).unwrap()));
+        execution.live.lock().unwrap().as_mut().unwrap().interaction.as_mut().unwrap().kind =
+            crate::execution::Kind::Questions(vec![
+                Question::new("Question?".into(), String::new(), vec![], Selection::Single)
+                    .unwrap(),
+            ]);
+        world.send(text(Some(7), 2, &format!("/task follow {}", task.id))).await;
+        let card = shared_question_card(&world).await;
+        world.send(shared_text_reply(card, 2)).await;
+        task_op(&world, KEY, tasks::Request::Get(task.id)).await.unwrap();
+        assert_eq!(execution.replies.load(Ordering::SeqCst), 0);
+        world.send(shared_text_reply(card, 1)).await;
+        world.send(shared_text_reply(card, 1)).await;
+        task_op(&world, KEY, tasks::Request::Get(task.id)).await.unwrap();
+        assert_eq!(execution.replies.load(Ordering::SeqCst), 1);
+        assert!(world.agents.prompts().is_empty());
+    }
+    #[tokio::test]
+    async fn shared_oversized_questions_cannot_be_answered_without_context() {
+        let (world, execution, task) = shared_world().await;
+        execution.live.lock().unwrap().as_mut().unwrap().interaction.as_mut().unwrap().kind =
+            crate::execution::Kind::Questions(vec![
+                Question::new("Q".repeat(34000), String::new(), vec![], Selection::Single).unwrap(),
+            ]);
+        world.send(text(Some(7), 2, &format!("/task follow {}", task.id))).await;
+        let card = shared_question_card(&world).await;
+        world.send(shared_text_reply(card, 1)).await;
+        task_op(&world, KEY, tasks::Request::Get(task.id)).await.unwrap();
+        assert_eq!(execution.replies.load(Ordering::SeqCst), 0);
+    }
+    #[tokio::test]
+    async fn shared_preflight_failure_does_not_publish_previous_attempt_result() {
+        let (world, execution, task) = shared_world().await;
+        execution
+            .tasks
+            .access(hub_core::tasks::service::Access::Internal, |book, _| {
+                book.record(task.id, 1, "OLD_RESULT_MUST_NOT_APPEAR")?;
+                book.finish(task.id, 1, hub_core::tasks::RunState::Completed)
+            })
+            .unwrap();
+        {
+            let mut state = execution.live.lock().unwrap();
+            let live = state.as_mut().unwrap();
+            live.active = false;
+            live.interaction = None;
+            live.status = "Git preflight failed".into();
+        }
+        world.send(text(Some(7), 2, &format!("/task follow {}", task.id))).await;
+        eventually("failure delivered", || {
+            world.texts().iter().any(|t| t.contains("Git preflight failed"))
+        })
+        .await;
+        assert!(!world.texts().iter().any(|t| t.contains("OLD_RESULT_MUST_NOT_APPEAR")));
+    }
+
+    #[tokio::test]
+    async fn shared_delivery_retries_transient_failure_without_restarting_agent() {
+        let (world, execution, task) = shared_world().await;
+        world.send(text(Some(7), 2, &format!("/task follow {}", task.id))).await;
+        shared_card(&world).await;
+        world.messenger.send_result(Err(crate::messenger::SendError::Failed("offline".into())));
+        execution.live.lock().unwrap().as_mut().unwrap().status = "Changed status".into();
+        eventually("retried delivery", || {
+            world.texts().iter().any(|t| t.contains("Changed status"))
+        })
+        .await;
+        assert_eq!(execution.launches.load(Ordering::SeqCst), 1);
+    }
+    #[tokio::test]
+    async fn shared_project_picker_aborts_pending_delivery_immediately() {
+        let (world, execution, task) = shared_world().await;
+        configure_project(&world);
+        world.send(text(Some(7), 2, &format!("/task follow {}", task.id))).await;
+        let (card, _) = shared_card(&world).await;
+        let confirm = choose_project(&world).await;
+        let release = world.messenger.delay_next_edit();
+        execution.live.lock().unwrap().as_mut().unwrap().status = "LATE_PRIVATE_CONTENT".into();
+        eventually("replacement started", || {
+            world.messenger.calls().iter().any(|c|matches!(c,
+            Call::EditKeyboard {message,keyboard,..} if *message==card && keyboard.is_empty()
+        ))
+        })
+        .await;
+        world.send(HubMessage::Press(confirm)).await;
+        eventually("project rebound", || {
+            world.store.last().is_some_and(|s| {
+                s.get(&KEY).is_some_and(|s| s.cwd.as_path() == world.root.path().join("project"))
+            })
+        })
+        .await;
+        let _ = release.send(());
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert!(!world.texts().iter().any(|t| t.contains("LATE_PRIVATE_CONTENT")));
+    }
+    #[tokio::test]
+    async fn shared_stop_rechecks_current_user_authorization() {
+        use crate::execution::Control;
+        let (world, execution, task) = shared_world().await;
+        let mut message = text(Some(7), 51, "/stop");
+        if let HubMessage::Inbound(ref mut inbound) = message {
+            inbound.user = Some(UserId(999));
+        }
+        world.send(message).await;
+        task_op(&world, KEY, tasks::Request::Get(task.id)).await.unwrap();
+        assert!(execution.busy());
+    }
+    #[tokio::test]
+    async fn shared_gui_and_telegram_starts_are_serialized_by_actor() {
+        use crate::execution::Control;
+        let (world, execution, task) = shared_world().await;
+        execution.stop(execution.snapshot().unwrap().token).unwrap();
+        let revision = world.tasks.read().unwrap().get(task.id).unwrap().revision;
+        let (gui_reply, gui) = oneshot::channel();
+        let (tg_reply, tg) = oneshot::channel();
+        world
+            .send(HubMessage::SharedTasks {
+                project: task.project.clone(),
+                request: tasks::Request::StartChecked {
+                    id: task.id,
+                    revision,
+                    next: Some("GUI".into()),
+                    rules_revision: 0,
+                },
+                reply: gui_reply,
+            })
+            .await;
+        world
+            .send(HubMessage::Tasks {
+                key: KEY,
+                project: task.project.clone(),
+                backend: BackendKind::Qwen,
+                request: tasks::Request::Start {
+                    id: task.id,
+                    revision,
+                    next: Some("Telegram".into()),
+                },
+                reply: tg_reply,
+            })
+            .await;
+        assert!(gui.await.unwrap().is_ok());
+        assert!(tg.await.unwrap().is_err());
+        assert_eq!(execution.launches.load(Ordering::SeqCst), 2);
+        assert_eq!(world.tasks.read().unwrap().get(task.id).unwrap().runs.len(), 2);
+        assert!(world.agents.prompts().is_empty());
+    }
+    #[tokio::test]
+    async fn shared_delivery_stops_later_parts_after_access_revocation() {
+        let (world, execution, task) = shared_world().await;
+        world.send(text(Some(7), 2, &format!("/task follow {}", task.id))).await;
+        shared_card(&world).await;
+        let release = world.messenger.delay_next_send();
+        execution.live.lock().unwrap().as_mut().unwrap().interaction.as_mut().unwrap().kind =
+            crate::execution::Kind::Permission(hub_core::domain::ToolRequest {
+                tool: "Read".into(),
+                summary: "PRIVATE ".repeat(1200),
+            });
+        let before = world.messenger.send_attempts().len();
+        eventually("first shared part", || world.messenger.send_attempts().len() > before).await;
+        world.settings.send_modify(|settings| Arc::make_mut(settings).telegram.chat = ChatId(-999));
+        let _ = release.send(());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(world.messenger.send_attempts().len(), before + 1);
+        assert_eq!(execution.replies.load(Ordering::SeqCst), 0);
     }
 }
