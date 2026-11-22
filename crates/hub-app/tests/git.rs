@@ -179,9 +179,10 @@ mod tests {
         git(&repo.work, &["switch", "-c", "other"]);
         let occupied = repo.root.path().join("occupied");
         git(&repo.work, &["worktree", "add", occupied.to_str().unwrap(), "Dev"]);
+        // An explicit backup suffix works with both BSD sed on macOS and GNU sed.
         git(
             &occupied,
-            &["-c", "sequence.editor=sed -i 's/^pick /edit /'", "rebase", "-i", "HEAD~1"],
+            &["-c", "sequence.editor=sed -i.bak 's/^pick /edit /'", "rebase", "-i", "HEAD~1"],
         );
         assert!(git(&repo.work, &["worktree", "list", "--porcelain"]).contains("detached"));
         assert!(hub_app::git::run(repo.request(), CancellationToken::new()).await.is_err());
