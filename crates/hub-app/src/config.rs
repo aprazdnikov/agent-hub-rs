@@ -106,7 +106,10 @@ impl SettingsStore for FileSettings {
         let text = toml::to_string_pretty(&SettingsFile::from_settings(settings, &self.home))
             .map_err(|error| write(io::Error::other(error)))?;
         // The secrets go first: a file pointing at a token that was never stored is worse.
-        self.secrets.write(Secret::TelegramToken, Some(settings.telegram.token.expose()))?;
+        self.secrets.write(
+            Secret::TelegramToken,
+            settings.telegram.configured().then(|| settings.telegram.token.expose()),
+        )?;
         self.secrets
             .write(Secret::OpenAiKey, settings.codex.api_key.as_ref().map(ApiKey::expose))?;
         let qwen_key = settings.qwen.endpoint.as_ref().map(|endpoint| endpoint.key().expose());
@@ -143,6 +146,22 @@ mod tests {
             dir.to_path_buf(),
             Box::new(MemorySecrets::default()),
         )
+    }
+
+    #[test]
+    fn local_agent_settings_roundtrip_without_telegram() {
+        let dir = tempfile::tempdir().unwrap();
+        let draft = Draft {
+            workspace_root: dir.path().display().to_string(),
+            model: "opus".into(),
+            ..Draft::default()
+        };
+        let settings = draft.parse(dir.path()).unwrap();
+        let store = store(dir.path());
+        store.save(&settings).unwrap();
+        assert!(
+            matches!(store.load().unwrap(), Loaded::Ready(loaded) if loaded == settings && !loaded.telegram.configured() && Draft::from_settings(&loaded).chat.is_empty())
+        );
     }
 
     #[test]

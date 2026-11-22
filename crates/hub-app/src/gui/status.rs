@@ -172,7 +172,8 @@ fn show_diagnostics(
                 "Есть несохранённые изменения: они не участвуют в проверке.",
             );
         }
-        if snapshot.bot == BotStatus::Unconfigured {
+        let ready = snapshot.bot != BotStatus::Unconfigured || snapshot.local_only;
+        if !ready {
             ui.label("Сохраните настройки, чтобы выполнить проверку.");
         }
         match &snapshot.diagnostics {
@@ -185,8 +186,7 @@ fn show_diagnostics(
             }
             DiagnosticStatus::Complete(report) => diagnostic_report(ui, report),
         }
-        let enabled = !matches!(snapshot.bot, BotStatus::Unconfigured)
-            && !matches!(snapshot.diagnostics, DiagnosticStatus::Running);
+        let enabled = ready && !matches!(snapshot.diagnostics, DiagnosticStatus::Running);
         if ui.add_enabled(enabled, egui::Button::new("Проверить настройки")).clicked()
         {
             send(Command::Diagnose);

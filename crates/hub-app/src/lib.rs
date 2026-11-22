@@ -28,3 +28,5 @@ pub mod git;
 pub mod desktop_tasks;
 
 pub mod local_execution;
+
+mod task_diff;

@@ -399,3 +399,232 @@ async fn completed_task_snapshot_survives_next_task_start() {
     assert_eq!(shared.snapshot().unwrap().id, second);
     shared.shutdown().await;
 }
+
+#[derive(Default)]
+struct ScriptedWorkflow {
+    calls: std::sync::Mutex<Vec<(BackendKind, String)>>,
+}
+impl Executor for ScriptedWorkflow {
+    fn run<'a>(
+        &'a self,
+        session: &'a TopicSession,
+        prompt: Prompt,
+        conversation: Conversation,
+        _settings: Arc<ExecutionSettings>,
+    ) -> BoxFuture<'a, ()> {
+        Box::pin(async move {
+            let call = {
+                let mut calls = self.calls.lock().unwrap();
+                calls.push((session.backend, prompt.text().into()));
+                calls.len()
+            };
+            if call == 2 {
+                std::fs::write(session.cwd.as_path().join("ready.txt"), "ok").unwrap();
+            }
+            let text = match session.backend {
+                BackendKind::Claude => "Reviewed: ready",
+                _ => "Implementation",
+            };
+            conversation.events.send(AgentEvent::AssistantText(text.into())).await.unwrap();
+            conversation
+                .events
+                .send(AgentEvent::Finished(Finished {
+                    session: SessionId::parse("fake").unwrap(),
+                    usage: Usage::Qwen { tokens: None },
+                    background: 0,
+                }))
+                .await
+                .unwrap();
+        })
+    }
+}
+
+#[tokio::test]
+async fn host_workflow_repairs_once_preserves_evidence_and_requires_human_acceptance() {
+    use hub_core::tasks::{ProjectRules, TaskStatus, workflow::WorkflowPreset};
+    for fixable in [true, false] {
+        let project = tempfile::tempdir().unwrap();
+        let file = if fixable { "ready.txt" } else { "missing.txt" };
+        #[cfg(unix)]
+        let command = format!("cat {file}");
+        #[cfg(windows)]
+        let command = format!("type {file}");
+        let mut book = TaskBook::default();
+        let id = book.create(project.path().into(), "qwen", "Title", "Fix").unwrap();
+        book.configure_rules(
+            project.path().into(),
+            0,
+            ProjectRules {
+                workflow: Some(WorkflowPreset {
+                    implementer: BackendKind::Qwen,
+                    command,
+                    reviewer: BackendKind::Claude,
+                }),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let service = Arc::new(TaskService::new(Box::new(Store(book))));
+        let executor = Arc::new(ScriptedWorkflow::default());
+        let mut runtime =
+            Runtime::new(service.clone(), executor.clone(), Arc::new(crate::git::LocalGitRunner));
+        runtime
+            .dispatch(
+                project.path(),
+                Request::StartChecked { id, revision: 1, next: None, rules_revision: 1 },
+                Arc::new(hub_core::settings::Draft::default().execution(project.path()).unwrap()),
+            )
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while runtime.busy() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let book = service.read().unwrap();
+        let task = book.get(id).unwrap();
+        assert_eq!(task.status, TaskStatus::NeedsReview);
+        let run = task.runs.first().unwrap();
+        assert_eq!(
+            run.workflow_report.checks.iter().map(|c| c.passed).collect::<Vec<_>>(),
+            [false, fixable]
+        );
+        assert_eq!(run.result, "Implementation");
+        let calls = executor.calls.lock().unwrap();
+        assert_eq!(calls.len(), if fixable { 3 } else { 2 });
+        assert!(calls[1].1.contains(file));
+        if fixable {
+            assert_eq!(calls[2].0, BackendKind::Claude);
+            assert_eq!(run.workflow_report.review, "Reviewed: ready");
+            assert_eq!(run.state, RunState::Completed);
+        } else {
+            assert!(run.workflow_report.review.is_empty());
+            assert_eq!(run.state, RunState::Failed);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn stopping_check_does_not_request_a_repair_or_review() {
+    use hub_core::tasks::{ProjectRules, workflow::WorkflowPreset};
+    let project = tempfile::tempdir().unwrap();
+    let mut book = TaskBook::default();
+    let id = book.create(project.path().into(), "qwen", "Stop", "Check cancellation").unwrap();
+    book.configure_rules(
+        project.path().into(),
+        0,
+        ProjectRules {
+            workflow: Some(WorkflowPreset {
+                implementer: BackendKind::Qwen,
+                command: "touch check-started && exec sleep 60".into(),
+                reviewer: BackendKind::Claude,
+            }),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let service = Arc::new(TaskService::new(Box::new(Store(book))));
+    let executor = Arc::new(ScriptedWorkflow::default());
+    let mut runtime =
+        Runtime::new(service.clone(), executor.clone(), Arc::new(crate::git::LocalGitRunner));
+    runtime
+        .dispatch(
+            project.path(),
+            Request::StartChecked { id, revision: 1, next: None, rules_revision: 1 },
+            Arc::new(hub_core::settings::Draft::default().execution(project.path()).unwrap()),
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !project.path().join("check-started").exists() {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    runtime.stop(runtime.snapshot().unwrap().token).unwrap();
+    runtime.shutdown().await;
+    let book = service.read().unwrap();
+    let run = &book.get(id).unwrap().runs[0];
+    assert_eq!(run.state, RunState::Interrupted);
+    assert_eq!(run.workflow_report.checks.len(), 1);
+    assert!(!run.workflow_report.checks[0].passed);
+    assert_eq!(executor.calls.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn queue_runs_two_isolated_jobs_and_routes_approvals_to_the_correct_attempt() {
+    use std::process::Command;
+    let project = tempfile::tempdir().unwrap();
+    let cwd = project.path();
+    let git = |args: &[&str]| {
+        let result = Command::new("git").args(args).current_dir(cwd).output().unwrap();
+        assert!(result.status.success(), "{:?}", result.stderr);
+        String::from_utf8(result.stdout).unwrap()
+    };
+    git(&["init", "-b", "main"]);
+    git(&[
+        "-c",
+        "user.email=test@example.invalid",
+        "-c",
+        "user.name=test",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "base",
+    ]);
+    let mut book = TaskBook::default();
+    let first = book.create(cwd.into(), "qwen", "one", "Inspect").unwrap();
+    let second = book.create(cwd.into(), "qwen", "two", "Inspect").unwrap();
+    book.enqueue(first, 1, None, true, None).unwrap();
+    book.enqueue(second, 1, None, true, None).unwrap();
+    let service = Arc::new(TaskService::new(Box::new(Store(book))));
+    let runtime = SharedRuntime::new(Runtime::new(
+        service.clone(),
+        Arc::new(Fake),
+        Arc::new(crate::git::LocalGitRunner),
+    ));
+    let settings = Arc::new(hub_core::settings::Draft::default().execution(cwd).unwrap());
+    for id in [first, second] {
+        let next = service.pending(false).unwrap();
+        assert_eq!(next.id, id);
+        runtime
+            .dispatch(cwd, Request::RunQueued { id, revision: next.revision }, settings.clone())
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while runtime.snapshot_for(cwd, id).is_none_or(|live| live.interaction.is_none()) {
+                if let Some(live) = runtime.snapshot_for(cwd, id) {
+                    assert!(live.active, "{}", live.status);
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(git(&["branch", "--show-current"]).trim(), "main");
+    assert!(git(&["status", "--porcelain"]).is_empty());
+    assert!(!runtime.capacity(true));
+    let one = runtime.snapshot_for(cwd, first).unwrap();
+    let two = runtime.snapshot_for(cwd, second).unwrap();
+    assert!(
+        runtime.respond(one.token, two.interaction.as_ref().unwrap().id, Answer::Allow).is_err()
+    );
+    runtime.respond(one.token, one.interaction.unwrap().id, Answer::Allow).unwrap();
+    runtime.respond(two.token, two.interaction.unwrap().id, Answer::Deny).unwrap();
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while runtime.busy() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    let saved = service.read().unwrap();
+    assert_eq!(saved.get(first).unwrap().runs[0].state, RunState::Completed);
+    assert_eq!(saved.get(second).unwrap().runs[0].state, RunState::Failed);
+    assert_ne!(
+        saved.get(first).unwrap().execution_dir(),
+        saved.get(second).unwrap().execution_dir()
+    );
+}

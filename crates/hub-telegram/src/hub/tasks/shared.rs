@@ -25,6 +25,7 @@ struct Follow {
     session: TopicSession,
     last: Option<Live>,
     card: Option<MessageId>,
+    feedback: Option<u64>,
     failures: u8,
     retry_at: Option<tokio::time::Instant>,
     delivery: Option<tokio::task::JoinHandle<Option<MessageId>>>,
@@ -38,6 +39,33 @@ impl Drop for Follow {
 }
 pub const PREFIX: &str = "te:";
 pub const CARD: &str = "🧭 Общая задача #";
+fn result_summary(run: &hub_core::tasks::Run, id: u64) -> String {
+    let report = &run.workflow_report;
+    if report.is_empty() {
+        return run.result.clone();
+    }
+    let excerpt = |value: &str| {
+        let mut chars = value.chars();
+        let mut text: String = chars.by_ref().take(450).collect();
+        if chars.next().is_some() {
+            text.push('…');
+        }
+        text
+    };
+    let mut lines = vec![excerpt(&run.result)];
+    for (i, check) in report.checks.iter().enumerate() {
+        lines.push(format!(
+            "Проверка {}: {}",
+            i + 1,
+            if check.passed { "прошла" } else { "не прошла" }
+        ));
+    }
+    if !report.review.is_empty() {
+        lines.push(format!("Ревью: {}", excerpt(&report.review)));
+    }
+    lines.push(format!("Полный отчёт и вывод проверок: /task attempt {id} {}", run.id));
+    lines.join("\n")
+}
 impl<A: Agents> Hub<A> {
     pub(in crate::hub) fn shared_task(
         &mut self,
@@ -68,18 +96,18 @@ impl<A: Agents> Hub<A> {
         let execution = self.execution.as_ref().ok_or("Общий исполнитель недоступен")?;
         let book = self.tasks.read()?;
         let rules_revision = book.rules(project).revision;
-        let (id, request) =
-            match request {
-                Request::Start { id, revision, next } => {
-                    (id, Request::StartChecked { id, revision, next, rules_revision })
-                }
-                Request::PrepareGit { id, revision, branch } => {
-                    (id, Request::PrepareGitChecked { id, revision, branch, rules_revision })
-                }
-                request @ (Request::StartChecked { id, .. }
-                | Request::PrepareGitChecked { id, .. }) => (id, request),
-                _ => return Err("Операция не поддерживается общим исполнителем".into()),
-            };
+        let (id, request) = match request {
+            Request::Start { id, revision, next } => {
+                (id, Request::StartChecked { id, revision, next, rules_revision })
+            }
+            Request::PrepareGit { id, revision, branch } => {
+                (id, Request::PrepareGitChecked { id, revision, branch, rules_revision })
+            }
+            request @ (Request::RunQueued { id, .. }
+            | Request::StartChecked { id, .. }
+            | Request::PrepareGitChecked { id, .. }) => (id, request),
+            _ => return Err("Операция не поддерживается общим исполнителем".into()),
+        };
         let task = book.get(id)?;
         if task.project != project {
             return Err("Задача относится к другому проекту".into());
@@ -96,11 +124,121 @@ impl<A: Agents> Hub<A> {
         execution.dispatch(project, request, Arc::new(ExecutionSettings::from(&settings)))?;
         super::manage::manage(&self.tasks, project, backend, Request::Get(id))
     }
+    pub(in crate::hub) fn pump_queue(&mut self) {
+        if self.shutdown.is_some()
+            || !self.running.is_empty()
+            || !self.actions.is_idle()
+            || !self.handoffs.is_idle()
+            || !self.snapshotting.is_empty()
+            || self.git_job.is_some()
+        {
+            return;
+        }
+        let Some(pending) = self.tasks.pending(true) else {
+            return;
+        };
+        if !self.execution.as_ref().is_some_and(|r| r.capacity(pending.isolated)) {
+            return;
+        }
+        let origin = pending.origin.map(|origin| {
+            (
+                TopicKey {
+                    chat: hub_core::domain::ChatId(origin.chat),
+                    thread: hub_core::domain::ThreadId(origin.thread),
+                },
+                origin.user.map(UserId),
+            )
+        });
+        // One interactive card per topic. Start the next queued job here only after the
+        // preceding job's terminal card has been delivered.
+        if let Some((key, Some(_))) = origin
+            && let Some(follow) = self.follows.entries.get(&key)
+            && (follow.delivery.is_some()
+                || self
+                    .execution
+                    .as_ref()
+                    .and_then(|execution| {
+                        execution.snapshot_for(follow.session.cwd.as_path(), follow.id)
+                    })
+                    .is_some_and(|live| live.active || follow.last.as_ref() != Some(&live)))
+        {
+            return;
+        }
+        let result = (|| {
+            let session = if let Some((key, user)) = origin {
+                let config = &self.settings.borrow().telegram;
+                if key.chat != config.chat
+                    || user.is_some_and(|user| {
+                        !crate::telegram::allowed(config, Some(key.chat), Some(user))
+                    })
+                {
+                    return Err("Доступ пользователя изменился".to_owned());
+                }
+                if user.is_some()
+                    && !self.follows.entries.contains_key(&key)
+                    && self.follows.entries.len() >= 32
+                {
+                    return Err("Достигнут лимит 32 подписок. Освободите тему и повторно поставьте задачу в очередь.".into());
+                }
+                let session = self
+                    .topics
+                    .get(&key)
+                    .filter(|s| s.cwd.as_path() == pending.project)
+                    .ok_or("Тема очереди больше не связана с проектом")?;
+                Some(session.clone())
+            } else {
+                None
+            };
+            self.shared_task(
+                &pending.project,
+                Request::RunQueued { id: pending.id, revision: pending.revision },
+                session.as_ref(),
+            )?;
+            if let Some((key, Some(user))) = origin {
+                self.shared_command(key, Some(user), &format!("follow {}", pending.id));
+            }
+            Ok(())
+        })();
+        if let Err(error) = result
+            && let Err(error) = self.tasks.pause_pending(&pending, &error)
+        {
+            tracing::warn!(%error,"cannot pause queued task");
+        }
+    }
     pub(in crate::hub) fn shared_stop(&self, key: TopicKey) -> bool {
+        self.stop_matching(key, false)
+    }
+    pub(in crate::hub) fn stop_preflight(&self, key: TopicKey) -> bool {
+        self.stop_matching(key, true)
+    }
+    fn stop_matching(&self, key: TopicKey, preflight: bool) -> bool {
         let Some(execution) = &self.execution else { return false };
-        let Some(live) = execution.snapshot().filter(|live| live.active) else { return false };
+        let Some(session) = self.topics.get(&key) else {
+            return false;
+        };
+        let live = if let Some(follow) = self.follows.entries.get(&key) {
+            execution.snapshot_for(session.cwd.as_path(), follow.id).filter(|live| live.active)
+        } else {
+            let mut jobs = execution.snapshots().into_iter().filter(|live| {
+                live.active
+                    && live.project == session.cwd.as_path()
+                    && (!preflight || live.run.is_none())
+            });
+            let first = jobs.next();
+            if jobs.next().is_some() {
+                return false;
+            }
+            first
+        };
+        let Some(live) = live else {
+            return false;
+        };
         if self.topics.get(&key).is_some_and(|s| s.cwd.as_path() == live.project) {
-            return execution.stop(live.token).is_ok();
+            return if preflight {
+                execution.stop_preflight(live.token).is_ok()
+            } else {
+                execution.stop(live.token).is_ok()
+            };
         }
         false
     }
@@ -160,6 +298,7 @@ impl<A: Agents> Hub<A> {
                 last: None,
                 card: None,
                 delivery: None,
+                feedback: None,
                 failures: 0,
                 retry_at: None,
             };
@@ -223,17 +362,23 @@ impl<A: Agents> Hub<A> {
                 follow.failures = 0;
                 follow.retry_at = None;
             }
-            let result = if live.active {
-                None
+            follow.feedback = None;
+            let (result, review_revision) = if live.active {
+                (None, None)
             } else {
-                self.tasks.read().ok().and_then(|book| book.get(live.id).ok().cloned()).and_then(
-                    |task| {
-                        task.runs
-                            .iter()
-                            .find(|run| Some(run.id) == live.run)
-                            .map(|run| run.result.clone())
-                    },
-                )
+                self.tasks
+                    .read()
+                    .ok()
+                    .and_then(|book| {
+                        let task = book.get(live.id).ok()?;
+                        let run = task.runs.iter().find(|r| Some(r.id) == live.run)?;
+                        let reviewable = !task.archived
+                            && task.status == hub_core::tasks::TaskStatus::NeedsReview
+                            && task.runs.last() == Some(run);
+                        let result = result_summary(run, task.id);
+                        Some((Some(result), reviewable.then_some(task.revision)))
+                    })
+                    .unwrap_or_default()
             };
             let delivery = super::shared_delivery::Delivery {
                 key: *key,
@@ -241,6 +386,7 @@ impl<A: Agents> Hub<A> {
                 previous: follow.card.take(),
                 live: live.clone(),
                 result,
+                review_revision,
                 execution: execution.clone(),
                 settings: self.settings.clone(),
                 sender: self.sender.clone(),
@@ -260,7 +406,7 @@ impl<A: Agents> Hub<A> {
         });
         self.refresh_shared();
     }
-    fn shared_pressed(&self, pressed: &Press) -> Result<String, String> {
+    fn shared_pressed(&mut self, pressed: &Press) -> Result<String, String> {
         let key = TopicKey {
             chat: pressed.chat.ok_or("Нет темы")?,
             thread: pressed.thread.ok_or("Нет темы")?,
@@ -277,15 +423,24 @@ impl<A: Agents> Hub<A> {
                 pressed.chat,
                 Some(pressed.user),
             )
+            || follow.card.is_none()
             || pressed.message != follow.card
         {
             return Err("Карточка или доступ устарели".into());
         }
         let execution = self.execution.as_ref().ok_or("Исполнитель недоступен")?;
         let live = execution
-            .snapshot()
-            .filter(|l| l.id == follow.id && l.project == follow.session.cwd.as_path())
+            .snapshot_for(follow.session.cwd.as_path(), follow.id)
             .ok_or("Запуск завершён")?;
+        if !live.active {
+            let (action, revision) = pressed
+                .data
+                .strip_prefix(PREFIX)
+                .and_then(|value| value.split_once(':'))
+                .and_then(|(action, rev)| Some((action, rev.parse::<u64>().ok()?)))
+                .ok_or("Карточка устарела")?;
+            return self.task_result_action(key, &live, action, revision, pressed.user);
+        }
         if !super::shared_delivery::offered(&live, &pressed.data) {
             return Err("Кнопка больше недоступна".into());
         }
@@ -332,6 +487,63 @@ impl<A: Agents> Hub<A> {
             _ => Err("Карточка устарела".into()),
         }
     }
+    fn task_result_action(
+        &mut self,
+        key: TopicKey,
+        live: &Live,
+        action: &str,
+        revision: u64,
+        user: UserId,
+    ) -> Result<String, String> {
+        use hub_core::tasks::TaskStatus;
+        let book = self.tasks.read()?;
+        let task = book.get(live.id)?;
+        let run = task.runs.last().filter(|r| Some(r.id) == live.run).ok_or("Попытка устарела")?;
+        if task.project != live.project
+            || task.revision != revision
+            || task.archived
+            || task.status != TaskStatus::NeedsReview
+        {
+            return Err("Карточка результата устарела; откройте /task get ID".into());
+        }
+        match action {
+            "accept" => {
+                self.task_snapshot(
+                    key,
+                    Request::Status { id: live.id, revision, status: TaskStatus::Accepted },
+                )?;
+                self.say(Target::Topic(key), format!("Задача #{} принята.", live.id));
+                Ok("Принято".into())
+            }
+            "diff" => {
+                if !self.task_deliveries.available(key) {
+                    return Err("Дождитесь отправки текущей карточки".into());
+                }
+                let patch = if run.diff.is_empty() {
+                    "Для этой попытки diff не сохранён"
+                } else {
+                    &run.diff
+                };
+                self.task_deliveries.send(
+                    key,
+                    Some(user),
+                    patch.to_owned(),
+                    false,
+                    self.sender.clone(),
+                    self.settings.clone(),
+                );
+                Ok("Отправляю изменения".into())
+            }
+            "feedback" => {
+                if let Some(follow) = self.follows.entries.get_mut(&key) {
+                    follow.feedback = Some(revision);
+                }
+                self.say(Target::Topic(key), format!("Ответьте на карточку результата задачи #{} текстом замечания. Это запустит следующую попытку.", live.id));
+                Ok("Ожидается замечание".into())
+            }
+            _ => Err("Кнопка устарела".into()),
+        }
+    }
     pub(in crate::hub) fn shared_reply(&mut self, inbound: &Inbound, key: TopicKey) -> bool {
         self.refresh_shared();
         let matched = self
@@ -359,10 +571,20 @@ impl<A: Agents> Hub<A> {
             {
                 return Err("Вопрос или доступ устарели".into());
             }
+            if let Some(revision) = follow.feedback {
+                let crate::inbound::Content::Text(next) = &inbound.content else {
+                    return Err("Ответьте текстом".into());
+                };
+                let id = follow.id;
+                self.task_snapshot(key, Request::Start { id, revision, next: Some(next.clone()) })?;
+                if let Some(follow) = self.follows.entries.get_mut(&key) {
+                    follow.feedback = None;
+                }
+                return Ok("Замечание передано, запущена следующая попытка".into());
+            }
             let execution = self.execution.as_ref().ok_or("Исполнитель недоступен")?;
             let live = execution
-                .snapshot()
-                .filter(|l| l.id == follow.id && l.project == follow.session.cwd.as_path())
+                .snapshot_for(follow.session.cwd.as_path(), follow.id)
                 .ok_or("Запуск завершён")?;
             let request = live.interaction.as_ref().ok_or("Вопрос уже закрыт")?;
             if follow.last.as_ref().and_then(|l| l.interaction.as_ref()).map(|r| r.id)

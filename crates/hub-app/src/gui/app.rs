@@ -19,6 +19,7 @@ use crate::updater::{UpdateCommand, UpdateState};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Tab {
+    Attention,
     Tasks,
     Memory,
     Status,
@@ -98,12 +99,13 @@ impl HubApp {
             exit,
         } = setup;
         let tab = match snapshot.borrow().bot {
+            BotStatus::Unconfigured if snapshot.borrow().local_only => Tab::Attention,
             BotStatus::Unconfigured => Tab::Settings,
             BotStatus::Stopped
             | BotStatus::Starting
             | BotStatus::Retrying { .. }
             | BotStatus::Running { .. }
-            | BotStatus::Failed(_) => Tab::Status,
+            | BotStatus::Failed(_) => Tab::Attention,
         };
         let mut form = SettingsForm::with_autostart(autostart);
         form.set_scale_path(ui_settings);
@@ -343,6 +345,9 @@ impl eframe::App for HubApp {
                         ui.label(egui::RichText::new("agent-hub").size(20.0).strong());
                         ui.add_space(20.0);
                     }
+                    let count = super::tasks::attention_count(&snapshot);
+                    let label = if count == 0 { "Требуют внимания".into() } else { format!("Требуют внимания ({count})") };
+                    ui.selectable_value(&mut self.tab, Tab::Attention, label);
                     ui.selectable_value(&mut self.tab, Tab::Status, "Статус");
                     ui.selectable_value(&mut self.tab, Tab::Topics, "Темы");
                     ui.selectable_value(&mut self.tab, Tab::Tasks, "Задачи");
@@ -370,6 +375,11 @@ impl eframe::App for HubApp {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(ui.visuals().extreme_bg_color).inner_margin(margin))
             .show(ui, |ui| match self.tab {
+                Tab::Attention => {
+                    if self.tasks.show_attention(ui, &snapshot) {
+                        self.tab = Tab::Tasks;
+                    }
+                }
                 Tab::Status => status::show(ui, &snapshot, self.form.has_unsaved(), &mut send),
                 Tab::Topics => self.topics.show(ui, &snapshot, &mut send),
                 Tab::Tasks => self.tasks.show(ui, &snapshot, &mut send),

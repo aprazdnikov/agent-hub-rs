@@ -38,7 +38,7 @@ impl fmt::Debug for Token {
     }
 }
 
-/// Non-empty allowlist.
+/// Empty only when Telegram is disabled.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Users(BTreeSet<UserId>);
 
@@ -302,6 +302,27 @@ pub struct TelegramSettings {
     pub token: Token,
     pub chat: ChatId,
     pub users: Users,
+}
+
+impl TelegramSettings {
+    #[must_use]
+    pub fn configured(&self) -> bool {
+        !self.token.expose().is_empty()
+    }
+
+    fn from_draft(draft: &Draft, errors: &mut Vec<FieldError>) -> Option<Self> {
+        if [&draft.token, &draft.chat, &draft.users].iter().all(|s| s.trim().is_empty()) {
+            return Some(Self {
+                token: Token(String::new()),
+                chat: ChatId(0),
+                users: Users(BTreeSet::new()),
+            });
+        }
+        let token = check(errors, Field::Token, parse_token(&draft.token));
+        let chat = check(errors, Field::Chat, parse_chat(&draft.chat));
+        let users = check(errors, Field::Users, parse_users(&draft.users));
+        Some(Self { token: token?, chat: chat?, users: users? })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -738,9 +759,7 @@ impl Draft {
             Field::Projects,
             projects::parse(&self.projects, actions.as_deref().unwrap_or_default()),
         );
-        let token = check(&mut errors, Field::Token, parse_token(&self.token));
-        let chat = check(&mut errors, Field::Chat, parse_chat(&self.chat));
-        let users = check(&mut errors, Field::Users, parse_users(&self.users));
+        let telegram = TelegramSettings::from_draft(self, &mut errors);
         let root = check(&mut errors, Field::WorkspaceRoot, parse_root(&self.workspace_root, home));
         let snapshots =
             check(&mut errors, Field::SnapshotsDir, parse_snapshots_dir(&self.snapshots_dir, home));
@@ -764,9 +783,7 @@ impl Draft {
         let background =
             check(&mut errors, Field::BackgroundTimeout, parse_seconds(&self.background_timeout));
         let (
-            Some(token),
-            Some(chat),
-            Some(users),
+            Some(telegram),
             Some(workspace_root),
             Some(snapshots_dir),
             Some(cli),
@@ -781,8 +798,8 @@ impl Draft {
             Some(approval),
             Some(background),
         ) = (
-            token, chat, users, root, snapshots, cli, model, budget, codex, qwen_cli, qwen_model,
-            endpoint, hermes, opencode, approval, background,
+            telegram, root, snapshots, cli, model, budget, codex, qwen_cli, qwen_model, endpoint,
+            hermes, opencode, approval, background,
         )
         else {
             return Err(errors);
@@ -796,7 +813,7 @@ impl Draft {
             progress_mode: self.progress_mode,
             actions,
             projects,
-            telegram: TelegramSettings { token, chat, users },
+            telegram,
             workspace_root,
             snapshots_dir,
             default_backend: self.default_backend,
@@ -824,7 +841,11 @@ impl Draft {
             actions: settings.actions.iter().map(Action::to_draft).collect(),
             projects: settings.projects.iter().map(Project::to_draft).collect(),
             token: settings.telegram.token.expose().to_owned(),
-            chat: settings.telegram.chat.0.to_string(),
+            chat: if settings.telegram.configured() {
+                settings.telegram.chat.0.to_string()
+            } else {
+                String::new()
+            },
             users: settings
                 .telegram
                 .users
@@ -1097,7 +1118,8 @@ pub struct SettingsFile {
 pub struct TelegramFile {
     #[serde(default, skip_serializing_if = "is_default")]
     pub progress: ProgressMode,
-    pub chat: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat: Option<i64>,
     pub users: Vec<u64>,
 }
 
@@ -1207,7 +1229,7 @@ impl SettingsFile {
             projects: settings.projects.iter().map(Project::to_draft).collect(),
             telegram: TelegramFile {
                 progress: settings.progress_mode,
-                chat: settings.telegram.chat.0,
+                chat: settings.telegram.configured().then_some(settings.telegram.chat.0),
                 users: settings.telegram.users.iter().map(|user| user.0).collect(),
             },
             workspace: WorkspaceFile { root: settings.workspace_root.display().to_string() },
@@ -1314,7 +1336,7 @@ impl SettingsFile {
             actions: self.actions.clone(),
             projects: self.projects.clone(),
             token,
-            chat: self.telegram.chat.to_string(),
+            chat: self.telegram.chat.map(|id| id.to_string()).unwrap_or_default(),
             users: self.telegram.users.iter().map(u64::to_string).collect::<Vec<_>>().join(", "),
             workspace_root: self.workspace.root.clone(),
             snapshots_dir: self.snapshots.dir.clone().unwrap_or_default(),
@@ -1716,9 +1738,9 @@ backend = "codex"
 
     #[test]
     fn all_errors_are_reported_at_once() {
-        let errors = Draft::default().parse(&home()).unwrap_err();
+        let errors = Draft { users: "1".into(), ..Draft::default() }.parse(&home()).unwrap_err();
         let fields: Vec<_> = errors.iter().map(|error| error.field).collect();
-        assert_eq!(fields, [Field::Token, Field::Chat, Field::Users, Field::WorkspaceRoot]);
+        assert_eq!(fields, [Field::Token, Field::Chat, Field::WorkspaceRoot]);
     }
 
     #[test]

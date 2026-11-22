@@ -632,6 +632,7 @@ impl SettingsForm {
 
     fn telegram(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
         ui.strong("Подключение");
+        ui.small("Для локальной работы оставьте все три поля Telegram пустыми.");
         field_row(ui, "Токен бота", |ui| {
             ui.add(input(&mut self.draft.token).password(!self.revealed.token));
             ui.checkbox(&mut self.revealed.token, "показать");

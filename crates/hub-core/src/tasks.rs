@@ -1,6 +1,8 @@
 //! Durable task state. Starting a model is deliberately outside this module.
 use crate::domain::BackendKind;
 pub mod git;
+pub mod queue;
+pub mod workflow;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -19,9 +21,14 @@ pub struct ProjectRules {
     pub text: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<git::GitPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<workflow::WorkflowPreset>,
 }
 impl ProjectRules {
     pub fn validate(&self) -> Result<(), String> {
+        if let Some(workflow) = &self.workflow {
+            workflow.validate()?;
+        }
         if let Some(git) = &self.git {
             git.validate()?;
         }
@@ -43,7 +50,16 @@ impl ProjectRules {
             .map_or("Подготовка Git выключена".to_owned(), |policy| {
                 format!("Подготовка Git обязательна: {}/{}", policy.remote, policy.base)
             });
-        format!("{text}\n{git}")
+        if let Some(plan) = &self.workflow {
+            format!(
+                "{text}\n{git}\nИсправить и проверить для {}: {} → ревью {}.",
+                plan.implementer.name(),
+                plan.command,
+                plan.reviewer.name()
+            )
+        } else {
+            format!("{text}\n{git}")
+        }
     }
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -114,6 +130,8 @@ pub struct Run {
     pub state: RunState,
     pub result: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub diff: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub diagnostic: String,
     #[serde(
         default,
@@ -123,6 +141,8 @@ pub struct Run {
     pub backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<ProjectRules>,
+    #[serde(default, skip_serializing_if = "workflow::WorkflowReport::is_empty")]
+    pub workflow_report: workflow::WorkflowReport,
 }
 fn explicit_backend<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -142,6 +162,8 @@ pub struct Task {
     pub status: TaskStatus,
     pub archived: bool,
     pub git: Option<git::Preparation>,
+    pub queue: Option<queue::Entry>,
+    pub isolated: bool,
 }
 impl Serialize for Task {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -154,7 +176,9 @@ impl Serialize for Task {
             "Task",
             7 + usize::from(explicit_status)
                 + usize::from(self.archived)
-                + usize::from(self.git.is_some()),
+                + usize::from(self.git.is_some())
+                + usize::from(self.queue.is_some())
+                + usize::from(self.isolated),
         )?;
         fields.serialize_field("id", &self.id)?;
         fields.serialize_field("revision", &self.revision)?;
@@ -171,6 +195,12 @@ impl Serialize for Task {
         }
         if let Some(git) = &self.git {
             fields.serialize_field("git", git)?;
+        }
+        if let Some(queue) = &self.queue {
+            fields.serialize_field("queue", queue)?;
+        }
+        if self.isolated {
+            fields.serialize_field("isolated", &true)?;
         }
         fields.end()
     }
@@ -192,6 +222,10 @@ struct StoredTask {
     archived: bool,
     #[serde(default)]
     git: Option<git::Preparation>,
+    #[serde(default)]
+    queue: Option<queue::Entry>,
+    #[serde(default)]
+    isolated: bool,
 }
 fn explicit_status<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -216,6 +250,8 @@ impl From<StoredTask> for Task {
             status,
             archived: raw.archived,
             git: raw.git,
+            queue: raw.queue,
+            isolated: raw.isolated,
         }
     }
 }
@@ -345,6 +381,7 @@ impl TaskBook {
         if current.enabled == rules.enabled
             && current.text == rules.text
             && current.git == rules.git
+            && current.workflow == rules.workflow
         {
             return Ok(());
         }
@@ -374,8 +411,16 @@ impl TaskBook {
     }
     pub fn encode(&self) -> Result<Vec<u8>, String> {
         self.validate()?;
-        let active = self.tasks.iter().any(Task::active);
-        let limit = if active { MAX_FILE_BYTES - 1024 } else { MAX_READ_BYTES };
+        // Each live attempt needs its own space to publish a terminal state while its
+        // neighbour is still running. Waiting intents may need a diagnostic before launch.
+        let active = self.tasks.iter().filter(|task| task.active()).count();
+        let waiting = self
+            .tasks
+            .iter()
+            .filter(|task| task.queue.as_ref().is_some_and(|entry| entry.error.is_none()))
+            .count();
+        let limit = if active == 0 { MAX_READ_BYTES } else { MAX_FILE_BYTES - active * 1024 };
+        let limit = limit - waiting * 3072;
         let bytes = serde_json::to_vec_pretty(self).map_err(|e| e.to_string())?;
         if bytes.len() <= limit {
             return Ok(bytes);
@@ -390,6 +435,8 @@ impl TaskBook {
     fn validate(&self) -> Result<(), String> {
         let mut ids = std::collections::BTreeSet::new();
         let mut running = 0;
+        let mut exclusive = false;
+        let mut positions = std::collections::BTreeSet::new();
         if self.version != 1 || self.next_id == 0 || self.tasks.len() > 100 {
             return Err("Неизвестная версия или неверные лимиты файла задач".into());
         }
@@ -408,6 +455,14 @@ impl TaskBook {
             entry.rules.validate()?;
         }
         for task in &self.tasks {
+            if let Some(q) = &task.queue
+                && (!q.valid() || !positions.insert(q.sequence))
+            {
+                return Err("Повреждена очередь задач".into());
+            }
+            if task.active() && !task.isolated {
+                exclusive = true;
+            }
             if let Some(git) = &task.git {
                 git.validate()?;
                 running += usize::from(git.state == git::PreparationState::Preparing);
@@ -429,6 +484,7 @@ impl TaskBook {
                 return Err("Некорректная запись задачи".into());
             }
             for (index, run) in task.runs.iter().enumerate() {
+                run.workflow_report.validate()?;
                 if let Some(rules) = &run.rules {
                     rules.validate()?;
                     if rules.revision == 0 {
@@ -438,6 +494,7 @@ impl TaskBook {
                 if usize::try_from(run.id).ok() != Some(index + 1)
                     || !text(&run.step, MAX_PROMPT)
                     || run.result.len() > MAX_RESULT
+                    || run.diff.len() > MAX_RESULT
                     || run.diagnostic.len() > 512
                     || run.backend.as_deref().is_some_and(|backend| {
                         BackendKind::parse(backend).is_none()
@@ -450,7 +507,7 @@ impl TaskBook {
                 running += usize::from(run.state == RunState::Running);
             }
         }
-        if running > 1 {
+        if running > 2 || (running > 1 && exclusive) {
             return Err("В файле задач более одного активного запуска".into());
         }
         Ok(())
@@ -498,6 +555,8 @@ impl TaskBook {
             status: TaskStatus::Planned,
             archived: false,
             git: None,
+            queue: None,
+            isolated: false,
         });
         self.next_id += 1;
         Ok(id)
@@ -571,7 +630,10 @@ impl TaskBook {
                 return Err("Сначала подготовьте Git по текущим правилам проекта.".into());
             }
         }
-        if self.tasks.iter().any(Task::active) {
+        let isolated = self.get(id)?.isolated;
+        if self.tasks.iter().filter(|t| t.active()).count() >= 2
+            || self.tasks.iter().any(|t| t.active() && (t.id == id || !isolated || !t.isolated))
+        {
             return Err(
                 "Другая задача уже выполняется. Дождитесь завершения или остановите её.".into()
             );
@@ -589,6 +651,9 @@ impl TaskBook {
         if task.runs.len() >= 32 {
             return Err("Достигнут лимит 32 запусков; история сохранена.".into());
         }
+        if task.queue.as_ref().is_some_and(|q| q.error.is_none()) {
+            return Err("Сначала снимите задачу с очереди.".into());
+        }
         let step = task.next_step(next)?.to_owned();
         let id = u32::try_from(task.runs.len() + 1).map_err(|e| e.to_string())?;
         task.revision.checked_add(2).ok_or("Лимит ревизий: нет места для завершения попытки")?;
@@ -598,14 +663,17 @@ impl TaskBook {
         {
             git.message.clear();
         }
+        task.queue = None;
         task.runs.push(Run {
             id,
             step,
             state: RunState::Running,
             result: String::new(),
+            diff: String::new(),
             diagnostic: String::new(),
             backend: Some(task.backend.clone()),
             rules: (rules.revision != 0).then_some(rules),
+            workflow_report: workflow::WorkflowReport::default(),
         });
         Ok(id)
     }
@@ -615,6 +683,26 @@ impl TaskBook {
             return Err("Событие относится к завершённому или другому запуску".into());
         }
         Ok(task)
+    }
+    pub fn record_diff(&mut self, id: u64, run: u32, diff: &str) -> Result<(), String> {
+        if diff.len() > MAX_RESULT {
+            return Err("Снимок изменений превышает 64 КиБ.".into());
+        }
+        if let Some(last) = self.active(id, run)?.runs.last_mut() {
+            diff.clone_into(&mut last.diff);
+        }
+        Ok(())
+    }
+    pub fn workflow_report_mut(
+        &mut self,
+        id: u64,
+        run: u32,
+    ) -> Result<&mut workflow::WorkflowReport, String> {
+        self.active(id, run)?
+            .runs
+            .last_mut()
+            .map(|r| &mut r.workflow_report)
+            .ok_or_else(|| "Попытка не найдена".into())
     }
     pub fn record(&mut self, id: u64, run: u32, result: &str) -> Result<(), String> {
         if !text(result, MAX_RESULT) {

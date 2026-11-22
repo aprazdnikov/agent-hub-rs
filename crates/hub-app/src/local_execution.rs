@@ -1,6 +1,7 @@
 //! One desktop operation, independent of Telegram transport. No automatic replay.
 mod channel;
 mod shared;
+mod workflow;
 use channel::Channel;
 pub use channel::{Answer, Interaction, Kind};
 use futures::future::BoxFuture;
@@ -79,6 +80,7 @@ pub struct Runtime {
     view: watch::Sender<Option<Live>>,
     job: Option<Job>,
     completed: Vec<Live>,
+    isolated: bool,
 }
 impl Runtime {
     pub fn new(
@@ -93,6 +95,7 @@ impl Runtime {
             view: watch::Sender::new(None),
             job: None,
             completed: Vec::new(),
+            isolated: false,
         }
     }
     #[must_use]
@@ -162,6 +165,22 @@ impl Runtime {
             }
         }
     }
+    fn resolve_request(&self, request: Request) -> Result<(u64, u64, u64, Action), String> {
+        Ok(match request {
+            Request::RunQueued { id, revision } => {
+                let book = self.service.read()?;
+                let q = book.get(id)?.queue.as_ref().ok_or("Задача снята с очереди")?;
+                (id, revision, q.rules_revision, Action::Start(q.next.clone()))
+            }
+            Request::StartChecked { id, revision, next, rules_revision } => {
+                (id, revision, rules_revision, Action::Start(next))
+            }
+            Request::PrepareGitChecked { id, revision, branch, rules_revision } => {
+                (id, revision, rules_revision, Action::Prepare(branch))
+            }
+            _ => return Err("Для запуска обновите карточку задачи и проверьте контекст.".into()),
+        })
+    }
     pub fn dispatch(
         &mut self,
         project: &Path,
@@ -174,15 +193,8 @@ impl Runtime {
                     .into(),
             );
         }
-        let (id, revision, rules_revision, action) = match request {
-            Request::StartChecked { id, revision, next, rules_revision } => {
-                (id, revision, rules_revision, Action::Start(next))
-            }
-            Request::PrepareGitChecked { id, revision, branch, rules_revision } => {
-                (id, revision, rules_revision, Action::Prepare(branch))
-            }
-            _ => return Err("Для запуска обновите карточку задачи и проверьте контекст.".into()),
-        };
+        let queued = matches!(request, Request::RunQueued { .. });
+        let (id, revision, rules_revision, action) = self.resolve_request(request)?;
         let book = self.service.read()?;
         let task = book.get(id)?;
         if task.project != project {
@@ -192,6 +204,9 @@ impl Runtime {
             return Err(
                 "Задача или правила изменились. Обновите карточку и проверьте контекст.".into()
             );
+        }
+        if !queued && task.queue.is_some() {
+            return Err("Сначала снимите задачу с очереди.".into());
         }
         let backend = BackendKind::parse(&task.backend).ok_or("Неизвестный агент задачи")?;
         let session = TopicSession::fresh(
@@ -205,6 +220,9 @@ impl Runtime {
             {
                 return Err("Задача или правила изменились".into());
             }
+            if queued {
+                book.claim_queue(id, revision)?;
+            }
             match &action {
                 Action::Prepare(branch) => {
                     book.prepare_git(id, revision, branch)?;
@@ -216,6 +234,7 @@ impl Runtime {
             }
             Ok(book.get(id)?.clone())
         })?;
+        self.isolated = task.isolated && matches!(action, Action::Start(_));
         let token = Uuid::new_v4();
         let cancel = CancellationToken::new();
         let channel = Arc::new(Channel::new(settings.timeouts.approval, cancel.clone()));
@@ -246,6 +265,14 @@ impl Runtime {
             let _cleanup = cleanup;
             let outcome =
                 worker.execute(task, session, action, settings, rules_revision, lease).await;
+            if queued && let Err(error) = &outcome {
+                let _ = worker.service.access(Access::Internal, |book, _| {
+                    if book.get(id)?.queue.is_some() {
+                        book.pause_queue(id, revision, error)?;
+                    }
+                    Ok(())
+                });
+            }
             worker.channel.close();
             worker.view.send_modify(|view| {
                 if let Some(view) = view {
@@ -296,6 +323,11 @@ impl Drop for GitIntent {
             tracing::error!(%error, "cannot finalize desktop Git preparation");
         }
     }
+}
+#[derive(Clone, Copy)]
+enum Output {
+    Implementation,
+    Review,
 }
 struct Attempt {
     service: Arc<TaskService>,
@@ -379,10 +411,19 @@ impl Worker {
                 return Err(error);
             }
         }
+        let mut session = session;
+        if task.isolated {
+            if self.service.read()?.rules(&task.project).git.is_some() {
+                return Err("Проект требует подготовку ветки в основном каталоге.".into());
+            }
+            self.status("Проверка отдельного worktree…");
+            let cwd = crate::git::worktree(&task, &self.cancel).await?;
+            session.cwd = AbsolutePath::new(cwd).ok_or("Нужен абсолютный путь worktree")?;
+        }
         if self.cancel.is_cancelled() {
             return Err("Запуск остановлен до начала работы агента.".into());
         }
-        let (run, prompt) = self.service.access(Access::Internal, |book, _| {
+        let (run, prompt, workflow) = self.service.access(Access::Internal, |book, _| {
             if book.rules(&task.project).revision != rules_revision {
                 return Err("Правила изменились. Проверьте контекст.".into());
             }
@@ -391,19 +432,66 @@ impl Worker {
                 .preview_with_rules(next.as_deref(), &book.rules(&task.project))?;
             let prompt = Prompt::new(text, vec![]).ok_or("Пустое поручение")?;
             let run = book.begin(task.id, task.revision, next.as_deref())?;
-            Ok((run, prompt))
+            Ok((
+                run,
+                prompt,
+                book.rules(&task.project).workflow.filter(|p| p.implementer == session.backend),
+            ))
         })?;
         self.view.send_modify(|view| {
             if let Some(view) = view {
                 view.run = Some(run);
             }
         });
-        let mut attempt =
-            Attempt { service: self.service.clone(), id: task.id, run, finished: false };
+        let attempt = Attempt { service: self.service.clone(), id: task.id, run, finished: false };
         drop(lease);
+        if self.cancel.is_cancelled() {
+            // begin() can block on persistence while a stop arrives. Dropping
+            // the attempt marks it interrupted before any Git or CLI work.
+            return Ok(RunState::Interrupted.label().into());
+        }
+        self.execute_attempt(&session, prompt, settings, attempt, workflow.as_ref()).await
+    }
+
+    async fn execute_attempt(
+        &self,
+        session: &TopicSession,
+        prompt: Prompt,
+        settings: Arc<ExecutionSettings>,
+        mut attempt: Attempt,
+        workflow: Option<&hub_core::tasks::workflow::WorkflowPreset>,
+    ) -> Result<String, String> {
         self.status("Агент выполняет задачу");
-        let state = self.run(&session, prompt, settings, &attempt).await?;
-        self.service.access(Access::Internal, |book, _| book.finish(task.id, run, state))?;
+        let cwd = session.cwd.as_path();
+        let baseline = crate::task_diff::baseline(cwd).await;
+        let mut state = self
+            .run(session, prompt.clone(), settings.clone(), &attempt, Output::Implementation)
+            .await?;
+        if state == RunState::Completed
+            && let Some(preset) = workflow
+        {
+            state = self
+                .verify(
+                    workflow::Workflow {
+                        preset,
+                        original: &prompt,
+                        session,
+                        baseline: baseline.as_deref(),
+                    },
+                    settings,
+                    &attempt,
+                )
+                .await?;
+        }
+        let diff = crate::task_diff::capture(cwd, baseline.as_deref()).await;
+        if let Err(error) = self
+            .service
+            .access(Access::Internal, |book, _| book.record_diff(attempt.id, attempt.run, &diff))
+        {
+            tracing::warn!(%error, "Не удалось сохранить изменения попытки");
+        }
+        self.service
+            .access(Access::Internal, |book, _| book.finish(attempt.id, attempt.run, state))?;
         attempt.finished = true;
         Ok(state.label().into())
     }
@@ -413,6 +501,7 @@ impl Worker {
         prompt: Prompt,
         settings: Arc<ExecutionSettings>,
         attempt: &Attempt,
+        output: Output,
     ) -> Result<RunState, String> {
         let (events, mut received) = mpsc::channel(64);
         let conversation = Conversation {
@@ -438,9 +527,9 @@ impl Worker {
                     return Ok(RunState::Interrupted);
                 },
                 event=received.recv(), if events_open=>{
-                    if let Some(event)=event {self.event(event,attempt,&mut state)?;} else {events_open=false;}
+                    if let Some(event)=event {self.event(event,attempt,&mut state,output)?;} else {events_open=false;}
                 },
-                ()=&mut future=>{while let Ok(event)=received.try_recv(){self.event(event,attempt,&mut state)?;} break;},
+                ()=&mut future=>{while let Ok(event)=received.try_recv(){self.event(event,attempt,&mut state,output)?;} break;},
             }
         }
         Ok(state)
@@ -450,8 +539,16 @@ impl Worker {
         event: AgentEvent,
         attempt: &Attempt,
         state: &mut RunState,
+        output: Output,
     ) -> Result<(), String> {
         match event {
+            AgentEvent::AssistantText(text) if matches!(output, Output::Review) => {
+                if text.trim().is_empty() || text.len() > 65536 {
+                    self.set_review(attempt, "")?;
+                } else {
+                    self.set_review(attempt, &text)?;
+                }
+            }
             AgentEvent::AssistantText(text) => {
                 self.service.access(Access::Internal, |book, _| {
                     if text.trim().is_empty() || text.len() > 65536 {
@@ -475,6 +572,12 @@ impl Worker {
             AgentEvent::Failed(error) => {
                 *state = RunState::Failed;
                 self.status(&error.chars().take(512).collect::<String>());
+                if matches!(output, Output::Review) {
+                    return self.set_review(
+                        attempt,
+                        &format!("Ошибка ревью: {}", error.chars().take(512).collect::<String>()),
+                    );
+                }
                 self.service.access(Access::Internal, |book, _| {
                     book.unavailable(
                         attempt.id,

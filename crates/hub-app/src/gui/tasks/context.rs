@@ -11,6 +11,10 @@ pub(super) struct LocalProject {
     error: Option<String>,
 }
 impl LocalProject {
+    pub(super) fn choose(&mut self, path: &std::path::Path) {
+        self.path = path.display().to_string();
+        self.open();
+    }
     fn open(&mut self) {
         self.opened = None;
         if !std::path::Path::new(&self.path).is_absolute() {

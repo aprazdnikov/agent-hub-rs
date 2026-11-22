@@ -117,11 +117,20 @@ pub struct Report {
 
 /// Checks a snapshot of the saved settings, without starting a task or a bot.
 pub async fn run(settings: std::sync::Arc<hub_core::settings::Settings>) -> Report {
-    let (workspace, agent, telegram) = tokio::join!(
-        check_workspace(&settings.workspace_root),
-        check_cli(&settings),
-        hub_telegram::telegram::diagnose(&settings.telegram.token, settings.telegram.chat),
-    );
+    let (workspace, agent, telegram) =
+        tokio::join!(check_workspace(&settings.workspace_root), check_cli(&settings), async {
+            use hub_telegram::telegram::{DiagnosticStep, TelegramDiagnostic, diagnose};
+            if settings.telegram.configured() {
+                diagnose(&settings.telegram.token, settings.telegram.chat).await
+            } else {
+                TelegramDiagnostic {
+                    token: DiagnosticStep::NotChecked,
+                    chat: DiagnosticStep::NotChecked,
+                    chat_kind: None,
+                    manage_topics: None,
+                }
+            }
+        },);
     Report { workspace, agent, agent_kind: settings.default_backend, telegram }
 }
 

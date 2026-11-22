@@ -17,6 +17,7 @@ pub(super) struct Delivery {
     pub previous: Option<MessageId>,
     pub live: Live,
     pub result: Option<String>,
+    pub review_revision: Option<u64>,
     pub execution: Arc<dyn Control>,
     pub settings: watch::Receiver<Arc<Settings>>,
     pub sender: Sender,
@@ -76,6 +77,18 @@ fn keyboard(live: &Live, complete: bool) -> Vec<Vec<Button>> {
         }]);
     }
     rows
+}
+fn result_buttons(revision: u64) -> Vec<Vec<Button>> {
+    vec![
+        vec![
+            Button { text: "Принять".into(), data: format!("te:accept:{revision}") },
+            Button { text: "Открыть diff".into(), data: format!("te:diff:{revision}") },
+        ],
+        vec![Button {
+            text: "Вернуть с замечанием".into(),
+            data: format!("te:feedback:{revision}"),
+        }],
+    ]
 }
 pub(super) fn complete(live: &Live) -> bool {
     context(live).len() <= 32768
@@ -140,7 +153,7 @@ impl Delivery {
         if let Some(result) = &self.result {
             let _ = write!(text, "\nРезультат:\n{result}");
         }
-        if !self.live.active {
+        if !self.live.active && self.review_revision.is_none() {
             let _ = write!(
                 text,
                 "\nСледующий шаг: /task get {} для ревизии, затем /task resume ID РЕВИЗИЯ ТЕКСТ_ШАГА.",
@@ -170,7 +183,10 @@ impl Delivery {
                 chunk
             });
             if last {
-                outgoing = outgoing.with_keyboard(keyboard(&self.live, complete));
+                outgoing = outgoing.with_keyboard(
+                    self.review_revision
+                        .map_or_else(|| keyboard(&self.live, complete), result_buttons),
+                );
             }
             message = tokio::time::timeout(
                 std::time::Duration::from_secs(10),

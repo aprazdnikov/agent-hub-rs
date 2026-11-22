@@ -321,3 +321,6 @@ pub async fn run(request: Request, cancel: CancellationToken) -> Result<String, 
         Err("Истекло время подготовки Git. Проверьте репозиторий: часть действий могла выполниться; автоматического повтора нет.".into())
     }
 }
+
+mod isolated;
+pub(crate) use isolated::worktree;

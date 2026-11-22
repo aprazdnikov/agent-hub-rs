@@ -40,6 +40,12 @@ pub struct Live {
 pub trait Control: Send + Sync + 'static {
     fn busy(&self) -> bool;
     fn snapshot(&self) -> Option<Live>;
+    fn snapshots(&self) -> Vec<Live> {
+        self.snapshot().into_iter().collect()
+    }
+    fn capacity(&self, _isolated: bool) -> bool {
+        !self.busy()
+    }
     fn snapshot_for(&self, project: &Path, id: u64) -> Option<Live> {
         self.snapshot().filter(|live| live.id == id && live.project == project)
     }
@@ -50,5 +56,16 @@ pub trait Control: Send + Sync + 'static {
         settings: Arc<ExecutionSettings>,
     ) -> Result<(), String>;
     fn stop(&self, token: Uuid) -> Result<(), String>;
+    fn stop_preflight(&self, token: Uuid) -> Result<(), String> {
+        if self
+            .snapshots()
+            .iter()
+            .any(|live| live.token == token && live.active && live.run.is_none())
+        {
+            self.stop(token)
+        } else {
+            Err("Подготовка уже завершена".into())
+        }
+    }
     fn respond(&self, token: Uuid, id: Uuid, answer: Answer) -> Result<(), String>;
 }

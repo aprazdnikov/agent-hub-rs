@@ -47,6 +47,17 @@ fn apply(
     request: Request,
 ) -> Result<Vec<Task>, String> {
     match request {
+        Request::Queue { id, revision, isolated, next, origin } => {
+            task(book, project, id)?;
+            book.enqueue(id, revision, next, isolated, origin)?;
+            Ok(vec![book.get(id)?.clone()])
+        }
+        Request::Unqueue { id, revision } => {
+            task(book, project, id)?;
+            book.unqueue(id, revision)?;
+            Ok(vec![book.get(id)?.clone()])
+        }
+        Request::RunQueued { .. } => Err("Запуск доступен только планировщику".into()),
         Request::List => Ok(book
             .tasks()
             .iter()

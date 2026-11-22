@@ -305,3 +305,59 @@ fn git_preparation_requires_durable_success_and_recovers_without_replay() {
     assert!(book.prepare_git(id, 5, "feat/other").is_err());
     assert!(TaskBook::decode(&book.encode().unwrap()).is_ok());
 }
+
+#[test]
+fn fifo_intents_survive_restart_but_a_claimed_preflight_never_replays() {
+    let mut book = TaskBook::default();
+    let project = std::env::temp_dir();
+    let a = book.create(project.clone(), "qwen", "one", "Inspect").unwrap();
+    let b = book.create(project, "qwen", "two", "Inspect").unwrap();
+    book.enqueue(b, 1, None, true, None).unwrap();
+    book.enqueue(a, 1, None, false, None).unwrap();
+    assert!(book.enqueue(a, 1, None, false, None).is_err());
+    let mut saved = TaskBook::decode(&book.encode().unwrap()).unwrap();
+    assert_eq!(saved.next_queued(false).unwrap().0.id, b);
+    saved.claim_queue(b, 2).unwrap();
+    let mut restored = TaskBook::decode(&saved.encode().unwrap()).unwrap();
+    assert!(!restored.recover());
+    assert_eq!(restored.next_queued(false).unwrap().0.id, a);
+    assert!(restored.get(b).unwrap().runs.is_empty());
+    restored.unqueue(b, 2).unwrap();
+    assert_eq!(restored.get(b).unwrap().revision, 3);
+}
+
+#[test]
+fn stale_task_or_rule_revisions_cannot_start_waiting_work() {
+    let mut book = TaskBook::default();
+    let project = std::env::temp_dir();
+    let id = book.create(project.clone(), "qwen", "one", "Inspect").unwrap();
+    book.enqueue(id, 1, None, false, None).unwrap();
+    book.set_rules(project, 0, true, "review first").unwrap();
+    assert!(book.claim_queue(id, 2).is_err());
+    book.assign(id, 2, "codex").unwrap();
+    assert!(book.claim_queue(id, 2).is_err());
+}
+
+#[test]
+fn full_book_with_two_isolated_runs_can_finish_both_in_order() {
+    let limit = hub_core::tasks::MAX_FILE_BYTES - 2048;
+    let mut raw = serde_json::json!({"version":1,"next_id":6,"tasks":(1..=5).map(|id|serde_json::json!({
+        "id":id,"revision":64,"isolated":true,"project":std::env::temp_dir(),"backend":"qwen","title":"Task","prompt":"Inspect",
+        "runs":(1..=32).map(|run|serde_json::json!({"id":run,"step":"Inspect","state":if id>=4 && run==32{"running"}else{"completed"},"result":""})).collect::<Vec<_>>()
+    })).collect::<Vec<_>>()});
+    let mut remaining = limit - serde_json::to_vec(&raw).unwrap().len();
+    for task in raw["tasks"].as_array_mut().unwrap() {
+        for run in task["runs"].as_array_mut().unwrap() {
+            let n = remaining.min(65536);
+            run["result"] = serde_json::Value::String("x".repeat(n));
+            remaining -= n;
+        }
+    }
+    let mut book = TaskBook::decode(&serde_json::to_vec(&raw).unwrap()).unwrap();
+    assert_eq!(book.encode().unwrap().len(), limit);
+    book.finish(4, 32, RunState::Completed).unwrap();
+    // The other worker is still running; reopening must preserve its attempt.
+    let mut book = TaskBook::decode(&book.encode().unwrap()).unwrap();
+    assert!(book.recover());
+    assert!(book.encode().is_ok());
+}

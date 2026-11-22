@@ -6,9 +6,12 @@ use hub_core::{
     tasks::{Task, TaskFilter, TaskStatus},
 };
 use hub_telegram::hub::tasks::{Request, Snapshot as TaskSnapshot};
+mod attention;
+pub(super) use attention::attention_count;
 mod context;
 mod git;
 mod local;
+mod result;
 mod rules;
 use std::{
     path::PathBuf,
@@ -20,6 +23,9 @@ type Scope = (Option<TopicKey>, PathBuf, BackendKind);
 type Reply = oneshot::Receiver<Result<TaskSnapshot, String>>;
 #[derive(Default)]
 pub struct TasksView {
+    result_view: result::View,
+    focused: Option<u64>,
+    reveal_interaction: bool,
     local_mode: Option<bool>,
     local_panel: local::Panel,
     local_block: LocalBlock,
@@ -188,12 +194,23 @@ impl TasksView {
         self.assignees.clear();
     }
     pub fn show(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot, send: &mut impl FnMut(Command)) {
-        super::theme::page_heading(
-            ui,
-            "Задачи",
-            "Ручной запуск и история попыток. После перезапуска работа не возобновляется автоматически.",
-        );
-        self.local_panel.show(ui, snapshot, send);
+        self.project_navigation(ui, snapshot);
+        egui::ScrollArea::vertical().id_salt("task_workspace").show(ui, |ui| {
+            self.show_project(ui, snapshot, send);
+        });
+    }
+    fn show_project(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: &Snapshot,
+        send: &mut impl FnMut(Command),
+    ) {
+        ui.heading("Задачи");
+        if self.reveal_interaction {
+            ui.scroll_to_cursor(Some(egui::Align::Min));
+            self.reveal_interaction = false;
+        }
+        self.local_panels(ui, snapshot, send);
         self.local_block = if snapshot.local.as_ref().is_some_and(|live| live.active) {
             LocalBlock::Job
         } else {
@@ -241,20 +258,20 @@ impl TasksView {
         let topic_running = snapshot.topics.iter().any(|topic| {
             Some(topic.key) == key && topic.state == hub_telegram::hub::TopicState::Running
         });
-        let tasks: Vec<_> = self
-            .tasks
-            .iter()
-            .filter(|task| self.filter.matches(task, &self.query))
-            .cloned()
-            .collect();
+        let snapshot_tasks = std::mem::take(&mut self.tasks);
+        let tasks: Vec<_> =
+            snapshot_tasks.iter().filter(|task| self.filter.matches(task, &self.query)).collect();
         if tasks.is_empty() {
             ui.label("Задачи по выбранным условиям не найдены.");
         }
-        egui::ScrollArea::vertical().show(ui, |ui| {
-            for task in &tasks {
-                self.card(ui, task, backend, topic_running, send);
-            }
-        });
+        self.task_navigation(ui, &tasks, snapshot);
+        if let Some(task) =
+            tasks.iter().find(|task| Some(task.id) == self.focused).or(tasks.first())
+        {
+            self.focused = Some(task.id);
+            self.card(ui, task, backend, topic_running, send);
+        }
+        self.tasks = snapshot_tasks;
     }
     fn toolbar(&mut self, ui: &mut egui::Ui, busy: bool, send: &mut impl FnMut(Command)) {
         if ui.add_enabled(!busy, egui::Button::new("Обновить задачи")).clicked() {
@@ -430,44 +447,63 @@ impl TasksView {
         });
         ui.add_space(8.0);
     }
-    fn launch_controls(
+    fn show_queue_controls(
         &mut self,
         ui: &mut egui::Ui,
         task: &Task,
+        next: &str,
+        send: &mut impl FnMut(Command),
+    ) -> bool {
+        let first = task.runs.is_empty();
+        if let Some(q) = &task.queue {
+            ui.label(q.error.clone().unwrap_or_else(|| format!("В очереди · №{}", q.sequence)));
+            if ui.button("Снять с очереди").clicked() {
+                self.request(Request::Unqueue { id: task.id, revision: task.revision }, send);
+            }
+            return true;
+        }
+        if !task.active()
+            && !self.rules.dirty()
+            && !self.mutation_pending()
+            && !task.archived
+            && matches!(task.status, TaskStatus::Planned | TaskStatus::NeedsReview)
+            && (first || !next.trim().is_empty())
+        {
+            ui.horizontal_wrapped(|ui| {
+                for (isolated, label) in
+                    [(false, "В очередь"), (true, "В очередь в отдельном worktree")]
+                {
+                    if (!first && isolated != task.isolated)
+                        || (isolated && self.rules.saved.git.is_some())
+                    {
+                        continue;
+                    }
+                    if ui.button(label).clicked() {
+                        self.request(
+                            Request::Queue {
+                                id: task.id,
+                                revision: task.revision,
+                                isolated,
+                                next: (!first).then(|| next.to_owned()),
+                                origin: None,
+                            },
+                            send,
+                        );
+                    }
+                }
+            });
+        }
+        false
+    }
+    fn launch_block(
+        &self,
+        task: &Task,
         backend: BackendKind,
         available: &Availability,
-        next: &mut String,
-        send: &mut impl FnMut(Command),
-    ) {
+        next: &str,
+    ) -> Option<&'static str> {
         let first = task.runs.is_empty();
-        ui.strong(if first { "2. Поручение" } else { "2. Следующий шаг" });
-        if first {
-            ui.add(egui::Label::new(&task.prompt).selectable(true));
-        } else {
-            ui.collapsing("Исходное поручение", |ui| {
-                ui.add(egui::Label::new(&task.prompt).selectable(true));
-            });
-            ui.label("Что агент должен сделать дальше? Прежний результат добавится автоматически.");
-            ui.add_enabled(
-                available.edit,
-                egui::TextEdit::multiline(next)
-                    .desired_rows(3)
-                    .char_limit(16384)
-                    .hint_text("Например: проверь предыдущий результат и исправь найденные ошибки"),
-            );
-        }
-        ui.add_space(8.0);
-        ui.strong("3. Проверка и запуск");
-        ui.small("Проверьте контекст, затем запустите работу отдельной кнопкой.");
-        ui.collapsing("Контекст следующего запуска", |ui| {
-            ui.label(format!("Поручение хаба · r{} · {}", task.revision, task.backend));
-            ui.small("Каждый запуск создаёт свежую CLI-сессию. Передаются сохранённые правила и контекст задачи; разрешения не переносятся.");
-            match task.preview_with_rules(if first { None } else { Some(next.as_str()) }, &self.rules.saved) {
-                Ok(text) => { ui.add(egui::Label::new(text).selectable(true)); }
-                Err(error) => { ui.label(error); }
-            }
-        });
-        let blocked = if self.local_context() && self.local_block == LocalBlock::Job {
+        if self.local_context() && self.local_block == LocalBlock::Job {
             Some("Локальная работа выполняется. Дождитесь завершения или остановите её выше.")
         } else if self.mutation_pending() {
             Some("Сохраняем изменения. Дождитесь подтверждения.")
@@ -497,14 +533,73 @@ impl TasksView {
             Some("Тема занята. Дождитесь завершения текущей работы или остановите её.")
         } else {
             None
-        };
+        }
+    }
+    fn launch_controls(
+        &mut self,
+        ui: &mut egui::Ui,
+        task: &Task,
+        backend: BackendKind,
+        available: &Availability,
+        next: &mut String,
+        send: &mut impl FnMut(Command),
+    ) {
+        let first = task.runs.is_empty();
+        ui.strong(if first { "2. Поручение" } else { "2. Следующий шаг" });
+        if first {
+            ui.add(egui::Label::new(&task.prompt).selectable(true));
+        } else {
+            ui.collapsing("Исходное поручение", |ui| {
+                ui.add(egui::Label::new(&task.prompt).selectable(true));
+            });
+            ui.label("Что агент должен сделать дальше? Прежний результат добавится автоматически.");
+            ui.add_enabled(
+                available.edit,
+                egui::TextEdit::multiline(next)
+                    .desired_rows(3)
+                    .char_limit(16384)
+                    .hint_text("Например: проверь предыдущий результат и исправь найденные ошибки"),
+            );
+        }
+        ui.add_space(8.0);
+        ui.strong("3. Проверка и запуск");
+        let workflow = self
+            .rules
+            .saved
+            .workflow
+            .as_ref()
+            .filter(|plan| plan.implementer.name() == task.backend);
+        if let Some(plan) = workflow {
+            ui.label(format!(
+                "{} → {} → ревью {}",
+                plan.implementer.name(),
+                plan.command,
+                plan.reviewer.name()
+            ));
+        }
+        let automated = workflow.is_some();
+        ui.small("Проверьте контекст, затем запустите работу отдельной кнопкой.");
+        ui.collapsing("Контекст следующего запуска", |ui| {
+            ui.label(format!("Поручение хаба · r{} · {}", task.revision, task.backend));
+            ui.small("Каждый запуск создаёт свежую CLI-сессию. Передаются сохранённые правила и контекст задачи; разрешения не переносятся.");
+            match task.preview_with_rules(if first { None } else { Some(next.as_str()) }, &self.rules.saved) {
+                Ok(text) => { ui.add(egui::Label::new(text).selectable(true)); }
+                Err(error) => { ui.label(error); }
+            }
+        });
+        if self.show_queue_controls(ui, task, next, send) {
+            return;
+        }
+        let blocked = self.launch_block(task, backend, available, next);
         if let Some(reason) = blocked {
             ui.label(reason);
         }
         if ui
             .add_enabled(
                 blocked.is_none(),
-                egui::Button::new(if self.local_context() {
+                egui::Button::new(if automated {
+                    "Исправить и проверить"
+                } else if self.local_context() {
                     if first {
                         "Запустить локально"
                     } else {
@@ -551,41 +646,36 @@ impl TasksView {
                 self.git_controls(ui, task, send);
                 self.executor_controls(ui, task, backend, available.edit, send);
                 if task.active() {
-                    if !task.git.as_ref().is_some_and(|git| git.state == hub_core::tasks::git::PreparationState::Preparing) {
-                        ui.label(if self.local_context() { "Выполняется. Кнопка остановки находится над выбором проекта." } else { "Выполняется. Остановить можно в теме Telegram или во вкладке «Темы»." });
+                    if !task.git.as_ref().is_some_and(|git| {
+                        git.state == hub_core::tasks::git::PreparationState::Preparing
+                    }) {
+                        ui.label(if self.local_context() {
+                            "Выполняется. Кнопка остановки находится над выбором проекта."
+                        } else {
+                            "Выполняется. Остановить можно в теме Telegram или во вкладке «Темы»."
+                        });
                     }
                 } else {
                     self.launch_controls(ui, task, backend, &available, &mut next, send);
                 }
             });
             ui.add_space(8.0);
-            ui.collapsing(format!("История попыток ({})", task.runs.len()), |ui| {
-                for run in &task.runs {
-                    ui.collapsing(
-                        format!(
-                            "Попытка {} — {} · {}",
-                            run.id,
-                            run.state.label(),
-                            run.backend.as_deref().unwrap_or(&task.backend)
-                        ),
-                        |ui| {
-                            ui.label(&run.step);
-                            ui.add(egui::Label::new(run.rules.as_ref().map_or("Редакция правил не сохранена (старый запуск или правила ещё не задавались)".into(), hub_core::tasks::ProjectRules::describe)).selectable(true));
-                            if !run.diagnostic.is_empty() {
-                                ui.label(&run.diagnostic);
-                            }
-                            ui.add(
-                                egui::Label::new(if run.result.is_empty() {
-                                    "Сохранённого текста результата нет"
-                                } else {
-                                    &run.result
-                                })
-                                .selectable(true),
-                            );
-                        },
-                    );
-                }
-            });
+            if let Some(step) = self.result_view.show(ui, task, &next, available.edit) {
+                next = step;
+            }
+            if task.status == TaskStatus::NeedsReview
+                && !task.archived
+                && ui.add_enabled(available.edit, egui::Button::new("Принять результат")).clicked()
+            {
+                self.request(
+                    Request::Status {
+                        id: task.id,
+                        revision: task.revision,
+                        status: TaskStatus::Accepted,
+                    },
+                    send,
+                );
+            }
             ui.collapsing("Статус и архив", |ui| {
                 self.workflow_controls(ui, task, !available.edit, send);
             });
@@ -682,6 +772,145 @@ mod tests {
                 commands,
             );
         }
+    }
+    #[test]
+    fn attention_opens_the_requested_parallel_permission() {
+        use crate::local_execution::{Answer, Interaction, Kind, Live};
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let cwd = std::env::temp_dir();
+        let job = |id| Live {
+            token: uuid::Uuid::new_v4(),
+            project: cwd.clone(),
+            id,
+            run: Some(1),
+            active: true,
+            status: "Ожидание".into(),
+            interaction: Some(Interaction {
+                id: uuid::Uuid::new_v4(),
+                kind: Kind::Permission(hub_core::domain::ToolRequest {
+                    tool: format!("Tool{id}"),
+                    summary: "Review".into(),
+                }),
+            }),
+        };
+        let first = job(1);
+        let second = job(2);
+        let snapshot = Snapshot {
+            local: Some(first.clone()),
+            local_jobs: vec![first, second.clone()],
+            ..Default::default()
+        };
+        assert_eq!(attention_count(&snapshot), 2);
+        let mut view = TasksView::default();
+        let mut opened = false;
+        let mut attention_frame = |events| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 900.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    opened |= view.show_attention(ui, &snapshot);
+                },
+            );
+            output.textures_delta.clear();
+            output
+        };
+        let _ = attention_frame(vec![]);
+        let output = attention_frame(vec![]);
+        let point = output
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if text.galley.text().contains("Разрешить Tool2") => {
+                    Some(text.visual_bounding_rect().center())
+                }
+                _ => None,
+            })
+            .unwrap();
+        for pressed in [true, false] {
+            let _ = attention_frame(vec![
+                egui::Event::PointerMoved(point),
+                egui::Event::PointerButton {
+                    pos: point,
+                    button: egui::PointerButton::Primary,
+                    pressed,
+                    modifiers: egui::Modifiers::NONE,
+                },
+            ]);
+        }
+        assert!(opened);
+        let mut commands = vec![];
+        click_text(&ctx, &mut view, &snapshot, "Разрешить один раз", &mut commands);
+        assert!(
+            commands
+                .iter()
+                .any(|cmd| matches!(cmd,Command::LocalAnswer{token,id,answer:Answer::Allow,..}
+            if *token==second.token && Some(*id)==second.interaction.as_ref().map(|i|i.id)))
+        );
+    }
+    #[test]
+    fn wide_task_workspace_places_project_list_before_tasks_and_details() {
+        use crate::desktop_tasks::TaskRow;
+        let ctx = egui::Context::default();
+        let dir = tempfile::tempdir().unwrap();
+        let project = hub_telegram::paths::workspace_root(dir.path()).unwrap();
+        let mut book = hub_core::tasks::TaskBook::default();
+        let first = book.create(project.as_path().to_owned(), "codex", "Первое", "Работа").unwrap();
+        book.create(project.as_path().to_owned(), "qwen", "Второе", "Ещё работа").unwrap();
+        let rows = book
+            .tasks()
+            .iter()
+            .map(|t| TaskRow {
+                id: t.id,
+                project: t.project.clone(),
+                title: t.title.clone(),
+                reason: None,
+            })
+            .collect();
+        let snapshot = Snapshot { task_index: Ok(rows), ..Default::default() };
+        let mut view = TasksView {
+            tasks: book.tasks().to_vec(),
+            refreshed: Some(Instant::now()),
+            ..Default::default()
+        };
+        view.local_project.choose(project.as_path());
+        view.scope = Some((None, project.as_path().to_owned(), BackendKind::Qwen));
+        view.focused = Some(first);
+        let mut render = || {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1440.0, 1000.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| view.show(ui, &snapshot, &mut |_| {}),
+            );
+            output.textures_delta.clear();
+            output
+        };
+        let _ = render();
+        let output = render();
+        let x = |label: &str| {
+            output
+                .shapes
+                .iter()
+                .find_map(|shape| match &shape.shape {
+                    egui::Shape::Text(text) if text.galley.text() == label => Some(text.pos.x),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("missing: {label}"))
+        };
+        let project_x = x("Проекты");
+        let tasks_x = x("#1  Первое\ncodex · Запланирована");
+        assert!(project_x < tasks_x && tasks_x < x("#1 · Первое · r1"));
     }
     #[test]
     fn failed_permission_delivery_allows_retry_or_deny() {
@@ -988,6 +1217,7 @@ mod tests {
             ..Default::default()
         };
         view.rules.accept(ProjectRules {
+            workflow: None,
             git: None,
             revision: 1,
             enabled: true,
@@ -1017,6 +1247,7 @@ mod tests {
                 git_busy: false,
                 tasks: vec![],
                 rules: ProjectRules {
+                    workflow: None,
                     git: None,
                     revision: 1,
                     enabled: true,
@@ -1057,7 +1288,13 @@ mod tests {
             refreshed: Some(Instant::now()),
             ..Default::default()
         };
-        let rules = ProjectRules { git: None, revision: 1, enabled: true, text: "Rule".into() };
+        let rules = ProjectRules {
+            workflow: None,
+            git: None,
+            revision: 1,
+            enabled: true,
+            text: "Rule".into(),
+        };
         view.rules.accept(rules.clone());
         let snapshot = Snapshot {
             bot: BotStatus::Running { username: "bot".into() },
@@ -1097,7 +1334,7 @@ mod tests {
             .send(Ok(TaskSnapshot {
                 git_busy: false,
                 tasks: vec![],
-                rules: ProjectRules { git: None, revision: 2, enabled: true, text },
+                rules: ProjectRules { workflow: None, git: None, revision: 2, enabled: true, text },
             }))
             .unwrap();
         input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);

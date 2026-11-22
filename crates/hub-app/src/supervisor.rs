@@ -97,8 +97,11 @@ pub struct AgentStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
+    pub local_only: bool,
+    pub task_index: Result<Vec<crate::desktop_tasks::TaskRow>, String>,
     pub bot: BotStatus,
     pub local: Option<crate::local_execution::Live>,
+    pub local_jobs: Vec<crate::local_execution::Live>,
     pub chat_access: Option<hub_telegram::telegram::ChatAccess>,
     pub outbox: OutboxStatus,
     pub diagnostics: DiagnosticStatus,
@@ -114,8 +117,11 @@ pub struct Snapshot {
 impl Default for Snapshot {
     fn default() -> Self {
         Self {
+            local_only: false,
+            task_index: Ok(Vec::new()),
             bot: BotStatus::Unconfigured,
             local: None,
+            local_jobs: Vec::new(),
             chat_access: None,
             outbox: OutboxStatus::Unknown,
             diagnostics: DiagnosticStatus::Idle,
@@ -168,6 +174,9 @@ pub enum Apply {
 /// What saving `next` does to the bot.
 #[must_use]
 pub fn plan(previous: Option<&Settings>, next: &Settings, activity: Activity) -> Apply {
+    if previous.is_some_and(|old| !old.telegram.configured()) && next.telegram.configured() {
+        return Apply::Start;
+    }
     match (previous, activity) {
         (None, Activity::Running | Activity::Stopped | Activity::Failed)
         | (Some(_), Activity::Failed) => Apply::Start,
@@ -254,6 +263,7 @@ pub struct Supervisor<C: Connector> {
     diagnostic_read: Option<BoxFuture<'static, crate::diagnostics::Report>>,
     outbox_read: Option<BoxFuture<'static, (ChatId, Result<usize, String>)>>,
     outbox_next: Instant,
+    task_index_next: Instant,
     local: Result<Arc<crate::local_execution::SharedRuntime>, String>,
     state: Snapshot,
     snapshot: watch::Sender<Snapshot>,
@@ -311,7 +321,12 @@ impl<C: Connector> Supervisor<C> {
             Ok(Loaded::Missing) => None,
             Ok(Loaded::Ready(settings)) => {
                 state.saved = Some(Draft::from_settings(&settings));
-                state.bot = BotStatus::Stopped;
+                state.local_only = !settings.telegram.configured();
+                state.bot = if settings.telegram.configured() {
+                    BotStatus::Stopped
+                } else {
+                    BotStatus::Unconfigured
+                };
                 Some(watch::Sender::new(Arc::new(settings)))
             }
             Ok(Loaded::Incomplete { draft, errors: _errors }) => {
@@ -347,6 +362,7 @@ impl<C: Connector> Supervisor<C> {
             retry: None,
             diagnostic_read: None,
             outbox_read: None,
+            task_index_next: Instant::now(),
             outbox_next: Instant::now(),
             state,
             snapshot,
@@ -410,7 +426,7 @@ impl<C: Connector> Supervisor<C> {
                 () = sleep_until(save_slow_at.unwrap_or_else(Instant::now)), if save_slow_at.is_some() => Event::SaveDelayed,
                 (chat, result) = reading => Event::OutboxRead(chat, result),
                 report = diagnosing => Event::DiagnosticDone(report),
-                () = sleep_until(self.outbox_next), if self.settings.is_some() && can_read => Event::ReadOutbox,
+                () = sleep_until(self.outbox_next), if self.telegram_configured() && can_read => Event::ReadOutbox,
             };
             self.saving = saving;
             self.connecting = connecting;
@@ -426,8 +442,23 @@ impl<C: Connector> Supervisor<C> {
     async fn apply_event(&mut self, event: Event<C::Error>) -> bool {
         match event {
             Event::LocalTick => {
+                self.pump_queue();
+                if Instant::now() >= self.task_index_next {
+                    self.task_index_next = Instant::now() + Duration::from_secs(3);
+                    if let Some(service) = self.connector.task_service() {
+                        let root =
+                            self.state.saved.as_ref().map(|draft| draft.workspace_root.as_str());
+                        let index = crate::desktop_tasks::index(&service, root, &self.home);
+                        if self.state.task_index != index {
+                            self.state.task_index = index;
+                            self.publish();
+                        }
+                    }
+                }
                 let local = self.local.as_ref().ok().and_then(|local| local.snapshot());
-                if local != self.state.local {
+                let jobs = self.local.as_ref().map(|r| r.snapshots()).unwrap_or_default();
+                if local != self.state.local || jobs != self.state.local_jobs {
+                    self.state.local_jobs = jobs;
                     self.state.local = local;
                     self.publish();
                 }
@@ -504,6 +535,33 @@ impl<C: Connector> Supervisor<C> {
         }
     }
 
+    fn pump_queue(&mut self) {
+        if self.mailbox().is_some()
+            || self.connecting.is_some()
+            || self.saving.is_some()
+            || self.settings_load_error.is_some()
+        {
+            return;
+        }
+        let Some(service) = self.connector.task_service() else {
+            return;
+        };
+        let Some(pending) = service.pending(false) else {
+            return;
+        };
+        if !self.local.as_ref().is_ok_and(|r| r.capacity(pending.isolated)) {
+            return;
+        }
+        let request = hub_telegram::hub::tasks::Request::RunQueued {
+            id: pending.id,
+            revision: pending.revision,
+        };
+        if let Err(error) = self.local_request(&pending.project, BackendKind::Codex, request)
+            && let Err(error) = service.pause_pending(&pending, &error)
+        {
+            tracing::warn!(%error,"cannot pause queued task");
+        }
+    }
     fn local_request(
         &mut self,
         project: &std::path::Path,
@@ -514,7 +572,9 @@ impl<C: Connector> Supervisor<C> {
         let service = self.connector.task_service().ok_or("Локальный сервис задач недоступен")?;
         let root = self.state.saved.as_ref().map(|draft| draft.workspace_root.as_str());
         let id = match &request {
-            Request::StartChecked { id, .. } | Request::PrepareGitChecked { id, .. } => Some(*id),
+            Request::RunQueued { id, .. }
+            | Request::StartChecked { id, .. }
+            | Request::PrepareGitChecked { id, .. } => Some(*id),
             _ => None,
         };
         if let Some(id) = id {
@@ -547,14 +607,17 @@ impl<C: Connector> Supervisor<C> {
             if self.local.is_err() {
                 self.local = make_execution(&self.connector, service.clone());
             }
+            let queued = matches!(request, Request::RunQueued { .. });
             self.local.as_mut().map_err(|error| error.clone())?.dispatch(
                 &project,
                 request,
                 Arc::new(settings),
             )?;
-            self.retry = None;
-            if matches!(self.state.bot, BotStatus::Retrying { .. }) {
-                self.state.bot = BotStatus::Stopped;
+            if !queued {
+                self.retry = None;
+                if matches!(self.state.bot, BotStatus::Retrying { .. }) {
+                    self.state.bot = BotStatus::Stopped;
+                }
             }
             return crate::desktop_tasks::request(
                 &service,
@@ -637,7 +700,7 @@ impl<C: Connector> Supervisor<C> {
                     self.stop_during_save = true;
                 }
                 self.stop().await;
-                if self.settings.is_some() {
+                if self.telegram_configured() {
                     self.status(BotStatus::Stopped);
                 }
             }
@@ -764,6 +827,7 @@ impl<C: Connector> Supervisor<C> {
         self.settings_load_error = None;
         self.retry = None;
         self.state.saved = Some(draft);
+        self.state.local_only = !settings.telegram.configured();
         self.state.notice = None;
         let previous = self.settings.as_ref().map(|live| Arc::clone(&live.borrow()));
         if previous.as_ref().is_none_or(|old| old.telegram.chat != settings.telegram.chat) {
@@ -781,7 +845,7 @@ impl<C: Connector> Supervisor<C> {
         } else {
             plan(previous.as_deref(), &settings, self.activity())
         };
-        if matches!(apply, Apply::Restart | Apply::Start) {
+        if settings.telegram.configured() && matches!(apply, Apply::Restart | Apply::Start) {
             self.state.bot = BotStatus::Starting;
             self.state.chat_access = None;
         }
@@ -794,6 +858,12 @@ impl<C: Connector> Supervisor<C> {
         self.publish();
         if let Some(reply) = memory_reply {
             let _ = reply.send(Ok(()));
+        }
+        if !self.telegram_configured() {
+            self.connecting = None;
+            self.stop().await;
+            self.status(BotStatus::Unconfigured);
+            return;
         }
         match apply {
             Apply::Start => self.start(),
@@ -828,7 +898,15 @@ impl<C: Connector> Supervisor<C> {
         }
     }
 
+    fn telegram_configured(&self) -> bool {
+        self.settings.as_ref().is_some_and(|s| s.borrow().telegram.configured())
+    }
+
     fn start(&mut self) {
+        if !self.telegram_configured() {
+            self.status(BotStatus::Unconfigured);
+            return;
+        }
         let Some(live) = &self.settings else { return };
         let receiver = live.subscribe();
         self.connecting = Some(self.connector.connect(receiver));
@@ -1481,6 +1559,28 @@ mod tests {
             repaint: Arc::new(|| {}),
         });
         assert_eq!(watched.borrow().bot, expected);
+    }
+
+    #[tokio::test]
+    async fn local_settings_can_disconnect_and_later_enable_telegram() {
+        let mut harness = harness(
+            Ok(Loaded::Ready(settings("-100", ""))),
+            &[Outcome::Connect, Outcome::Connect],
+            false,
+        );
+        harness.until("connected", running).await;
+        let mut local = draft("-100", "local-model");
+        local.token.clear();
+        local.chat.clear();
+        local.users.clear();
+        harness.send(Command::Save(Box::new(local))).await;
+        harness.until("local only", |s| s.local_only && s.bot == BotStatus::Unconfigured).await;
+        assert_eq!((harness.connects(), harness.stops()), (1, 1));
+        harness.send(Command::Start).await;
+        harness.send(Command::Save(Box::new(draft("-100", "local-model")))).await;
+        harness.until("reconnected", running).await;
+        assert!(!harness.snapshot.borrow().local_only);
+        assert_eq!(harness.connects(), 2);
     }
 
     #[tokio::test]

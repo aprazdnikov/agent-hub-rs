@@ -10,7 +10,7 @@ use hub_core::{
     tasks::{ProjectRules, RunState, Task, TaskBook, TaskFilter, TaskStatus},
 };
 
-pub const HELP: &str = "/task — задачи проекта\n/task rules\n/task git РЕДАКЦИЯ REMOTE БАЗОВАЯ_ВЕТКА\n/task git РЕДАКЦИЯ off\n/task prepare ID РЕВИЗИЯ НОВАЯ_ВЕТКА\n/task git-stop\n/task rules-set РЕДАКЦИЯ on|off | ТЕКСТ\n/task create Название | Поручение\n/task list [all|planned|review|accepted|deferred|archived] [поиск]\n/task get ID\n/task follow ID — управление общей задачей\n/task unfollow\n/task assign ID РЕВИЗИЯ АГЕНТ\n/task preview ID [Следующий шаг]\n/task attempt ID ПОПЫТКА\n/task status ID РЕВИЗИЯ planned|review|accepted|deferred\n/task archive ID РЕВИЗИЯ\n/task restore ID РЕВИЗИЯ\n/task run ID РЕВИЗИЯ\n/task resume ID РЕВИЗИЯ Следующий шаг после проверки прежних эффектов\nПри создании агент и каталог берутся из текущей темы. Повторный запуск всегда требует явного следующего шага; автоматического повтора нет. Результат запуска не означает приёмку пользователем.";
+pub const HELP: &str = "/task — задачи проекта\n/task rules\n/task git РЕДАКЦИЯ REMOTE БАЗОВАЯ_ВЕТКА\n/task git РЕДАКЦИЯ off\n/task prepare ID РЕВИЗИЯ НОВАЯ_ВЕТКА\n/task git-stop\n/task rules-set РЕДАКЦИЯ on|off | ТЕКСТ\n/task create Название | Поручение\n/task list [all|planned|review|accepted|deferred|archived] [поиск]\n/task get ID\n/task follow ID — управление общей задачей\n/task unfollow\n/task assign ID РЕВИЗИЯ АГЕНТ\n/task preview ID [Следующий шаг]\n/task attempt ID ПОПЫТКА\n/task status ID РЕВИЗИЯ planned|review|accepted|deferred\n/task archive ID РЕВИЗИЯ\n/task restore ID РЕВИЗИЯ\n/task queue ID РЕВИЗИЯ [следующий шаг] — очередь\n/task worktree ID РЕВИЗИЯ [следующий шаг] — очередь в отдельной копии репозитория\n/task unqueue ID РЕВИЗИЯ — снять с очереди\n/task run ID РЕВИЗИЯ\n/task resume ID РЕВИЗИЯ Следующий шаг после проверки прежних эффектов\nПри создании агент и каталог берутся из текущей темы. Повторный запуск всегда требует явного следующего шага; автоматического повтора нет. Результат запуска не означает приёмку пользователем.";
 #[derive(Clone, Debug, Default)]
 pub struct Snapshot {
     pub tasks: Vec<Task>,
@@ -19,24 +19,92 @@ pub struct Snapshot {
 }
 #[derive(Clone, Debug)]
 pub enum Request {
+    Queue {
+        id: u64,
+        revision: u64,
+        isolated: bool,
+        next: Option<String>,
+        origin: Option<hub_core::tasks::queue::Origin>,
+    },
+    Unqueue {
+        id: u64,
+        revision: u64,
+    },
+    /// Internal scheduler dispatch, never parsed from a message.
+    RunQueued {
+        id: u64,
+        revision: u64,
+    },
     List,
     Rules,
-    SaveGitPolicy { revision: u64, policy: Option<hub_core::tasks::git::GitPolicy> },
-    SaveProjectRules { revision: u64, rules: ProjectRules },
-    PrepareGit { id: u64, revision: u64, branch: String },
-    PrepareGitChecked { id: u64, revision: u64, branch: String, rules_revision: u64 },
+    SaveGitPolicy {
+        revision: u64,
+        policy: Option<hub_core::tasks::git::GitPolicy>,
+    },
+    SaveProjectRules {
+        revision: u64,
+        rules: ProjectRules,
+    },
+    PrepareGit {
+        id: u64,
+        revision: u64,
+        branch: String,
+    },
+    PrepareGitChecked {
+        id: u64,
+        revision: u64,
+        branch: String,
+        rules_revision: u64,
+    },
     CancelGit,
-    SaveRules { revision: u64, enabled: bool, text: String },
-    StartChecked { id: u64, revision: u64, next: Option<String>, rules_revision: u64 },
-    Search { filter: TaskFilter, query: String },
-    Status { id: u64, revision: u64, status: TaskStatus },
-    Archive { id: u64, revision: u64, archived: bool },
-    Attempt { id: u64, run: u32 },
+    SaveRules {
+        revision: u64,
+        enabled: bool,
+        text: String,
+    },
+    StartChecked {
+        id: u64,
+        revision: u64,
+        next: Option<String>,
+        rules_revision: u64,
+    },
+    Search {
+        filter: TaskFilter,
+        query: String,
+    },
+    Status {
+        id: u64,
+        revision: u64,
+        status: TaskStatus,
+    },
+    Archive {
+        id: u64,
+        revision: u64,
+        archived: bool,
+    },
+    Attempt {
+        id: u64,
+        run: u32,
+    },
     Get(u64),
-    Assign { id: u64, revision: u64, backend: BackendKind },
-    Preview { id: u64, next: Option<String> },
-    Create { title: String, prompt: String },
-    Start { id: u64, revision: u64, next: Option<String> },
+    Assign {
+        id: u64,
+        revision: u64,
+        backend: BackendKind,
+    },
+    Preview {
+        id: u64,
+        next: Option<String>,
+    },
+    Create {
+        title: String,
+        prompt: String,
+    },
+    Start {
+        id: u64,
+        revision: u64,
+        next: Option<String>,
+    },
 }
 #[derive(Debug)]
 pub struct ManagedRun {
@@ -90,6 +158,26 @@ fn parse_git(command: &str, tail: &str) -> Result<Request, String> {
             branch: (*branch).into(),
         }),
         _ => Err(HELP.into()),
+    }
+}
+fn parse_queue(command: &str, tail: &str) -> Result<Request, String> {
+    let (id, rest) = word(tail).ok_or(HELP)?;
+    let (revision, next) = word(rest).ok_or(HELP)?;
+    let id = id.parse().map_err(|_| HELP)?;
+    let revision = revision.parse().map_err(|_| HELP)?;
+    if command == "unqueue" {
+        if !next.trim().is_empty() {
+            return Err(HELP.into());
+        }
+        Ok(Request::Unqueue { id, revision })
+    } else {
+        Ok(Request::Queue {
+            id,
+            revision,
+            isolated: command == "worktree",
+            next: (!next.trim().is_empty()).then(|| next.into()),
+            origin: None,
+        })
     }
 }
 pub fn parse(raw: &str) -> Result<Request, String> {
@@ -167,6 +255,7 @@ pub fn parse(raw: &str) -> Result<Request, String> {
             }
             Ok(Request::Get(id.parse().map_err(|_| HELP)?))
         }
+        "queue" | "worktree" | "unqueue" => parse_queue(command, tail),
         "run" | "resume" => {
             let (id, tail) = word(tail).ok_or(HELP)?;
             let (revision, step) = word(tail).ok_or(HELP)?;
@@ -188,6 +277,15 @@ pub fn parse(raw: &str) -> Result<Request, String> {
 #[must_use]
 pub fn describe(task: &Task) -> String {
     let status = task.status.label();
+    let queue = task.queue.as_ref().map_or(String::new(), |q| {
+        q.error.clone().unwrap_or_else(|| {
+            format!(
+                "В очереди · позиция {}{}",
+                q.sequence,
+                if q.isolated { " · worktree" } else { "" }
+            )
+        })
+    });
     let archive = if task.archived { " · В архиве" } else { "" };
     let history = task
         .runs
@@ -211,10 +309,11 @@ pub fn describe(task: &Task) -> String {
             &run.result
         }
     });
+    let report = task.runs.last().map(|r| r.workflow_report.describe()).unwrap_or_default();
     let diagnostic = task.runs.last().map_or("", |run| run.diagnostic.as_str());
     let git = task.git.as_ref().map_or(String::new(), hub_core::tasks::git::Preparation::describe);
     format!(
-        "Задача #{} · r{} · {} · {status}{archive}\n{git}\n{}\nПроект: {}\nПоручение: {}\n{}\n\nПоследний результат:\n{}\n{diagnostic}\n\nДля первого запуска: /task run {} {}\nДля продолжения: /task resume {} {} СЛЕДУЮЩИЙ ШАГ\nЗавершение запуска не означает приёмку задачи.",
+        "Задача #{} · r{} · {} · {status}{archive}\n{queue}\n{git}\n{}\nПроект: {}\nПоручение: {}\n{}\n\nПоследний результат:\n{}\n{diagnostic}\n{report}\n\nДля первого запуска: /task run {} {}\nДля продолжения: /task resume {} {} СЛЕДУЮЩИЙ ШАГ\nЗавершение запуска не означает приёмку задачи.",
         task.id,
         task.revision,
         task.backend,
@@ -240,8 +339,14 @@ pub fn describe_attempt(task: &Task, run: u32) -> Result<String, String> {
         "Редакция правил не сохранена (старый запуск или правила ещё не задавались)".into(),
         ProjectRules::describe,
     );
+    let report = attempt.workflow_report.describe();
+    let changes = if attempt.diff.is_empty() {
+        String::new()
+    } else {
+        format!("\nИзменения:\n{}", attempt.diff)
+    };
     Ok(format!(
-        "Задача #{} · попытка {} · {} · {}\nШаг:\n{}\nРезультат:\n{}\n{}\n{rules}",
+        "Задача #{} · попытка {} · {} · {}\nШаг:\n{}\nРезультат:\n{}\n{}\n{rules}\n{report}{changes}",
         task.id,
         run,
         attempt.state.label(),
@@ -294,7 +399,17 @@ impl<A: Agents> Hub<A> {
         if self.shared_command(key, user, raw) {
             return;
         }
-        let request = parse(raw);
+        let request = parse(raw).and_then(|mut request| {
+            if let Request::Queue { origin, .. } = &mut request {
+                let user = user.ok_or("Неизвестный пользователь")?;
+                *origin = Some(hub_core::tasks::queue::Origin {
+                    chat: key.chat.0,
+                    thread: key.thread.0,
+                    user: Some(user.0),
+                });
+            }
+            Ok(request)
+        });
         let preview = matches!(&request, Ok(Request::Preview { .. }));
         let result = request.clone().and_then(|request| self.task_snapshot(key, request));
         if self.execution.is_some()
@@ -321,14 +436,30 @@ impl<A: Agents> Hub<A> {
     pub(super) fn task_snapshot(
         &mut self,
         key: TopicKey,
-        request: Request,
+        mut request: Request,
     ) -> Result<Snapshot, String> {
         let session = self.task_context(key, &request)?;
+        if let Request::Queue { origin, id, .. } = &mut request {
+            if self.execution.is_none() {
+                return Err("Очередь требует общего исполнителя приложения.".into());
+            }
+            let book = self.tasks.read()?;
+            let task = book.get(*id)?;
+            if task.project != session.cwd.as_path() || task.backend != session.backend.name() {
+                return Err("Выберите тему проекта с назначенным агентом.".into());
+            }
+            // A desktop command sent through a topic also keeps that topic's execution settings.
+            origin.get_or_insert(hub_core::tasks::queue::Origin {
+                chat: key.chat.0,
+                thread: key.thread.0,
+                user: None,
+            });
+        }
         if self.execution.is_some()
             && matches!(request, Request::CancelGit)
             && self.tasks.access(Access::Read, |_, busy| Ok(busy))?
         {
-            if !self.shared_stop(key) {
+            if !self.stop_preflight(key) {
                 return Err("В этой теме нет общей подготовки Git".into());
             }
             return manage::manage(
@@ -441,6 +572,9 @@ impl<A: Agents> Hub<A> {
         next: Option<&str>,
         book: TaskBook,
     ) -> Result<Vec<Task>, String> {
+        if book.get(id)?.isolated || book.get(id)?.queue.is_some() {
+            return Err("Для выполнения этой задачи нужен общий исполнитель приложения.".into());
+        }
         if book.rules(session.cwd.as_path()).git.is_some() {
             self.checked_git_start(key, session, id, revision, next, book)
         } else {

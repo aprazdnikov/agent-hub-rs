@@ -41,6 +41,11 @@ impl TaskService {
         });
         Self { state: Mutex::new(State { book, storage, busy: false }) }
     }
+    /// Read a small projection without cloning run histories or changing the store.
+    pub fn inspect<T>(&self, project: impl FnOnce(&TaskBook) -> T) -> Result<T, String> {
+        let state = self.state.lock().map_err(|_| "Сервис задач недоступен")?;
+        state.book.as_ref().map(project).map_err(Clone::clone)
+    }
     pub fn read(&self) -> Result<TaskBook, String> {
         self.state
             .lock()
@@ -90,6 +95,39 @@ impl TaskService {
         self.access(Access::Internal, |book, _| {
             book.recover();
             Ok(())
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Pending {
+    pub id: u64,
+    pub project: std::path::PathBuf,
+    pub revision: u64,
+    pub isolated: bool,
+    pub origin: Option<super::queue::Origin>,
+}
+
+impl TaskService {
+    /// Poll the FIFO without cloning the task book or an attempt's retained output.
+    pub fn pending(&self, connected: bool) -> Option<Pending> {
+        let state = self.state.lock().ok()?;
+        if state.busy {
+            return None;
+        }
+        let (task, q) = state.book.as_ref().ok()?.next_queued(connected)?;
+        Some(Pending {
+            id: task.id,
+            project: task.project.clone(),
+            revision: q.revision,
+            isolated: q.isolated,
+            origin: q.origin,
+        })
+    }
+
+    pub fn pause_pending(&self, pending: &Pending, error: &str) -> Result<(), String> {
+        self.access(Access::Internal, |book, _| {
+            book.pause_queue(pending.id, pending.revision, error)
         })
     }
 }

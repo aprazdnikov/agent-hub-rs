@@ -373,6 +373,7 @@ impl<A: Agents> Hub<A> {
             let message = tokio::select! {
                 message = mailbox.recv() => message,
                 _ = refresh.tick(), if !self.running.is_empty() || !self.voices.is_empty() || !self.handoffs.is_empty() || self.execution.is_some() => {
+                    self.pump_queue();
                     self.refresh_shared();
                     self.handoffs.refresh(&self.settings.borrow(), &self.topics);
                     if !self.handoffs.creating() { self.handoff_topics.clear(); }
@@ -6374,10 +6375,17 @@ mod tests {
             if live.as_ref().is_some_and(|l| l.active) {
                 return Err("busy".into());
             }
-            let tasks::Request::StartChecked { id, revision, next, .. } = request else {
-                return Err("unsupported".into());
+            let (id, revision, next, queued) = match request {
+                tasks::Request::StartChecked { id, revision, next, .. } => {
+                    (id, revision, next, false)
+                }
+                tasks::Request::RunQueued { id, revision } => (id, revision, None, true),
+                _ => return Err("unsupported".into()),
             };
             self.tasks.access(hub_core::tasks::service::Access::Internal, |book, _| {
+                if queued {
+                    book.claim_queue(id, revision)?;
+                }
                 book.begin(id, revision, next.as_deref())
             })?;
             self.launches.fetch_add(1, Ordering::SeqCst);
@@ -6451,6 +6459,58 @@ mod tests {
         world.execution = Some(execution.clone());
         world.restart().await;
         (world, execution, task)
+    }
+    #[tokio::test]
+    async fn queued_telegram_launch_rechecks_sender_and_reattaches_interactions() {
+        use crate::execution::Control;
+        let (mut world, execution, _) = shared_world().await;
+        let queued = task_op(
+            &world,
+            KEY,
+            tasks::Request::Create { title: "Queued".into(), prompt: "Inspect files".into() },
+        )
+        .await
+        .unwrap()
+        .remove(0);
+        world.send(text(Some(7), 2, &format!("/task queue {} 1", queued.id))).await;
+        eventually("queue persisted", || {
+            world.tasks.read().unwrap().get(queued.id).unwrap().queue.is_some()
+        })
+        .await;
+        world.restart().await;
+        execution.stop(execution.snapshot().unwrap().token).unwrap();
+        let _ = shared_card(&world).await;
+        assert_eq!(execution.snapshot().unwrap().id, queued.id);
+        let rejected = task_op(
+            &world,
+            KEY,
+            tasks::Request::Create { title: "Other".into(), prompt: "Check files".into() },
+        )
+        .await
+        .unwrap()
+        .remove(0);
+        world.send(text(Some(7), 3, &format!("/task queue {} 1", rejected.id))).await;
+        eventually("second queue persisted", || {
+            world.tasks.read().unwrap().get(rejected.id).unwrap().queue.is_some()
+        })
+        .await;
+        let mut settings = world.settings.borrow().as_ref().clone();
+        settings.telegram.chat = ChatId(-999);
+        world.settings.send_replace(Arc::new(settings));
+        execution.stop(execution.snapshot().unwrap().token).unwrap();
+        eventually("unauthorized intent paused", || {
+            world
+                .tasks
+                .read()
+                .unwrap()
+                .get(rejected.id)
+                .unwrap()
+                .queue
+                .as_ref()
+                .is_some_and(|q| q.error.is_some())
+        })
+        .await;
+        assert_eq!(execution.launches.load(Ordering::SeqCst), 2);
     }
     async fn shared_card(world: &World) -> (MessageId, String) {
         eventually("shared approval",||world.messenger.calls().iter().any(|c|matches!(c,Call::Send{message,..} if message.keyboard.iter().flatten().any(|b|b.data.starts_with("te:a:"))))).await;
@@ -6685,6 +6745,57 @@ mod tests {
         })
         .await;
         assert!(!world.texts().iter().any(|t| t.contains("OLD_RESULT_MUST_NOT_APPEAR")));
+    }
+
+    #[tokio::test]
+    async fn result_card_accepts_once_and_only_for_subscriber() {
+        use crate::execution::Control;
+        use hub_core::tasks::TaskStatus;
+        let (world, execution, task) = shared_world().await;
+        let live = execution.snapshot().unwrap();
+        execution.stop(live.token).unwrap();
+        execution.live.lock().unwrap().as_mut().unwrap().run = Some(1);
+        world.send(text(Some(7), 2, &format!("/task follow {}", task.id))).await;
+        let button = || {
+            world.messenger.calls().into_iter().find_map(|call| {
+                let Call::Send { id, message, .. } = call else { return None };
+                message
+                    .keyboard
+                    .iter()
+                    .flatten()
+                    .find(|b| b.data.starts_with("te:accept:"))
+                    .map(|b| (id, b.data.clone()))
+            })
+        };
+        eventually("result card", || button().is_some()).await;
+        let (message, data) = button().unwrap();
+        for (name, user, expected) in [
+            ("other", UserId(2), TaskStatus::NeedsReview),
+            ("owner", UserId(1), TaskStatus::Accepted),
+            ("repeat", UserId(1), TaskStatus::Accepted),
+        ] {
+            world
+                .send(HubMessage::Press(Press {
+                    thread: Some(KEY.thread),
+                    callback: name.into(),
+                    user,
+                    chat: Some(KEY.chat),
+                    message: Some(message),
+                    html: None,
+                    data: data.clone(),
+                }))
+                .await;
+            eventually("button answered", || {
+                world
+                    .messenger
+                    .calls()
+                    .iter()
+                    .any(|call| matches!(call,Call::Answer {callback,..} if callback==name))
+            })
+            .await;
+            assert_eq!(world.tasks.read().unwrap().get(task.id).unwrap().status, expected);
+        }
+        assert_eq!(world.texts().iter().filter(|t| t.contains("принята.")).count(), 1);
     }
 
     #[tokio::test]

@@ -1,6 +1,9 @@
 //! A revision-bound draft survives background reads; only an explicit save accepts it.
 use eframe::egui;
-use hub_core::tasks::ProjectRules;
+use hub_core::{
+    domain::BackendKind,
+    tasks::{ProjectRules, workflow::WorkflowPreset},
+};
 use hub_telegram::hub::tasks::Request;
 
 #[derive(Default)]
@@ -21,6 +24,34 @@ impl Editor {
     pub fn accept(&mut self, rules: ProjectRules) {
         self.draft = rules.clone();
         self.saved = rules;
+    }
+    fn workflow_settings(&mut self, ui: &mut egui::Ui, project: &std::path::Path) {
+        let mut enabled = self.draft.workflow.is_some();
+        if ui.checkbox(&mut enabled, "Исправить и проверить автоматически").changed()
+        {
+            self.draft.workflow = enabled.then(|| WorkflowPreset {
+                implementer: BackendKind::Codex,
+                command: String::new(),
+                reviewer: BackendKind::Claude,
+            });
+        }
+        let Some(plan) = &mut self.draft.workflow else { return };
+        ui.small("Применяется к запускам выбранного исполнителя из GUI и Telegram. После ошибки проверки допускается одна попытка исправления.");
+        for (label, backend) in
+            [("Исполнитель", &mut plan.implementer), ("Ревьюер", &mut plan.reviewer)]
+        {
+            egui::ComboBox::from_id_salt((project, label))
+                .selected_text(format!("{label}: {}", backend.name()))
+                .show_ui(ui, |ui| {
+                    for candidate in BackendKind::ALL {
+                        ui.selectable_value(backend, candidate, candidate.name());
+                    }
+                });
+        }
+        ui.label("Доверенная команда проверки на этом компьютере");
+        ui.add(
+            egui::TextEdit::singleline(&mut plan.command).hint_text("cargo test").char_limit(2048),
+        );
     }
     pub fn show(
         &mut self,
@@ -53,6 +84,7 @@ impl Editor {
                     ui.small("Перед новой задачей: чистый каталог → fetch → fast-forward базы → новая ветка. Без stash, reset и push.");
                 }
             });
+            ui.add_enabled_ui(!saving, |ui| self.workflow_settings(ui, project));
             if self.draft.revision != self.saved.revision {
                 ui.label("Правила изменены в другой сессии. Ваш черновик сохранён на экране; скопируйте нужный текст и загрузите актуальную редакцию.");
             } else if self.dirty() {
@@ -63,7 +95,7 @@ impl Editor {
             }
             ui.horizontal(|ui| {
                 if ui.add_enabled(!blocked && self.dirty() && self.draft.revision == self.saved.revision && self.draft.validate().is_ok(), egui::Button::new("Сохранить правила")).clicked() {
-                    request = Some(if self.draft.git == self.saved.git {
+                    request = Some(if self.draft.git == self.saved.git && self.draft.workflow == self.saved.workflow {
                         Request::SaveRules { revision: self.draft.revision, enabled: self.draft.enabled, text: self.draft.text.clone() }
                     } else { Request::SaveProjectRules { revision: self.draft.revision, rules: self.draft.clone() } });
                 }
@@ -82,9 +114,16 @@ mod tests {
     #[test]
     fn refresh_preserves_draft_and_conflict_until_explicit_acceptance() {
         let mut editor = Editor::default();
-        editor.observe(ProjectRules { git: None, revision: 1, enabled: true, text: "Old".into() });
+        editor.observe(ProjectRules {
+            workflow: None,
+            git: None,
+            revision: 1,
+            enabled: true,
+            text: "Old".into(),
+        });
         editor.draft.text = "Typing".into();
         editor.observe(ProjectRules {
+            workflow: None,
             git: None,
             revision: 2,
             enabled: false,
