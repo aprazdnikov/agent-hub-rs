@@ -119,7 +119,6 @@ pub(super) fn warning(ui: &egui::Ui) -> (Color32, Color32) {
 }
 
 /// review ring `229,192,123` in dark, `183,121,31` in light.
-#[cfg_attr(not(test), expect(dead_code, reason = "ahead of use in later GUI-refresh tasks"))]
 pub(super) fn review_color(ui: &egui::Ui) -> Color32 {
     if ui.visuals().dark_mode {
         Color32::from_rgb(229, 192, 123)

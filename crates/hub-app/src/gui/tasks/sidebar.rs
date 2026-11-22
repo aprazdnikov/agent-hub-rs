@@ -2,6 +2,7 @@
 
 use super::{Page, Snapshot, TasksView, attention, result::Tab};
 use crate::desktop_tasks::{Attention, TaskRow};
+use crate::gui::theme::{self, Tone};
 use crate::local_execution::Kind;
 use eframe::egui;
 use hub_core::domain::AbsolutePath;
@@ -296,25 +297,52 @@ enum Mark {
     Warning,
 }
 
+// The mockup (sidebar-review.html) fades opacity 1→0.35 over a 1.6s period;
+// repainting every 500ms keeps the dot moving without a busy frame loop.
+const PULSE_PERIOD_SECS: f32 = 1.6;
+const PULSE_MIN_OPACITY: f32 = 0.35;
+const PULSE_REPAINT: Duration = Duration::from_millis(500);
+
+fn pulse(ui: &egui::Ui) -> f32 {
+    let Ok(elapsed) = Duration::try_from_secs_f64(ui.ctx().input(|input| input.time).max(0.0))
+    else {
+        return 1.0;
+    };
+    let phase = (elapsed.as_secs_f32() * std::f32::consts::TAU / PULSE_PERIOD_SECS).cos();
+    PULSE_MIN_OPACITY + (1.0 - PULSE_MIN_OPACITY) * (0.5 + 0.5 * phase)
+}
+
 impl Mark {
-    fn paint(self, ui: &egui::Ui, center: egui::Pos2, color: egui::Color32) {
+    fn paint(self, ui: &egui::Ui, center: egui::Pos2) {
+        let visuals = ui.visuals();
         match self {
-            Self::Idle | Self::Running => {
-                let radius = if matches!(self, Self::Running) { 3.0 } else { 1.5 };
-                ui.painter().circle_filled(center, radius, color);
+            Self::Idle => {
+                ui.painter().circle_filled(
+                    center,
+                    4.0,
+                    visuals.widgets.noninteractive.bg_stroke.color,
+                );
+            }
+            Self::Running => {
+                ui.painter().circle_filled(
+                    center,
+                    4.0,
+                    visuals.hyperlink_color.gamma_multiply(pulse(ui)),
+                );
+                ui.ctx().request_repaint_after(PULSE_REPAINT);
             }
             Self::Review => {
-                ui.painter().circle_stroke(center, 3.0, egui::Stroke::new(1.25, color));
-            }
-            Self::Question | Self::Warning => {
-                let symbol = if matches!(self, Self::Question) { "?" } else { "!" };
-                ui.painter().text(
+                ui.painter().circle_stroke(
                     center,
-                    egui::Align2::CENTER_CENTER,
-                    symbol,
-                    egui::TextStyle::Button.resolve(ui.style()),
-                    color,
+                    3.0,
+                    egui::Stroke::new(2.0, theme::review_color(ui)),
                 );
+            }
+            Self::Question => {
+                ui.painter().circle_filled(center, 4.0, visuals.hyperlink_color);
+            }
+            Self::Warning => {
+                ui.painter().circle_filled(center, 4.0, theme::tone_colors(ui, Tone::Error).1);
             }
         }
     }
@@ -343,7 +371,6 @@ fn row_button(
         egui::TextStyle::Button.into(),
         egui::Align::Center,
     );
-    let color = if selected { accent } else { ui.visuals().weak_text_color() };
     let mark_id = egui::Id::new("task-state");
     let icon = egui::Atom::custom(mark_id, egui::vec2(11.0, 16.0));
     let mut detail = format!("#{} · {}", link.id, link.backend);
@@ -356,7 +383,7 @@ fn row_button(
         .min_size(egui::vec2(width, 28.0))
         .atom_ui(ui);
     if let Some(rect) = button.rect(mark_id) {
-        mark.paint(ui, rect.center(), color);
+        mark.paint(ui, rect.center());
     }
     button.response.on_hover_text(format!("{}\n{detail}", link.title)).clicked()
 }
@@ -405,6 +432,8 @@ fn project_menu(
     menu.on_hover_text(label);
 }
 
+const BADGE_RESERVE: f32 = 40.0;
+
 struct ProjectRow<'a> {
     path: &'a Path,
     name: &'a str,
@@ -418,6 +447,7 @@ impl ProjectRow<'_> {
         ui: &mut egui::Ui,
         selected: bool,
         searching: bool,
+        attention: usize,
         intent: &mut Option<Intent>,
     ) -> bool {
         let toggle = ui.add_enabled(
@@ -433,7 +463,9 @@ impl ProjectRow<'_> {
             egui::WidgetInfo::labeled(egui::WidgetType::Button, !searching, &label)
         });
         let toggled = toggle.on_hover_text(label).clicked();
-        let width = (ui.available_width() - 37.0).max(20.0);
+        // The chip (9px padding each side plus a few small digits) joins the fixed menu slot.
+        let badge = f32::from(attention > 0) * BADGE_RESERVE;
+        let width = (ui.available_width() - 37.0 - badge).max(20.0);
         let text = egui::RichText::new(self.name).strong();
         let text = if selected { text.color(ui.visuals().hyperlink_color) } else { text };
         let button =
@@ -444,6 +476,9 @@ impl ProjectRow<'_> {
             .clicked()
         {
             *intent = Some(Intent::Chat(self.path.to_owned(), None));
+        }
+        if attention > 0 {
+            theme::chip(ui, Tone::Accent, &attention.to_string());
         }
         project_menu(ui, self.path, self.name, self.filter, intent);
         toggled
@@ -520,9 +555,16 @@ impl State {
                     .unwrap_or(active || (current.project.is_none() && first == Some(project)));
             ui.push_id(project, |ui| {
                 let row = ProjectRow { path: project, name, expanded, filter };
+                let attention_items = attention::project_attention(snapshot, project);
                 if ui
                     .horizontal(|ui| {
-                        row.header(ui, active && current.in_tasks, !query.is_empty(), &mut intent)
+                        row.header(
+                            ui,
+                            active && current.in_tasks,
+                            !query.is_empty(),
+                            attention_items,
+                            &mut intent,
+                        )
                     })
                     .inner
                 {
@@ -798,11 +840,13 @@ impl TasksView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use hub_core::domain::BackendKind;
+    use crate::local_execution::{Interaction, Live};
+    use hub_core::domain::{BackendKind, Question, QuestionOption, Selection};
     use hub_core::options::OptionsDraft;
     use hub_core::projects::ProjectDraft;
     use hub_core::settings::Draft;
     use hub_core::tasks::TaskBook;
+    use uuid::Uuid;
 
     fn settings(root: &Path) -> Draft {
         Draft {
@@ -881,7 +925,18 @@ mod tests {
     }
 
     impl Screen {
-        fn draw(&mut self, events: Vec<egui::Event>) -> Vec<(String, egui::Pos2)> {
+        fn themed(snapshot: Snapshot) -> Self {
+            let ctx = egui::Context::default();
+            crate::gui::configure_theme(&ctx);
+            Self { ctx, view: TasksView::default(), snapshot, width: 1024.0, last: None }
+        }
+
+        fn frame(
+            &mut self,
+            events: Vec<egui::Event>,
+            time: f64,
+            system_theme: Option<egui::Theme>,
+        ) -> egui::FullOutput {
             let mut output = self.ctx.run_ui(
                 egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(
@@ -889,6 +944,8 @@ mod tests {
                         egui::vec2(self.width, if self.width < 660.0 { 360.0 } else { 650.0 }),
                     )),
                     events,
+                    time: Some(time),
+                    system_theme,
                     ..Default::default()
                 },
                 |ui| {
@@ -899,19 +956,22 @@ mod tests {
             );
             output.textures_delta.clear();
             output
-                .shapes
-                .into_iter()
-                .filter_map(|shape| {
-                    if let egui::Shape::Text(text) = shape.shape {
-                        Some((
-                            text.galley.text().to_owned(),
-                            text.galley.rect.translate(text.pos.to_vec2()).center(),
-                        ))
-                    } else {
-                        None
-                    }
-                })
-                .collect()
+        }
+
+        fn draw(&mut self, events: Vec<egui::Event>) -> Vec<(String, egui::Pos2)> {
+            text_labels(&self.frame(events, 0.0, None))
+        }
+
+        fn wait_until(&mut self, needle: &str, time: f64) -> egui::FullOutput {
+            let until = Instant::now() + Duration::from_secs(3);
+            loop {
+                let output = self.frame(Vec::new(), time, Some(egui::Theme::Light));
+                if text_labels(&output).iter().any(|(text, _)| text == needle) {
+                    let _ = self.frame(Vec::new(), time, Some(egui::Theme::Light));
+                    return self.frame(Vec::new(), time, Some(egui::Theme::Light));
+                }
+                assert!(Instant::now() < until, "missing {needle:?}");
+            }
         }
 
         fn click(&mut self, label: &str, index: usize) {
@@ -1012,6 +1072,235 @@ mod tests {
         screen.click("...", 0);
         screen.click("Память проекта", 0);
         assert_eq!(screen.last, Some(SidebarAction::Memory(path)));
+    }
+
+    fn text_labels(output: &egui::FullOutput) -> Vec<(String, egui::Pos2)> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape {
+                    Some((
+                        text.galley.text().to_owned(),
+                        text.galley.rect.translate(text.pos.to_vec2()).center(),
+                    ))
+                } else {
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn dots(output: &egui::FullOutput) -> Vec<egui::epaint::CircleShape> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Circle(circle) => Some(*circle),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn repaint_delay(output: &egui::FullOutput) -> Duration {
+        output
+            .viewport_output
+            .get(&egui::ViewportId::ROOT)
+            .map_or(Duration::MAX, |viewport| viewport.repaint_delay)
+    }
+
+    fn live_running(project: &Path, id: u64) -> Live {
+        Live {
+            token: Uuid::new_v4(),
+            project: project.to_owned(),
+            id,
+            run: Some(1),
+            active: true,
+            status: "Выполняется".into(),
+            interaction: None,
+        }
+    }
+
+    fn live_question(project: &Path, id: u64) -> Live {
+        let options = ["Да", "Нет"]
+            .map(|label| QuestionOption { label: label.into(), description: String::new() });
+        Live {
+            token: Uuid::new_v4(),
+            project: project.to_owned(),
+            id,
+            run: Some(1),
+            active: true,
+            status: "Ожидает ответа".into(),
+            interaction: Some(Interaction {
+                id: Uuid::new_v4(),
+                kind: Kind::Questions(vec![
+                    Question::new(
+                        "Продолжать?".into(),
+                        String::new(),
+                        options.into(),
+                        Selection::Multiple,
+                    )
+                    .unwrap(),
+                ]),
+            }),
+        }
+    }
+
+    #[test]
+    fn marks_use_status_colors() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("Atlas");
+        std::fs::create_dir(&project).unwrap();
+        let project = checked_project(&project, None).unwrap();
+        let mut book = TaskBook::default();
+        let running = book.create(project.clone(), "codex", "Рабочая задача", "Пилить").unwrap();
+        let question =
+            book.create(project.clone(), "codex", "Задача с вопросом", "Уточнить").unwrap();
+        let review =
+            book.create(project.clone(), "codex", "Задача на проверке", "Собрать").unwrap();
+        let warning =
+            book.create(project.clone(), "codex", "Задача с ошибкой", "Сломалось").unwrap();
+        let idle = book.create(project.clone(), "codex", "Спокойная задача", "Потом").unwrap();
+        let rows = vec![
+            TaskRow::from(book.get(running).unwrap()),
+            TaskRow::from(book.get(question).unwrap()),
+            TaskRow { reason: Some(Attention::Review), ..TaskRow::from(book.get(review).unwrap()) },
+            TaskRow {
+                reason: Some(Attention::AgentFailed),
+                ..TaskRow::from(book.get(warning).unwrap())
+            },
+            TaskRow::from(book.get(idle).unwrap()),
+        ];
+        let snapshot = Snapshot {
+            saved: Some(settings(root.path())),
+            task_index: Ok(rows),
+            local_jobs: vec![live_running(&project, running), live_question(&project, question)],
+            ..Default::default()
+        };
+        let mut screen = Screen::themed(snapshot);
+        let output = screen.wait_until("Рабочая задача", 0.0);
+        let dots = dots(&output);
+        let accent = egui::Color32::from_rgb(13, 100, 79);
+        let border = egui::Color32::from_rgb(213, 221, 215);
+        let ring = egui::Color32::from_rgb(183, 121, 31);
+        let error = egui::Color32::from_rgb(148, 49, 47);
+        assert_eq!(dots.len(), 5, "one dot per task row");
+        let size = |value: f32, expected: f32| (value - expected).abs() < 0.01;
+        assert_eq!(
+            dots.iter().filter(|dot| size(dot.radius, 4.0) && dot.stroke.width < 0.01).count(),
+            4,
+            "four filled dots are 8px across"
+        );
+        assert_eq!(
+            dots.iter().filter(|dot| dot.fill == accent && size(dot.radius, 4.0)).count(),
+            2,
+            "running and question use the accent dot"
+        );
+        assert!(dots.iter().any(|dot| dot.fill == border), "idle uses the border color");
+        assert!(dots.iter().any(|dot| dot.fill == error), "warning uses the error color");
+        assert!(
+            dots.iter().any(|dot| size(dot.radius, 3.0)
+                && dot.fill == egui::Color32::TRANSPARENT
+                && size(dot.stroke.width, 2.0)
+                && dot.stroke.color == ring),
+            "review is a 2px ring in the review color"
+        );
+    }
+
+    #[test]
+    fn running_dot_pulses_and_schedules_repaint_only_while_running() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("Atlas");
+        std::fs::create_dir(&project).unwrap();
+        let project = checked_project(&project, None).unwrap();
+        let mut book = TaskBook::default();
+        let running = book.create(project.clone(), "codex", "Рабочая задача", "Пилить").unwrap();
+        let question =
+            book.create(project.clone(), "codex", "Задача с вопросом", "Уточнить").unwrap();
+        let rows = vec![
+            TaskRow::from(book.get(running).unwrap()),
+            TaskRow::from(book.get(question).unwrap()),
+        ];
+        let mut screen = Screen::themed(Snapshot {
+            saved: Some(settings(root.path())),
+            task_index: Ok(rows),
+            local_jobs: vec![live_running(&project, running), live_question(&project, question)],
+            ..Default::default()
+        });
+        let accent = egui::Color32::from_rgb(13, 100, 79);
+        let settled = screen.wait_until("Рабочая задача", 0.0);
+        assert!(
+            dots(&settled).iter().any(|dot| dot.fill == accent),
+            "the pulse starts at full opacity"
+        );
+        let delay = repaint_delay(&settled);
+        assert!(
+            Duration::from_millis(400) <= delay && delay <= Duration::from_millis(500),
+            "a running task schedules the next pulse frame, got {delay:?}"
+        );
+        let faded = screen.wait_until("Рабочая задача", 0.8);
+        assert!(
+            dots(&faded).iter().any(|dot| (70..=110).contains(&dot.fill.a())),
+            "half a period later the running dot is dimmed near the mockup's 0.35"
+        );
+        screen.snapshot.local_jobs.retain(|job| job.interaction.is_some());
+        let calm = screen.wait_until("Задача с вопросом", 0.0);
+        assert_eq!(
+            repaint_delay(&calm),
+            Duration::MAX,
+            "without running tasks nothing schedules a repaint"
+        );
+    }
+
+    #[test]
+    fn project_badge_counts_attention_items() {
+        let root = tempfile::tempdir().unwrap();
+        let atlas = root.path().join("Atlas");
+        let hub = root.path().join("Hub");
+        for path in [&atlas, &hub] {
+            std::fs::create_dir(path).unwrap();
+        }
+        let atlas = checked_project(&atlas, None).unwrap();
+        let hub = checked_project(&hub, None).unwrap();
+        let mut book = TaskBook::default();
+        let ask = book.create(atlas.clone(), "codex", "Отчёт по очереди", "Собрать").unwrap();
+        let done = book.create(atlas.clone(), "codex", "Поиск по каталогу", "Собрать").unwrap();
+        let calm = book.create(hub.clone(), "codex", "Спокойная задача", "Собрать").unwrap();
+        let rows = vec![
+            TaskRow::from(book.get(ask).unwrap()),
+            TaskRow { reason: Some(Attention::Review), ..TaskRow::from(book.get(done).unwrap()) },
+            TaskRow::from(book.get(calm).unwrap()),
+        ];
+        let snapshot = Snapshot {
+            saved: Some(settings(root.path())),
+            task_index: Ok(rows),
+            local_jobs: vec![live_question(&atlas, ask)],
+            ..Default::default()
+        };
+        let mut screen = Screen::themed(snapshot);
+        let output = screen.wait_until("Атлас", 0.0);
+        let labels = text_labels(&output);
+        let header_y = |name: &str| {
+            labels.iter().find(|(text, _)| text == name).map(|(_, pos)| pos.y).unwrap()
+        };
+        let badges: Vec<_> = labels.iter().filter(|(text, _)| text == "2").collect();
+        assert_eq!(badges.len(), 1, "the attention chip appears once");
+        assert!(
+            (badges[0].1.y - header_y("Атлас")).abs() <= 6.0,
+            "the chip sits in the header of the project with attention"
+        );
+        assert!(
+            !labels.iter().any(|(text, pos)| matches!(text.as_str(), "1" | "2" | "3")
+                && (pos.y - header_y("Hub")).abs() <= 6.0),
+            "the clean project shows no badge"
+        );
+        // The chip must not push the project menu out of the row.
+        screen.click("...", 0);
+        let menu = screen.draw(Vec::new());
+        assert!(
+            menu.iter().any(|(text, _)| text == "Новая задача"),
+            "menu opens next to the badge"
+        );
     }
 
     #[test]

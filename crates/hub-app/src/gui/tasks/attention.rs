@@ -73,7 +73,6 @@ pub(in crate::gui) fn attention_count(snapshot: &Snapshot) -> usize {
 }
 
 /// Attention items of one project; feeds the sidebar badge.
-#[cfg_attr(not(test), expect(dead_code, reason = "ahead of use in Task 7 sidebar badge"))]
 pub(super) fn project_attention(snapshot: &Snapshot, project: &Path) -> usize {
     items(snapshot).filter(|item| item.project() == project).count()
 }
