@@ -121,40 +121,42 @@ impl TasksView {
         });
         opened
     }
-    pub(super) fn project_navigation(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot) {
+    pub(in crate::gui) fn project_navigation(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: &Snapshot,
+        in_tasks: bool,
+    ) -> bool {
         let projects: BTreeSet<_> =
             snapshot.task_index.iter().flatten().map(|row| &row.project).collect();
         if projects.is_empty() {
-            return;
+            return false;
         }
-        let mut draw = |ui: &mut egui::Ui| {
-            ui.strong("Проекты");
-            for path in &projects {
-                let label = path
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or_else(|| path.to_str().unwrap_or("Проект"));
-                if ui
-                    .selectable_label(
-                        self.scope
-                            .as_ref()
-                            .is_some_and(|scope| scope.1.as_path() == path.as_path()),
-                        label,
-                    )
-                    .on_hover_text(path.display().to_string())
-                    .clicked()
-                {
-                    self.navigate(path, None, Tab::Changes);
-                }
-            }
-        };
-        if ui.available_width() >= 900.0 {
-            egui::Panel::left("task_projects").default_size(150.0).show(ui, |ui| {
-                egui::ScrollArea::vertical().id_salt("projects_list").show(ui, &mut draw);
+        let narrow = ui.available_width() < 820.0;
+        let mut opened = false;
+        egui::Panel::left("task_projects")
+            .default_size(if narrow { 120.0 } else { 180.0 })
+            .size_range(100.0..=if narrow { 150.0 } else { 300.0 })
+            .show(ui, |ui| {
+                ui.strong("Проекты");
+                ui.separator();
+                egui::ScrollArea::vertical().id_salt("projects_list").show(ui, |ui| {
+                    for path in projects {
+                        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("Проект");
+                        let selected =
+                            in_tasks && self.scope.as_ref().is_some_and(|scope| scope.1 == *path);
+                        if ui
+                            .add(egui::Button::selectable(selected, name).truncate())
+                            .on_hover_text(path.display().to_string())
+                            .clicked()
+                        {
+                            self.navigate(path, None, Tab::Summary);
+                            opened = true;
+                        }
+                    }
+                });
             });
-        } else {
-            ui.collapsing("Список проектов", &mut draw);
-        }
+        opened
     }
     pub(super) fn task_navigation(
         &mut self,

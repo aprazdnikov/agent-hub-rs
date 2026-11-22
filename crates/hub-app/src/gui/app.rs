@@ -82,7 +82,7 @@ pub struct HubApp {
 }
 
 impl HubApp {
-    fn navigation(&mut self, ui: &mut egui::Ui, count: usize, wide: bool) {
+    fn navigation(&mut self, ui: &mut egui::Ui, count: usize) {
         let attention = if count == 0 {
             "Требуют внимания".into()
         } else {
@@ -97,10 +97,6 @@ impl HubApp {
             (Tab::Log, "Лог"),
             (Tab::Settings, "Настройки"),
         ] {
-            if wide && tab == Tab::Status {
-                ui.add_space(12.0);
-                ui.separator();
-            }
             ui.selectable_value(&mut self.tab, tab, label);
         }
     }
@@ -356,33 +352,15 @@ impl eframe::App for HubApp {
                 save_sent = true;
             }
         };
-        let wide = ui.available_width() >= 1220.0;
         let count = super::tasks::attention_count(&snapshot);
-        if wide {
-            egui::Panel::left("app_navigation").exact_size(170.0).resizable(false).show(ui, |ui| {
-                ui.add_space(14.0);
-                ui.label(egui::RichText::new("agent-hub").size(22.0).strong());
-                ui.add_space(14.0);
-                ui.with_layout(egui::Layout::top_down_justified(egui::Align::LEFT), |ui| {
-                    self.navigation(ui, count, true);
-                });
-            });
-        }
-        if !wide
-            || self.saving()
-            || snapshot.notice.is_some()
-            || banner(&self.updates.borrow()).is_some()
-        {
-            egui::Panel::top("tabs")
+        egui::Panel::top("tabs")
             .frame(
                 egui::Frame::new()
                     .fill(ui.visuals().panel_fill)
                     .inner_margin(egui::Margin::symmetric(20, 12)),
             )
             .show(ui, |ui| {
-                if !wide {
-                    ui.horizontal_wrapped(|ui| self.navigation(ui, count, false));
-                }
+                ui.horizontal_wrapped(|ui| self.navigation(ui, count));
                 // Store failures matter most on «Настройки», where the app opens in exactly those cases.
                 if self.saving() {
                     let message = if snapshot.save_status == SaveStatus::Delayed {
@@ -397,6 +375,8 @@ impl eframe::App for HubApp {
                 }
                 self.update_banner(ui, active(&snapshot));
             });
+        if self.tasks.project_navigation(ui, &snapshot, self.tab == Tab::Tasks) {
+            self.tab = Tab::Tasks;
         }
         self.confirm_restart(ui.ctx(), active(&snapshot));
         self.confirm_pending_exit(ui.ctx());

@@ -194,7 +194,6 @@ impl TasksView {
         self.assignees.clear();
     }
     pub fn show(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot, send: &mut impl FnMut(Command)) {
-        self.project_navigation(ui, snapshot);
         egui::ScrollArea::vertical().id_salt("task_workspace").show(ui, |ui| {
             egui::Frame::new()
                 .inner_margin(egui::Margin::symmetric(12, 0))
@@ -929,7 +928,10 @@ mod tests {
                     )),
                     ..Default::default()
                 },
-                |ui| view.show(ui, &snapshot, &mut |_| {}),
+                |ui| {
+                    view.project_navigation(ui, &snapshot, true);
+                    view.show(ui, &snapshot, &mut |_| {});
+                },
             );
             output.textures_delta.clear();
             output
