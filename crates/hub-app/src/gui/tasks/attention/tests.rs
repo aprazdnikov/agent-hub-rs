@@ -118,9 +118,9 @@ fn question(project: &str, id: u64) -> Live {
 
 #[test]
 fn parallel_permission_shows_full_request_and_recovers_from_failed_delivery_in_place() {
-    let full = format!("cargo test {}\n--package hub-app", "x".repeat(225));
+    let full = "cargo test --locked\n--workspace\n--exclude hub-core\n--features wayland x11 glow\n--package hub-app";
     let first = permission(1, "cargo check");
-    let second = permission(2, &full);
+    let second = permission(2, full);
     let mut screen = Screen::new(Snapshot {
         local: Some(first.clone()),
         local_jobs: vec![first, second.clone()],
@@ -128,9 +128,9 @@ fn parallel_permission_shows_full_request_and_recovers_from_failed_delivery_in_p
     });
     assert_eq!(attention_count(&screen.snapshot), 2);
     assert!(screen.contains("Разрешение"));
-    assert!(!screen.contains(&full));
+    assert!(!screen.contains(full));
     screen.click("Подробнее", 0);
-    assert!(screen.contains(&full));
+    assert!(screen.contains(full));
     screen.click("Разрешить один раз", 1);
     let Some(Command::LocalAnswer { token, id, answer: Answer::Allow, reply }) =
         screen.commands.pop()
@@ -355,22 +355,57 @@ fn question_card_answers_without_expand_step() {
 
 #[test]
 fn permission_card_shows_actions_and_details_toggle() {
-    let long = format!("cargo test --locked\n{}\n--package hub-app", "workspace check ".repeat(30));
-    let live = permission(1, &long);
+    let long = "cargo test --locked\n--workspace\n--exclude hub-core\n--features wayland x11 glow\n--package hub-app";
+    let live = permission(1, long);
     let mut screen = Screen::new(Snapshot { local: Some(live.clone()), ..Default::default() });
     assert!(screen.contains("Разрешить один раз"));
     assert!(screen.contains("Отклонить"));
     assert!(screen.contains("Подробнее"));
-    assert!(!screen.contains(&long));
+    assert!(!screen.contains(long));
     screen.click("Подробнее", 0);
-    assert!(screen.contains(&long));
+    assert!(screen.contains(long));
     assert!(screen.contains("Свернуть"));
     screen.click("Свернуть", 0);
-    assert!(!screen.contains(&long));
+    assert!(!screen.contains(long));
     screen.click("Разрешить один раз", 0);
     assert!(
         matches!(screen.commands.pop(), Some(Command::LocalAnswer { token, id, answer: Answer::Allow, .. }) if token == live.token && Some(id) == live.interaction.as_ref().map(|r| r.id))
     );
+}
+
+#[test]
+fn permission_summary_collapses_by_lines_not_characters() {
+    let summary = "строка 1\nстрока 2\nстрока 3\nстрока 4\nстрока 5";
+    let mut screen =
+        Screen::new(Snapshot { local: Some(permission(1, summary)), ..Default::default() });
+    assert!(
+        screen.contains("строка 1\nстрока 2\nстрока 3…"),
+        "collapsed summary keeps its first three lines with breaks"
+    );
+    assert!(!screen.contains(summary));
+    assert!(screen.contains("Подробнее"));
+    screen.click("Подробнее", 0);
+    assert!(screen.contains(summary));
+    let three = "одна\nдве\nтри";
+    let mut short =
+        Screen::new(Snapshot { local: Some(permission(2, three)), ..Default::default() });
+    assert!(short.contains(three));
+    assert!(!short.contains("Подробнее"), "summaries up to 3 lines stay uncollapsed");
+}
+
+#[test]
+fn answered_live_request_shows_status_only_inline() {
+    let live = question("Hub", 1);
+    let mut screen = Screen::new(Snapshot { local: Some(live.clone()), ..Default::default() });
+    screen.click("Отказаться отвечать", 0);
+    let Some(Command::LocalAnswer { reply, .. }) = screen.commands.pop() else {
+        panic!("missing answer")
+    };
+    reply.send(Ok(())).unwrap();
+    assert!(screen.contains("Ответ получен."));
+    assert!(!screen.contains("Задача #1 · Ответ получен."), "no duplicate global row while inline");
+    screen.snapshot.local = None;
+    assert!(screen.contains("Задача #1 · Ответ получен."));
 }
 
 #[test]
@@ -393,9 +428,9 @@ fn narrow_inbox_stacks_action_below_content() {
 
 #[test]
 fn narrow_inbox_supports_keyboard_and_clicks_in_button_padding() {
-    let long = format!("cargo test --locked\n{}\n--package hub-app", "workspace check ".repeat(30));
+    let long = "cargo test --locked\n--workspace\n--exclude hub-core\n--features wayland x11 glow\n--package hub-app";
     let mut screen =
-        Screen::new(Snapshot { local: Some(permission(1, &long)), ..Default::default() });
+        Screen::new(Snapshot { local: Some(permission(1, long)), ..Default::default() });
     screen.size = egui::vec2(330.0, 560.0);
     let target = screen.rect("Подробнее", 0).center();
     let key = |screen: &mut Screen, key| {
@@ -419,11 +454,11 @@ fn narrow_inbox_supports_keyboard_and_clicks_in_button_padding() {
     });
     assert!(focused, "the permission details link must be reachable with Tab");
     key(&mut screen, egui::Key::Enter);
-    assert!(screen.contains(&long));
+    assert!(screen.contains(long));
     let beside_text = screen.rect("Свернуть", 0).right_center() + egui::vec2(4.0, 0.0);
     screen.pointer(beside_text, true);
     screen.pointer(beside_text, false);
-    assert!(!screen.contains(&long), "a click in the link's padding collapses the summary");
+    assert!(!screen.contains(long), "a click in the link's padding collapses the summary");
     assert!(screen.contains("Подробнее"));
     assert!(screen.commands.is_empty());
 }

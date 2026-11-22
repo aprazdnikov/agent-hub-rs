@@ -1,6 +1,6 @@
 use super::{Command, Snapshot, TasksView, local, result::Tab};
 use crate::{
-    desktop_tasks::{Attention, TaskRow, excerpt},
+    desktop_tasks::{Attention, TaskRow},
     gui::{
         look::agent_title,
         theme::{self, Tone},
@@ -20,6 +20,15 @@ use uuid::Uuid;
 pub(super) struct Inbox {
     project: Option<PathBuf>,
     details: Option<(Uuid, Uuid)>,
+}
+
+/// Spec «Входящие»: collapsed permission summary shows up to 3 lines.
+const SUMMARY_LINES: usize = 3;
+
+fn clamp_lines(summary: &str) -> String {
+    let mut lines = summary.lines();
+    let head = lines.by_ref().take(SUMMARY_LINES).collect::<Vec<_>>().join("\n");
+    if lines.next().is_some() { format!("{head}…") } else { head }
 }
 
 pub(super) fn jobs(snapshot: &Snapshot) -> impl Iterator<Item = &Live> {
@@ -145,14 +154,14 @@ impl<'a> Item<'a> {
                         |r| Cow::Borrowed(r.title.as_str()),
                     );
                     let collapsible = matches!(&request.kind, Kind::Permission(tool)
-                        if tool.summary != excerpt(&tool.summary));
+                        if tool.summary.lines().count() > SUMMARY_LINES);
                     let collapsed = collapsible && inbox.details != Some(key);
                     let shown = match &request.kind {
                         Kind::Permission(tool) if collapsed => Cow::Owned(Interaction {
                             id: request.id,
                             kind: Kind::Permission(ToolRequest {
                                 tool: tool.tool.clone(),
-                                summary: excerpt(&tool.summary),
+                                summary: clamp_lines(&tool.summary),
                             }),
                         }),
                         _ => Cow::Borrowed(request),
@@ -355,16 +364,23 @@ impl TasksView {
             .chain(self.sidebar.projects().map(|(path, name)| (path, Cow::Borrowed(name))))
             .collect();
         self.inbox.heading(ui, &projects);
-        self.local_panel.feedback(ui, self.inbox.project.as_deref(), self.inbox.details);
+        let visible: Vec<_> = items(snapshot)
+            .filter(|item| self.inbox.project.as_deref().is_none_or(|p| p == item.project()))
+            .collect();
+        let inline: Vec<(Uuid, Uuid)> = visible
+            .iter()
+            .filter_map(|item| match item {
+                Item::Request(live, request, _) => Some((live.token, request.id)),
+                Item::Task(..) => None,
+            })
+            .collect();
+        self.local_panel.feedback(ui, self.inbox.project.as_deref(), &inline);
         if let Err(error) = &snapshot.task_index {
             ui.colored_label(
                 ui.visuals().error_fg_color,
                 format!("Не удалось загрузить задачи. {error}"),
             );
         }
-        let visible: Vec<_> = items(snapshot)
-            .filter(|item| self.inbox.project.as_deref().is_none_or(|p| p == item.project()))
-            .collect();
         let mut target = None;
         let mut open_chat = false;
         egui::ScrollArea::vertical().id_salt(("inbox_items", &self.inbox.project)).show(ui, |ui| {

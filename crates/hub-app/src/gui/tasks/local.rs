@@ -52,14 +52,16 @@ impl Panel {
         });
     }
 
+    /// Global feedback rows, skipped for requests whose card renders inline
+    /// (`inline` keys) — the card already shows sent/error state.
     pub(super) fn feedback(
         &self,
         ui: &mut egui::Ui,
         project: Option<&Path>,
-        details: Option<(Uuid, Uuid)>,
+        inline: &[(Uuid, Uuid)],
     ) {
         for (key, editor) in &self.editors {
-            if Some(*key) == details
+            if inline.contains(key)
                 || editor.feedback_until.is_none()
                 || project.is_some_and(|p| p != editor.project)
             {
