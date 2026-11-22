@@ -24,10 +24,20 @@ pub(super) struct View {
     run: Option<u32>,
     file_error: Option<String>,
     expanded: BTreeSet<u32>,
+    /// The «⋯» menu landed on Parameters and wants the next-run context open; consumed there.
+    context_open: bool,
 }
 impl View {
     pub(super) fn select(&mut self, tab: Tab, task: Option<u64>) {
         *self = Self { task, tab, ..Default::default() };
+    }
+    /// Called right after `select`, which resets the flag; records the one-shot request.
+    pub(super) fn request_context_open(&mut self) {
+        self.context_open = true;
+    }
+    /// Consumes the pending request so only the frame it was made in forces the section open.
+    pub(super) fn take_context_open(&mut self) -> bool {
+        std::mem::take(&mut self.context_open)
     }
     pub(super) fn tab(&mut self, task: &Task) -> Tab {
         if self.task != Some(task.id) {
