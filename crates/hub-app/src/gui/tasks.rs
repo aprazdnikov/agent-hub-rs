@@ -755,6 +755,23 @@ mod tests {
         });
         output.textures_delta.clear();
     }
+    fn sized_frame(
+        ctx: &egui::Context,
+        view: &mut TasksView,
+        snapshot: &Snapshot,
+        screen: egui::Rect,
+        events: Vec<egui::Event>,
+        commands: &mut Vec<Command>,
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_ui(
+            egui::RawInput { screen_rect: Some(screen), events, ..Default::default() },
+            |ui| {
+                view.show(ui, snapshot, &mut |command| commands.push(command));
+            },
+        );
+        output.textures_delta.clear();
+        output
+    }
     fn input_frame(
         ctx: &egui::Context,
         view: &mut TasksView,
@@ -762,21 +779,14 @@ mod tests {
         events: Vec<egui::Event>,
         commands: &mut Vec<Command>,
     ) -> egui::FullOutput {
-        let mut output = ctx.run_ui(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(1000.0, 900.0),
-                )),
-                events,
-                ..Default::default()
-            },
-            |ui| {
-                view.show(ui, snapshot, &mut |command| commands.push(command));
-            },
-        );
-        output.textures_delta.clear();
-        output
+        sized_frame(
+            ctx,
+            view,
+            snapshot,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 900.0)),
+            events,
+            commands,
+        )
     }
     fn labels(output: &egui::FullOutput) -> Vec<&str> {
         output
@@ -848,6 +858,94 @@ mod tests {
             ..Default::default()
         };
         (book, id, snapshot, view)
+    }
+
+    fn has_clock(labels: &[&str]) -> bool {
+        labels.iter().any(|label| {
+            let bytes = label.as_bytes();
+            bytes.len() == 5
+                && bytes[0].is_ascii_digit()
+                && bytes[1].is_ascii_digit()
+                && bytes[2] == b':'
+                && bytes[3].is_ascii_digit()
+                && bytes[4].is_ascii_digit()
+        })
+    }
+
+    #[test]
+    fn long_agent_answer_collapses_and_expands_by_click() {
+        let (_, _, snapshot, mut view) = review_fixture();
+        view.tasks[0].runs[0].result =
+            (1..=12).map(|n| format!("Строка {n}")).collect::<Vec<_>>().join("\n");
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert!(labels(&out).contains(&"Развернуть"), "long answers start collapsed");
+        assert!(!labels(&out).contains(&"Свернуть"));
+        assert!(labels(&out).iter().any(|label| label.contains("Строка 8")));
+        assert!(!labels(&out).iter().any(|label| label.contains("Строка 12")));
+        click_text(&ctx, &mut view, &snapshot, "Развернуть", &mut commands);
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert!(labels(&out).contains(&"Свернуть"), "clicking expands and offers to collapse");
+        assert!(labels(&out).iter().any(|label| label.contains("Строка 12")));
+        click_text(&ctx, &mut view, &snapshot, "Свернуть", &mut commands);
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert!(labels(&out).contains(&"Развернуть"), "collapsing returns the clamped body");
+        assert!(!labels(&out).iter().any(|label| label.contains("Строка 12")));
+    }
+
+    #[test]
+    fn bubbles_show_role_and_time_only_when_known() {
+        let (_, _, snapshot, mut view) = review_fixture();
+        view.tasks[0].runs[0].started_at = None;
+        view.tasks[0].runs[0].finished_at = None;
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let texts = labels(&out);
+        assert!(texts.contains(&"Вы"), "user bubble header names the role");
+        assert!(texts.contains(&"qwen"), "agent bubble header names the backend");
+        assert!(!has_clock(&texts), "unknown times must not render");
+        drop(texts);
+        view.tasks[0].runs[0].started_at = Some(ts());
+        view.tasks[0].runs[0].finished_at = Some(ts());
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let texts = labels(&out);
+        assert!(has_clock(&texts), "known dates render local HH:MM");
+    }
+
+    #[test]
+    fn result_link_only_on_latest_reviewable_run() {
+        let (mut book, id, snapshot, mut view) = review_fixture();
+        let revision = view.tasks[0].revision;
+        let second = book.begin(id, revision, Some("Второй шаг"), ts()).unwrap();
+        book.record(id, second, "Ответ второго запуска").unwrap();
+        book.finish(id, second, RunState::Completed, ts()).unwrap();
+        view.tasks = book.tasks().to_vec();
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let texts = labels(&out);
+        assert_eq!(
+            texts.iter().filter(|label| **label == "Результат →").count(),
+            1,
+            "only the latest reviewable run links to its result"
+        );
+    }
+
+    #[test]
+    fn chat_survives_compact_window_with_inline_result() {
+        let (_, _, snapshot, mut view) = review_fixture();
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 300.0));
+        let out = sized_frame(&ctx, &mut view, &snapshot, screen, vec![], &mut commands);
+        let texts = labels(&out);
+        assert!(texts.contains(&"Открыть результат"), "inline result mode survives compact mode");
+        assert!(
+            texts.contains(&"Вы") && texts.contains(&"qwen"),
+            "bubble headers survive compact mode"
+        );
     }
 
     #[test]
@@ -1243,9 +1341,7 @@ mod tests {
                 .shapes
                 .iter()
                 .find_map(|shape| match &shape.shape {
-                    egui::Shape::Text(text)
-                        if text.galley.text().contains("Длинная история чата") =>
-                    {
+                    egui::Shape::Text(text) if text.galley.text() == "Результат →" => {
                         Some(shape.clip_rect)
                     }
                     _ => None,

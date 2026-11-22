@@ -324,7 +324,7 @@ impl TasksView {
                     ui.weak("Переписка появится после первого запуска.");
                 }
             } else {
-                result::View::transcript(ui, task);
+                result::View::transcript(ui, task, &mut self.result_view);
             }
         });
     }

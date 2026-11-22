@@ -102,9 +102,9 @@ pub fn surface(ui: &egui::Ui) -> egui::Frame {
 
 /// Semantic color pair for status surfaces; resolved per active theme.
 #[derive(Clone, Copy, PartialEq, Eq)]
-#[cfg_attr(not(test), expect(dead_code, reason = "ahead of use in later GUI-refresh tasks"))]
 pub(super) enum Tone {
     Accent,
+    #[cfg_attr(not(test), expect(dead_code, reason = "ahead of use in later GUI-refresh tasks"))]
     Warning,
     Error,
     Neutral,
@@ -148,7 +148,6 @@ pub(super) fn tone_colors(ui: &egui::Ui, tone: Tone) -> (Color32, Color32) {
 }
 
 /// Status capsule: small text on the tone background.
-#[cfg_attr(not(test), expect(dead_code, reason = "ahead of use in later GUI-refresh tasks"))]
 pub(super) fn chip(ui: &mut egui::Ui, tone: Tone, text: &str) -> egui::Response {
     let (bg, fg) = tone_colors(ui, tone);
     egui::Frame::new()
@@ -170,7 +169,6 @@ pub(super) fn card(ui: &egui::Ui) -> egui::Frame {
         .inner_margin(egui::Margin::symmetric(14, 12))
 }
 
-#[cfg_attr(not(test), expect(dead_code, reason = "ahead of use in later GUI-refresh tasks"))]
 pub(super) fn bubble(ui: &egui::Ui, user: bool) -> egui::Frame {
     let frame = egui::Frame::new().corner_radius(12).inner_margin(egui::Margin::symmetric(12, 9));
     if user {

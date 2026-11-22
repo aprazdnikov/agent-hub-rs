@@ -1,6 +1,9 @@
 //! Task review tabs and annotations against the saved patch of a particular attempt.
+use crate::gui::theme::{Tone, bubble, chip, tone_colors};
 use eframe::egui;
-use hub_core::tasks::{Run, Task};
+use hub_core::tasks::{Run, RunState, Task};
+use jiff::{Timestamp, Zoned, tz::TimeZone};
+use std::collections::BTreeSet;
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Tab {
@@ -20,6 +23,7 @@ pub(super) struct View {
     note: String,
     run: Option<u32>,
     file_error: Option<String>,
+    expanded: BTreeSet<u32>,
 }
 impl View {
     pub(super) fn select(&mut self, tab: Tab, task: Option<u64>) {
@@ -33,7 +37,7 @@ impl View {
     }
     pub(super) fn review_run(task: &Task) -> Option<&Run> {
         task.runs.iter().rev().find(|run| {
-            run.state != hub_core::tasks::RunState::Running
+            run.state != RunState::Running
                 || !run.result.is_empty()
                 || !run.files.is_empty()
                 || !run.diff.is_empty()
@@ -127,25 +131,11 @@ impl View {
             });
         annotation
     }
-    pub(super) fn transcript(ui: &mut egui::Ui, task: &Task) {
-        for turn in &task.runs {
-            ui.strong("Вы");
-            ui.add(egui::Label::new(&turn.step).wrap().selectable(true));
-            ui.add_space(5.0);
-            ui.strong(format!(
-                "{} · {}",
-                turn.backend.as_deref().unwrap_or(&task.backend),
-                turn.state.label()
-            ));
-            if !turn.result.is_empty() {
-                ui.add(egui::Label::new(&turn.result).wrap().selectable(true));
-            }
-            if !turn.diagnostic.is_empty() {
-                ui.colored_label(ui.visuals().error_fg_color, &turn.diagnostic);
-            }
-            if !turn.files.is_empty() {
-                ui.small(format!("Файлов в результате · {}", turn.files.len()));
-            }
+    pub(super) fn transcript(ui: &mut egui::Ui, task: &Task, view: &mut Self) {
+        for run in &task.runs {
+            user_bubble(ui, &run.step, run.started_at);
+            ui.add_space(12.0);
+            agent_bubble(ui, task, run, view);
             ui.add_space(12.0);
         }
     }
@@ -259,6 +249,138 @@ impl View {
         None
     }
 }
+// Agent answers longer than this many lines start collapsed in the chat (design spec «Чат задачи»).
+const RESULT_CLAMP_LINES: usize = 8;
+
+fn state_tone(state: RunState) -> Tone {
+    match state {
+        RunState::Completed => Tone::Accent,
+        RunState::Running => Tone::Neutral,
+        RunState::Failed | RunState::Interrupted => Tone::Error,
+    }
+}
+
+/// `HH:MM` in the system zone; `None` (old books, recovered runs) hides the time entirely.
+pub(super) fn format_time(ts: Option<Timestamp>) -> Option<String> {
+    let zoned = ts?.to_zoned(TimeZone::system());
+    Some(zoned.strftime("%H:%M").to_string())
+}
+
+/// The calendar date is only worth a tooltip when the run happened on another day.
+fn time_hover_date(ts: Option<Timestamp>) -> Option<String> {
+    let zoned = ts?.to_zoned(TimeZone::system());
+    (zoned.date() != Zoned::now().date()).then(|| zoned.strftime("%d.%m.%Y").to_string())
+}
+
+fn time_label(ui: &mut egui::Ui, ts: Option<Timestamp>) {
+    if let Some(time) = format_time(ts) {
+        let response =
+            ui.add(egui::Label::new(egui::RichText::new(time).small().weak()).selectable(false));
+        if let Some(date) = time_hover_date(ts) {
+            response.on_hover_text(date);
+        }
+    }
+}
+
+fn user_bubble(ui: &mut egui::Ui, step: &str, started_at: Option<Timestamp>) {
+    let row = ui.available_rect_before_wrap();
+    let cap = row.width() * 0.78;
+    let contents = |ui: &mut egui::Ui| {
+        bubble(ui, true).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.strong("Вы");
+                time_label(ui, started_at);
+            });
+            ui.add(egui::Label::new(step).wrap().selectable(true));
+        });
+    };
+    // Measure the natural bubble width against the cap, then draw the same contents
+    // flush with the right edge: frames only shrink-wrap while laid out left-to-right.
+    // The measuring copy stays invisible and disabled so it paints nothing and cannot
+    // steal hover, tooltips or text-cursor state from the drawn bubble.
+    let width = ui
+        .scope_builder(
+            egui::UiBuilder::new().invisible().disabled().max_rect(egui::Rect::from_min_size(
+                ui.cursor().min,
+                egui::vec2(cap, f32::INFINITY),
+            )),
+            contents,
+        )
+        .response
+        .rect
+        .width();
+    ui.scope_builder(
+        egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+            egui::pos2(row.max.x - width, row.min.y),
+            egui::vec2(width, f32::INFINITY),
+        )),
+        contents,
+    );
+}
+
+fn agent_bubble(ui: &mut egui::Ui, task: &Task, run: &Run, view: &mut View) {
+    let width = ui.available_width();
+    ui.scope_builder(
+        egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
+            ui.cursor().min,
+            egui::vec2(width * 0.86, f32::INFINITY),
+        )),
+        |ui| {
+            bubble(ui, false).show(ui, |ui| {
+                ui.horizontal(|ui| {
+                    let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::HOVER);
+                    let accent = ui.visuals().hyperlink_color;
+                    ui.painter().circle_filled(dot.center(), 4.0, accent);
+                    ui.strong(run.backend.as_deref().unwrap_or(&task.backend));
+                    chip(ui, state_tone(run.state), run.state.label());
+                    time_label(ui, run.finished_at);
+                });
+                if !run.result.is_empty() {
+                    let long = run.result.lines().count() > RESULT_CLAMP_LINES;
+                    let shown_full = !long || view.expanded.contains(&run.id);
+                    let body = if shown_full {
+                        run.result.clone()
+                    } else {
+                        run.result.lines().take(RESULT_CLAMP_LINES).collect::<Vec<_>>().join("\n")
+                    };
+                    ui.add(egui::Label::new(body).wrap().selectable(true));
+                    if long && ui.link(if shown_full { "Свернуть" } else { "Развернуть" }).clicked()
+                    {
+                        if shown_full {
+                            view.expanded.remove(&run.id);
+                        } else {
+                            view.expanded.insert(run.id);
+                        }
+                    }
+                }
+                if !run.diagnostic.is_empty() {
+                    ui.colored_label(tone_colors(ui, Tone::Error).1, &run.diagnostic);
+                }
+                let checks = &run.workflow_report.checks;
+                let latest = Some(run) == View::review_run(task);
+                if !run.files.is_empty() || !checks.is_empty() || latest {
+                    ui.horizontal(|ui| {
+                        if !run.files.is_empty() {
+                            chip(ui, Tone::Neutral, &format!("Файлов · {}", run.files.len()));
+                        }
+                        if !checks.is_empty() {
+                            let passed = checks.iter().filter(|check| check.passed).count();
+                            chip(
+                                ui,
+                                Tone::Neutral,
+                                &format!("Проверки · {passed}/{}", checks.len()),
+                            );
+                        }
+                        if latest && ui.link("Результат →").clicked() {
+                            view.select(Tab::Summary, Some(task.id));
+                        }
+                    });
+                }
+            });
+        },
+    );
+}
+
 fn annotate(next: &str, anchor: &str, note: &str) -> Option<String> {
     if note.trim().is_empty() {
         return None;
