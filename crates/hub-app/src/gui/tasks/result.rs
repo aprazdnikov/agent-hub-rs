@@ -251,6 +251,8 @@ impl View {
 }
 // Agent answers longer than this many lines start collapsed in the chat (design spec «Чат задачи»).
 const RESULT_CLAMP_LINES: usize = 8;
+// Height of the transparent→surface band fading the clamped body into the bubble (mockup: 26px).
+const RESULT_FADE_HEIGHT: f32 = 26.0;
 
 fn state_tone(state: RunState) -> Tone {
     match state {
@@ -272,7 +274,17 @@ fn time_hover_date(ts: Option<Timestamp>) -> Option<String> {
     (zoned.date() != Zoned::now().date()).then(|| zoned.strftime("%d.%m.%Y").to_string())
 }
 
-fn time_label(ui: &mut egui::Ui, ts: Option<Timestamp>) {
+/// Small weak clock text; `flush` pushes it to the right edge of the enclosing row
+/// (design spec «время справа»), a no-op when no timestamp is known.
+fn time_label(ui: &mut egui::Ui, ts: Option<Timestamp>, flush: bool) {
+    if flush && format_time(ts).is_some() {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| time_text(ui, ts));
+    } else {
+        time_text(ui, ts);
+    }
+}
+
+fn time_text(ui: &mut egui::Ui, ts: Option<Timestamp>) {
     if let Some(time) = format_time(ts) {
         let response =
             ui.add(egui::Label::new(egui::RichText::new(time).small().weak()).selectable(false));
@@ -285,26 +297,18 @@ fn time_label(ui: &mut egui::Ui, ts: Option<Timestamp>) {
 fn user_bubble(ui: &mut egui::Ui, step: &str, started_at: Option<Timestamp>) {
     let row = ui.available_rect_before_wrap();
     let cap = row.width() * 0.78;
-    let contents = |ui: &mut egui::Ui| {
-        bubble(ui, true).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.strong("Вы");
-                time_label(ui, started_at);
-            });
-            ui.add(egui::Label::new(step).wrap().selectable(true));
-        });
-    };
-    // Measure the natural bubble width against the cap, then draw the same contents
-    // flush with the right edge: frames only shrink-wrap while laid out left-to-right.
-    // The measuring copy stays invisible and disabled so it paints nothing and cannot
-    // steal hover, tooltips or text-cursor state from the drawn bubble.
+    // Measure the natural bubble width against the cap with a packed header, then draw
+    // at exactly that width so the time can be flush right without widening the bubble:
+    // frames only shrink-wrap while laid out left-to-right. The measuring copy stays
+    // invisible (egui makes it disabled too) so it paints nothing and cannot steal
+    // hover, tooltips or text-cursor state from the drawn bubble.
     let width = ui
         .scope_builder(
-            egui::UiBuilder::new().invisible().disabled().max_rect(egui::Rect::from_min_size(
+            egui::UiBuilder::new().invisible().max_rect(egui::Rect::from_min_size(
                 ui.cursor().min,
                 egui::vec2(cap, f32::INFINITY),
             )),
-            contents,
+            |ui| user_contents(ui, step, started_at, false),
         )
         .response
         .rect
@@ -314,71 +318,105 @@ fn user_bubble(ui: &mut egui::Ui, step: &str, started_at: Option<Timestamp>) {
             egui::pos2(row.max.x - width, row.min.y),
             egui::vec2(width, f32::INFINITY),
         )),
-        contents,
+        |ui| user_contents(ui, step, started_at, true),
     );
 }
 
+fn user_contents(ui: &mut egui::Ui, step: &str, started_at: Option<Timestamp>, flush_time: bool) {
+    bubble(ui, true).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.strong("Вы");
+            time_label(ui, started_at, flush_time);
+        });
+        ui.add(egui::Label::new(step).wrap().selectable(true));
+    });
+}
+
 fn agent_bubble(ui: &mut egui::Ui, task: &Task, run: &Run, view: &mut View) {
-    let width = ui.available_width();
+    let row = ui.available_rect_before_wrap();
+    let cap = row.width() * 0.86;
+    let top = row.min.y;
+    let width = ui
+        .scope_builder(
+            egui::UiBuilder::new().invisible().max_rect(egui::Rect::from_min_size(
+                ui.cursor().min,
+                egui::vec2(cap, f32::INFINITY),
+            )),
+            |ui| agent_contents(ui, task, run, view, false),
+        )
+        .response
+        .rect
+        .width();
     ui.scope_builder(
         egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
-            ui.cursor().min,
-            egui::vec2(width * 0.86, f32::INFINITY),
+            egui::pos2(row.min.x, top),
+            egui::vec2(width, f32::INFINITY),
         )),
-        |ui| {
-            bubble(ui, false).show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::HOVER);
-                    let accent = ui.visuals().hyperlink_color;
-                    ui.painter().circle_filled(dot.center(), 4.0, accent);
-                    ui.strong(run.backend.as_deref().unwrap_or(&task.backend));
-                    chip(ui, state_tone(run.state), run.state.label());
-                    time_label(ui, run.finished_at);
-                });
-                if !run.result.is_empty() {
-                    let long = run.result.lines().count() > RESULT_CLAMP_LINES;
-                    let shown_full = !long || view.expanded.contains(&run.id);
-                    let body = if shown_full {
-                        run.result.clone()
-                    } else {
-                        run.result.lines().take(RESULT_CLAMP_LINES).collect::<Vec<_>>().join("\n")
-                    };
-                    ui.add(egui::Label::new(body).wrap().selectable(true));
-                    if long && ui.link(if shown_full { "Свернуть" } else { "Развернуть" }).clicked()
-                    {
-                        if shown_full {
-                            view.expanded.remove(&run.id);
-                        } else {
-                            view.expanded.insert(run.id);
-                        }
-                    }
+        |ui| agent_contents(ui, task, run, view, true),
+    );
+}
+
+fn agent_contents(ui: &mut egui::Ui, task: &Task, run: &Run, view: &mut View, flush_time: bool) {
+    bubble(ui, false).show(ui, |ui| {
+        ui.horizontal(|ui| {
+            let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::HOVER);
+            let accent = ui.visuals().hyperlink_color;
+            ui.painter().circle_filled(dot.center(), 4.0, accent);
+            ui.strong(run.backend.as_deref().unwrap_or(&task.backend));
+            chip(ui, state_tone(run.state), run.state.label());
+            time_label(ui, run.finished_at, flush_time);
+        });
+        if !run.result.is_empty() {
+            let long = run.result.lines().count() > RESULT_CLAMP_LINES;
+            let shown_full = !long || view.expanded.contains(&run.id);
+            let body = if shown_full {
+                run.result.clone()
+            } else {
+                run.result.lines().take(RESULT_CLAMP_LINES).collect::<Vec<_>>().join("\n")
+            };
+            let response = ui.add(egui::Label::new(body).wrap().selectable(true));
+            if long && !shown_full {
+                let height = RESULT_FADE_HEIGHT.min(response.rect.height());
+                let band = egui::Rect::from_min_size(
+                    egui::pos2(response.rect.left(), response.rect.bottom() - height),
+                    egui::vec2(response.rect.width(), height),
+                );
+                let surface = ui.visuals().panel_fill;
+                ui.painter().add(egui::Shape::gradient_rect(
+                    band,
+                    egui::Direction::TopDown,
+                    [egui::Color32::TRANSPARENT, surface],
+                ));
+            }
+            if long && ui.link(if shown_full { "Свернуть" } else { "Развернуть" }).clicked()
+            {
+                if shown_full {
+                    view.expanded.remove(&run.id);
+                } else {
+                    view.expanded.insert(run.id);
                 }
-                if !run.diagnostic.is_empty() {
-                    ui.colored_label(tone_colors(ui, Tone::Error).1, &run.diagnostic);
+            }
+        }
+        if !run.diagnostic.is_empty() {
+            ui.colored_label(tone_colors(ui, Tone::Error).1, &run.diagnostic);
+        }
+        let checks = &run.workflow_report.checks;
+        let latest = Some(run) == View::review_run(task);
+        if !run.files.is_empty() || !checks.is_empty() || latest {
+            ui.horizontal(|ui| {
+                if !run.files.is_empty() {
+                    chip(ui, Tone::Neutral, &format!("Файлов · {}", run.files.len()));
                 }
-                let checks = &run.workflow_report.checks;
-                let latest = Some(run) == View::review_run(task);
-                if !run.files.is_empty() || !checks.is_empty() || latest {
-                    ui.horizontal(|ui| {
-                        if !run.files.is_empty() {
-                            chip(ui, Tone::Neutral, &format!("Файлов · {}", run.files.len()));
-                        }
-                        if !checks.is_empty() {
-                            let passed = checks.iter().filter(|check| check.passed).count();
-                            chip(
-                                ui,
-                                Tone::Neutral,
-                                &format!("Проверки · {passed}/{}", checks.len()),
-                            );
-                        }
-                        if latest && ui.link("Результат →").clicked() {
-                            view.select(Tab::Summary, Some(task.id));
-                        }
-                    });
+                if !checks.is_empty() {
+                    let passed = checks.iter().filter(|check| check.passed).count();
+                    chip(ui, Tone::Neutral, &format!("Проверки · {passed}/{}", checks.len()));
+                }
+                if latest && ui.link("Результат →").clicked() {
+                    view.select(Tab::Summary, Some(task.id));
                 }
             });
-        },
-    );
+        }
+    });
 }
 
 fn annotate(next: &str, anchor: &str, note: &str) -> Option<String> {

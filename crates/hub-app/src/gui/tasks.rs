@@ -860,16 +860,114 @@ mod tests {
         (book, id, snapshot, view)
     }
 
+    fn looks_like_clock(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        bytes.len() == 5
+            && bytes[0].is_ascii_digit()
+            && bytes[1].is_ascii_digit()
+            && bytes[2] == b':'
+            && bytes[3].is_ascii_digit()
+            && bytes[4].is_ascii_digit()
+    }
+
     fn has_clock(labels: &[&str]) -> bool {
-        labels.iter().any(|label| {
-            let bytes = label.as_bytes();
-            bytes.len() == 5
-                && bytes[0].is_ascii_digit()
-                && bytes[1].is_ascii_digit()
-                && bytes[2] == b':'
-                && bytes[3].is_ascii_digit()
-                && bytes[4].is_ascii_digit()
+        labels.iter().any(|label| looks_like_clock(label))
+    }
+
+    fn text_rect_containing(output: &egui::FullOutput, needle: &str) -> Option<egui::Rect> {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text().contains(needle) => {
+                Some(text.galley.rect.translate(text.pos.to_vec2()))
+            }
+            _ => None,
         })
+    }
+
+    fn clock_rects(output: &egui::FullOutput) -> Vec<egui::Rect> {
+        let mut clocks: Vec<(f32, egui::Rect)> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if looks_like_clock(text.galley.text()) => {
+                    Some((text.pos.y, text.galley.rect.translate(text.pos.to_vec2())))
+                }
+                _ => None,
+            })
+            .collect();
+        clocks.sort_by(|a, b| a.0.total_cmp(&b.0));
+        clocks.into_iter().map(|(_, rect)| rect).collect()
+    }
+
+    fn gradient_fades(output: &egui::FullOutput) -> Vec<(egui::Rect, [egui::Color32; 2])> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Mesh(mesh) if mesh.vertices.len() >= 4 => {
+                    let bounds = egui::Rect::from_points(
+                        &mesh.vertices.iter().map(|vertex| vertex.pos).collect::<Vec<_>>(),
+                    );
+                    let colors = [mesh.vertices[0].color, mesh.vertices[2].color];
+                    (!bounds.is_negative()).then_some((bounds, colors))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn clamped_agent_answer_fades_and_expanding_removes_the_fade() {
+        let (_, _, snapshot, mut view) = review_fixture();
+        view.tasks[0].runs[0].result = (1..=12)
+            .map(|n| format!("Строка {n} — развёрнутый абзац ответа агента для проверки затухания"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let surface = ctx.style_of(ctx.theme()).visuals.panel_fill;
+        let body = text_rect_containing(&out, "Строка 8").unwrap();
+        assert!(body.width() > 200.0, "long lines make the clamped body wide");
+        let fades: Vec<(egui::Rect, [egui::Color32; 2])> = gradient_fades(&out)
+            .into_iter()
+            .filter(|(bounds, _)| (bounds.bottom() - body.bottom()).abs() <= 2.0)
+            .collect();
+        assert_eq!(fades.len(), 1, "one gradient band over the clamped body bottom");
+        assert_eq!(
+            fades[0].1,
+            [egui::Color32::TRANSPARENT, surface],
+            "transparent fades to surface"
+        );
+        assert!(fades[0].0.height() <= 27.0, "the band stays inside the mockup's 26px");
+        click_text(&ctx, &mut view, &snapshot, "Развернуть", &mut commands);
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert!(gradient_fades(&out).is_empty(), "an expanded answer has no fade band");
+    }
+
+    #[test]
+    fn bubble_time_sits_at_the_right_edge_of_its_header() {
+        let (_, _, snapshot, mut view) = review_fixture();
+        view.tasks[0].runs[0].started_at = Some(ts());
+        view.tasks[0].runs[0].finished_at = Some(ts());
+        view.tasks[0].runs[0].result = (1..=12)
+            .map(|n| format!("Строка {n} — развёрнутый абзац ответа агента для проверки затухания"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let clocks = clock_rects(&out);
+        assert_eq!(clocks.len(), 2, "one clock per bubble header");
+        let step = text_rect_containing(&out, "Исходный вопрос").unwrap();
+        let body = text_rect_containing(&out, "Строка 8").unwrap();
+        assert!(
+            (clocks[0].max.x - step.max.x).abs() <= 2.0,
+            "the user clock sits flush with the step text edge: {clocks:?} {step:?}"
+        );
+        assert!(
+            (clocks[1].max.x - body.max.x).abs() <= 2.0,
+            "the agent clock sits flush with the answer body edge: {clocks:?} {body:?}"
+        );
     }
 
     #[test]

@@ -170,7 +170,15 @@ pub(super) fn card(ui: &egui::Ui) -> egui::Frame {
 }
 
 pub(super) fn bubble(ui: &egui::Ui, user: bool) -> egui::Frame {
-    let frame = egui::Frame::new().corner_radius(12).inner_margin(egui::Margin::symmetric(12, 9));
+    // The 4px corner at the sender's lower edge reads as the bubble tail (design spec «Чат задачи»).
+    let corner_radius = if user {
+        egui::CornerRadius { nw: 12, ne: 12, sw: 12, se: 4 }
+    } else {
+        egui::CornerRadius { nw: 12, ne: 12, sw: 4, se: 12 }
+    };
+    let frame = egui::Frame::new()
+        .corner_radius(corner_radius)
+        .inner_margin(egui::Margin::symmetric(12, 9));
     if user {
         frame.fill(ui.visuals().selection.bg_fill)
     } else {
@@ -221,6 +229,19 @@ mod tests {
                 .unwrap();
             assert!(rect.shrink2(egui::vec2(8.0, 4.0)).contains_rect(label));
         }
+    }
+
+    #[test]
+    fn bubble_frames_have_a_small_tail_corner_at_the_sender_side() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let user = bubble(ui, true);
+            assert_eq!(user.corner_radius, egui::CornerRadius { nw: 12, ne: 12, sw: 12, se: 4 });
+            let agent = bubble(ui, false);
+            assert_eq!(agent.corner_radius, egui::CornerRadius { nw: 12, ne: 12, sw: 4, se: 12 });
+        });
+        output.textures_delta.clear();
     }
 
     #[test]
