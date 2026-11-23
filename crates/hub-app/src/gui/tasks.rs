@@ -1435,6 +1435,95 @@ mod tests {
     }
 
     #[test]
+    fn new_task_project_pick_in_topic_mode_keeps_the_picked_project() {
+        use crate::desktop_tasks::TaskRow;
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = hub_telegram::paths::workspace_root(a_dir.path()).unwrap().as_path().to_owned();
+        let b = hub_telegram::paths::workspace_root(b_dir.path()).unwrap().as_path().to_owned();
+        let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
+        let topic_a = TopicView {
+            key,
+            title: Some("Test".into()),
+            session: TopicSession::fresh(BackendKind::Qwen, AbsolutePath::new(a.clone()).unwrap()),
+            state: TopicState::Waiting,
+            memory_enabled: None,
+            parameters: String::new(),
+            progress: hub_core::progress::TaskProgress::default(),
+        };
+        let mut book = hub_core::tasks::TaskBook::default();
+        book.create(a.clone(), "qwen", "A", "Read").unwrap();
+        book.create(b.clone(), "qwen", "B", "Read").unwrap();
+        let rows: Vec<_> = book.tasks().iter().map(TaskRow::from).collect();
+        let snapshot = Snapshot {
+            bot: BotStatus::Running { username: "bot".into() },
+            topics: vec![topic_a],
+            task_index: Ok(rows),
+            ..Default::default()
+        };
+        let mut view = TasksView {
+            page: Page::New,
+            selected: Some(key),
+            local_mode: Some(false),
+            scope: Some((Some(key), a.clone(), BackendKind::Qwen)),
+            refreshed: Some(Instant::now()),
+            ..Default::default()
+        };
+        let mut commands = Vec::new();
+        // The catalog fills from an off-thread folder scan driven by project_navigation;
+        // render frames until both projects are listed, then never draw the sidebar again
+        // so the «Проект» combo labels stay the unique click targets.
+        let listed = |view: &TasksView| {
+            view.sidebar.projects().any(|(path, _)| path == a.as_path())
+                && view.sidebar.projects().any(|(path, _)| path == b.as_path())
+        };
+        for _ in 0..200 {
+            if listed(&view) {
+                break;
+            }
+            let mut render = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1400.0, 1000.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    view.project_navigation(ui, &snapshot, true);
+                    view.show(ui, &snapshot, &mut |command| commands.push(command));
+                },
+            );
+            render.textures_delta.clear();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(listed(&view), "the sidebar catalog never listed both projects");
+        let name_a = view
+            .sidebar
+            .projects()
+            .find(|(path, _)| *path == a.as_path())
+            .map(|(_, name)| name.to_owned())
+            .expect("project A is listed");
+        let name_b = view
+            .sidebar
+            .projects()
+            .find(|(path, _)| *path == b.as_path())
+            .map(|(_, name)| name.to_owned())
+            .expect("project B is listed");
+        click_text(&ctx, &mut view, &snapshot, &name_a, &mut commands);
+        click_text(&ctx, &mut view, &snapshot, &name_b, &mut commands);
+        assert_eq!(
+            view.local_project.opened(),
+            Some(b.as_path()),
+            "picking a project without a topic must keep it as the local target, not the old topic project"
+        );
+        assert_eq!(view.local_mode, Some(true), "the pick implicitly moved the form to local mode");
+        assert_eq!(view.selected, None, "the dropped topic selection must not return");
+    }
+
+    #[test]
     fn new_task_mode_flip_to_topic_anchors_the_local_project() {
         let ctx = egui::Context::default();
         ctx.all_styles_mut(|style| style.animation_time = 0.0);

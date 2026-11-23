@@ -1,6 +1,9 @@
 use super::{BackendKind, BotStatus, Scope, Snapshot, TasksView};
 use eframe::egui;
-use std::{path::PathBuf, sync::mpsc};
+use std::{
+    path::{Path, PathBuf},
+    sync::mpsc,
+};
 
 #[derive(Default)]
 pub(super) struct LocalProject {
@@ -89,6 +92,39 @@ impl LocalProject {
         }
     }
 }
+// The «Проект» selector in the compact row: the picked path lands in `choice`
+// for the migration pass; `current` labels and highlights the active project.
+fn project_combo(
+    ui: &mut egui::Ui,
+    projects: Vec<(PathBuf, String)>,
+    current: Option<&Path>,
+    choice: &mut Option<PathBuf>,
+) {
+    let label = projects
+        .iter()
+        .find(|(path, _)| current == Some(path.as_path()))
+        .map_or_else(|| "Выберите проект".to_owned(), |(_, name)| name.clone());
+    egui::ComboBox::from_id_salt("new_task_project").selected_text(label).show_ui(ui, |ui| {
+        for (path, name) in projects {
+            if ui
+                .selectable_label(current == Some(path.as_path()), name)
+                .on_hover_text(path.display().to_string())
+                .clicked()
+            {
+                *choice = Some(path);
+            }
+        }
+    });
+}
+
+/// What the selector row changed during one frame. Named fields keep the two
+/// optional paths from being transposed — mixing them silently loses a project.
+struct RowChanges {
+    previous: Option<bool>,
+    choice: Option<PathBuf>,
+    anchor: Option<PathBuf>,
+}
+
 impl TasksView {
     pub(super) fn resolved_scope(&mut self, snapshot: &Snapshot) -> Option<Scope> {
         let local = *self.local_mode.get_or_insert_with(|| {
@@ -125,24 +161,7 @@ impl TasksView {
         ui.horizontal_wrapped(|ui| {
             if !projects.is_empty() {
                 ui.label("Проект");
-                let label = projects
-                    .iter()
-                    .find(|(path, _)| current.as_deref() == Some(path.as_path()))
-                    .map_or_else(|| "Выберите проект".to_owned(), |(_, name)| name.clone());
-                egui::ComboBox::from_id_salt("new_task_project").selected_text(label).show_ui(
-                    ui,
-                    |ui| {
-                        for (path, name) in projects {
-                            if ui
-                                .selectable_label(current.as_deref() == Some(path.as_path()), name)
-                                .on_hover_text(path.display().to_string())
-                                .clicked()
-                            {
-                                choice = Some(path);
-                            }
-                        }
-                    },
-                );
+                project_combo(ui, projects, current.as_deref(), &mut choice);
             }
             ui.label("Где запустить");
             egui::ComboBox::from_id_salt("task_mode")
@@ -200,19 +219,24 @@ impl TasksView {
         });
         self.local_project.backend = Some(agent);
         self.local_mode = Some(mode);
-        self.apply_context_selection(ui, snapshot, previous, choice, project);
+        self.apply_context_selection(
+            ui,
+            snapshot,
+            RowChanges { previous, choice, anchor: project },
+        );
     }
-    // `project` is the scope captured before the row mutated `local_mode`, the same
-    // anchor the non-creating path uses: a mode flip transfers or anchors that project,
-    // never a scope re-resolved in the new mode (which may resolve to nothing).
+    // The migration anchors on the project the scope resolved to before the row mutated
+    // `local_mode` — the same pre-flip value the non-creating path captures, never a
+    // scope re-resolved in the new mode (which may resolve to nothing). When the pick
+    // itself flips the mode (a chosen project has no topic), the anchor becomes the
+    // picked path, so the flip guard re-anchors what the user just chose.
     fn apply_context_selection(
         &mut self,
         ui: &mut egui::Ui,
         snapshot: &Snapshot,
-        previous: Option<bool>,
-        choice: Option<PathBuf>,
-        project: Option<PathBuf>,
+        changes: RowChanges,
     ) {
+        let RowChanges { previous, choice, mut anchor } = changes;
         if let Some(path) = choice {
             self.local_project.choose(&path);
             if self.local_mode == Some(false) {
@@ -222,10 +246,11 @@ impl TasksView {
                     self.local_mode = Some(true);
                 }
             }
+            anchor = Some(path);
         }
         let mode = self.local_mode == Some(true);
         if previous == Some(!mode)
-            && let Some(project) = project
+            && let Some(project) = anchor
         {
             if mode {
                 self.local_project.choose(&project);
