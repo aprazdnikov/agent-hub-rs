@@ -179,6 +179,17 @@ fn button_label_width(ui: &egui::Ui, label: &str) -> f32 {
     text_width + 2.0 * ui.spacing().button_padding.x
 }
 
+// Width of a `ui.link` label, laid out the same way `Label::layout_in_ui` does,
+// so the rules link can be pushed to the right end of the action row without wrapping.
+fn link_label_width(ui: &egui::Ui, text: &str) -> f32 {
+    let job = egui::WidgetText::from(RichText::new(text)).into_layout_job(
+        ui.style(),
+        egui::FontSelection::Default,
+        Align::Min,
+    );
+    ui.fonts_mut(|fonts| fonts.layout_job(std::sync::Arc::unwrap_or_clone(job))).size().x
+}
+
 // The bottom panel reserves the composer before it lays out, and the composer must
 // split its width before the buttons exist; both derive the same numbers here: the
 // field width after the visible action buttons and the height of the bottom row.
@@ -237,30 +248,93 @@ impl TasksView {
         ui.label("Что поручить агенту");
         let editor = ui.make_persistent_id(("task_create_prompt", scope.as_ref().map(|s| &s.1)));
         let submit = shortcut(ui, editor);
+        // The prompt grows like the chat composer: one line to eight, then it scrolls inside.
+        let max_height = ui.text_style_height(&egui::TextStyle::Body) * 8.0 + 8.0;
+        egui::ScrollArea::vertical()
+            .id_salt("new_task_prompt")
+            .min_scrolled_height(0.0)
+            .max_height(max_height)
+            .show(ui, |ui| {
+                ui.add_enabled(
+                    !creating,
+                    egui::TextEdit::multiline(&mut self.prompt)
+                        .id(editor)
+                        .desired_rows(1)
+                        .desired_width(f32::INFINITY)
+                        .char_limit(16384),
+                );
+            });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Название");
+            ui.weak("· необязательно, по умолчанию — первая строка поручения");
+        });
         ui.add_enabled(
             !creating,
-            egui::TextEdit::multiline(&mut self.prompt)
-                .id(editor)
-                .desired_rows(3)
-                .desired_width(f32::INFINITY)
-                .char_limit(16384),
+            egui::TextEdit::singleline(&mut self.title)
+                .id_salt(("task_create_title", scope.as_ref().map(|s| &s.1)))
+                .hint_text("По умолчанию — первая строка поручения")
+                .char_limit(256),
         );
-        ui.collapsing("Название задачи", |ui| {
-            ui.add_enabled(
-                !creating,
-                egui::TextEdit::singleline(&mut self.title)
-                    .id_salt(("task_create_title", scope.as_ref().map(|s| &s.1)))
-                    .hint_text("По умолчанию — первая строка поручения")
-                    .char_limit(256),
-            );
-        });
         let title = task_title(&self.title, &self.prompt);
         let valid = !self.prompt.trim().is_empty()
             && !title.is_empty()
             && title.len() <= 256
             && self.prompt.len() <= 16384;
         let save = scope.is_some() && valid && !self.mutation_pending();
-        let blocked = if scope.is_none() {
+        let blocked = self.create_block(scope.as_ref(), snapshot, &title);
+        let start = save && blocked.is_none();
+        // The rules link sits at the right end of the action row while the width allows it;
+        // in a narrow window it wraps below the buttons instead of being cut off.
+        let rules_link = "Правила проекта ›";
+        let gap = (ui.available_width()
+            - button_label_width(ui, "Начать задачу")
+            - button_label_width(ui, "Сохранить черновик")
+            - link_label_width(ui, rules_link)
+            - 2.0 * ui.spacing().item_spacing.x)
+            .max(0.0);
+        let choice = ui
+            .horizontal_wrapped(|ui| {
+                let launch = primary_button(ui, start, "Начать задачу")
+                    .on_disabled_hover_text(blocked.unwrap_or_default())
+                    .clicked()
+                    || (start && submit);
+                let save_draft =
+                    ui.add_enabled(save, egui::Button::new("Сохранить черновик")).clicked();
+                if scope.is_some() {
+                    ui.add_space(gap);
+                    if ui.link(rules_link).clicked() {
+                        self.page = Page::Rules;
+                    }
+                }
+                (launch || save_draft).then_some(launch)
+            })
+            .inner;
+        if let Some(reason) = blocked {
+            ui.small(reason);
+        }
+        if let (Some(start), Some(scope)) = (choice, scope) {
+            self.dispatch(
+                scope,
+                Request::Create { title, prompt: self.prompt.clone() },
+                Effect::Create {
+                    start_with_rules: start.then_some(self.rules.saved.revision),
+                    open: true,
+                },
+                send,
+            );
+        }
+    }
+
+    // The single reason «Начать задачу» is held back, in the original chain order.
+    // Draft saving is gated separately by `save`.
+    fn create_block(
+        &self,
+        scope: Option<&Scope>,
+        snapshot: &Snapshot,
+        title: &str,
+    ) -> Option<&'static str> {
+        if scope.is_none() {
             Some("Выберите каталог проекта или тему Telegram.")
         } else if self.prompt.len() > 16384 {
             Some("Сократите поручение до 16 КиБ.")
@@ -274,36 +348,12 @@ impl TasksView {
             Some("Дождитесь завершения операции Git.")
         } else if self.local_context() && self.local_block == LocalBlock::Job {
             Some("Локальный агент занят. Можно сохранить черновик.")
-        } else if scope.as_ref().is_some_and(|s| topic_running(s, snapshot)) {
+        } else if scope.is_some_and(|s| topic_running(s, snapshot)) {
             Some("Тема занята. Можно сохранить черновик.")
         } else if self.refreshed.is_none() {
             Some("Загружаем правила проекта…")
         } else {
             None
-        };
-        if let Some(reason) = blocked {
-            ui.small(reason);
-        }
-        let start = save && blocked.is_none();
-        let choice = ui
-            .horizontal_wrapped(|ui| {
-                let launch =
-                    primary_button(ui, start, "Начать задачу").clicked() || (start && submit);
-                let save_draft =
-                    ui.add_enabled(save, egui::Button::new("Сохранить черновик")).clicked();
-                (launch || save_draft).then_some(launch)
-            })
-            .inner;
-        if let (Some(start), Some(scope)) = (choice, scope) {
-            self.dispatch(
-                scope,
-                Request::Create { title, prompt: self.prompt.clone() },
-                Effect::Create {
-                    start_with_rules: start.then_some(self.rules.saved.revision),
-                    open: true,
-                },
-                send,
-            );
         }
     }
 

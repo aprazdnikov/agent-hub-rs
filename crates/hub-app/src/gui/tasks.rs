@@ -39,7 +39,7 @@ enum Effect {
     StartAfterPrompt { id: u64, rules_revision: u64, review: bool },
     Review { id: u64, follow: bool },
 }
-#[derive(Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 enum Page {
     #[default]
     Task,
@@ -850,9 +850,17 @@ mod tests {
             .shapes
             .iter()
             .find_map(|shape| match &shape.shape {
-                egui::Shape::Text(label) if label.galley.text() == text => {
-                    Some(label.galley.rect.translate(label.pos.to_vec2()).center())
-                }
+                // A label continued on a wrapped row owns only its first row without
+                // the leading indentation, so that is the rect a real click would hit.
+                egui::Shape::Text(label) if label.galley.text() == text => Some(
+                    label
+                        .galley
+                        .rows
+                        .first()?
+                        .rect_without_leading_space()
+                        .translate(label.pos.to_vec2())
+                        .center(),
+                ),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("missing text: {text}"));
@@ -1305,6 +1313,100 @@ mod tests {
         assert_ne!(view.focused, Some(created));
         assert!(view.tasks.is_empty());
         assert!(commands.is_empty());
+    }
+
+    fn new_task_topic_form() -> (Snapshot, TasksView) {
+        let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
+        let snapshot = Snapshot {
+            bot: BotStatus::Running { username: "bot".into() },
+            topics: vec![topic(key)],
+            ..Default::default()
+        };
+        let view = TasksView {
+            page: Page::New,
+            selected: Some(key),
+            scope: Some((Some(key), test_project(), BackendKind::Qwen)),
+            refreshed: Some(Instant::now()),
+            ..Default::default()
+        };
+        (snapshot, view)
+    }
+
+    #[test]
+    fn new_task_title_field_is_visible_without_expanding() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let (snapshot, mut view) = new_task_topic_form();
+        let mut commands = Vec::new();
+        let output = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let texts = labels(&output);
+        assert!(
+            !texts.contains(&"Название задачи"),
+            "the title must not hide behind a collapsing header"
+        );
+        assert!(
+            texts.contains(&"По умолчанию — первая строка поручения"),
+            "the optional title hint must render without any expanding"
+        );
+    }
+
+    #[test]
+    fn new_task_prompt_grows_with_text_and_ctrl_enter_starts() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let (snapshot, mut view) = new_task_topic_form();
+        let mut commands = Vec::new();
+        let title_y = |view: &mut TasksView, commands: &mut Vec<Command>| {
+            let output = input_frame(&ctx, view, &snapshot, vec![], commands);
+            text_rect_containing(&output, "По умолчанию — первая строка поручения")
+                .expect("the title hint must stay visible while the prompt grows")
+                .min
+                .y
+        };
+        let one = title_y(&mut view, &mut commands);
+        view.prompt = "первая\nвторая\nтретья".into();
+        let three = title_y(&mut view, &mut commands);
+        assert!(three > one, "the prompt field grows with text: {one} -> {three}");
+        view.prompt = (1..=9).map(|n| format!("строка {n}")).collect::<Vec<_>>().join("\n");
+        let nine = title_y(&mut view, &mut commands);
+        let prompt_text = (1..=20).map(|n| format!("строка {n}")).collect::<Vec<_>>().join("\n");
+        view.prompt.clone_from(&prompt_text);
+        let many = title_y(&mut view, &mut commands);
+        assert!(many > three, "eight lines is taller than three: {three} -> {many}");
+        assert!(
+            (many - nine).abs() < 1.0,
+            "the field stops growing at eight lines: {nine} -> {many}"
+        );
+        click_text(&ctx, &mut view, &snapshot, &prompt_text, &mut commands);
+        input_frame(
+            &ctx,
+            &mut view,
+            &snapshot,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            }],
+            &mut commands,
+        );
+        let Command::Tasks { request: Request::Create { title, prompt }, .. } =
+            commands.pop().expect("Ctrl+Enter must submit the form")
+        else {
+            panic!("create")
+        };
+        assert_eq!(title, "строка 1");
+        assert_eq!(prompt, view.prompt);
+    }
+
+    #[test]
+    fn new_task_opens_project_rules_from_the_link() {
+        let ctx = egui::Context::default();
+        let (snapshot, mut view) = new_task_topic_form();
+        let mut commands = Vec::new();
+        click_text(&ctx, &mut view, &snapshot, "Правила проекта ›", &mut commands);
+        assert_eq!(view.page, Page::Rules);
     }
 
     #[test]
@@ -2450,9 +2552,6 @@ mod tests {
             };
             let mut commands = Vec::new();
             view.page = Page::New;
-            if field == "Название черновика" {
-                click_text(&ctx, &mut view, &snapshot, "Название задачи", &mut commands);
-            }
             click_text(&ctx, &mut view, &snapshot, field, &mut commands);
             let focus = ctx.memory(egui::Memory::focused).expect("text field focused");
             input_frame(
