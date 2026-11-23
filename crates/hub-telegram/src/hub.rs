@@ -2835,6 +2835,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delayed_topic_created_after_sync_stays_dropped() {
+        let world = world(FakeAgents::default());
+        world.send(inbound(Some(7), 1, Content::TopicCreated { name: "Старая".into() })).await;
+        *world.messenger.probes.lock().unwrap() = Some(Ok(false));
+        assert_eq!(sync(&world).await.unwrap(), "Удалено устаревших тем: 1");
+        // Delayed service events for a topic the sync proved missing must not resurrect it.
+        world.send(inbound(Some(7), 50, Content::TopicCreated { name: "Призрак".into() })).await;
+        world.send(text(Some(7), 51, "Оживи")).await;
+        // The second sync round trip proves the actor processed the ghosts above.
+        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны");
+        assert!(!world.store.last().unwrap().contains_key(&KEY));
+        assert!(!world.store.titles.lock().unwrap().contains_key(&KEY));
+        assert!(!world.handle.views.borrow().iter().any(|topic| topic.key == KEY));
+        assert_eq!(
+            world.texts().iter().filter(|text| text.contains("Новая сессия")).count(),
+            1,
+            "the ghost must not greet with a new session"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_reports_cleanup_disk_failure() {
+        let world = world(FakeAgents::default());
+        world.send(inbound(Some(7), 1, Content::TopicCreated { name: "Старая".into() })).await;
+        // The first sync round trip is the barrier: the topic is created and saved to disk.
+        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны");
+        world.store.fail.store(true, Ordering::SeqCst);
+        *world.messenger.probes.lock().unwrap() = Some(Ok(false));
+        let error = sync(&world).await.unwrap_err();
+        assert!(error.contains("Не удалось очистить 1 тем на диске"), "got: {error}");
+        assert!(error.contains("повторите синхронизацию"), "got: {error}");
+        assert!(!error.contains("Все темы актуальны"), "got: {error}");
+        // Nothing was cleaned durably, so the reply must not claim a removal count.
+        assert!(!error.contains("Удалено"), "got: {error}");
+        // The failed cleanup keeps the row for a retry, and the Delete button now reaches it
+        // through the `deleted` marker without another Telegram call.
+        assert!(world.store.last().unwrap().contains_key(&KEY));
+        world.store.fail.store(false, Ordering::SeqCst);
+        delete_topic(&world, KEY).await.unwrap();
+        assert!(!world.store.last().unwrap().contains_key(&KEY));
+        assert!(
+            !world.messenger.calls().iter().any(|call| matches!(call, Call::DeleteTopic(_))),
+            "the retry must reuse the proven-missing answer, not delete in Telegram again"
+        );
+    }
+
+    #[tokio::test]
     async fn actions_work_in_general_and_topic_without_starting_an_agent() {
         let world = world(FakeAgents::default());
         let mut settings = (**world.settings.borrow()).clone();

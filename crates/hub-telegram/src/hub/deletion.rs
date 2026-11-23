@@ -213,6 +213,7 @@ impl<A: Agents> Hub<A> {
 
     pub(super) fn finish_sync(&mut self, done: SyncDone) {
         let mut removed = 0;
+        let mut failed = 0;
         for key in done.stale {
             // A probe answer is only a decision when the topic is still unbound and free;
             // work may have arrived while the walk was running.
@@ -222,17 +223,37 @@ impl<A: Agents> Hub<A> {
             {
                 continue;
             }
-            if self.clean_deleted_topic(key).is_ok() {
+            // Mark deleted before cleanup, as finish_deletion does: the inbound gate drops
+            // delayed TopicCreated/text for a topic the walk proved missing, and a cleanup
+            // that failed on disk stays retryable through the Delete button.
+            self.deleted.insert(key);
+            if let Err(error) = self.clean_deleted_topic(key) {
+                failed += 1;
+                tracing::warn!(topic = ?key, %error, "synced topic could not be cleaned on disk");
+            } else {
                 removed += 1;
             }
         }
-        let result = match done.retry_after {
-            Some(retry_after) => {
+        // A stale topic left on disk is not "all topics are current"; report the failure the
+        // way deletion does: what broke and how to retry.
+        let disk_failure = (failed > 0).then(|| {
+            format!("Не удалось очистить {failed} тем на диске — повторите синхронизацию.")
+        });
+        let result = match (done.retry_after, disk_failure) {
+            (Some(retry_after), disk_failure) => {
                 let error = SendError::RetryAfter(retry_after);
-                Err(format!("{error}, повторите позже"))
+                let message = format!("{error}, повторите позже");
+                Err(match disk_failure {
+                    Some(disk_failure) => format!("{message}. {disk_failure}"),
+                    None => message,
+                })
             }
-            None if removed == 0 => Ok("Все темы актуальны".to_owned()),
-            None => Ok(format!("Удалено устаревших тем: {removed}")),
+            (None, Some(disk_failure)) => Err(match removed {
+                0 => disk_failure,
+                removed => format!("Удалено устаревших тем: {removed}. {disk_failure}"),
+            }),
+            (None, None) if removed == 0 => Ok("Все темы актуальны".to_owned()),
+            (None, None) => Ok(format!("Удалено устаревших тем: {removed}")),
         };
         let _ = done.reply.send(result);
     }
