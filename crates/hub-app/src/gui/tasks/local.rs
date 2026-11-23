@@ -1,7 +1,9 @@
 use super::Command;
+use crate::gui::theme;
 use crate::local_execution::{Answer, Interaction, Kind, Live};
 use eframe::egui;
 use hub_core::domain::{Question, Selection};
+use std::sync::Arc;
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
@@ -52,14 +54,16 @@ impl Panel {
         });
     }
 
+    /// Global feedback rows, skipped for requests whose card renders inline
+    /// (`inline` keys) — the card already shows sent/error state.
     pub(super) fn feedback(
         &self,
         ui: &mut egui::Ui,
         project: Option<&Path>,
-        expanded: Option<(Uuid, Uuid)>,
+        inline: &[(Uuid, Uuid)],
     ) {
         for (key, editor) in &self.editors {
-            if Some(*key) == expanded
+            if inline.contains(key)
                 || editor.feedback_until.is_none()
                 || project.is_some_and(|p| p != editor.project)
             {
@@ -85,27 +89,32 @@ impl Panel {
         send: &mut impl FnMut(Command),
     ) {
         ui.push_id(live.token, |ui| {
-            ui.horizontal_wrapped(|ui| {
-                ui.label(&live.status).on_hover_text(format!(
-                    "В теме проекта за этой задачей можно следить командой /task follow {}",
-                    live.id,
-                ));
-                if live.active && ui.button("Остановить локальную работу").clicked()
-                {
-                    send(Command::LocalStop(live.token));
+            theme::card(ui).show(ui, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(&live.status).on_hover_text(format!(
+                        "В теме проекта за этой задачей можно следить командой /task follow {}",
+                        live.id,
+                    ));
+                    if live.active && ui.button("Остановить локальную работу").clicked()
+                    {
+                        send(Command::LocalStop(live.token));
+                    }
+                });
+                if let Some(request) = &live.interaction {
+                    self.decision(ui, live, request, None, send);
                 }
             });
-            if let Some(request) = &live.interaction {
-                self.decision(ui, live, request, send);
-            }
         });
     }
 
+    /// `max_rows` clamps the permission summary to that many visual rows;
+    /// the collapsed inbox card passes `Some(SUMMARY_LINES)` (spec line 79).
     pub(super) fn decision(
         &mut self,
         ui: &mut egui::Ui,
         live: &Live,
         request: &Interaction,
+        max_rows: Option<usize>,
         send: &mut impl FnMut(Command),
     ) {
         if !live.active {
@@ -129,13 +138,18 @@ impl Panel {
                             .id_salt("permission_details")
                             .max_height(160.0)
                             .show(ui, |ui| {
-                                ui.add(
-                                    egui::Label::new(
-                                        egui::RichText::new(&tool.summary).monospace(),
-                                    )
-                                    .wrap()
-                                    .selectable(true),
+                                let mut job = egui::WidgetText::from(
+                                    egui::RichText::new(&tool.summary).monospace(),
+                                )
+                                .into_layout_job(
+                                    ui.style(),
+                                    egui::FontSelection::Default,
+                                    egui::Align::Min,
                                 );
+                                if let Some(rows) = max_rows {
+                                    Arc::make_mut(&mut job).wrap.max_rows = rows;
+                                }
+                                ui.add(egui::Label::new(job).wrap().selectable(true));
                             });
                         ui.horizontal_wrapped(|ui| {
                             if ui.button("Разрешить один раз").clicked() {

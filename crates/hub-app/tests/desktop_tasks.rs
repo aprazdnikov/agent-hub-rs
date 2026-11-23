@@ -6,6 +6,10 @@ mod tests {
         tasks::{TaskStatus, service::TaskService},
     };
     use hub_telegram::hub::tasks::Request;
+
+    fn ts() -> jiff::Timestamp {
+        jiff::Timestamp::from_second(1_700_000_000).unwrap()
+    }
     #[test]
     fn local_management_is_persistent_revisioned_and_project_scoped() {
         let root = tempfile::tempdir().unwrap();
@@ -74,7 +78,7 @@ mod tests {
         std::fs::write(project.path().join(name), "original").unwrap();
         service
             .access(Access::Internal, |book, _| {
-                book.begin(id, 1, None)?;
+                book.begin(id, 1, None, ts())?;
                 book.record_file(
                     id,
                     1,
@@ -84,7 +88,7 @@ mod tests {
             .unwrap();
         assert!(apply(project.path(), delete(2)).is_err());
         service
-            .access(Access::Internal, |book, _| book.finish(id, 1, RunState::Completed))
+            .access(Access::Internal, |book, _| book.finish(id, 1, RunState::Completed, ts()))
             .unwrap();
         service
             .access(Access::Internal, |book, _| {
@@ -153,13 +157,18 @@ mod tests {
             let id = t.tasks[0].id;
             service
                 .access(Access::Internal, |b, _| {
-                    let run = b.begin(id, 1, None)?;
+                    let run = b.begin(id, 1, None, ts())?;
                     if n == 0 {
                         b.unavailable(id, run, "Нет подключения к исполнителю")?;
                     } else {
                         b.record(id, run, "Черновики сохраняются для каждой задачи.")?;
                     }
-                    b.finish(id, run, if n == 0 { RunState::Failed } else { RunState::Completed })
+                    b.finish(
+                        id,
+                        run,
+                        if n == 0 { RunState::Failed } else { RunState::Completed },
+                        ts(),
+                    )
                 })
                 .unwrap();
         }

@@ -1,9 +1,12 @@
 //! Chat, result review and execution parameters for the selected durable task.
 use super::{
-    Availability, BackendKind, Command, Effect, LocalBlock, Page, Request, Rework, Scope, Snapshot,
-    Task, TaskStatus, TasksView, result,
+    Availability, BackendKind, Command, Effect, LocalBlock, Page, QueueBlock, Request, Rework,
+    Scope, Snapshot, Task, TaskStatus, TasksView, result,
 };
-use crate::gui::{look::agent_title, theme::primary_button};
+use crate::gui::{
+    look::{agent_title, topic_url},
+    theme::{Tone, chip, chip_width, primary_button, tone_colors},
+};
 use eframe::egui;
 use egui::{Align, Layout, RichText};
 use hub_core::tasks::RunState;
@@ -65,6 +68,30 @@ fn task_state(task: &Task) -> &'static str {
     }
 }
 
+// Chip tone for the header state, mirroring `task_state` branch order so the color
+// describes exactly the text it shows (spec «Шапка задачи», макет chat.html).
+fn task_state_tone(task: &Task) -> Tone {
+    if task.archived {
+        Tone::Neutral
+    } else if task.active() {
+        Tone::Accent
+    } else if task.queue.is_some()
+        || matches!(task.status, TaskStatus::Accepted | TaskStatus::Deferred)
+    {
+        Tone::Neutral
+    } else if task
+        .runs
+        .last()
+        .is_some_and(|run| matches!(run.state, RunState::Failed | RunState::Interrupted))
+    {
+        Tone::Error
+    } else if task.status == TaskStatus::NeedsReview {
+        Tone::Warning
+    } else {
+        Tone::Neutral
+    }
+}
+
 fn topic_running(scope: &Scope, snapshot: &Snapshot) -> bool {
     snapshot.topics.iter().any(|topic| {
         Some(topic.key) == scope.0 && topic.state == hub_telegram::hub::TopicState::Running
@@ -99,6 +126,104 @@ fn shortcut(ui: &mut egui::Ui, editor: egui::Id) -> bool {
         && ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::Enter))
 }
 
+// Composer frame from chat.html: 1px border, radius 12, surface fill, mockup padding.
+const COMPOSER_FRAME_MARGIN: egui::Margin = egui::Margin { left: 12, right: 6, top: 6, bottom: 6 };
+// Spec «Чат задачи»: below this chat height bubbles, the header and composer switch to compact.
+const COMPACT_CHAT_HEIGHT: f32 = 360.0;
+const COMPOSER_FRAME_EXTRA: f32 = 14.0; // margins 6+6 plus the 1px border top and bottom
+const COMPOSER_FIELD_MARGIN: egui::Margin = egui::Margin::symmetric(4, 2);
+
+fn ui_font(ui: &egui::Ui, style: &egui::TextStyle) -> egui::FontId {
+    ui.style()
+        .text_styles
+        .get(style)
+        .cloned()
+        .unwrap_or_else(|| egui::FontId::proportional(ui.text_style_height(style)))
+}
+
+// Natural galley size of the heading title, so the header can truncate the title
+// to the width left by the state chip instead of pushing the chip out (spec line 65).
+fn heading_size(ui: &egui::Ui, text: &str) -> egui::Vec2 {
+    let job = egui::WidgetText::from(RichText::new(text).heading().strong()).into_layout_job(
+        ui.style(),
+        egui::FontSelection::Default,
+        Align::Min,
+    );
+    ui.fonts_mut(|fonts| fonts.layout_job(std::sync::Arc::unwrap_or_clone(job))).size()
+}
+
+// Height of the composer field for a draft at a known width: the wrapped galley
+// between one and eight body lines plus the field's inner margins, matching the
+// ScrollArea clamp in `message_field`.
+fn composer_field_height(ui: &egui::Ui, draft: &str, width: f32) -> f32 {
+    let body_line = ui.text_style_height(&egui::TextStyle::Body);
+    let job = egui::text::LayoutJob::simple(
+        draft.to_owned(),
+        ui_font(ui, &egui::TextStyle::Body),
+        egui::Color32::PLACEHOLDER,
+        width.max(48.0),
+    );
+    let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
+    (galley.size().y + 2.0 * f32::from(COMPOSER_FIELD_MARGIN.top))
+        .clamp(body_line + 8.0, body_line * 8.0 + 8.0)
+}
+
+fn button_label_width(ui: &egui::Ui, label: &str) -> f32 {
+    let job = egui::text::LayoutJob::simple(
+        label.to_owned(),
+        ui_font(ui, &egui::TextStyle::Button),
+        egui::Color32::PLACEHOLDER,
+        f32::INFINITY,
+    );
+    let text_width = ui.fonts_mut(|fonts| fonts.layout_job(job)).size().x;
+    text_width + 2.0 * ui.spacing().button_padding.x
+}
+
+// Width of a `ui.link` label, laid out the same way `Label::layout_in_ui` does,
+// so the rules link can be pushed to the right end of the action row without wrapping.
+fn link_label_width(ui: &egui::Ui, text: &str) -> f32 {
+    let job = egui::WidgetText::from(RichText::new(text)).into_layout_job(
+        ui.style(),
+        egui::FontSelection::Default,
+        Align::Min,
+    );
+    ui.fonts_mut(|fonts| fonts.layout_job(std::sync::Arc::unwrap_or_clone(job))).size().x
+}
+
+// The bottom panel reserves the composer before it lays out, and the composer must
+// split its width before the buttons exist; both derive the same numbers here: the
+// field width after the visible action buttons and the height of the bottom row.
+fn composer_row(
+    ui: &egui::Ui,
+    available_width: f32,
+    draft: &str,
+    send_label: &str,
+    show_save: bool,
+    show_open: bool,
+) -> f32 {
+    let spacing_x = ui.spacing().item_spacing.x;
+    let button_height =
+        ui.spacing().interact_size.y.max(
+            ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y,
+        );
+    let mut zone = spacing_x + button_label_width(ui, send_label);
+    if show_save {
+        zone += spacing_x + button_label_width(ui, "Сохранить");
+    }
+    if show_open {
+        zone += spacing_x + button_label_width(ui, "Открыть результат");
+    }
+    let field_width = (available_width - zone).max(48.0);
+    let field_height = composer_field_height(ui, draft, field_width);
+    field_height.max(button_height)
+}
+
+struct ComposerGuards {
+    dirty: bool,
+    conflict: bool,
+    blocked: Option<&'static str>,
+}
+
 impl TasksView {
     pub(super) fn new_task(
         &mut self,
@@ -123,30 +248,93 @@ impl TasksView {
         ui.label("Что поручить агенту");
         let editor = ui.make_persistent_id(("task_create_prompt", scope.as_ref().map(|s| &s.1)));
         let submit = shortcut(ui, editor);
+        // The prompt grows like the chat composer: one line to eight, then it scrolls inside.
+        let max_height = ui.text_style_height(&egui::TextStyle::Body) * 8.0 + 8.0;
+        egui::ScrollArea::vertical()
+            .id_salt("new_task_prompt")
+            .min_scrolled_height(0.0)
+            .max_height(max_height)
+            .show(ui, |ui| {
+                ui.add_enabled(
+                    !creating,
+                    egui::TextEdit::multiline(&mut self.prompt)
+                        .id(editor)
+                        .desired_rows(1)
+                        .desired_width(f32::INFINITY)
+                        .char_limit(16384),
+                );
+            });
+        ui.add_space(6.0);
+        ui.horizontal(|ui| {
+            ui.label("Название");
+            ui.weak("· необязательно, по умолчанию — первая строка поручения");
+        });
         ui.add_enabled(
             !creating,
-            egui::TextEdit::multiline(&mut self.prompt)
-                .id(editor)
-                .desired_rows(3)
-                .desired_width(f32::INFINITY)
-                .char_limit(16384),
+            egui::TextEdit::singleline(&mut self.title)
+                .id_salt(("task_create_title", scope.as_ref().map(|s| &s.1)))
+                .hint_text("По умолчанию — первая строка поручения")
+                .char_limit(256),
         );
-        ui.collapsing("Название задачи", |ui| {
-            ui.add_enabled(
-                !creating,
-                egui::TextEdit::singleline(&mut self.title)
-                    .id_salt(("task_create_title", scope.as_ref().map(|s| &s.1)))
-                    .hint_text("По умолчанию — первая строка поручения")
-                    .char_limit(256),
-            );
-        });
         let title = task_title(&self.title, &self.prompt);
         let valid = !self.prompt.trim().is_empty()
             && !title.is_empty()
             && title.len() <= 256
             && self.prompt.len() <= 16384;
         let save = scope.is_some() && valid && !self.mutation_pending();
-        let blocked = if scope.is_none() {
+        let blocked = self.create_block(scope.as_ref(), snapshot, &title);
+        let start = save && blocked.is_none();
+        // The rules link sits at the right end of the action row while the width allows it;
+        // in a narrow window it wraps below the buttons instead of being cut off.
+        let rules_link = "Правила проекта ›";
+        let gap = (ui.available_width()
+            - button_label_width(ui, "Начать задачу")
+            - button_label_width(ui, "Сохранить черновик")
+            - link_label_width(ui, rules_link)
+            - 2.0 * ui.spacing().item_spacing.x)
+            .max(0.0);
+        let choice = ui
+            .horizontal_wrapped(|ui| {
+                let launch = primary_button(ui, start, "Начать задачу")
+                    .on_disabled_hover_text(blocked.unwrap_or_default())
+                    .clicked()
+                    || (start && submit);
+                let save_draft =
+                    ui.add_enabled(save, egui::Button::new("Сохранить черновик")).clicked();
+                if scope.is_some() {
+                    ui.add_space(gap);
+                    if ui.link(rules_link).clicked() {
+                        self.page = Page::Rules;
+                    }
+                }
+                (launch || save_draft).then_some(launch)
+            })
+            .inner;
+        if let Some(reason) = blocked {
+            ui.small(reason);
+        }
+        if let (Some(start), Some(scope)) = (choice, scope) {
+            self.dispatch(
+                scope,
+                Request::Create { title, prompt: self.prompt.clone() },
+                Effect::Create {
+                    start_with_rules: start.then_some(self.rules.saved.revision),
+                    open: true,
+                },
+                send,
+            );
+        }
+    }
+
+    // The single reason «Начать задачу» is held back, in the original chain order.
+    // Draft saving is gated separately by `save`.
+    fn create_block(
+        &self,
+        scope: Option<&Scope>,
+        snapshot: &Snapshot,
+        title: &str,
+    ) -> Option<&'static str> {
+        if scope.is_none() {
             Some("Выберите каталог проекта или тему Telegram.")
         } else if self.prompt.len() > 16384 {
             Some("Сократите поручение до 16 КиБ.")
@@ -160,36 +348,12 @@ impl TasksView {
             Some("Дождитесь завершения операции Git.")
         } else if self.local_context() && self.local_block == LocalBlock::Job {
             Some("Локальный агент занят. Можно сохранить черновик.")
-        } else if scope.as_ref().is_some_and(|s| topic_running(s, snapshot)) {
+        } else if scope.is_some_and(|s| topic_running(s, snapshot)) {
             Some("Тема занята. Можно сохранить черновик.")
         } else if self.refreshed.is_none() {
             Some("Загружаем правила проекта…")
         } else {
             None
-        };
-        if let Some(reason) = blocked {
-            ui.small(reason);
-        }
-        let start = save && blocked.is_none();
-        let choice = ui
-            .horizontal_wrapped(|ui| {
-                let launch =
-                    primary_button(ui, start, "Начать задачу").clicked() || (start && submit);
-                let save_draft =
-                    ui.add_enabled(save, egui::Button::new("Сохранить черновик")).clicked();
-                (launch || save_draft).then_some(launch)
-            })
-            .inner;
-        if let (Some(start), Some(scope)) = (choice, scope) {
-            self.dispatch(
-                scope,
-                Request::Create { title, prompt: self.prompt.clone() },
-                Effect::Create {
-                    start_with_rules: start.then_some(self.rules.saved.revision),
-                    open: true,
-                },
-                send,
-            );
         }
     }
 
@@ -220,7 +384,11 @@ impl TasksView {
                     self.parameters(ui, task, &available, &next, snapshot, send);
                 });
             }
-            _ => self.review(ui, task, &mut next, &available, send),
+            result::Tab::Summary
+            | result::Tab::Changes
+            | result::Tab::Checks
+            | result::Tab::Files
+            | result::Tab::History => self.review(ui, task, &mut next, &available, send),
         });
         if task.runs.is_empty() {
             if next == task.prompt {
@@ -262,35 +430,43 @@ impl TasksView {
         snapshot: &Snapshot,
         send: &mut impl FnMut(Command),
     ) {
-        let compact = ui.available_height() < 360.0;
-        self.chat_header(ui, task, snapshot, compact);
+        let compact = ui.available_height() < COMPACT_CHAT_HEIGHT;
+        self.chat_header(ui, task, available, next.as_str(), snapshot, send);
         let needs_answer = self
             .selected_live(snapshot)
             .is_some_and(|live| live.active && live.interaction.is_some());
         let has_result =
             result::View::review_run(task).is_some() || task.status == TaskStatus::NeedsReview;
-        let body_line = ui.text_style_height(&egui::TextStyle::Body);
         let button_height = ui.spacing().interact_size.y.max(
             ui.text_style_height(&egui::TextStyle::Button) + 2.0 * ui.spacing().button_padding.y,
         );
         let inline_result = has_result && compact && !needs_answer;
-        let result_space = if has_result && !inline_result {
-            button_height + ui.spacing().item_spacing.y
-        } else {
-            0.0
-        };
+        // design.md:171 — «Открыть результат» duplicates inline only in compact mode; outside
+        // it the header primary owns the review state, so the pinned bar keeps the button
+        // only for the result-bearing states whose header primary is something else.
+        let pinned_result = has_result && !inline_result && task.status != TaskStatus::NeedsReview;
+        let result_space =
+            if pinned_result { button_height + ui.spacing().item_spacing.y } else { 0.0 };
         let composer_height = if needs_answer {
             (ui.available_height() * 0.60).clamp(130.0, 380.0)
         } else {
-            body_line * 2.0 + button_height + 40.0
+            let row_height = composer_row(
+                ui,
+                // frame margins 12+6 plus the 1px border on both sides
+                ui.available_width() - 20.0,
+                next,
+                if task.runs.is_empty() { "Запустить" } else { "Отправить" },
+                task.runs.is_empty() && next != &task.prompt,
+                inline_result,
+            );
+            row_height + COMPOSER_FRAME_EXTRA + ui.spacing().interact_size.y + 12.0
         };
         egui::Panel::bottom(ui.id().with("composer"))
             .exact_size(composer_height + result_space)
             .frame(egui::Frame::NONE)
             .show_separator_line(false)
             .show(ui, |ui| {
-                if has_result && !inline_result && ui.button("Открыть результат").clicked()
-                {
+                if pinned_result && ui.button("Открыть результат").clicked() {
                     self.result_view.select(result::Tab::Summary, Some(task.id));
                 }
                 ui.separator();
@@ -324,31 +500,63 @@ impl TasksView {
                     ui.weak("Переписка появится после первого запуска.");
                 }
             } else {
-                result::View::transcript(ui, task);
+                result::View::transcript(ui, task, &mut self.result_view);
             }
         });
     }
 
-    fn chat_header(&mut self, ui: &mut egui::Ui, task: &Task, snapshot: &Snapshot, compact: bool) {
-        let Some(scope) = self.scope.as_ref() else { return };
+    fn chat_header(
+        &mut self,
+        ui: &mut egui::Ui,
+        task: &Task,
+        available: &Availability,
+        next: &str,
+        snapshot: &Snapshot,
+        send: &mut impl FnMut(Command),
+    ) {
+        let Some(scope) = self.scope.clone() else { return };
+        let compact = ui.available_height() < COMPACT_CHAT_HEIGHT;
         if compact {
             ui.spacing_mut().item_spacing.y = 3.0;
         }
         self.breadcrumb(ui, task);
+        // The pending-delete row renders in exactly one place per tab: here while the Chat tab
+        // is active; on Parameters it belongs to «Управление задачей» (workflow_controls).
+        let confirming = self.confirm_delete == Some((task.id, task.revision))
+            && matches!(self.result_view.tab(task), result::Tab::Chat);
         ui.horizontal(|ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("Параметры").clicked() {
-                    self.result_view.select(result::Tab::Parameters, Some(task.id));
+                // A pending delete replaces the actions and the menu: the user must answer it first.
+                if !confirming {
+                    self.header_menu(ui, task, available, next, send);
+                    self.header_actions(ui, task, available, snapshot, send);
                 }
                 ui.vertical(|ui| {
                     ui.set_width(ui.available_width());
-                    ui.add(
-                        egui::Label::new(RichText::new(&task.title).heading().strong()).truncate(),
-                    )
-                    .on_hover_text(&task.title);
+                    ui.horizontal(|ui| {
+                        let state = task_state(task);
+                        let size = heading_size(ui, &task.title);
+                        let reserve = chip_width(ui, state) + ui.spacing().item_spacing.x;
+                        let title_width = (ui.available_width() - reserve).max(48.0).min(size.x);
+                        ui.allocate_ui_with_layout(
+                            egui::vec2(title_width, size.y),
+                            Layout::left_to_right(Align::Center),
+                            |ui| {
+                                ui.add(
+                                    egui::Label::new(RichText::new(&task.title).heading().strong())
+                                        .truncate(),
+                                )
+                                .on_hover_text(&task.title);
+                            },
+                        );
+                        chip(ui, task_state_tone(task), state);
+                    });
                 });
             });
         });
+        if confirming {
+            self.delete_confirm(ui, task, send);
+        }
         let agent = match BackendKind::parse(&task.backend) {
             Some(agent) => agent_title(agent),
             None => &task.backend,
@@ -365,7 +573,7 @@ impl TasksView {
             },
         );
         let location = format!("{agent} · {target} · {}", task_state(task));
-        let memory = memory_description(task, scope, snapshot);
+        let memory = memory_description(task, &scope, snapshot);
         if compact {
             ui.horizontal_wrapped(|ui| {
                 ui.small(location);
@@ -377,6 +585,185 @@ impl TasksView {
             ui.small(memory);
         }
         ui.separator();
+    }
+
+    // The primary action by task state, mirroring `task_state` precedence
+    // (spec «Шапка задачи и меню действий»): running → stop or topic, queue,
+    // review, failed run; drafts and finished states keep the composer button.
+    fn header_actions(
+        &mut self,
+        ui: &mut egui::Ui,
+        task: &Task,
+        available: &Availability,
+        snapshot: &Snapshot,
+        send: &mut impl FnMut(Command),
+    ) {
+        if task.archived {
+            return;
+        }
+        if task.active() {
+            let Some(scope) = self.scope.as_ref() else { return };
+            if scope.0.is_none() {
+                if let Some(token) =
+                    self.selected_live(snapshot).filter(|live| live.active).map(|live| live.token)
+                {
+                    let stop = egui::Button::new(
+                        RichText::new("Остановить").color(tone_colors(ui, Tone::Error).1),
+                    );
+                    if ui.add(stop).clicked() {
+                        send(Command::LocalStop(token));
+                    }
+                }
+            } else {
+                chip(ui, Tone::Accent, "Выполняется");
+                let url = scope.0.and_then(topic_url);
+                let open = ui
+                    .add_enabled(url.is_some(), egui::Button::new("Открыть тему"))
+                    .on_hover_text("Открыть тему в Telegram");
+                if open.clicked()
+                    && let Some(url) = url
+                {
+                    ui.ctx().open_url(egui::OpenUrl::new_tab(url));
+                }
+            }
+            return;
+        }
+        if task.queue.is_some() {
+            if ui.button("Снять с очереди").clicked() {
+                self.request(Request::Unqueue { id: task.id, revision: task.revision }, send);
+            }
+            return;
+        }
+        if matches!(task.status, TaskStatus::Accepted | TaskStatus::Deferred) {
+            return;
+        }
+        if task
+            .runs
+            .last()
+            .is_some_and(|run| matches!(run.state, RunState::Failed | RunState::Interrupted))
+        {
+            if ui.button("Разобрать запуск").clicked() {
+                self.result_view.select(result::Tab::Checks, Some(task.id));
+            }
+            return;
+        }
+        if task.status == TaskStatus::NeedsReview {
+            if primary_button(ui, true, "Открыть результат").clicked() {
+                self.result_view.select(result::Tab::Summary, Some(task.id));
+            }
+            if ui.add_enabled(available.edit, egui::Button::new("Принять")).clicked() {
+                self.request(
+                    Request::Status {
+                        id: task.id,
+                        revision: task.revision,
+                        status: TaskStatus::Accepted,
+                    },
+                    send,
+                );
+            }
+        }
+    }
+
+    fn header_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        task: &Task,
+        available: &Availability,
+        next: &str,
+        send: &mut impl FnMut(Command),
+    ) {
+        let queued = task.queue.is_some();
+        let first = task.runs.is_empty();
+        let offers = if queued { Vec::new() } else { self.queue_offer(task, next) };
+        let _ = ui.menu_button("…", |ui| {
+            if ui.button("Параметры задачи").clicked() {
+                self.result_view.select(result::Tab::Parameters, Some(task.id));
+            }
+            if ui.button("Правила проекта").clicked() {
+                self.page = Page::Rules;
+            }
+            if ui.button("Контекст следующего запуска").clicked() {
+                self.result_view.select(result::Tab::Parameters, Some(task.id));
+                // `select` resets the view; the request is recorded after it.
+                self.result_view.request_context_open();
+            }
+            if queued || !offers.is_empty() {
+                ui.separator();
+            }
+            if queued {
+                if ui.button("Снять с очереди").clicked() {
+                    self.request(Request::Unqueue { id: task.id, revision: task.revision }, send);
+                }
+            } else {
+                for (isolated, label, block) in offers {
+                    let button = ui
+                        .add_enabled(block.is_none(), egui::Button::new(label))
+                        .on_disabled_hover_text(block.map_or("", QueueBlock::label));
+                    if button.clicked() {
+                        self.request(
+                            Request::Queue {
+                                id: task.id,
+                                revision: task.revision,
+                                isolated,
+                                next: (!first).then(|| next.to_owned()),
+                                origin: None,
+                            },
+                            send,
+                        );
+                    }
+                }
+            }
+            let archive = egui::Button::new(if task.archived {
+                "Восстановить"
+            } else {
+                "В архив"
+            });
+            if ui.add_enabled(available.edit, archive).clicked() {
+                self.request(
+                    Request::Archive {
+                        id: task.id,
+                        revision: task.revision,
+                        archived: !task.archived,
+                    },
+                    send,
+                );
+            }
+            ui.separator();
+            let delete =
+                egui::Button::new(RichText::new("Удалить…").color(tone_colors(ui, Tone::Error).1));
+            let delete = if queued {
+                ui.add_enabled(false, delete)
+                    .on_disabled_hover_text("Сначала снимите задачу с очереди")
+            } else {
+                ui.add_enabled(available.edit, delete)
+            };
+            if delete.clicked() {
+                self.confirm_delete = Some((task.id, task.revision));
+            }
+        });
+    }
+
+    fn composer_guards(
+        &self,
+        task: &Task,
+        available: &Availability,
+        backend: BackendKind,
+        next: &str,
+    ) -> ComposerGuards {
+        let dirty = task.runs.is_empty() && next != task.prompt;
+        let conflict = dirty
+            && self
+                .prompt_drafts
+                .get(&(task.project.clone(), task.id))
+                .is_some_and(|draft| draft.original != task.prompt);
+        let blocked = if conflict {
+            Some("Сравните изменения поручения в чате.")
+        } else if task.queue.is_some() {
+            Some("Задача в очереди. Управление — в параметрах.")
+        } else {
+            self.launch_block(task, backend, available, next)
+        };
+        ComposerGuards { dirty, conflict, blocked }
     }
 
     fn composer(
@@ -394,76 +781,86 @@ impl TasksView {
             && task.queue.is_none()
             && !task.archived
             && !matches!(task.status, TaskStatus::Accepted | TaskStatus::Deferred);
-        let submit = self.message_field(ui, task, next, !first || can_edit_prompt);
-        let dirty = first && next != &task.prompt;
-        let conflict = dirty
-            && self
-                .prompt_drafts
-                .get(&(task.project.clone(), task.id))
-                .is_some_and(|draft| draft.original != task.prompt);
-        let blocked = if conflict {
-            Some("Сравните изменения поручения в чате.")
-        } else if task.queue.is_some() {
-            Some("Задача в очереди. Управление — в параметрах.")
-        } else {
-            self.launch_block(task, backend, available, next)
-        };
         let button = if first { "Запустить" } else { "Отправить" };
-        let clicked = ui
-            .horizontal(|ui| {
-                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                    let clicked = primary_button(ui, blocked.is_none(), button)
-                        .on_disabled_hover_text(blocked.unwrap_or_default())
-                        .clicked();
-                    if dirty
-                        && ui
-                            .add_enabled(
-                                can_edit_prompt
-                                    && !conflict
-                                    && !next.trim().is_empty()
-                                    && next.len() <= 16384,
-                                egui::Button::new("Сохранить"),
-                            )
-                            .clicked()
-                    {
-                        self.request(
-                            Request::EditPrompt {
-                                id: task.id,
-                                revision: task.revision,
-                                prompt: next.clone(),
-                            },
-                            send,
-                        );
-                    }
-                    if inline_result && ui.button("Открыть результат").clicked() {
-                        self.result_view.select(result::Tab::Summary, Some(task.id));
-                    }
-                    let note = match blocked {
-                        Some("Введите сообщение агенту.") | None if !first => {
-                            if cfg!(target_os = "macos") {
-                                "⌘+Enter для отправки"
-                            } else {
-                                "Ctrl+Enter для отправки"
-                            }
+        let before = self.composer_guards(task, available, backend, next);
+        let frame = egui::Frame::new()
+            .fill(ui.visuals().panel_fill)
+            .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+            .corner_radius(12.0)
+            .inner_margin(COMPOSER_FRAME_MARGIN);
+        let row_height =
+            composer_row(ui, ui.available_width(), next, button, before.dirty, inline_result);
+        let (send_clicked, save_clicked, submit) = frame
+            .show(ui, |ui| {
+                ui.allocate_ui_with_layout(
+                    egui::vec2(ui.available_width(), row_height),
+                    Layout::right_to_left(Align::Max),
+                    |ui| {
+                        let send_clicked = primary_button(ui, before.blocked.is_none(), button)
+                            .on_disabled_hover_text(before.blocked.unwrap_or_default())
+                            .clicked();
+                        let save_clicked = before.dirty
+                            && ui
+                                .add_enabled(
+                                    can_edit_prompt
+                                        && !before.conflict
+                                        && !next.trim().is_empty()
+                                        && next.len() <= 16384,
+                                    egui::Button::new("Сохранить"),
+                                )
+                                .clicked();
+                        if inline_result && ui.button("Открыть результат").clicked()
+                        {
+                            self.result_view.select(result::Tab::Summary, Some(task.id));
                         }
-                        other => other.unwrap_or_default(),
-                    };
-                    if !note.is_empty() {
-                        ui.add_sized(
-                            [ui.available_width(), ui.spacing().interact_size.y],
-                            egui::Label::new(RichText::new(note).small().weak())
-                                .halign(Align::Min)
-                                .wrap(),
-                        )
-                        .on_hover_text(note);
-                    }
-                    clicked
-                })
+                        let field = ui.allocate_ui_with_layout(
+                            egui::vec2(ui.available_width(), row_height),
+                            egui::Layout {
+                                main_align: Align::Max,
+                                ..egui::Layout::top_down(Align::Min)
+                            },
+                            |ui| self.message_field(ui, task, next, !first || can_edit_prompt),
+                        );
+                        (send_clicked, save_clicked, field.inner)
+                    },
+                )
                 .inner
             })
             .inner;
-        if blocked.is_none()
-            && (clicked || submit)
+        let after = self.composer_guards(task, available, backend, next);
+        // A click can land in the same frame as the field changed the draft,
+        // so the fresh guards decide whether the save and the send actually fire.
+        if save_clicked
+            && after.dirty
+            && can_edit_prompt
+            && !after.conflict
+            && !next.trim().is_empty()
+            && next.len() <= 16384
+        {
+            self.request(
+                Request::EditPrompt { id: task.id, revision: task.revision, prompt: next.clone() },
+                send,
+            );
+        }
+        let note = match after.blocked {
+            Some("Введите сообщение агенту.") | None if !first => {
+                if cfg!(target_os = "macos") {
+                    "⌘+Enter для отправки"
+                } else {
+                    "Ctrl+Enter для отправки"
+                }
+            }
+            other => other.unwrap_or_default(),
+        };
+        if !note.is_empty() {
+            ui.add_sized(
+                [ui.available_width(), ui.spacing().interact_size.y],
+                egui::Label::new(RichText::new(note).small().weak()).halign(Align::Min).wrap(),
+            )
+            .on_hover_text(note);
+        }
+        if after.blocked.is_none()
+            && (send_clicked || submit)
             && let Some(scope) = self.scope.clone()
         {
             self.start_message(scope, task, next, send);
@@ -513,7 +910,7 @@ impl TasksView {
     ) -> bool {
         let editor = ui.make_persistent_id("task_message");
         let submit = shortcut(ui, editor);
-        let max_height = ui.text_style_height(&egui::TextStyle::Body) * 2.0 + 8.0;
+        let max_height = ui.text_style_height(&egui::TextStyle::Body) * 8.0 + 8.0;
         egui::ScrollArea::vertical()
             .id_salt("message_field")
             .min_scrolled_height(0.0)
@@ -531,9 +928,15 @@ impl TasksView {
                     egui::TextEdit::multiline(next)
                         .id(editor)
                         .desired_width(f32::INFINITY)
-                        .desired_rows(2)
+                        .desired_rows(1)
                         .char_limit(16384)
-                        .hint_text(hint),
+                        .hint_text(hint)
+                        // the composer frame owns the border, the field stays transparent
+                        .frame(
+                            egui::Frame::new()
+                                .fill(egui::Color32::TRANSPARENT)
+                                .inner_margin(COMPOSER_FIELD_MARGIN),
+                        ),
                 );
                 if let Some(r) = &mut self.reworking
                     && r.task == task.id
@@ -585,7 +988,7 @@ impl TasksView {
             self.rules.saved.workflow.as_ref().filter(|p| p.implementer.name() == task.backend)
         {
             ui.label(format!(
-                "{} → {} → ревью {}",
+                "{} › {} › ревью {}",
                 plan.implementer.name(),
                 plan.command,
                 plan.reviewer.name()
@@ -594,20 +997,26 @@ impl TasksView {
         if ui.button("Правила проекта").clicked() {
             self.page = Page::Rules;
         }
-        ui.collapsing("Контекст следующего запуска", |ui| {
-            ui.label(format!("Поручение хаба · r{} · {}", task.revision, task.backend));
-            ui.small("Каждый запуск создаёт новую CLI-сессию с сохранёнными правилами и контекстом задачи.");
-            let mut preview;
-            let task = if task.runs.is_empty() && next != task.prompt {
-                preview = task.clone();
-                next.clone_into(&mut preview.prompt);
-                &preview
-            } else { task };
-            match task.preview_with_rules((!task.runs.is_empty()).then_some(next), &self.rules.saved) {
-                Ok(text) => { ui.add(egui::Label::new(text).wrap().selectable(true)); }
-                Err(error) => { ui.label(error); }
-            }
-        });
+        // The «…» menu can ask to land here with the context already open.
+        let open_context = self.result_view.take_context_open();
+        egui::CollapsingHeader::new("Контекст следующего запуска")
+            .open(open_context.then_some(true))
+            .show(ui, |ui| {
+                ui.label(format!("Поручение хаба · r{} · {}", task.revision, task.backend));
+                ui.small("Каждый запуск создаёт новую CLI-сессию с сохранёнными правилами и контекстом задачи.");
+                let mut preview;
+                let task = if task.runs.is_empty() && next != task.prompt {
+                    preview = task.clone();
+                    next.clone_into(&mut preview.prompt);
+                    &preview
+                } else { task };
+                match task
+                    .preview_with_rules((!task.runs.is_empty()).then_some(next), &self.rules.saved)
+                {
+                    Ok(text) => { ui.add(egui::Label::new(text).wrap().selectable(true)); }
+                    Err(error) => { ui.label(error); }
+                }
+            });
         self.show_queue_controls(ui, task, next, send);
         ui.collapsing("Управление задачей", |ui| {
             self.workflow_controls(ui, task, !available.edit, send);

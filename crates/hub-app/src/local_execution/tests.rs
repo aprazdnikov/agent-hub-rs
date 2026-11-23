@@ -4,6 +4,10 @@ use hub_core::{
     domain::{Finished, SessionId, Usage},
     tasks::TaskBook,
 };
+
+fn ts() -> jiff::Timestamp {
+    jiff::Timestamp::from_second(1_700_000_000).unwrap()
+}
 struct Store(TaskBook);
 impl TaskStorage for Store {
     fn load_tasks(&mut self) -> Result<TaskBook, String> {
@@ -667,7 +671,7 @@ fn result_file_survives_project_removal_and_reopening_task_store() {
     let id = book.create(project.path().into(), "codex", "Отчёт", "Сохранить").unwrap();
     store.save_tasks(&book).unwrap();
     let service = Arc::new(TaskService::new(Box::new(store)));
-    let run = service.access(Access::Internal, |book, _| book.begin(id, 1, None)).unwrap();
+    let run = service.access(Access::Internal, |book, _| book.begin(id, 1, None, ts())).unwrap();
     let target = files::FileTarget {
         service: service.clone(),
         task: id,

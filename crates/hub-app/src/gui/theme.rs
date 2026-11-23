@@ -100,6 +100,107 @@ pub fn surface(ui: &egui::Ui) -> egui::Frame {
     egui::Frame::group(ui.style()).fill(ui.visuals().panel_fill).inner_margin(20).corner_radius(10)
 }
 
+/// Semantic color pair for status surfaces; resolved per active theme.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum Tone {
+    Accent,
+    Warning,
+    Error,
+    Neutral,
+}
+
+/// warning bg `58,49,32` / fg `229,192,123` in dark, `251,240,220` / `138,90,0` in light.
+pub(super) fn warning(ui: &egui::Ui) -> (Color32, Color32) {
+    if ui.visuals().dark_mode {
+        (Color32::from_rgb(58, 49, 32), Color32::from_rgb(229, 192, 123))
+    } else {
+        (Color32::from_rgb(251, 240, 220), Color32::from_rgb(138, 90, 0))
+    }
+}
+
+/// review ring `229,192,123` in dark, `183,121,31` in light.
+pub(super) fn review_color(ui: &egui::Ui) -> Color32 {
+    if ui.visuals().dark_mode {
+        Color32::from_rgb(229, 192, 123)
+    } else {
+        Color32::from_rgb(183, 121, 31)
+    }
+}
+
+/// (bg, fg) for a status tone; also the single source for diff line colors in `tasks/result.rs`.
+pub(super) fn tone_colors(ui: &egui::Ui, tone: Tone) -> (Color32, Color32) {
+    let visuals = ui.visuals();
+    match tone {
+        Tone::Accent => (visuals.selection.bg_fill, visuals.hyperlink_color),
+        Tone::Warning => warning(ui),
+        Tone::Error => (
+            visuals.extreme_bg_color,
+            if visuals.dark_mode {
+                Color32::from_rgb(253, 166, 160)
+            } else {
+                Color32::from_rgb(148, 49, 47)
+            },
+        ),
+        Tone::Neutral => (visuals.extreme_bg_color, visuals.weak_text_color()),
+    }
+}
+
+/// Status capsule: small text on the tone background.
+pub(super) fn chip(ui: &mut egui::Ui, tone: Tone, text: &str) -> egui::Response {
+    let (bg, fg) = tone_colors(ui, tone);
+    egui::Frame::new()
+        .fill(bg)
+        .corner_radius(egui::CornerRadius::same(255))
+        .inner_margin(CHIP_MARGIN)
+        .show(ui, |ui| {
+            ui.add(egui::Label::new(egui::RichText::new(text).small().color(fg)).selectable(false))
+        })
+        .inner
+}
+
+const CHIP_MARGIN: egui::Margin = egui::Margin::symmetric(9, 2);
+
+/// Width a [`chip`] takes for this text, so a neighbour can truncate instead of
+/// pushing the chip out of the row. Must stay in sync with [`chip`].
+#[must_use]
+pub(super) fn chip_width(ui: &egui::Ui, text: &str) -> f32 {
+    let job = egui::WidgetText::from(egui::RichText::new(text).small()).into_layout_job(
+        ui.style(),
+        egui::FontSelection::Default,
+        egui::Align::Min,
+    );
+    let text_width =
+        ui.fonts_mut(|fonts| fonts.layout_job(std::sync::Arc::unwrap_or_clone(job))).size().x;
+    text_width + 2.0 * f32::from(CHIP_MARGIN.left)
+}
+
+pub(super) fn card(ui: &egui::Ui) -> egui::Frame {
+    egui::Frame::new()
+        .fill(ui.visuals().panel_fill)
+        .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+        .corner_radius(10)
+        .inner_margin(egui::Margin::symmetric(14, 12))
+}
+
+pub(super) fn bubble(ui: &egui::Ui, user: bool) -> egui::Frame {
+    // The 4px corner at the sender's lower edge reads as the bubble tail (design spec «Чат задачи»).
+    let corner_radius = if user {
+        egui::CornerRadius { nw: 12, ne: 12, sw: 12, se: 4 }
+    } else {
+        egui::CornerRadius { nw: 12, ne: 12, sw: 4, se: 12 }
+    };
+    let frame = egui::Frame::new()
+        .corner_radius(corner_radius)
+        .inner_margin(egui::Margin::symmetric(12, 9));
+    if user {
+        frame.fill(ui.visuals().selection.bg_fill)
+    } else {
+        frame
+            .fill(ui.visuals().panel_fill)
+            .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -140,6 +241,92 @@ mod tests {
                 })
                 .unwrap();
             assert!(rect.shrink2(egui::vec2(8.0, 4.0)).contains_rect(label));
+        }
+    }
+
+    #[test]
+    fn bubble_frames_have_a_small_tail_corner_at_the_sender_side() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            let user = bubble(ui, true);
+            assert_eq!(user.corner_radius, egui::CornerRadius { nw: 12, ne: 12, sw: 12, se: 4 });
+            let agent = bubble(ui, false);
+            assert_eq!(agent.corner_radius, egui::CornerRadius { nw: 12, ne: 12, sw: 4, se: 12 });
+        });
+        output.textures_delta.clear();
+    }
+
+    #[test]
+    fn status_tokens_have_dark_variants_and_chips_render() {
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let mut warning_pairs = Vec::new();
+        let mut error_fgs = Vec::new();
+        let mut review_colors = Vec::new();
+        for theme in [Theme::Light, Theme::Dark] {
+            let mut output = ctx.run_ui(
+                egui::RawInput { system_theme: Some(theme), ..Default::default() },
+                |ui| {
+                    let (bg, fg) = tone_colors(ui, Tone::Warning);
+                    assert_ne!(bg, fg);
+                    warning_pairs.push((bg, fg));
+                    assert_ne!(tone_colors(ui, Tone::Accent).0, tone_colors(ui, Tone::Accent).1);
+                    assert_ne!(tone_colors(ui, Tone::Neutral).0, tone_colors(ui, Tone::Neutral).1);
+                    error_fgs.push(tone_colors(ui, Tone::Error).1);
+                    review_colors.push(review_color(ui));
+                    assert!(chip(ui, Tone::Warning, "Нужна проверка").rect.width() > 0.0);
+                    card(ui).show(ui, |ui| {
+                        ui.label("карточка");
+                    });
+                    bubble(ui, true).show(ui, |ui| {
+                        ui.label("вы");
+                    });
+                    bubble(ui, false).show(ui, |ui| {
+                        ui.label("агент");
+                    });
+                },
+            );
+            output.textures_delta.clear();
+        }
+        assert_ne!(warning_pairs[0], warning_pairs[1], "warning token needs a dark variant");
+        assert_ne!(error_fgs[0], error_fgs[1], "error token needs a dark variant");
+        assert_ne!(review_colors[0], review_colors[1], "review ring needs a dark variant");
+    }
+
+    #[test]
+    fn gui_labels_use_only_covered_glyphs() {
+        // egui draws a character with no glyph in the installed font as the box '◻'.
+        // The bundled proportional family lacks several symbols, so any label using one
+        // showed that square; the GUI switched those labels to covered equivalents:
+        // '⚠'→'!', '✓'→'√', '→'→'›', '←'→'‹', '⋯'→'…', '▶'→'⏵'.
+        // This pins the font coverage behind that swap: the glyphs now in labels must be
+        // covered, and the removed ones must stay uncovered (so they are never reintroduced).
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let used =
+            ['…', '›', '‹', '√', '⏵', '⏹', '!', '?', '·', '№', '⌘', '«', '»', '–', '—', '•', '○'];
+        // '●' was tried for the topics icon plate and found uncovered; the plate uses '•'.
+        let removed = ['⚠', '✓', '→', '←', '⋯', '▶', '●'];
+        let drawn: String = used.iter().copied().collect();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.label(drawn.as_str());
+        });
+        output.textures_delta.clear();
+        let font = egui::FontId::proportional(14.0);
+        for ch in used {
+            assert!(
+                ctx.fonts_mut(|fonts| fonts.has_glyph(&font, ch)),
+                "label glyph {ch} (U+{:04X}) is missing from the proportional font",
+                u32::from(ch),
+            );
+        }
+        for ch in removed {
+            assert!(
+                !ctx.fonts_mut(|fonts| fonts.has_glyph(&font, ch)),
+                "{ch} (U+{:04X}) has no glyph and was replaced; keep it out of GUI labels",
+                u32::from(ch),
+            );
         }
     }
 

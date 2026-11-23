@@ -332,7 +332,7 @@ fn disabled_override(output: &str) -> Result<bool, String> {
 fn authorization_state(output: &str) -> State {
     match output.trim() {
         "enabled" | "legacy" => State::Enabled,
-        "requires-approval" => State::NeedsAttention("Разрешите Agent Hub в Системных настройках macOS → Основные → Объекты входа → Разрешить в фоновом режиме, затем обновите состояние.".to_owned()),
+        "requires-approval" => State::NeedsAttention("Разрешите Agent Hub в Системных настройках macOS › Основные › Объекты входа › Разрешить в фоновом режиме, затем обновите состояние.".to_owned()),
         "not-registered" | "not-found" => State::NeedsAttention("macOS не подтвердила регистрацию автозапуска. Проверьте Объекты входа в Системных настройках и включите автозапуск заново.".to_owned()),
         _ => State::NeedsAttention("macOS вернула неизвестное разрешение автозапуска. Обновите состояние и проверьте Объекты входа в Системных настройках.".to_owned()),
     }

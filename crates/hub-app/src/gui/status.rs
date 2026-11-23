@@ -45,7 +45,7 @@ pub fn show(ui: &mut egui::Ui, snapshot: &Snapshot, unsaved: bool, send: &mut im
                     BotStatus::Stopped | BotStatus::Failed(_) => (true, false),
                     BotStatus::Starting | BotStatus::Running { .. } | BotStatus::Retrying { .. } => (false, true),
                 };
-                if ui.add_enabled(start, egui::Button::new("▶ Запустить")).clicked() {
+                if ui.add_enabled(start, egui::Button::new("⏵ Запустить")).clicked() {
                     send(Command::Start);
                 }
                 if ui.add_enabled(stop, egui::Button::new("⏹ Остановить")).clicked() {

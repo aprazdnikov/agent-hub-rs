@@ -69,6 +69,9 @@ pub enum Command {
         key: TopicKey,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    SyncTopics {
+        reply: oneshot::Sender<Result<String, String>>,
+    },
     Quit(oneshot::Sender<()>),
 }
 
@@ -725,6 +728,18 @@ impl<C: Connector> Supervisor<C> {
                     let _ = reply.send(Err("Для удаления темы запустите бота.".into()));
                 }
             }
+            Command::SyncTopics { reply } => {
+                if let Some(mailbox) = self.mailbox() {
+                    if let Err(error) = mailbox.try_send(HubMessage::SyncTopics { reply })
+                        && let HubMessage::SyncTopics { reply } = error.into_inner()
+                    {
+                        let _ = reply
+                            .send(Err("Бот занят или остановлен. Повторите синхронизацию.".into()));
+                    }
+                } else {
+                    let _ = reply.send(Err("Для синхронизации тем запустите бота.".into()));
+                }
+            }
             Command::ResetTopic(key) => tell(self.mailbox(), HubMessage::Reset(key)).await,
             Command::Quit(done) => {
                 // `run` handles Quit before dispatching here.
@@ -1165,8 +1180,10 @@ mod tests {
                             HubMessage::Reset(key) => {
                                 format!("reset {}/{}", key.chat.0, key.thread.0)
                             }
+                            HubMessage::SyncTopics { .. } => "sync".to_owned(),
                             HubMessage::DeleteTopic { .. }
                             | HubMessage::DeletionDone(_)
+                            | HubMessage::SyncDone(_)
                             | HubMessage::TaskResultUnavailable { .. }
                             | HubMessage::Tasks { .. }
                             | HubMessage::SharedTasks { .. }
@@ -2204,6 +2221,31 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(*harness.probe.messages.lock().unwrap(), ["stop -100/7", "reset -100/7"]);
+    }
+
+    #[tokio::test]
+    async fn sync_command_reaches_the_hub() {
+        let mut harness = harness(Ok(Loaded::Ready(settings("-100", ""))), &[], false);
+        harness.until("running", running).await;
+        let (reply, result) = oneshot::channel();
+        harness.send(Command::SyncTopics { reply }).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while harness.probe.messages.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*harness.probe.messages.lock().unwrap(), ["sync"]);
+        drop(result);
+    }
+
+    #[tokio::test]
+    async fn sync_command_without_bot_reports_error() {
+        let harness = harness(Ok(Loaded::Missing), &[], true);
+        let (reply, result) = oneshot::channel();
+        harness.send(Command::SyncTopics { reply }).await;
+        assert!(result.await.expect("sync reply").unwrap_err().contains("запустите бота"));
     }
 
     #[tokio::test]

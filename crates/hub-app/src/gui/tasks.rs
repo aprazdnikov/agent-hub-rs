@@ -39,7 +39,7 @@ enum Effect {
     StartAfterPrompt { id: u64, rules_revision: u64, review: bool },
     Review { id: u64, follow: bool },
 }
-#[derive(Default, PartialEq, Eq)]
+#[derive(Debug, Default, PartialEq, Eq)]
 enum Page {
     #[default]
     Task,
@@ -95,6 +95,25 @@ enum LocalBlock {
 struct Availability {
     edit: bool,
     launch: bool,
+}
+#[derive(Clone, Copy)]
+enum QueueBlock {
+    SavePrompt,
+    NeedStep,
+    RulesDirty,
+    Busy,
+}
+impl QueueBlock {
+    fn label(self) -> &'static str {
+        match self {
+            Self::SavePrompt => "Сохраните поручение в чате перед постановкой в очередь.",
+            Self::NeedStep => {
+                "Чтобы поставить продолжение в очередь, введите следующий шаг в чате (до 16 КиБ)."
+            }
+            Self::RulesDirty => "Сначала сохраните правила проекта перед постановкой в очередь.",
+            Self::Busy => "Дождитесь завершения текущего изменения.",
+        }
+    }
 }
 // Changing the executor or memory policy preserves the message being composed.
 // Normalize legacy ownership on copies so future Run fields participate in equality too.
@@ -518,28 +537,28 @@ impl TasksView {
             }
             let current = (task.id, task.revision);
             if self.confirm_delete == Some(current) {
-                ui.label(format!(
-                    "Удалить задачу #{} «{}» вместе с перепиской и вложениями?",
-                    task.id, task.title
-                ));
-                ui.horizontal(|ui| {
-                    if ui.button("Отмена").clicked() {
-                        self.confirm_delete = None;
-                    }
-                    if ui.button("Удалить безвозвратно").clicked() {
-                        self.confirm_delete = None;
-                        self.request(
-                            Request::Delete { id: task.id, revision: task.revision },
-                            send,
-                        );
-                    }
-                });
+                self.delete_confirm(ui, task, send);
             } else if ui
                 .add_enabled(task.queue.is_none(), egui::Button::new("Удалить задачу"))
                 .on_disabled_hover_text("Сначала снимите задачу с очереди")
                 .clicked()
             {
                 self.confirm_delete = Some(current);
+            }
+        });
+    }
+    fn delete_confirm(&mut self, ui: &mut egui::Ui, task: &Task, send: &mut impl FnMut(Command)) {
+        ui.label(format!(
+            "Удалить задачу #{} «{}» вместе с перепиской и вложениями?",
+            task.id, task.title
+        ));
+        ui.horizontal(|ui| {
+            if ui.button("Отмена").clicked() {
+                self.confirm_delete = None;
+            }
+            if ui.button("Удалить безвозвратно").clicked() {
+                self.confirm_delete = None;
+                self.request(Request::Delete { id: task.id, revision: task.revision }, send);
             }
         });
     }
@@ -617,6 +636,40 @@ impl TasksView {
         });
         ui.add_space(8.0);
     }
+    /// Why a queued action is not available right now, shared by the Parameters
+    /// queue block and the chat «…» menu so both offer the same conditions.
+    fn queue_offer(
+        &self,
+        task: &Task,
+        next: &str,
+    ) -> Vec<(bool, &'static str, Option<QueueBlock>)> {
+        if task.active()
+            || task.archived
+            || !matches!(task.status, TaskStatus::Planned | TaskStatus::NeedsReview)
+        {
+            return Vec::new();
+        }
+        let first = task.runs.is_empty();
+        let block = if first && next != task.prompt {
+            Some(QueueBlock::SavePrompt)
+        } else if next.trim().is_empty() || next.len() > 16384 {
+            Some(QueueBlock::NeedStep)
+        } else if self.rules.dirty() {
+            Some(QueueBlock::RulesDirty)
+        } else if self.mutation_pending() {
+            Some(QueueBlock::Busy)
+        } else {
+            None
+        };
+        [(false, "В очередь"), (true, "В очередь в отдельном worktree")]
+            .into_iter()
+            .filter(|(isolated, _)| {
+                (first || *isolated == task.isolated)
+                    && (!*isolated || self.rules.saved.git.is_none())
+            })
+            .map(|(isolated, label)| (isolated, label, block))
+            .collect()
+    }
     fn show_queue_controls(
         &mut self,
         ui: &mut egui::Ui,
@@ -624,7 +677,6 @@ impl TasksView {
         next: &str,
         send: &mut impl FnMut(Command),
     ) {
-        let first = task.runs.is_empty();
         if let Some(q) = &task.queue {
             ui.label(q.error.clone().unwrap_or_else(|| format!("В очереди · №{}", q.sequence)));
             if ui.button("Снять с очереди").clicked() {
@@ -632,42 +684,29 @@ impl TasksView {
             }
             return;
         }
-        if !task.active()
-            && !task.archived
-            && matches!(task.status, TaskStatus::Planned | TaskStatus::NeedsReview)
+        let first = task.runs.is_empty();
+        let offers = self.queue_offer(task, next);
+        if let Some(block) = offers.first().and_then(|(_, _, block)| *block)
+            && matches!(block, QueueBlock::SavePrompt | QueueBlock::NeedStep)
         {
-            let valid_step =
-                !next.trim().is_empty() && next.len() <= 16384 && (!first || next == task.prompt);
-            let ready = valid_step && !self.rules.dirty() && !self.mutation_pending();
-            if first && next != task.prompt {
-                ui.small("Сохраните поручение в чате перед постановкой в очередь.");
-            } else if !valid_step {
-                ui.small("Чтобы поставить продолжение в очередь, введите следующий шаг в чате (до 16 КиБ).");
-            }
-            ui.horizontal_wrapped(|ui| {
-                for (isolated, label) in
-                    [(false, "В очередь"), (true, "В очередь в отдельном worktree")]
-                {
-                    if (!first && isolated != task.isolated)
-                        || (isolated && self.rules.saved.git.is_some())
-                    {
-                        continue;
-                    }
-                    if ui.add_enabled(ready, egui::Button::new(label)).clicked() {
-                        self.request(
-                            Request::Queue {
-                                id: task.id,
-                                revision: task.revision,
-                                isolated,
-                                next: (!first).then(|| next.to_owned()),
-                                origin: None,
-                            },
-                            send,
-                        );
-                    }
-                }
-            });
+            ui.small(block.label());
         }
+        ui.horizontal_wrapped(|ui| {
+            for (isolated, label, block) in offers {
+                if ui.add_enabled(block.is_none(), egui::Button::new(label)).clicked() {
+                    self.request(
+                        Request::Queue {
+                            id: task.id,
+                            revision: task.revision,
+                            isolated,
+                            next: (!first).then(|| next.to_owned()),
+                            origin: None,
+                        },
+                        send,
+                    );
+                }
+            }
+        });
     }
     fn launch_block(
         &self,
@@ -727,6 +766,9 @@ mod tests {
     use hub_core::domain::{AbsolutePath, ChatId, ThreadId, TopicSession};
     use hub_core::tasks::RunState;
     use hub_telegram::hub::{TopicState, TopicView};
+    fn ts() -> jiff::Timestamp {
+        jiff::Timestamp::from_second(1_700_000_000).unwrap()
+    }
     fn test_project() -> PathBuf {
         hub_telegram::paths::workspace_root(&std::env::temp_dir()).unwrap().as_path().to_owned()
     }
@@ -752,6 +794,23 @@ mod tests {
         });
         output.textures_delta.clear();
     }
+    fn sized_frame(
+        ctx: &egui::Context,
+        view: &mut TasksView,
+        snapshot: &Snapshot,
+        screen: egui::Rect,
+        events: Vec<egui::Event>,
+        commands: &mut Vec<Command>,
+    ) -> egui::FullOutput {
+        let mut output = ctx.run_ui(
+            egui::RawInput { screen_rect: Some(screen), events, ..Default::default() },
+            |ui| {
+                view.show(ui, snapshot, &mut |command| commands.push(command));
+            },
+        );
+        output.textures_delta.clear();
+        output
+    }
     fn input_frame(
         ctx: &egui::Context,
         view: &mut TasksView,
@@ -759,21 +818,14 @@ mod tests {
         events: Vec<egui::Event>,
         commands: &mut Vec<Command>,
     ) -> egui::FullOutput {
-        let mut output = ctx.run_ui(
-            egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(1000.0, 900.0),
-                )),
-                events,
-                ..Default::default()
-            },
-            |ui| {
-                view.show(ui, snapshot, &mut |command| commands.push(command));
-            },
-        );
-        output.textures_delta.clear();
-        output
+        sized_frame(
+            ctx,
+            view,
+            snapshot,
+            egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 900.0)),
+            events,
+            commands,
+        )
     }
     fn labels(output: &egui::FullOutput) -> Vec<&str> {
         output
@@ -798,9 +850,17 @@ mod tests {
             .shapes
             .iter()
             .find_map(|shape| match &shape.shape {
-                egui::Shape::Text(label) if label.galley.text() == text => {
-                    Some(label.galley.rect.translate(label.pos.to_vec2()).center())
-                }
+                // A label continued on a wrapped row owns only its first row without
+                // the leading indentation, so that is the rect a real click would hit.
+                egui::Shape::Text(label) if label.galley.text() == text => Some(
+                    label
+                        .galley
+                        .rows
+                        .first()?
+                        .rect_without_leading_space()
+                        .translate(label.pos.to_vec2())
+                        .center(),
+                ),
                 _ => None,
             })
             .unwrap_or_else(|| panic!("missing text: {text}"));
@@ -827,9 +887,9 @@ mod tests {
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut book = hub_core::tasks::TaskBook::default();
         let id = book.create(project.clone(), "qwen", "Проверка чата", "Исходный вопрос").unwrap();
-        book.begin(id, 1, None).unwrap();
+        book.begin(id, 1, None, ts()).unwrap();
         book.record(id, 1, "Ответ агента").unwrap();
-        book.finish(id, 1, RunState::Completed).unwrap();
+        book.finish(id, 1, RunState::Completed, ts()).unwrap();
         let snapshot = Snapshot {
             bot: BotStatus::Running { username: "bot".into() },
             topics: vec![topic(key)],
@@ -845,6 +905,261 @@ mod tests {
             ..Default::default()
         };
         (book, id, snapshot, view)
+    }
+
+    fn looks_like_clock(text: &str) -> bool {
+        let bytes = text.as_bytes();
+        bytes.len() == 5
+            && bytes[0].is_ascii_digit()
+            && bytes[1].is_ascii_digit()
+            && bytes[2] == b':'
+            && bytes[3].is_ascii_digit()
+            && bytes[4].is_ascii_digit()
+    }
+
+    fn has_clock(labels: &[&str]) -> bool {
+        labels.iter().any(|label| looks_like_clock(label))
+    }
+
+    fn text_rect_containing(output: &egui::FullOutput, needle: &str) -> Option<egui::Rect> {
+        output.shapes.iter().find_map(|shape| match &shape.shape {
+            egui::Shape::Text(text) if text.galley.text().contains(needle) => {
+                Some(text.galley.rect.translate(text.pos.to_vec2()))
+            }
+            _ => None,
+        })
+    }
+
+    fn clock_rects(output: &egui::FullOutput) -> Vec<egui::Rect> {
+        let mut clocks: Vec<(f32, egui::Rect)> = output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(text) if looks_like_clock(text.galley.text()) => {
+                    Some((text.pos.y, text.galley.rect.translate(text.pos.to_vec2())))
+                }
+                _ => None,
+            })
+            .collect();
+        clocks.sort_by(|a, b| a.0.total_cmp(&b.0));
+        clocks.into_iter().map(|(_, rect)| rect).collect()
+    }
+
+    fn gradient_fades(output: &egui::FullOutput) -> Vec<(egui::Rect, [egui::Color32; 2])> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Mesh(mesh) if mesh.vertices.len() >= 4 => {
+                    let bounds = egui::Rect::from_points(
+                        &mesh.vertices.iter().map(|vertex| vertex.pos).collect::<Vec<_>>(),
+                    );
+                    let colors = [mesh.vertices[0].color, mesh.vertices[2].color];
+                    (!bounds.is_negative()).then_some((bounds, colors))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn clamped_agent_answer_fades_and_expanding_removes_the_fade() {
+        let (_, _, snapshot, mut view) = review_fixture();
+        view.tasks[0].runs[0].result = (1..=12)
+            .map(|n| format!("Строка {n} — развёрнутый абзац ответа агента для проверки затухания"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let surface = ctx.style_of(ctx.theme()).visuals.panel_fill;
+        let body = text_rect_containing(&out, "Строка 8").unwrap();
+        assert!(body.width() > 200.0, "long lines make the clamped body wide");
+        let fades: Vec<(egui::Rect, [egui::Color32; 2])> = gradient_fades(&out)
+            .into_iter()
+            .filter(|(bounds, _)| (bounds.bottom() - body.bottom()).abs() <= 2.0)
+            .collect();
+        assert_eq!(fades.len(), 1, "one gradient band over the clamped body bottom");
+        assert_eq!(
+            fades[0].1,
+            [egui::Color32::TRANSPARENT, surface],
+            "transparent fades to surface"
+        );
+        assert!(fades[0].0.height() <= 27.0, "the band stays inside the mockup's 26px");
+        click_text(&ctx, &mut view, &snapshot, "Развернуть", &mut commands);
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert!(gradient_fades(&out).is_empty(), "an expanded answer has no fade band");
+    }
+
+    #[test]
+    fn bubble_time_sits_at_the_right_edge_of_its_header() {
+        let (_, _, snapshot, mut view) = review_fixture();
+        view.tasks[0].runs[0].started_at = Some(ts());
+        view.tasks[0].runs[0].finished_at = Some(ts());
+        view.tasks[0].runs[0].result = (1..=12)
+            .map(|n| format!("Строка {n} — развёрнутый абзац ответа агента для проверки затухания"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let clocks = clock_rects(&out);
+        assert_eq!(clocks.len(), 2, "one clock per bubble header");
+        let step = text_rect_containing(&out, "Исходный вопрос").unwrap();
+        let body = text_rect_containing(&out, "Строка 8").unwrap();
+        assert!(
+            (clocks[0].max.x - step.max.x).abs() <= 2.0,
+            "the user clock sits flush with the step text edge: {clocks:?} {step:?}"
+        );
+        assert!(
+            (clocks[1].max.x - body.max.x).abs() <= 2.0,
+            "the agent clock sits flush with the answer body edge: {clocks:?} {body:?}"
+        );
+    }
+
+    #[test]
+    fn long_agent_answer_collapses_and_expands_by_click() {
+        let (_, _, snapshot, mut view) = review_fixture();
+        view.tasks[0].runs[0].result =
+            (1..=12).map(|n| format!("Строка {n}")).collect::<Vec<_>>().join("\n");
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert!(labels(&out).contains(&"Развернуть"), "long answers start collapsed");
+        assert!(!labels(&out).contains(&"Свернуть"));
+        assert!(labels(&out).iter().any(|label| label.contains("Строка 8")));
+        assert!(!labels(&out).iter().any(|label| label.contains("Строка 12")));
+        click_text(&ctx, &mut view, &snapshot, "Развернуть", &mut commands);
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert!(labels(&out).contains(&"Свернуть"), "clicking expands and offers to collapse");
+        assert!(labels(&out).iter().any(|label| label.contains("Строка 12")));
+        click_text(&ctx, &mut view, &snapshot, "Свернуть", &mut commands);
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert!(labels(&out).contains(&"Развернуть"), "collapsing returns the clamped body");
+        assert!(!labels(&out).iter().any(|label| label.contains("Строка 12")));
+    }
+
+    #[test]
+    fn bubbles_show_role_and_time_only_when_known() {
+        let (_, _, snapshot, mut view) = review_fixture();
+        view.tasks[0].runs[0].started_at = None;
+        view.tasks[0].runs[0].finished_at = None;
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let texts = labels(&out);
+        assert!(texts.contains(&"Вы"), "user bubble header names the role");
+        assert!(texts.contains(&"qwen"), "agent bubble header names the backend");
+        assert!(!has_clock(&texts), "unknown times must not render");
+        drop(texts);
+        view.tasks[0].runs[0].started_at = Some(ts());
+        view.tasks[0].runs[0].finished_at = Some(ts());
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let texts = labels(&out);
+        assert!(has_clock(&texts), "known dates render local HH:MM");
+    }
+
+    #[test]
+    fn result_link_only_on_latest_reviewable_run() {
+        let (mut book, id, snapshot, mut view) = review_fixture();
+        let revision = view.tasks[0].revision;
+        let second = book.begin(id, revision, Some("Второй шаг"), ts()).unwrap();
+        book.record(id, second, "Ответ второго запуска").unwrap();
+        book.finish(id, second, RunState::Completed, ts()).unwrap();
+        view.tasks = book.tasks().to_vec();
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let texts = labels(&out);
+        assert_eq!(
+            texts.iter().filter(|label| **label == "Результат ›").count(),
+            1,
+            "only the latest reviewable run links to its result"
+        );
+    }
+
+    #[test]
+    fn chat_survives_compact_window_with_inline_result() {
+        let (_, _, snapshot, mut view) = review_fixture();
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 300.0));
+        let out = sized_frame(&ctx, &mut view, &snapshot, screen, vec![], &mut commands);
+        let texts = labels(&out);
+        assert!(texts.contains(&"Открыть результат"), "inline result mode survives compact mode");
+        assert!(
+            texts.contains(&"Вы") && texts.contains(&"qwen"),
+            "bubble headers survive compact mode"
+        );
+    }
+
+    #[test]
+    fn composer_field_grows_with_text_up_to_eight_lines() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let (_, _, snapshot, mut view) = review_fixture();
+        let mut commands = Vec::new();
+        let style = ctx.style_of(ctx.theme());
+        let panel_fill = style.visuals.panel_fill;
+        let body_font = style.text_styles.get(&egui::TextStyle::Body).cloned().expect("body font");
+        let composer_height = |view: &mut TasksView, commands: &mut Vec<Command>| {
+            let output = input_frame(&ctx, view, &snapshot, vec![], commands);
+            let mut frames = output.shapes.iter().filter_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect)
+                    if rect.fill == panel_fill
+                        && (rect.stroke.width - 1.0).abs() < 0.01
+                        && rect.corner_radius == egui::CornerRadius::same(12) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            });
+            let frame = frames.next().expect("composer frame");
+            assert!(frames.next().is_none(), "exactly one composer frame");
+            frame.height()
+        };
+        click_text(&ctx, &mut view, &snapshot, "Сообщение агенту", &mut commands);
+        let one = composer_height(&mut view, &mut commands);
+        let body_line = ctx.fonts_mut(|fonts| fonts.row_height(&body_font));
+        input_frame(
+            &ctx,
+            &mut view,
+            &snapshot,
+            vec![egui::Event::Text("первая\nвторая\nтретья".into())],
+            &mut commands,
+        );
+        let three = composer_height(&mut view, &mut commands);
+        assert!(three > one, "the field grows with the text: {one} -> {three}");
+        input_frame(
+            &ctx,
+            &mut view,
+            &snapshot,
+            vec![
+                egui::Event::Key {
+                    key: egui::Key::A,
+                    physical_key: None,
+                    pressed: true,
+                    repeat: false,
+                    modifiers: egui::Modifiers::COMMAND,
+                },
+                egui::Event::Text(
+                    (1..=20).map(|n| format!("строка {n}")).collect::<Vec<_>>().join("\n"),
+                ),
+            ],
+            &mut commands,
+        );
+        let many = composer_height(&mut view, &mut commands);
+        assert!(many > three, "eight lines is taller than three");
+        assert!(
+            many <= body_line * 8.0 + 22.0 + 2.0,
+            "the composer stops growing at eight lines: {many} > {}",
+            body_line * 8.0 + 22.0 + 2.0
+        );
+        assert!(
+            many >= body_line * 8.0 + 14.0,
+            "the cap is eight lines, not fewer: {many} < {}",
+            body_line * 8.0 + 14.0
+        );
     }
 
     #[test]
@@ -915,7 +1230,7 @@ mod tests {
             assert_eq!((requested, next.as_deref()), (id, Some("Проверьте итог")));
             assert!(!view.take_inbox_return());
             if succeeds {
-                book.begin(id, revision, next.as_deref()).unwrap();
+                book.begin(id, revision, next.as_deref(), ts()).unwrap();
                 reply
                     .send(Ok(TaskSnapshot { tasks: book.tasks().to_vec(), ..Default::default() }))
                     .unwrap();
@@ -1000,6 +1315,234 @@ mod tests {
         assert!(commands.is_empty());
     }
 
+    fn new_task_topic_form() -> (Snapshot, TasksView) {
+        let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
+        let snapshot = Snapshot {
+            bot: BotStatus::Running { username: "bot".into() },
+            topics: vec![topic(key)],
+            ..Default::default()
+        };
+        let view = TasksView {
+            page: Page::New,
+            selected: Some(key),
+            scope: Some((Some(key), test_project(), BackendKind::Qwen)),
+            refreshed: Some(Instant::now()),
+            ..Default::default()
+        };
+        (snapshot, view)
+    }
+
+    #[test]
+    fn new_task_title_field_is_visible_without_expanding() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let (snapshot, mut view) = new_task_topic_form();
+        let mut commands = Vec::new();
+        let output = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let texts = labels(&output);
+        assert!(
+            !texts.contains(&"Название задачи"),
+            "the title must not hide behind a collapsing header"
+        );
+        assert!(
+            texts.contains(&"По умолчанию — первая строка поручения"),
+            "the optional title hint must render without any expanding"
+        );
+    }
+
+    #[test]
+    fn new_task_prompt_grows_with_text_and_ctrl_enter_starts() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let (snapshot, mut view) = new_task_topic_form();
+        let mut commands = Vec::new();
+        let title_y = |view: &mut TasksView, commands: &mut Vec<Command>| {
+            let output = input_frame(&ctx, view, &snapshot, vec![], commands);
+            text_rect_containing(&output, "По умолчанию — первая строка поручения")
+                .expect("the title hint must stay visible while the prompt grows")
+                .min
+                .y
+        };
+        let one = title_y(&mut view, &mut commands);
+        view.prompt = "первая\nвторая\nтретья".into();
+        let three = title_y(&mut view, &mut commands);
+        assert!(three > one, "the prompt field grows with text: {one} -> {three}");
+        view.prompt = (1..=9).map(|n| format!("строка {n}")).collect::<Vec<_>>().join("\n");
+        let nine = title_y(&mut view, &mut commands);
+        let prompt_text = (1..=20).map(|n| format!("строка {n}")).collect::<Vec<_>>().join("\n");
+        view.prompt.clone_from(&prompt_text);
+        let many = title_y(&mut view, &mut commands);
+        assert!(many > three, "eight lines is taller than three: {three} -> {many}");
+        assert!(
+            (many - nine).abs() < 1.0,
+            "the field stops growing at eight lines: {nine} -> {many}"
+        );
+        click_text(&ctx, &mut view, &snapshot, &prompt_text, &mut commands);
+        input_frame(
+            &ctx,
+            &mut view,
+            &snapshot,
+            vec![egui::Event::Key {
+                key: egui::Key::Enter,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: egui::Modifiers::COMMAND,
+            }],
+            &mut commands,
+        );
+        let Command::Tasks { request: Request::Create { title, prompt }, .. } =
+            commands.pop().expect("Ctrl+Enter must submit the form")
+        else {
+            panic!("create")
+        };
+        assert_eq!(title, "строка 1");
+        assert_eq!(prompt, view.prompt);
+    }
+
+    #[test]
+    fn new_task_opens_project_rules_from_the_link() {
+        let ctx = egui::Context::default();
+        let (snapshot, mut view) = new_task_topic_form();
+        let mut commands = Vec::new();
+        click_text(&ctx, &mut view, &snapshot, "Правила проекта ›", &mut commands);
+        assert_eq!(view.page, Page::Rules);
+    }
+
+    #[test]
+    fn new_task_mode_flip_to_local_transfers_the_topic_project() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let (snapshot, mut view) = new_task_topic_form();
+        view.local_mode = Some(false);
+        let mut commands = Vec::new();
+        click_text(&ctx, &mut view, &snapshot, "В теме Telegram", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "Локально", &mut commands);
+        assert_eq!(
+            view.local_project.opened(),
+            Some(test_project().as_path()),
+            "flipping to «Локально» must transfer the topic's project into the catalog"
+        );
+        assert!(
+            view.resolved_scope(&snapshot).is_some_and(|(_, path, _)| path == test_project()),
+            "the local scope must stay resolved after the flip"
+        );
+        let output = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert!(
+            !labels(&output).contains(&"Выберите каталог проекта или тему Telegram."),
+            "the flip must not leave the form blocked on a missing catalog"
+        );
+    }
+
+    #[test]
+    fn new_task_project_pick_in_topic_mode_keeps_the_picked_project() {
+        use crate::desktop_tasks::TaskRow;
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let a_dir = tempfile::tempdir().unwrap();
+        let b_dir = tempfile::tempdir().unwrap();
+        let a = hub_telegram::paths::workspace_root(a_dir.path()).unwrap().as_path().to_owned();
+        let b = hub_telegram::paths::workspace_root(b_dir.path()).unwrap().as_path().to_owned();
+        let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
+        let topic_a = TopicView {
+            key,
+            title: Some("Test".into()),
+            session: TopicSession::fresh(BackendKind::Qwen, AbsolutePath::new(a.clone()).unwrap()),
+            state: TopicState::Waiting,
+            memory_enabled: None,
+            parameters: String::new(),
+            progress: hub_core::progress::TaskProgress::default(),
+        };
+        let mut book = hub_core::tasks::TaskBook::default();
+        book.create(a.clone(), "qwen", "A", "Read").unwrap();
+        book.create(b.clone(), "qwen", "B", "Read").unwrap();
+        let rows: Vec<_> = book.tasks().iter().map(TaskRow::from).collect();
+        let snapshot = Snapshot {
+            bot: BotStatus::Running { username: "bot".into() },
+            topics: vec![topic_a],
+            task_index: Ok(rows),
+            ..Default::default()
+        };
+        let mut view = TasksView {
+            page: Page::New,
+            selected: Some(key),
+            local_mode: Some(false),
+            scope: Some((Some(key), a.clone(), BackendKind::Qwen)),
+            refreshed: Some(Instant::now()),
+            ..Default::default()
+        };
+        let mut commands = Vec::new();
+        // The catalog fills from an off-thread folder scan driven by project_navigation;
+        // render frames until both projects are listed, then never draw the sidebar again
+        // so the «Проект» combo labels stay the unique click targets.
+        let listed = |view: &TasksView| {
+            view.sidebar.projects().any(|(path, _)| path == a.as_path())
+                && view.sidebar.projects().any(|(path, _)| path == b.as_path())
+        };
+        for _ in 0..200 {
+            if listed(&view) {
+                break;
+            }
+            let mut render = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1400.0, 1000.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    view.project_navigation(ui, &snapshot, true);
+                    view.show(ui, &snapshot, &mut |command| commands.push(command));
+                },
+            );
+            render.textures_delta.clear();
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert!(listed(&view), "the sidebar catalog never listed both projects");
+        let name_a = view
+            .sidebar
+            .projects()
+            .find(|(path, _)| *path == a.as_path())
+            .map(|(_, name)| name.to_owned())
+            .expect("project A is listed");
+        let name_b = view
+            .sidebar
+            .projects()
+            .find(|(path, _)| *path == b.as_path())
+            .map(|(_, name)| name.to_owned())
+            .expect("project B is listed");
+        click_text(&ctx, &mut view, &snapshot, &name_a, &mut commands);
+        click_text(&ctx, &mut view, &snapshot, &name_b, &mut commands);
+        assert_eq!(
+            view.local_project.opened(),
+            Some(b.as_path()),
+            "picking a project without a topic must keep it as the local target, not the old topic project"
+        );
+        assert_eq!(view.local_mode, Some(true), "the pick implicitly moved the form to local mode");
+        assert_eq!(view.selected, None, "the dropped topic selection must not return");
+    }
+
+    #[test]
+    fn new_task_mode_flip_to_topic_anchors_the_local_project() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
+        let (snapshot, mut view) = new_task_topic_form();
+        view.local_project.choose(&test_project());
+        view.local_mode = Some(true);
+        view.selected = None;
+        view.scope = Some((None, test_project(), BackendKind::Qwen));
+        let mut commands = Vec::new();
+        click_text(&ctx, &mut view, &snapshot, "Локально", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "В теме Telegram", &mut commands);
+        assert_eq!(
+            view.selected,
+            Some(key),
+            "flipping to «В теме Telegram» must anchor the topic of the local project"
+        );
+    }
+
     #[test]
     fn drafts_return_to_their_own_task_after_project_switches() {
         let (book, id, snapshot, mut view) = review_fixture();
@@ -1022,8 +1565,8 @@ mod tests {
         };
         let mut other_book = hub_core::tasks::TaskBook::default();
         let other_id = other_book.create(other_path, "qwen", "Соседний проект", "Шаг").unwrap();
-        other_book.begin(other_id, 1, None).unwrap();
-        other_book.finish(other_id, 1, RunState::Completed).unwrap();
+        other_book.begin(other_id, 1, None, ts()).unwrap();
+        other_book.finish(other_id, 1, RunState::Completed, ts()).unwrap();
         assert_eq!(id, other_id, "distinct projects with the same id must remain isolated");
         reply
             .send(Ok(TaskSnapshot { tasks: other_book.tasks().to_vec(), ..Default::default() }))
@@ -1233,23 +1776,23 @@ mod tests {
             let _ = render(&mut view);
             let output = render(&mut view);
             assert_eq!(bounds(&output, "Отправить"), send);
-            let result = bounds(&output, "Открыть результат");
+            // Outside compact the review state keeps its result entry in the header only, so
+            // the composer row tops the pinned stack; compact adds its inline button inside
+            // that same row (see the compact header test).
             let draft = bounds(&output, "Черновик сообщения");
             assert!(send.bottom() <= screen.bottom() && send.bottom() > height - 80.0);
             let transcript = output
                 .shapes
                 .iter()
                 .find_map(|shape| match &shape.shape {
-                    egui::Shape::Text(text)
-                        if text.galley.text().contains("Длинная история чата") =>
-                    {
+                    egui::Shape::Text(text) if text.galley.text() == "Результат ›" => {
                         Some(shape.clip_rect)
                     }
                     _ => None,
                 })
                 .unwrap();
             assert!(
-                transcript.bottom() <= result.top().min(draft.top()),
+                transcript.bottom() <= draft.top(),
                 "history overlaps controls at {width}×{height}"
             );
             let crumb = format!("{}  /  #1", test_project().file_name().unwrap().to_string_lossy());
@@ -1387,8 +1930,8 @@ mod tests {
         book.configure_rules(project.clone(), 0, rules).unwrap();
         book.prepare_git(id, 1, "task/first").unwrap();
         book.finish_git(id, 2, Ok("a".repeat(40))).unwrap();
-        let run = book.begin(id, 3, None).unwrap();
-        book.finish(id, run, RunState::Completed).unwrap();
+        let run = book.begin(id, 3, None, ts()).unwrap();
+        book.finish(id, run, RunState::Completed, ts()).unwrap();
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut view = TasksView {
             scope: Some((Some(key), project.clone(), BackendKind::Qwen)),
@@ -1442,7 +1985,8 @@ mod tests {
             ..Default::default()
         };
         let mut commands = Vec::new();
-        click_text(&ctx, &mut view, &snapshot, "Параметры", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Подготовить ветку Git", &mut commands);
         assert!(
             matches!(commands.pop(), Some(Command::Tasks { request: Request::PrepareGitChecked { revision: 4, branch, .. }, .. }) if branch == "task/retry")
@@ -1476,7 +2020,8 @@ mod tests {
         let mut commands = Vec::new();
         click_text(&ctx, &mut view, &snapshot, "Запустить", &mut commands);
         assert!(commands.is_empty());
-        click_text(&ctx, &mut view, &snapshot, "Параметры", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Подготовить ветку Git", &mut commands);
         let Command::Tasks {
             request:
@@ -1622,7 +2167,8 @@ mod tests {
             ..Default::default()
         };
         let mut commands = Vec::new();
-        click_text(&ctx, &mut view, &snapshot, "Параметры", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Правила проекта", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Rule", &mut commands);
         let focus = ctx.memory(egui::Memory::focused).unwrap();
@@ -1642,7 +2188,8 @@ mod tests {
         click_text(&ctx, &mut view, &snapshot, "В чат", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Запустить", &mut commands);
         assert!(commands.is_empty());
-        click_text(&ctx, &mut view, &snapshot, "Параметры", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Правила проекта", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Сохранить правила", &mut commands);
         let Command::Tasks {
@@ -1679,7 +2226,7 @@ mod tests {
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut book = hub_core::tasks::TaskBook::default();
         let id = book.create(test_project(), "qwen", "Task", "Read").unwrap();
-        book.begin(id, 1, None).unwrap();
+        book.begin(id, 1, None, ts()).unwrap();
         let mut view = TasksView {
             selected: Some(key),
             scope: Some((Some(key), test_project(), BackendKind::Qwen)),
@@ -1693,7 +2240,8 @@ mod tests {
             ..Default::default()
         };
         let mut commands = Vec::new();
-        click_text(&ctx, &mut view, &snapshot, "Параметры", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Назначить", &mut commands);
         assert!(commands.is_empty());
         assert_eq!(view.tasks, book.tasks());
@@ -1718,13 +2266,15 @@ mod tests {
             ..Default::default()
         };
         let mut commands = Vec::new();
-        click_text(&ctx, &mut view, &snapshot, "Параметры", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "qwen", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "codex", &mut commands);
         assert!(commands.is_empty(), "choosing an agent is only a draft");
         click_text(&ctx, &mut view, &snapshot, "В чат", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Запустить", &mut commands);
-        click_text(&ctx, &mut view, &snapshot, "Параметры", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         assert!(commands.is_empty(), "cannot launch with an unsaved agent choice");
         click_text(&ctx, &mut view, &snapshot, "Назначить", &mut commands);
         let Command::Tasks {
@@ -1757,9 +2307,9 @@ mod tests {
         let project = test_project();
         let mut book = hub_core::tasks::TaskBook::default();
         let id = book.create(project.clone(), "qwen", "Task", "Первый вопрос").unwrap();
-        book.begin(id, 1, None).unwrap();
+        book.begin(id, 1, None, ts()).unwrap();
         book.record(id, 1, "Первый ответ").unwrap();
-        book.finish(id, 1, RunState::Completed).unwrap();
+        book.finish(id, 1, RunState::Completed, ts()).unwrap();
         let revision = book.get(id).unwrap().revision;
         let mut view = TasksView {
             selected: Some(key),
@@ -1805,7 +2355,7 @@ mod tests {
         assert_eq!(view.next[&id], draft);
         click_text(&ctx, &mut view, &snapshot, "Отправить", &mut commands);
         let Command::Tasks { reply, .. } = commands.pop().unwrap() else { panic!("retry") };
-        let run = book.begin(id, revision, Some(draft)).unwrap();
+        let run = book.begin(id, revision, Some(draft), ts()).unwrap();
         book.record(id, run, "Промежуточный ответ").unwrap();
         reply
             .send(Ok(TaskSnapshot { tasks: book.tasks().to_vec(), ..Default::default() }))
@@ -1830,7 +2380,7 @@ mod tests {
         view.next.insert(id, "Черновик во время работы".into());
         view.request(Request::List, &mut |command| commands.push(command));
         let Command::Tasks { reply, .. } = commands.pop().unwrap() else { panic!("refresh") };
-        book.finish(id, run, RunState::Completed).unwrap();
+        book.finish(id, run, RunState::Completed, ts()).unwrap();
         reply
             .send(Ok(TaskSnapshot { tasks: book.tasks().to_vec(), ..Default::default() }))
             .unwrap();
@@ -1845,9 +2395,9 @@ mod tests {
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut book = hub_core::tasks::TaskBook::default();
         let id = book.create(test_project(), "codex", "Task", "Read").unwrap();
-        book.begin(id, 1, None).unwrap();
+        book.begin(id, 1, None, ts()).unwrap();
         book.record(id, 1, "Готовый результат").unwrap();
-        book.finish(id, 1, RunState::Completed).unwrap();
+        book.finish(id, 1, RunState::Completed, ts()).unwrap();
         let mut view = TasksView {
             selected: Some(key),
             scope: Some((Some(key), test_project(), BackendKind::Qwen)),
@@ -1869,12 +2419,14 @@ mod tests {
 
         assert_eq!(
             labels(&output).iter().filter(|label| **label == "Открыть результат").count(),
-            1
+            1,
+            "non-compact review state: only the header primary, no duplicate in the pinned bar"
         );
         assert!(!labels(&output).contains(&"Управление задачей"));
         click_text(&ctx, &mut view, &snapshot, "Отправить", &mut commands);
         assert!(commands.is_empty(), "unassigned task must not launch");
-        click_text(&ctx, &mut view, &snapshot, "Параметры", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         let output = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
         for section in ["Агент и память", "Контекст следующего запуска", "Управление задачей"]
         {
@@ -1885,14 +2437,26 @@ mod tests {
         let output = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
         for section in [
             "Готовый результат",
-            "Изменения",
-            "Проверки",
-            "История попыток (1)",
+            "Сводка",
+            "Изменения · 0 файлов",
+            "Проверки · 0/0",
+            "Файлы · 0",
+            "История · 1",
             "Принять результат",
             "На доработку",
         ] {
             assert!(labels(&output).contains(&section), "missing {section}");
         }
+        click_text(&ctx, &mut view, &snapshot, "Изменения · 0 файлов", &mut commands);
+        let output = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert!(
+            labels(&output).contains(&"Для этой попытки снимок изменений отсутствует."),
+            "the empty diff section says so"
+        );
+        assert!(
+            !labels(&output).contains(&"Готовый результат"),
+            "Сводка is hidden while Изменения is active"
+        );
     }
     #[test]
     fn changing_task_memory_preserves_the_composer_draft() {
@@ -1912,9 +2476,9 @@ mod tests {
         let receiving = TopicKey { chat: key.chat, thread: ThreadId(8) };
         let mut book = hub_core::tasks::TaskBook::default();
         let id = book.create(test_project(), "codex", "Task", "Read").unwrap();
-        book.begin(id, 1, None).unwrap();
+        book.begin(id, 1, None, ts()).unwrap();
         book.record(id, 1, "Previous result").unwrap();
-        book.finish(id, 1, RunState::Completed).unwrap();
+        book.finish(id, 1, RunState::Completed, ts()).unwrap();
         let mut raw = serde_json::to_value(&book).unwrap();
         raw["tasks"][0]["runs"][0].as_object_mut().unwrap().remove("backend");
         let mut book =
@@ -1953,7 +2517,8 @@ mod tests {
             .send(Ok(TaskSnapshot { tasks: book.tasks().to_vec(), ..TaskSnapshot::default() }))
             .unwrap();
         input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
-        click_text(&ctx, &mut view, &snapshot, "Параметры", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "codex", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "qwen", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Назначить", &mut commands);
@@ -1996,7 +2561,8 @@ mod tests {
         let mut commands = Vec::new();
         input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
         assert!(commands.is_empty(), "rendering a different topic agent must not assign it");
-        click_text(&ctx, &mut view, &snapshot, "Параметры", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "codex", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "qwen", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Назначить", &mut commands);
@@ -2035,7 +2601,8 @@ mod tests {
             ..Default::default()
         };
         let mut commands = Vec::new();
-        click_text(&ctx, &mut view, &snapshot, "Параметры", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Контекст следующего запуска", &mut commands);
         let output = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
         assert!(output.shapes.iter().any(|shape| matches!(&shape.shape, egui::Shape::Text(text) if text.galley.text() == expected)));
@@ -2119,9 +2686,6 @@ mod tests {
             };
             let mut commands = Vec::new();
             view.page = Page::New;
-            if field == "Название черновика" {
-                click_text(&ctx, &mut view, &snapshot, "Название задачи", &mut commands);
-            }
             click_text(&ctx, &mut view, &snapshot, field, &mut commands);
             let focus = ctx.memory(egui::Memory::focused).expect("text field focused");
             input_frame(
@@ -2191,9 +2755,9 @@ mod tests {
         let mut view = TasksView::default();
         let available = view.availability(book.get(id).unwrap(), BackendKind::Qwen, true);
         assert!(available.edit && !available.launch);
-        book.begin(id, 1, None).unwrap();
+        book.begin(id, 1, None, ts()).unwrap();
         assert!(!view.availability(book.get(id).unwrap(), BackendKind::Qwen, false).edit);
-        book.finish(id, 1, RunState::Completed).unwrap();
+        book.finish(id, 1, RunState::Completed, ts()).unwrap();
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let (sender, receiver) = oneshot::channel();
         view.pending = Some(Pending {
@@ -2321,11 +2885,531 @@ mod tests {
         let mut commands = Vec::new();
         view.request(Request::List, &mut |command| commands.push(command));
         let Command::Tasks { reply, .. } = commands.pop().unwrap() else { panic!("task request") };
-        book.begin(id, 1, None).unwrap();
+        book.begin(id, 1, None, ts()).unwrap();
         reply
             .send(Ok(TaskSnapshot { tasks: book.tasks().to_vec(), ..TaskSnapshot::default() }))
             .unwrap();
         view.update(&mut |c| commands.push(c));
         assert!(!view.next.contains_key(&id), "a different revision needs a new step");
+    }
+
+    fn local_running_fixture() -> (uuid::Uuid, Snapshot, TasksView) {
+        let project = test_project();
+        let mut book = hub_core::tasks::TaskBook::default();
+        let id =
+            book.create(project.clone(), "qwen", "Локальный запуск", "Прочитать README").unwrap();
+        book.begin(id, 1, None, ts()).unwrap();
+        let token = uuid::Uuid::new_v4();
+        let snapshot = Snapshot {
+            local: Some(crate::local_execution::Live {
+                token,
+                project: project.clone(),
+                id,
+                run: Some(1),
+                active: true,
+                status: "Агент работает".into(),
+                interaction: None,
+            }),
+            task_index: Ok(book.tasks().iter().map(crate::desktop_tasks::TaskRow::from).collect()),
+            ..Default::default()
+        };
+        let mut view = TasksView {
+            local_mode: Some(true),
+            scope: Some((None, project.clone(), BackendKind::Qwen)),
+            tasks: book.tasks().to_vec(),
+            focused: Some(id),
+            refreshed: Some(Instant::now()),
+            ..Default::default()
+        };
+        view.local_project.choose(&project);
+        (token, snapshot, view)
+    }
+
+    #[test]
+    fn running_local_task_stops_from_header() {
+        let (token, snapshot, mut view) = local_running_fixture();
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert!(labels(&out).contains(&"Остановить"), "running local task offers stop in header");
+        click_text(&ctx, &mut view, &snapshot, "Остановить", &mut commands);
+        let command = commands.pop().unwrap();
+        assert!(matches!(command, Command::LocalStop(actual) if actual == token));
+    }
+
+    #[test]
+    fn chat_decision_panel_renders_inside_a_card() {
+        let project = test_project();
+        let mut book = hub_core::tasks::TaskBook::default();
+        let id =
+            book.create(project.clone(), "qwen", "Решение в чате", "Прочитать README").unwrap();
+        book.begin(id, 1, None, ts()).unwrap();
+        let snapshot = Snapshot {
+            local: Some(crate::local_execution::Live {
+                token: uuid::Uuid::new_v4(),
+                project: project.clone(),
+                id,
+                run: Some(1),
+                active: true,
+                status: "Ожидает решения".into(),
+                interaction: Some(crate::local_execution::Interaction {
+                    id: uuid::Uuid::new_v4(),
+                    kind: crate::local_execution::Kind::Permission(hub_core::domain::ToolRequest {
+                        tool: "Bash".into(),
+                        summary: "cargo check".into(),
+                    }),
+                }),
+            }),
+            task_index: Ok(book.tasks().iter().map(crate::desktop_tasks::TaskRow::from).collect()),
+            ..Default::default()
+        };
+        let mut view = TasksView {
+            local_mode: Some(true),
+            scope: Some((None, project, BackendKind::Qwen)),
+            tasks: book.tasks().to_vec(),
+            focused: Some(id),
+            refreshed: Some(Instant::now()),
+            ..Default::default()
+        };
+        view.local_project.choose(&test_project());
+        let ctx = egui::Context::default();
+        crate::gui::configure_theme(&ctx);
+        let mut commands = Vec::new();
+        input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let surface = ctx.style_of(ctx.theme()).visuals.panel_fill;
+        let card = out
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Rect(rect)
+                    if rect.fill == surface
+                        && (rect.stroke.width - 1.0).abs() < 0.01
+                        && rect.corner_radius == egui::CornerRadius::same(10) =>
+                {
+                    Some(rect.rect)
+                }
+                _ => None,
+            })
+            .expect("the chat decision panel draws the card frame");
+        for label in ["Остановить локальную работу", "Разрешить один раз"]
+        {
+            let rect = all_text_rects(&out, label)
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| panic!("missing {label}"));
+            assert!(
+                card.contains_rect(rect),
+                "{label} must sit inside the decision card: {rect:?} in {card:?}"
+            );
+        }
+    }
+
+    fn telegram_running_fixture() -> (u64, Snapshot, TasksView) {
+        let project = test_project();
+        let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
+        let mut book = hub_core::tasks::TaskBook::default();
+        let id = book.create(project.clone(), "qwen", "Тема в работе", "Прочитать README").unwrap();
+        book.begin(id, 1, None, ts()).unwrap();
+        let mut running = topic(key);
+        running.state = TopicState::Running;
+        let snapshot = Snapshot {
+            bot: BotStatus::Running { username: "bot".into() },
+            topics: vec![running],
+            task_index: Ok(book.tasks().iter().map(crate::desktop_tasks::TaskRow::from).collect()),
+            ..Default::default()
+        };
+        let view = TasksView {
+            selected: Some(key),
+            scope: Some((Some(key), project, BackendKind::Qwen)),
+            tasks: book.tasks().to_vec(),
+            focused: Some(id),
+            refreshed: Some(Instant::now()),
+            ..Default::default()
+        };
+        (id, snapshot, view)
+    }
+
+    #[test]
+    fn running_telegram_task_offers_topic_not_stop() {
+        let (_, snapshot, mut view) = telegram_running_fixture();
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let texts = labels(&out);
+        assert!(!texts.contains(&"Остановить"), "bridge sessions are not stopped from the task");
+        assert!(texts.contains(&"Открыть тему"), "telegram scope offers the topic link");
+        assert!(texts.contains(&"Выполняется"), "running state is shown as a chip");
+    }
+
+    #[test]
+    fn chat_header_shows_task_state_chip() {
+        let (_, _, snapshot, mut view) = review_fixture();
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert!(
+            labels(&out).contains(&"Нужна проверка"),
+            "chat header shows the task state chip next to the title"
+        );
+    }
+
+    #[test]
+    fn review_task_accepts_from_header() {
+        let (_, id, snapshot, mut view) = review_fixture();
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let texts = labels(&out);
+        assert!(texts.contains(&"Открыть результат") && texts.contains(&"Принять"));
+        click_text(&ctx, &mut view, &snapshot, "Принять", &mut commands);
+        let Command::Tasks {
+            request: Request::Status { id: accepted, revision, status: TaskStatus::Accepted },
+            ..
+        } = commands.pop().unwrap()
+        else {
+            panic!("accept")
+        };
+        assert_eq!(accepted, id);
+        assert_eq!(revision, view.tasks[0].revision);
+    }
+
+    #[test]
+    fn menu_archives_and_opens_parameters() {
+        let (_, id, snapshot, mut view) = review_fixture();
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "В архив", &mut commands);
+        let Command::Tasks {
+            request: Request::Archive { id: archived, revision, archived: true },
+            reply,
+            ..
+        } = commands.pop().unwrap()
+        else {
+            panic!("archive")
+        };
+        assert_eq!(archived, id);
+        assert_eq!(revision, view.tasks[0].revision);
+        reply.send(Ok(TaskSnapshot::default())).unwrap();
+        view.update(&mut |c| commands.push(c));
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
+        assert_eq!(view.result_view.tab(&view.tasks[0]), result::Tab::Parameters);
+    }
+
+    fn all_text_rects(output: &egui::FullOutput, text: &str) -> Vec<egui::Rect> {
+        output
+            .shapes
+            .iter()
+            .filter_map(|shape| match &shape.shape {
+                egui::Shape::Text(label) if label.galley.text() == text => {
+                    Some(label.galley.rect.translate(label.pos.to_vec2()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn header_actions_do_not_overlap_composer_in_compact_window() {
+        let (_, _, snapshot, mut view) = review_fixture();
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(1000.0, 300.0));
+        let _ = sized_frame(&ctx, &mut view, &snapshot, screen, vec![], &mut commands);
+        let out = sized_frame(&ctx, &mut view, &snapshot, screen, vec![], &mut commands);
+        let results = all_text_rects(&out, "Открыть результат");
+        assert_eq!(results.len(), 2, "header primary + inline composer button at 300px");
+        assert!(!all_text_rects(&out, "…").is_empty(), "the menu survives compact mode");
+        let accept = all_text_rects(&out, "Принять").into_iter().next().expect("header accept");
+        let send = all_text_rects(&out, "Отправить").into_iter().next().expect("composer send");
+        for header in [results[0], accept] {
+            assert!(
+                !header.intersects(send) && header.bottom() <= send.top(),
+                "header actions must stay above the composer: {header:?} vs {send:?}"
+            );
+        }
+        assert!(
+            results[1].y_range().intersects(send.y_range()),
+            "the inline result button stays in the composer row"
+        );
+    }
+
+    #[test]
+    fn menu_delete_confirms_before_removing_the_task() {
+        let (_, id, snapshot, mut view) = review_fixture();
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "Удалить…", &mut commands);
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let texts = labels(&out);
+        assert!(
+            texts.contains(&"Отмена") && texts.contains(&"Удалить безвозвратно"),
+            "the menu asks before deleting"
+        );
+        click_text(&ctx, &mut view, &snapshot, "Удалить безвозвратно", &mut commands);
+        let Command::Tasks { request: Request::Delete { id: deleted, .. }, .. } =
+            commands.pop().unwrap()
+        else {
+            panic!("delete")
+        };
+        assert_eq!(deleted, id);
+    }
+
+    #[test]
+    fn delete_confirm_renders_one_row_per_tab() {
+        let (_, id, snapshot, mut view) = review_fixture();
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let mut commands = Vec::new();
+        // The confirm question text is the row's identity: the buttons can sit under the
+        // Parameters fold, but never does a second question line appear on any tab.
+        let rows = |out: &egui::FullOutput| {
+            out.shapes
+                .iter()
+                .filter(|shape| {
+                    matches!(&shape.shape, egui::Shape::Text(text)
+                        if text.galley.text().contains("вместе с перепиской и вложениями?"))
+                })
+                .count()
+        };
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "Удалить…", &mut commands);
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert_eq!(rows(&out), 1, "chat: one confirm row");
+        assert_eq!(all_text_rects(&out, "Удалить безвозвратно").len(), 1, "chat buttons visible");
+        view.result_view.select(result::Tab::Parameters, Some(id));
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert_eq!(rows(&out), 0, "the Parameters section starts collapsed");
+        click_text(&ctx, &mut view, &snapshot, "Управление задачей", &mut commands);
+        let _ = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert_eq!(rows(&out), 1, "Parameters keeps its own single row");
+        click_text(&ctx, &mut view, &snapshot, "В чат", &mut commands);
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert_eq!(rows(&out), 1, "chat again: one row");
+        click_text(&ctx, &mut view, &snapshot, "Отмена", &mut commands);
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert_eq!(rows(&out), 0, "cancel clears it");
+        assert!(commands.is_empty(), "confirm rows never dispatch on their own");
+    }
+
+    fn draft_telegram_fixture() -> (u64, Snapshot, TasksView) {
+        let project = test_project();
+        let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
+        let mut book = hub_core::tasks::TaskBook::default();
+        let id = book.create(project.clone(), "qwen", "Черновик", "Прочитать README").unwrap();
+        let snapshot = Snapshot {
+            bot: BotStatus::Running { username: "bot".into() },
+            topics: vec![topic(key)],
+            task_index: Ok(book.tasks().iter().map(crate::desktop_tasks::TaskRow::from).collect()),
+            ..Default::default()
+        };
+        let view = TasksView {
+            selected: Some(key),
+            scope: Some((Some(key), project, BackendKind::Qwen)),
+            tasks: book.tasks().to_vec(),
+            focused: Some(id),
+            refreshed: Some(Instant::now()),
+            ..Default::default()
+        };
+        (id, snapshot, view)
+    }
+
+    #[test]
+    fn menu_offers_queue_variants_for_a_draft_and_queues_isolated() {
+        let (id, snapshot, mut view) = draft_telegram_fixture();
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let texts = labels(&out);
+        assert!(texts.contains(&"В очередь") && texts.contains(&"В очередь в отдельном worktree"));
+        click_text(&ctx, &mut view, &snapshot, "В очередь в отдельном worktree", &mut commands);
+        let Command::Tasks {
+            request: Request::Queue { id: queued, revision, isolated, next, origin: None },
+            ..
+        } = commands.pop().unwrap()
+        else {
+            panic!("queue")
+        };
+        assert_eq!((queued, revision, isolated), (id, 1, true));
+        assert!(next.is_none(), "the first run queues without a continuation step");
+    }
+
+    #[test]
+    fn menu_context_item_opens_parameters_with_the_preview_expanded() {
+        let (_, snapshot, mut view) = draft_telegram_fixture();
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let expected = view.tasks[0].preview(None).unwrap();
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "Контекст следующего запуска", &mut commands);
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert_eq!(view.result_view.tab(&view.tasks[0]), result::Tab::Parameters);
+        assert!(
+            out.shapes.iter().any(|shape| matches!(
+                &shape.shape,
+                egui::Shape::Text(text) if text.galley.text() == expected
+            )),
+            "the context section opens expanded without a second click"
+        );
+        assert!(commands.is_empty());
+    }
+
+    #[test]
+    fn queued_task_unqueues_from_header() {
+        let (id, snapshot, mut view) = draft_telegram_fixture();
+        view.tasks[0].queue = Some(hub_core::tasks::queue::Entry {
+            sequence: 1,
+            revision: view.tasks[0].revision,
+            rules_revision: 1,
+            next: None,
+            isolated: false,
+            origin: None,
+            error: None,
+        });
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert!(labels(&out).contains(&"Снять с очереди"));
+        click_text(&ctx, &mut view, &snapshot, "Снять с очереди", &mut commands);
+        let Command::Tasks { request: Request::Unqueue { id: unqueued, .. }, .. } =
+            commands.pop().unwrap()
+        else {
+            panic!("unqueue")
+        };
+        assert_eq!(unqueued, id);
+    }
+
+    #[test]
+    fn failed_run_offers_investigation_from_header() {
+        let project = test_project();
+        let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
+        let mut book = hub_core::tasks::TaskBook::default();
+        let id =
+            book.create(project.clone(), "qwen", "Упавший запуск", "Прочитать README").unwrap();
+        book.begin(id, 1, None, ts()).unwrap();
+        book.finish(id, 1, RunState::Failed, ts()).unwrap();
+        let snapshot = Snapshot {
+            bot: BotStatus::Running { username: "bot".into() },
+            topics: vec![topic(key)],
+            task_index: Ok(book.tasks().iter().map(crate::desktop_tasks::TaskRow::from).collect()),
+            ..Default::default()
+        };
+        let mut view = TasksView {
+            selected: Some(key),
+            scope: Some((Some(key), project, BackendKind::Qwen)),
+            tasks: book.tasks().to_vec(),
+            focused: Some(id),
+            refreshed: Some(Instant::now()),
+            ..Default::default()
+        };
+        let ctx = egui::Context::default();
+        let mut commands = Vec::new();
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert!(labels(&out).contains(&"Разобрать запуск"));
+        click_text(&ctx, &mut view, &snapshot, "Разобрать запуск", &mut commands);
+        assert!(commands.is_empty(), "investigation is navigation, not a request");
+        assert_eq!(view.result_view.tab(&view.tasks[0]), result::Tab::Checks);
+    }
+
+    #[test]
+    fn inbox_check_link_lands_on_checks_tab() {
+        use crate::desktop_tasks::{Attention, TaskRow};
+        let project = test_project();
+        let mut book = hub_core::tasks::TaskBook::default();
+        let id = book.create(project.clone(), "qwen", "Упавшая проверка", "Проверь").unwrap();
+        let run = book.begin(id, 1, None, ts()).unwrap();
+        book.record(id, run, "Ответ с упавшей проверкой").unwrap();
+        book.finish(id, run, RunState::Completed, ts()).unwrap();
+        let mut tasks = book.tasks().to_vec();
+        tasks[0].runs[0].workflow_report = hub_core::tasks::workflow::WorkflowReport {
+            checks: vec![hub_core::tasks::workflow::CheckResult {
+                passed: false,
+                output: "exit 101".into(),
+            }],
+            review: String::new(),
+        };
+        let row = TaskRow {
+            reason: Some(Attention::CheckFailed),
+            summary: "Проверка не прошла".into(),
+            ..TaskRow::from(&tasks[0])
+        };
+        let snapshot = Snapshot { task_index: Ok(vec![row]), ..Default::default() };
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let mut view = TasksView::default();
+        let mut commands = Vec::new();
+        let inbox = |view: &mut TasksView,
+                     commands: &mut Vec<Command>,
+                     events: Vec<egui::Event>|
+         -> egui::FullOutput {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(1000.0, 900.0),
+                    )),
+                    events,
+                    ..Default::default()
+                },
+                |ui| {
+                    view.show_attention(ui, &snapshot, &mut |command| commands.push(command));
+                },
+            );
+            output.textures_delta.clear();
+            output
+        };
+        inbox(&mut view, &mut commands, vec![]);
+        let out = inbox(&mut view, &mut commands, vec![]);
+        let position = out
+            .shapes
+            .iter()
+            .find_map(|shape| match &shape.shape {
+                egui::Shape::Text(label) if label.galley.text() == "Открыть проверку" => {
+                    Some(label.galley.rect.translate(label.pos.to_vec2()).center())
+                }
+                _ => None,
+            })
+            .expect("the failed-check card offers «Открыть проверку»");
+        for pressed in [true, false] {
+            inbox(
+                &mut view,
+                &mut commands,
+                vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ],
+            );
+        }
+        assert!(view.review_from_inbox, "the link leaves a way back to the inbox");
+        // The first task screen frame only asks for the task list; the review needs the reply.
+        input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        let Command::LocalTasks { reply, .. } = commands.pop().unwrap() else {
+            panic!("local list")
+        };
+        reply.send(Ok(TaskSnapshot { tasks, ..Default::default() })).unwrap();
+        let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert_eq!(
+            view.result_view.tab(&view.tasks[0]),
+            result::Tab::Checks,
+            "the Checks tab survives the review screen render"
+        );
+        let texts = labels(&out);
+        assert!(texts.contains(&"Проверки · 0/1"), "the tab row counts the failed check");
+        assert!(texts.contains(&"Проверка 1 · не прошла"));
+        assert!(texts.contains(&"exit 101"), "the checks section is the active one");
+        assert!(
+            !texts.contains(&"Ответ с упавшей проверкой"),
+            "the summary section stays closed under the deep link"
+        );
     }
 }

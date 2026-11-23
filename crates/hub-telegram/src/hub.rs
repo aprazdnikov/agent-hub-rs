@@ -55,7 +55,7 @@ use crate::transfer::{
 
 mod deletion;
 pub mod tasks;
-pub use deletion::DeletionDone;
+pub use deletion::{DeletionDone, SyncDone};
 
 pub(crate) const INBOX: usize = 32;
 const MAILBOX: usize = 256;
@@ -179,6 +179,11 @@ pub enum HubMessage {
         reply: oneshot::Sender<Result<(), String>>,
     },
     DeletionDone(DeletionDone),
+    /// Compare every known topic with Telegram and drop the ones that no longer exist there.
+    SyncTopics {
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    SyncDone(SyncDone),
     /// A `/save` or `/restore` reached a decision point or finished its file work.
     Snapshot(SnapshotDone),
     /// A live session reported subscription limits.
@@ -563,11 +568,7 @@ impl<A: Agents> Hub<A> {
                 self.sender.clone(),
             ),
             HubMessage::ActionDone(done) => self.actions.complete(done, self.sender.clone()),
-            HubMessage::Inbound(inbound) => {
-                if self.shutdown.is_none() {
-                    self.inbound(inbound);
-                }
-            }
+            HubMessage::Inbound(inbound) => self.inbound(inbound),
             HubMessage::Press(pressed) => self.press(pressed),
             HubMessage::Quota(update) => self.quotas.apply(update, Timestamp::now()),
             HubMessage::Limits(LimitsDone(polled)) => self.limits_done(polled),
@@ -599,6 +600,8 @@ impl<A: Agents> Hub<A> {
             }
             HubMessage::DeleteTopic { key, reply } => self.delete_topic(key, reply),
             HubMessage::DeletionDone(done) => self.finish_deletion(done),
+            HubMessage::SyncTopics { reply } => self.sync_topics(reply),
+            HubMessage::SyncDone(done) => self.finish_sync(done),
             HubMessage::Reset(key) => {
                 if self.topic_unavailable(key) {
                     return;
@@ -662,6 +665,9 @@ impl<A: Agents> Hub<A> {
     }
 
     fn inbound(&mut self, inbound: Inbound) {
+        if self.shutdown.is_some() {
+            return;
+        }
         if inbound.key().is_some_and(|key| self.topic_unavailable(key)) {
             return;
         }
@@ -2117,6 +2123,9 @@ mod tests {
     use crate::messenger::SendError;
     use crate::testing::{Call, FakeMessenger};
 
+    fn ts() -> jiff::Timestamp {
+        jiff::Timestamp::from_second(1_700_000_000).unwrap()
+    }
     const KEY: TopicKey = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
 
     enum Script {
@@ -2735,6 +2744,140 @@ mod tests {
                 .filter(|call| matches!(call, Call::DeleteTopic(key) if *key == KEY))
                 .count(),
             1
+        );
+    }
+
+    async fn sync(world: &World) -> Result<String, String> {
+        let (reply, result) = oneshot::channel();
+        world.send(HubMessage::SyncTopics { reply }).await;
+        result.await.expect("sync reply")
+    }
+
+    fn probe_calls(world: &World) -> Vec<TopicKey> {
+        world
+            .messenger
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::ProbeTopic(key) => Some(key),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn sync_removes_stale_topics_and_keeps_live() {
+        let world = world(FakeAgents::default());
+        world.send(inbound(Some(7), 1, Content::TopicCreated { name: "Старая".into() })).await;
+        world.send(inbound(Some(8), 2, Content::TopicCreated { name: "Живая".into() })).await;
+        let live = TopicKey { chat: KEY.chat, thread: ThreadId(8) };
+        // The one-shot script makes the first probe (thread 7, BTreeMap order) find the topic
+        // gone; the second falls back to the fake's default of a live topic.
+        *world.messenger.probes.lock().unwrap() = Some(Ok(false));
+        assert_eq!(sync(&world).await.unwrap(), "Удалено устаревших тем: 1");
+        assert_eq!(probe_calls(&world), [KEY, live]);
+        assert!(!world.messenger.calls().iter().any(|call| matches!(call, Call::DeleteTopic(_))));
+        let stored = world.store.last().unwrap();
+        assert!(!stored.contains_key(&KEY) && stored.contains_key(&live));
+    }
+
+    #[tokio::test]
+    async fn sync_skips_busy_and_deleted_topics() {
+        let world = world(FakeAgents::scripted(vec![Script::UntilStopped]));
+        world.send(inbound(Some(7), 1, Content::TopicCreated { name: "Занятая".into() })).await;
+        let stale = TopicKey { chat: KEY.chat, thread: ThreadId(8) };
+        world.send(inbound(Some(8), 2, Content::TopicCreated { name: "Удалённая".into() })).await;
+        world.send(text(Some(7), 5, "Работа")).await;
+        eventually("running", || world.running()).await;
+        // A deletion whose disk cleanup failed leaves the topic stored and marked as deleted.
+        world.store.fail.store(true, Ordering::SeqCst);
+        assert!(delete_topic(&world, stale).await.is_err());
+        world.store.fail.store(false, Ordering::SeqCst);
+        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны");
+        assert!(probe_calls(&world).is_empty());
+        let stored = world.store.last().unwrap();
+        assert!(stored.contains_key(&KEY) && stored.contains_key(&stale));
+    }
+
+    #[tokio::test]
+    async fn sync_stops_on_retry_after() {
+        let world = world(FakeAgents::default());
+        world.send(inbound(Some(7), 1, Content::TopicCreated { name: "Старая".into() })).await;
+        world.send(inbound(Some(8), 2, Content::TopicCreated { name: "Живая".into() })).await;
+        let live = TopicKey { chat: KEY.chat, thread: ThreadId(8) };
+        *world.messenger.probes.lock().unwrap() =
+            Some(Err(SendError::RetryAfter(Duration::from_secs(3))));
+        assert_eq!(
+            sync(&world).await.unwrap_err(),
+            "Telegram просит подождать 3 с, повторите позже"
+        );
+        // The walk stops at the first rate limit: one probe only, no further API hammering.
+        assert_eq!(probe_calls(&world), [KEY]);
+        let stored = world.store.last().unwrap();
+        assert!(stored.contains_key(&KEY) && stored.contains_key(&live));
+    }
+
+    #[tokio::test]
+    async fn sync_keeps_topic_when_probe_is_uncertain() {
+        let world = world(FakeAgents::default());
+        world
+            .send(inbound(Some(7), 1, Content::TopicCreated { name: "Сомнительная".into() }))
+            .await;
+        world.send(inbound(Some(8), 2, Content::TopicCreated { name: "Живая".into() })).await;
+        let live = TopicKey { chat: KEY.chat, thread: ThreadId(8) };
+        // Uncertainty must not remove the topic, but does not stop the walk either.
+        *world.messenger.probes.lock().unwrap() =
+            Some(Err(SendError::Rejected("проверьте права".into())));
+        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны");
+        assert_eq!(probe_calls(&world), [KEY, live]);
+        let stored = world.store.last().unwrap();
+        assert!(stored.contains_key(&KEY) && stored.contains_key(&live));
+    }
+
+    #[tokio::test]
+    async fn delayed_topic_created_after_sync_stays_dropped() {
+        let world = world(FakeAgents::default());
+        world.send(inbound(Some(7), 1, Content::TopicCreated { name: "Старая".into() })).await;
+        *world.messenger.probes.lock().unwrap() = Some(Ok(false));
+        assert_eq!(sync(&world).await.unwrap(), "Удалено устаревших тем: 1");
+        // Delayed service events for a topic the sync proved missing must not resurrect it.
+        world.send(inbound(Some(7), 50, Content::TopicCreated { name: "Призрак".into() })).await;
+        world.send(text(Some(7), 51, "Оживи")).await;
+        // The second sync round trip proves the actor processed the ghosts above.
+        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны");
+        assert!(!world.store.last().unwrap().contains_key(&KEY));
+        assert!(!world.store.titles.lock().unwrap().contains_key(&KEY));
+        assert!(!world.handle.views.borrow().iter().any(|topic| topic.key == KEY));
+        assert_eq!(
+            world.texts().iter().filter(|text| text.contains("Новая сессия")).count(),
+            1,
+            "the ghost must not greet with a new session"
+        );
+    }
+
+    #[tokio::test]
+    async fn sync_reports_cleanup_disk_failure() {
+        let world = world(FakeAgents::default());
+        world.send(inbound(Some(7), 1, Content::TopicCreated { name: "Старая".into() })).await;
+        // The first sync round trip is the barrier: the topic is created and saved to disk.
+        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны");
+        world.store.fail.store(true, Ordering::SeqCst);
+        *world.messenger.probes.lock().unwrap() = Some(Ok(false));
+        let error = sync(&world).await.unwrap_err();
+        assert!(error.contains("Не удалось очистить 1 тем на диске"), "got: {error}");
+        assert!(error.contains("повторите синхронизацию"), "got: {error}");
+        assert!(!error.contains("Все темы актуальны"), "got: {error}");
+        // Nothing was cleaned durably, so the reply must not claim a removal count.
+        assert!(!error.contains("Удалено"), "got: {error}");
+        // The failed cleanup keeps the row for a retry, and the Delete button now reaches it
+        // through the `deleted` marker without another Telegram call.
+        assert!(world.store.last().unwrap().contains_key(&KEY));
+        world.store.fail.store(false, Ordering::SeqCst);
+        delete_topic(&world, KEY).await.unwrap();
+        assert!(!world.store.last().unwrap().contains_key(&KEY));
+        assert!(
+            !world.messenger.calls().iter().any(|call| matches!(call, Call::DeleteTopic(_))),
+            "the retry must reuse the proven-missing answer, not delete in Telegram again"
         );
     }
 
@@ -6188,9 +6331,9 @@ mod tests {
             for (revision, step, result) in
                 [(1, None, "First result"), (3, Some("Next"), "Second result")]
             {
-                let run = book.begin(task.id, revision, step).unwrap();
+                let run = book.begin(task.id, revision, step, ts()).unwrap();
                 book.record(task.id, run, result).unwrap();
-                book.finish(task.id, run, hub_core::tasks::RunState::Completed).unwrap();
+                book.finish(task.id, run, hub_core::tasks::RunState::Completed, ts()).unwrap();
             }
         }
         world.restart().await;
@@ -6211,9 +6354,9 @@ mod tests {
         let target = if task.backend == "qwen" { BackendKind::Codex } else { BackendKind::Qwen };
         {
             let mut book = world.store.tasks.lock().unwrap();
-            let run = book.begin(task.id, 1, None).unwrap();
+            let run = book.begin(task.id, 1, None, ts()).unwrap();
             book.record(task.id, run, "Previous result").unwrap();
-            book.finish(task.id, run, hub_core::tasks::RunState::Completed).unwrap();
+            book.finish(task.id, run, hub_core::tasks::RunState::Completed, ts()).unwrap();
         }
         world.restart().await;
         let assigned = task_op(
@@ -6393,7 +6536,7 @@ mod tests {
         let mut world = world(FakeAgents::default());
         let task = create_managed(&world).await;
         // Simulate a durable intent left by a crash before an outcome was saved.
-        world.store.tasks.lock().unwrap().begin(task.id, 1, None).unwrap();
+        world.store.tasks.lock().unwrap().begin(task.id, 1, None, ts()).unwrap();
         world.restart().await;
         let tasks = task_op(&world, KEY, tasks::Request::Get(task.id)).await.unwrap();
         assert_eq!(
@@ -6570,9 +6713,9 @@ mod tests {
         let mut world = world;
         {
             let mut book = world.store.tasks.lock().unwrap();
-            let run = book.begin(task.id, 1, None).unwrap();
+            let run = book.begin(task.id, 1, None, ts()).unwrap();
             book.record(task.id, run, &"secret ".repeat(2000)).unwrap();
-            book.finish(task.id, run, hub_core::tasks::RunState::Completed).unwrap();
+            book.finish(task.id, run, hub_core::tasks::RunState::Completed, ts()).unwrap();
         }
         world.restart().await;
         task_op(&world, KEY, tasks::Request::List).await.unwrap();
@@ -6625,7 +6768,7 @@ mod tests {
                 if queued {
                     book.claim_queue(id, revision)?;
                 }
-                book.begin(id, revision, next.as_deref())
+                book.begin(id, revision, next.as_deref(), ts())
             })?;
             self.launches.fetch_add(1, Ordering::SeqCst);
             *live = Some(crate::execution::Live {
@@ -6651,7 +6794,7 @@ mod tests {
             live.active = false;
             live.interaction = None;
             self.tasks.access(hub_core::tasks::service::Access::Internal, |book, _| {
-                book.finish(live.id, 1, hub_core::tasks::RunState::Interrupted)
+                book.finish(live.id, 1, hub_core::tasks::RunState::Interrupted, ts())
             })?;
             Ok(())
         }
@@ -6968,7 +7111,7 @@ mod tests {
             .tasks
             .access(hub_core::tasks::service::Access::Internal, |book, _| {
                 book.record(task.id, 1, "OLD_RESULT_MUST_NOT_APPEAR")?;
-                book.finish(task.id, 1, hub_core::tasks::RunState::Completed)
+                book.finish(task.id, 1, hub_core::tasks::RunState::Completed, ts())
             })
             .unwrap();
         {

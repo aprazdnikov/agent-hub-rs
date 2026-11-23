@@ -3,6 +3,7 @@ use crate::domain::BackendKind;
 pub mod git;
 pub mod queue;
 pub mod workflow;
+use jiff::Timestamp;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -169,6 +170,10 @@ pub struct Run {
     pub rules: Option<ProjectRules>,
     #[serde(default, skip_serializing_if = "workflow::WorkflowReport::is_empty")]
     pub workflow_report: workflow::WorkflowReport,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<Timestamp>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<Timestamp>,
 }
 fn explicit_backend<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -727,7 +732,13 @@ impl TaskBook {
         }
         Ok(())
     }
-    pub fn begin(&mut self, id: u64, revision: u64, next: Option<&str>) -> Result<u32, String> {
+    pub fn begin(
+        &mut self,
+        id: u64,
+        revision: u64,
+        next: Option<&str>,
+        now: Timestamp,
+    ) -> Result<u32, String> {
         let rules = self.rules(&self.get(id)?.project);
         if let Some(policy) = &rules.git {
             let prepared = self.get(id)?.git.as_ref().is_some_and(|git| {
@@ -782,6 +793,8 @@ impl TaskBook {
             backend: Some(task.backend.clone()),
             rules: (rules.revision != 0).then_some(rules),
             workflow_report: workflow::WorkflowReport::default(),
+            started_at: Some(now),
+            finished_at: None,
         });
         Ok(id)
     }
@@ -842,7 +855,13 @@ impl TaskBook {
         }
         Ok(())
     }
-    pub fn finish(&mut self, id: u64, run: u32, state: RunState) -> Result<(), String> {
+    pub fn finish(
+        &mut self,
+        id: u64,
+        run: u32,
+        state: RunState,
+        now: Timestamp,
+    ) -> Result<(), String> {
         if state == RunState::Running {
             return Err("Нужно конечное состояние запуска".into());
         }
@@ -851,6 +870,7 @@ impl TaskBook {
         task.status = TaskStatus::NeedsReview;
         if let Some(last) = task.runs.last_mut() {
             last.state = state;
+            last.finished_at = Some(now);
             if last.result.is_empty() && last.diagnostic.is_empty() {
                 last.diagnostic = "Запуск завершён без сохранённого текста ответа.".into();
             }

@@ -83,7 +83,7 @@ impl Editor {
                     ui.add(egui::TextEdit::singleline(&mut git.remote).id_salt(("git_remote", project)).char_limit(80));
                     ui.label("Базовая ветка — точное имя, например Dev или master");
                     ui.add(egui::TextEdit::singleline(&mut git.base).id_salt(("git_base", project)).char_limit(160));
-                    ui.small("Перед новой задачей: чистый каталог → fetch → fast-forward базы → новая ветка. Без stash, reset и push.");
+                    ui.small("Перед новой задачей: чистый каталог › fetch › fast-forward базы › новая ветка. Без stash, reset и push.");
                 }
             });
         ui.add_enabled_ui(!saving, |ui| self.workflow_settings(ui, project));

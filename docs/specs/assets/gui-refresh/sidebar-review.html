@@ -1,0 +1,120 @@
+<style>
+  .ah { --canvas:#F8F9F7; --surface:#FFFFFF; --text:#1C2521; --muted:#54645C; --border:#D5DDD7; --accent:#0D644F; --selected:#DCEEE5;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--text); font-size: 13px; line-height: 1.45; }
+  .ah * { box-sizing: border-box; }
+  .ah-win { background: var(--canvas); border: 1px solid var(--border); border-radius: 10px; padding: 16px; }
+  .ah-weak { color: var(--muted); }
+  .ah-small { font-size: 11px; }
+  .ah-btn { display: inline-block; border: 1px solid var(--border); background: var(--surface); color: var(--text);
+            border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: pointer; }
+  .ah-btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .ah-row { display: flex; align-items: center; gap: 8px; }
+  .ah-grow { flex: 1; min-width: 0; }
+  .ah-side { background: var(--surface); border-right: 1px solid var(--border); padding: 12px 10px; width: 230px; flex: none; }
+  .ah-search { border: 1px solid var(--border); border-radius: 6px; background: var(--canvas); padding: 6px 10px;
+               font-size: 12px; color: var(--muted); margin-bottom: 10px; }
+  .ah-proj { display: flex; align-items: center; gap: 6px; font-weight: 700; font-size: 13px; padding: 5px 6px; }
+  .ah-badge { margin-left: auto; background: var(--selected); color: var(--accent); border-radius: 999px;
+              font-size: 10px; font-weight: 700; padding: 1px 7px; }
+  .ah-task { display: flex; align-items: center; gap: 8px; padding: 5px 6px 5px 18px; font-size: 12px; border-radius: 6px; }
+  .ah-task-sel { background: var(--selected); color: var(--accent); font-weight: 600; }
+  .ah-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+  .ah-dot-run { background: var(--accent); animation: ah-pulse 1.6s ease-in-out infinite; }
+  .ah-dot-review { background: transparent; border: 2px solid #B7791F; width: 7px; height: 7px; }
+  .ah-dot-q { background: var(--accent); }
+  .ah-dot-err { background: #94312F; }
+  .ah-dot-idle { background: var(--border); }
+  @keyframes ah-pulse { 0%,100% { opacity: 1; } 50% { opacity: .35; } }
+  .ah-glyph { width: 8px; flex: none; font-size: 11px; font-weight: 700; text-align: center; }
+  .ah-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin: 10px 0 12px; }
+  .ah-tab { padding: 6px 12px; font-size: 12px; color: var(--muted); cursor: pointer; border-bottom: 2px solid transparent; }
+  .ah-tab-on { color: var(--accent); font-weight: 700; border-bottom-color: var(--accent); }
+  .ah-chip { display: inline-block; border-radius: 999px; padding: 2px 9px; font-size: 11px; font-weight: 600;
+             background: var(--selected); color: var(--accent); }
+  .ah-filechip { display: inline-block; border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px;
+                 font-size: 11px; color: var(--muted); background: var(--surface); margin-right: 6px; }
+  .ah-bar { border-top: 1px solid var(--border); padding-top: 10px; margin-top: 12px; }
+  .ah-old-sep { border-top: 1px solid var(--border); margin: 8px 0; }
+  .ah-collapse { font-size: 12px; font-weight: 600; padding: 4px 0; color: var(--text); }
+</style>
+
+<h2>Мелочи: сайдбар и экран результата</h2>
+<p class="subtitle">Последние два экрана. Навигация не меняется — только читаемость состояний и меньше вложенных раскрытий.</p>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">Сайдбар · сейчас</div>
+    <div class="mockup-body">
+      <div class="ah">
+        <div class="ah-side" style="border:1px solid var(--border); border-radius:10px; width:auto">
+          <div class="ah-small ah-weak" style="margin-bottom:6px">Проекты</div>
+          <div class="ah-search">Найти задачу</div>
+          <div class="ah-proj">▾ Atlas <span class="ah-weak" style="margin-left:auto">⋯</span></div>
+          <div class="ah-task"><span class="ah-glyph ah-weak">?</span> Отчёт по очереди</div>
+          <div class="ah-task"><span class="ah-dot ah-dot-idle" style="width:3px;height:3px"></span> Инструкция для команды</div>
+          <div class="ah-proj">▾ Витрина <span class="ah-weak" style="margin-left:auto">⋯</span></div>
+          <div class="ah-task ah-task-sel"><span class="ah-dot ah-dot-review" style="width:5px;height:5px;border-width:1px"></span> Поиск по каталогу</div>
+          <div class="ah-task"><span class="ah-dot ah-dot-idle" style="width:3px;height:3px"></span> Перевод формы заказа</div>
+        </div>
+        <p class="ah-small ah-weak" style="margin-top:8px">Точки 1.5–3 px, «?» и «!» текстом. Состояние читается только по увеличению.</p>
+      </div>
+    </div>
+  </div>
+  <div class="mockup">
+    <div class="mockup-header">Сайдбар · предлагаю</div>
+    <div class="mockup-body">
+      <div class="ah">
+        <div class="ah-side" style="border:1px solid var(--border); border-radius:10px; width:auto">
+          <div class="ah-small ah-weak" style="margin-bottom:6px">Проекты</div>
+          <div class="ah-search">Найти задачу</div>
+          <div class="ah-proj">▾ Atlas <span class="ah-badge">1</span> <span class="ah-weak">⋯</span></div>
+          <div class="ah-task" title="Ждёт ответа"><span class="ah-dot ah-dot-q"></span> Отчёт по очереди</div>
+          <div class="ah-task" title="Выполняется"><span class="ah-dot ah-dot-run"></span> Инструкция для команды</div>
+          <div class="ah-proj">▾ Витрина <span class="ah-badge">1</span> <span class="ah-weak">⋯</span></div>
+          <div class="ah-task ah-task-sel" title="На проверке"><span class="ah-dot ah-dot-review"></span> Поиск по каталогу</div>
+          <div class="ah-task" title="Ошибка запуска"><span class="ah-dot ah-dot-err"></span> Перевод формы заказа</div>
+        </div>
+        <p class="ah-small ah-weak" style="margin-top:8px">Цветные точки 8 px: зелёная пульсирует при работе, янтарное кольцо — проверка, красная — ошибка. У проекта — счётчик требующих внимания. Тултипы с состоянием остаются.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h2 style="margin-top:26px">Экран результата: вложенные раскрытия → вкладки</h2>
+<p class="subtitle">Сейчас: «Изменения», «Проверки», «Файлы», «История попыток» — стопка раскрывающихся секций, внутри ещё раскрытия. Предлагаю: сводка сверху и вкладки-секции, одна открыта за раз.</p>
+
+<div class="mockup">
+  <div class="mockup-header">Результат · предлагаю</div>
+  <div class="mockup-body">
+    <div class="ah">
+      <div class="ah-win" style="max-width:860px; margin:0 auto">
+        <div class="ah-small ah-weak">Витрина&nbsp;&nbsp;/&nbsp;&nbsp;#3</div>
+        <div class="ah-row" style="margin-top:2px">
+          <div class="ah-grow"><strong style="font-size:18px">Поиск по каталогу</strong></div>
+          <span class="ah-chip">Попытка 4 · Завершён</span>
+        </div>
+        <div class="ah-tabs">
+          <span class="ah-tab ah-tab-on">Сводка</span>
+          <span class="ah-tab">Изменения · 3 файла</span>
+          <span class="ah-tab">Проверки · 2/2</span>
+          <span class="ah-tab">Файлы · 2</span>
+          <span class="ah-tab">История · 4</span>
+        </div>
+        <div>Проверил на ширине 375 и 1280 пикселей. В обоих случаях можно сразу печатать следующий запрос. Обе проверки прошли.</div>
+        <div style="margin-top:10px">
+          <span class="ah-filechip">📄 report.txt</span>
+          <span class="ah-filechip">📄 screenshot.png</span>
+          <span class="ah-filechip">✓ проверки 2/2</span>
+        </div>
+        <div class="ah-bar ah-row">
+          <span class="ah-btn ah-btn-primary">Принять результат</span>
+          <span class="ah-btn">На доработку</span>
+          <span class="ah-grow"></span>
+          <span class="ah-small ah-weak">Замечания к строкам diff — во вкладке «Изменения», как сейчас</span>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<p class="ah-small ah-weak" style="margin-top:12px">Если оба экрана устраивают — соберу всё в короткий документ-дизайн (что меняем, что не трогаем, порядок работ) и покажу на утверждение перед кодом.</p>
