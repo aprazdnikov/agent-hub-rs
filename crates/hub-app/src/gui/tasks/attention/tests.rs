@@ -61,6 +61,49 @@ impl Screen {
             .nth(index)
             .map_or_else(|| panic!("missing {text:?} at {index} in {labels:?}"), |(_, p)| *p)
     }
+    /// Filled rectangles painted by one frame, for layout-size assertions.
+    fn rects(&mut self) -> Vec<(egui::Color32, egui::Rect)> {
+        let output = self.ctx.run_ui(
+            egui::RawInput {
+                events: vec![],
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)),
+                ..Default::default()
+            },
+            |ui| {
+                self.opened |=
+                    self.view.show_attention(ui, &self.snapshot, &mut |c| self.commands.push(c));
+            },
+        );
+        output
+            .shapes
+            .into_iter()
+            .filter_map(|shape| {
+                if let egui::Shape::Rect(rect) = shape.shape {
+                    let visible = rect.rect.intersect(shape.clip_rect);
+                    if rect.fill != egui::Color32::TRANSPARENT && visible.is_positive() {
+                        return Some((rect.fill, visible));
+                    }
+                }
+                None
+            })
+            .collect()
+    }
+    /// The icon plate behind a header glyph: the filled rect of plate height
+    /// that contains the glyph, asserting that exactly one such rect exists.
+    fn plate(&mut self, glyph: &str) -> egui::Rect {
+        let glyph = self.rect(glyph, 0);
+        let candidates: Vec<egui::Rect> = self
+            .rects()
+            .into_iter()
+            .map(|(_, rect)| rect)
+            .filter(|rect| rect.height() > 20.0 && rect.height() < 40.0)
+            .filter(|rect| rect.contains(glyph.center()))
+            .collect();
+        match candidates.as_slice() {
+            [rect] => *rect,
+            _ => panic!("expected exactly one plate rect around {glyph:?}, got {candidates:?}"),
+        }
+    }
     fn contains(&mut self, text: &str) -> bool {
         self.frame(vec![]).iter().any(|(label, _)| label == text)
     }
@@ -452,6 +495,36 @@ fn narrow_inbox_stacks_action_below_content() {
     let title = screen.rect("Поиск по каталогу", 0);
     let action = screen.rect("Проверить", 0);
     assert!(action.top() >= title.bottom(), "action must stack below the content at 400px");
+}
+
+#[test]
+fn icon_plate_does_not_stretch_the_card_header() {
+    for width in [1000.0, 400.0] {
+        let mut book = hub_core::tasks::TaskBook::default();
+        let id = book
+            .create(std::env::temp_dir(), "codex", "Поиск по каталогу", "Проверь")
+            .unwrap();
+        let row = TaskRow {
+            reason: Some(Attention::Review),
+            summary: "Готово".into(),
+            ..TaskRow::from(book.get(id).unwrap())
+        };
+        let mut screen = Screen::new(Snapshot {
+            task_index: Ok(vec![row]),
+            ..Default::default()
+        });
+        screen.size = egui::vec2(width, 800.0);
+        let plate = screen.plate("√");
+        assert!(
+            (24.0..=40.0).contains(&plate.width()),
+            "icon plate stretched to {plate:?} across the card_header at {width}px"
+        );
+        let title = screen.rect("Поиск по каталогу", 0);
+        assert!(
+            title.width() > 40.0,
+            "title squeezed into a vertical one-character column: {title:?} at {width}px"
+        );
+    }
 }
 
 #[test]

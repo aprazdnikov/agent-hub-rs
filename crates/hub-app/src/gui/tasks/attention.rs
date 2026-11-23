@@ -294,12 +294,18 @@ enum HeaderEnd<'a> {
 fn icon_plate(ui: &mut egui::Ui, glyph: &str, tone: Tone) {
     let (bg, fg) = theme::tone_colors(ui, tone);
     egui::Frame::new().fill(bg).corner_radius(8).show(ui, |ui| {
-        ui.set_min_size(egui::vec2(26.0, 26.0));
-        ui.centered_and_justified(|ui| {
-            ui.add(
-                egui::Label::new(egui::RichText::new(glyph).strong().color(fg)).selectable(false),
-            );
-        });
+        // A fixed box, not just a minimum: `centered_and_justified` inside a
+        // horizontal row otherwise stretches the frame across the whole card.
+        ui.allocate_ui_with_layout(
+            egui::vec2(26.0, 26.0),
+            egui::Layout::centered_and_justified(egui::Direction::TopDown),
+            |ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(glyph).strong().color(fg))
+                        .selectable(false),
+                );
+            },
+        );
     });
 }
 
