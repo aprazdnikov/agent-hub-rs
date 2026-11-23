@@ -2,11 +2,15 @@
 
 use eframe::egui;
 use hub_core::domain::{BackendKind, TopicKey};
+use hub_core::options::memory_label;
 use hub_core::progress::Phase;
 use hub_telegram::hub::{TopicState, TopicView};
+use std::path::Path;
+use tokio::sync::oneshot::error::TryRecvError;
 
 use crate::gui::folder::{Destination, Opener};
 use crate::gui::look::{short_session, topic_url};
+use crate::gui::theme::{self, Tone};
 use crate::supervisor::{Command, Snapshot};
 
 #[derive(Default)]
@@ -17,10 +21,20 @@ pub struct TopicsView {
     deleting: Option<(TopicKey, String)>,
     deletion_result: Option<(TopicKey, tokio::sync::oneshot::Receiver<Result<(), String>>)>,
     deletion_notice: Option<Result<String, String>>,
+    sync_reply: Option<tokio::sync::oneshot::Receiver<Result<String, String>>>,
+    sync_notice: Option<SyncNotice>,
     memory_reply: Option<tokio::sync::oneshot::Receiver<Result<(), String>>>,
     memory_error: Option<String>,
     filter: TopicFilter,
     opener: Opener,
+}
+
+/// One-line notice for a «Синхронизировать» request. The hub going away mid-sync
+/// is not a failed sync, so `Interrupted` renders as a neutral notice, not an error.
+enum SyncNotice {
+    Done(String),
+    Rejected(String),
+    Interrupted,
 }
 
 #[derive(Default)]
@@ -56,26 +70,55 @@ fn state_text(state: TopicState) -> &'static str {
 impl TopicsView {
     pub fn poll(&mut self, ctx: &egui::Context) {
         self.opener.poll(ctx);
+        let mut waiting = false;
+        if let Some(receipt) = &mut self.sync_reply {
+            match receipt.try_recv() {
+                Ok(Ok(message)) => self.sync_notice = Some(SyncNotice::Done(message)),
+                Ok(Err(message)) => self.sync_notice = Some(SyncNotice::Rejected(message)),
+                Err(TryRecvError::Closed) => self.sync_notice = Some(SyncNotice::Interrupted),
+                Err(TryRecvError::Empty) => waiting = true,
+            }
+            if !waiting {
+                self.sync_reply = None;
+            }
+        }
         if let Some((key, receipt)) = self.deletion_result.as_mut() {
-            use tokio::sync::oneshot::error::TryRecvError;
-            let result = match receipt.try_recv() {
-                Ok(result) => result,
-                Err(TryRecvError::Empty) => {
-                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
-                    return;
+            match receipt.try_recv() {
+                Ok(result) => {
+                    self.deletion_notice = Some(
+                        result.map(|()| format!("Тема #{} удалена из Telegram.", key.thread.0)),
+                    );
+                    self.deletion_result = None;
                 }
+                Err(TryRecvError::Empty) => waiting = true,
                 Err(TryRecvError::Closed) => {
-                    Err("Связь с ботом прервана. Проверьте тему в Telegram.".into())
+                    self.deletion_notice =
+                        Some(Err("Связь с ботом прервана. Проверьте тему в Telegram.".into()));
+                    self.deletion_result = None;
                 }
-            };
-            self.deletion_notice =
-                Some(result.map(|()| format!("Тема #{} удалена из Telegram.", key.thread.0)));
-            self.deletion_result = None;
+            }
+        }
+        if waiting {
+            ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot, send: &mut impl FnMut(Command)) {
-        ui.heading("Темы Telegram");
+        ui.horizontal(|ui| {
+            ui.heading("Темы Telegram");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(self.sync_reply.is_none(), egui::Button::new("Синхронизировать"))
+                    .on_hover_text("Проверить темы в Telegram и убрать удалённые там")
+                    .clicked()
+                {
+                    let (reply, received) = tokio::sync::oneshot::channel();
+                    self.sync_reply = Some(received);
+                    self.sync_notice = None;
+                    send(Command::SyncTopics { reply });
+                }
+            });
+        });
         ui.add_space(8.0);
         if !snapshot.topics.is_empty() {
             ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
@@ -93,8 +136,19 @@ impl TopicsView {
             }
             None => {}
         }
+        match &self.sync_notice {
+            Some(SyncNotice::Done(message)) => {
+                ui.label(message);
+            }
+            Some(SyncNotice::Rejected(message)) => {
+                ui.colored_label(ui.visuals().error_fg_color, message);
+            }
+            Some(SyncNotice::Interrupted) => {
+                ui.label("Синхронизация прервана");
+            }
+            None => {}
+        }
         if let Some(reply) = &mut self.memory_reply {
-            use tokio::sync::oneshot::error::TryRecvError;
             match reply.try_recv() {
                 Ok(result) => {
                     self.memory_error = result.err();
@@ -132,8 +186,8 @@ impl TopicsView {
             }
             egui::ScrollArea::vertical().id_salt("telegram_topic_rows").show(ui, |ui| {
                 for topic in topics {
-                    ui.push_id(topic.key, |ui| self.row(ui, topic, send));
-                    ui.separator();
+                    ui.push_id(topic.key, |ui| self.card(ui, topic, send));
+                    ui.add_space(4.0);
                 }
             });
         }
@@ -202,100 +256,116 @@ impl TopicsView {
         });
     }
 
-    fn row(&mut self, ui: &mut egui::Ui, topic: &TopicView, send: &mut impl FnMut(Command)) {
+    fn card(&mut self, ui: &mut egui::Ui, topic: &TopicView, send: &mut impl FnMut(Command)) {
         let path = topic.session.cwd.as_path();
         let project = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
         let running = topic.state == TopicState::Running;
         let phase = topic.progress.phase();
-        let state = if running && phase != Phase::Unknown {
-            phase.label()
-        } else {
-            state_text(topic.state)
-        };
-        let open = self.expanded == Some(topic.key);
+        let tone = if running { Tone::Accent } else { Tone::Neutral };
         let url = topic_url(topic.key);
-        ui.horizontal_wrapped(|ui| {
-            let title = name(topic);
-            ui.strong(&title);
-            let telegram = ui.add_enabled(url.is_some(), egui::Button::new("Telegram"));
-            if telegram.on_hover_text("Открыть тему в Telegram").clicked() {
-                self.opener.start(Destination::Topic(topic.key), ui.ctx());
-            }
-            if ui.selectable_label(open, "Параметры").clicked() {
-                self.expanded = if open { None } else { Some(topic.key) };
+        let open = self.expanded == Some(topic.key);
+        theme::card(ui).show(ui, |ui| {
+            ui.horizontal(|ui| {
+                icon_plate(ui, if running { "•" } else { "○" }, tone);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    self.menu(ui, topic, send);
+                    if ui
+                        .add_enabled(url.is_some(), egui::Button::new("Telegram"))
+                        .on_hover_text("Открыть тему в Telegram")
+                        .clicked()
+                    {
+                        self.opener.start(Destination::Topic(topic.key), ui.ctx());
+                    }
+                    if running && ui.button("Остановить").clicked() {
+                        send(Command::StopTopic(topic.key));
+                    }
+                    ui.vertical(|ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal_wrapped(|ui| {
+                            let title = name(topic);
+                            ui.strong(&title);
+                            theme::chip(ui, tone, state_text(topic.state));
+                            if running && phase != Phase::Unknown {
+                                theme::chip(ui, Tone::Neutral, phase.label());
+                            }
+                        });
+                        ui.weak(format!("{project} · {}", topic.session.backend.name()))
+                            .on_hover_text(path.display().to_string());
+                    });
+                });
+            });
+            if open {
+                ui.separator();
+                details(ui, topic, running, phase, path);
             }
         });
-        ui.weak(format!("{project} · {} · {state}", topic.session.backend.name()))
-            .on_hover_text(path.display().to_string());
-        if self.expanded != Some(topic.key) {
-            return;
-        }
-        ui.indent("topic_parameters", |ui| {
-            ui.add_enabled_ui(self.memory_reply.is_none(), |ui| {
-                let value =
-                    super::memory::scope(ui, "Память темы", topic.session.preferences.memory);
-                if value != topic.session.preferences.memory {
-                    let (reply, received) = tokio::sync::oneshot::channel();
-                    self.memory_reply = Some(received);
-                    self.memory_error = None;
-                    send(Command::TopicMemory { key: topic.key, value, reply });
+    }
+
+    fn menu(&mut self, ui: &mut egui::Ui, topic: &TopicView, send: &mut impl FnMut(Command)) {
+        let running = topic.state == TopicState::Running;
+        let path = topic.session.cwd.as_path();
+        let url = topic_url(topic.key);
+        let memory_busy = self.memory_reply.is_some();
+        let current = topic.session.preferences.memory;
+        let session_id = topic.session.session.as_ref().map(|id| id.as_str().to_owned());
+        let _ = ui.menu_button("…", |ui| {
+            ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
+            egui::containers::menu::SubMenuButton::from_button(
+                egui::Button::new("Память темы").right_text(memory_label(current)),
+            )
+            .ui(ui, |ui| {
+                for mode in [None, Some(true), Some(false)] {
+                    let label = egui::Button::selectable(current == mode, memory_label(mode));
+                    let picked = ui.add_enabled(!memory_busy, label).clicked();
+                    if picked && mode != current {
+                        let (reply, received) = tokio::sync::oneshot::channel();
+                        self.memory_reply = Some(received);
+                        self.memory_error = None;
+                        send(Command::TopicMemory { key: topic.key, value: mode, reply });
+                        ui.close();
+                    }
                 }
             });
-            if running {
-                ui.weak(match topic.memory_enabled {
-                    Some(true) => "Память текущего запуска включена",
-                    Some(false) => "Память текущего запуска выключена",
-                    None => "Состояние памяти текущего запуска неизвестно",
-                });
+            if ui.button("Параметры и прогресс").clicked() {
+                self.expanded = (self.expanded != Some(topic.key)).then_some(topic.key);
+                ui.close();
             }
-            for line in topic.parameters.lines() {
-                ui.label(line);
+            if ui.button("Открыть папку").clicked() {
+                self.opener.start(Destination::Folder(path.to_owned()), ui.ctx());
+                ui.close();
             }
-            if phase != Phase::Unknown {
-                for line in topic.progress.describe(std::time::Instant::now()).lines() {
-                    ui.small(line);
-                }
+            if ui.add_enabled(url.is_some(), egui::Button::new("Скопировать ссылку")).clicked()
+                && let Some(link) = &url
+            {
+                ui.ctx().copy_text(link.clone());
             }
-            ui.horizontal_wrapped(|ui| {
-                ui.label(path.display().to_string());
-                if ui.button("Открыть папку").clicked() {
-                    self.opener.start(Destination::Folder(path.to_owned()), ui.ctx());
-                }
-                if let Some(url) = url
-                    && ui.button("Скопировать ссылку").clicked()
-                {
-                    ui.ctx().copy_text(url);
-                }
-                if let Some(id) = &topic.session.session
-                    && ui
-                        .add(
-                            egui::Button::new(short_session(id.as_str()))
-                                .frame_when_inactive(false),
-                        )
-                        .on_hover_text("Скопировать полный session_id")
-                        .clicked()
-                {
-                    ui.ctx().copy_text(id.as_str().to_owned());
-                }
-            });
-            ui.horizontal_wrapped(|ui| {
-                if ui.add_enabled(running, egui::Button::new("Остановить")).clicked() {
-                    send(Command::StopTopic(topic.key));
-                }
-                if ui.add_enabled(!running, egui::Button::new("Сбросить сессию")).clicked()
-                {
-                    self.resetting = Some(topic.key);
-                }
-                if ui
-                    .add_enabled(
-                        !running && topic.key.thread.0 > 1 && self.deletion_result.is_none(),
-                        egui::Button::new("Удалить тему"),
-                    )
-                    .clicked()
-                {
-                    self.deleting = Some((topic.key, name(topic)));
-                }
-            });
+            let mut copy_session = egui::Button::new("Скопировать session_id");
+            if let Some(id) = &session_id {
+                copy_session = copy_session.right_text(short_session(id));
+            }
+            if ui.add_enabled(session_id.is_some(), copy_session).clicked()
+                && let Some(id) = &session_id
+            {
+                ui.ctx().copy_text(id.clone());
+            }
+            ui.separator();
+            if ui.add_enabled(!running, egui::Button::new("Сбросить сессию…")).clicked()
+            {
+                self.resetting = Some(topic.key);
+                ui.close();
+            }
+            let danger =
+                egui::RichText::new("Удалить тему…").color(theme::tone_colors(ui, Tone::Error).1);
+            if ui
+                .add_enabled(
+                    !running && topic.key.thread.0 > 1 && self.deletion_result.is_none(),
+                    egui::Button::new(danger),
+                )
+                .clicked()
+            {
+                self.deleting = Some((topic.key, name(topic)));
+                ui.close();
+            }
         });
     }
 
@@ -341,6 +411,44 @@ impl TopicsView {
         }
     }
 }
+
+fn icon_plate(ui: &mut egui::Ui, glyph: &str, tone: Tone) {
+    let (bg, fg) = theme::tone_colors(ui, tone);
+    egui::Frame::new().fill(bg).corner_radius(8).show(ui, |ui| {
+        // A fixed box, not just a minimum: `centered_and_justified` inside a
+        // horizontal row otherwise stretches the frame across the whole card.
+        ui.allocate_ui_with_layout(
+            egui::vec2(26.0, 26.0),
+            egui::Layout::centered_and_justified(egui::Direction::TopDown),
+            |ui| {
+                ui.add(
+                    egui::Label::new(egui::RichText::new(glyph).strong().color(fg))
+                        .selectable(false),
+                );
+            },
+        );
+    });
+}
+
+fn details(ui: &mut egui::Ui, topic: &TopicView, running: bool, phase: Phase, path: &Path) {
+    if running {
+        ui.weak(match topic.memory_enabled {
+            Some(true) => "Память текущего запуска включена",
+            Some(false) => "Память текущего запуска выключена",
+            None => "Состояние памяти текущего запуска неизвестно",
+        });
+    }
+    ui.label(path.display().to_string());
+    for line in topic.parameters.lines() {
+        ui.label(line);
+    }
+    if phase != Phase::Unknown {
+        for line in topic.progress.describe(std::time::Instant::now()).lines() {
+            ui.small(line);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -449,6 +557,98 @@ mod tests {
     }
 
     #[test]
+    fn topic_card_shows_state_and_phase_chips() {
+        let ctx = egui::Context::default();
+        let mut view = TopicsView::default();
+        let mut running = topic(7, "Рабочая", BackendKind::Claude, TopicState::Running);
+        running.progress = hub_core::progress::TaskProgress::new(std::time::Instant::now());
+        let waiting = topic(8, "Свободная", BackendKind::Codex, TopicState::Waiting);
+        let snapshot = Snapshot { topics: vec![running, waiting], ..Snapshot::default() };
+        let shown = labels(&draw(&ctx, &mut view, &snapshot));
+        for chip_text in ["работает", "Подготовка", "свободна"] {
+            assert!(
+                shown.iter().any(|text| text == chip_text),
+                "missing chip {chip_text}: {shown:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_button_sends_command_and_notifies_result() {
+        let ctx = egui::Context::default();
+        let mut view = TopicsView::default();
+        let snapshot = Snapshot {
+            topics: vec![topic(42, "Проект", BackendKind::Claude, TopicState::Waiting)],
+            ..Snapshot::default()
+        };
+        let mut commands = Vec::new();
+        for (outcome, expected) in [
+            (Ok("Все темы актуальны".to_owned()), "Все темы актуальны"),
+            (
+                Err("Бот занят или остановлен. Повторите синхронизацию.".to_owned()),
+                "Бот занят или остановлен. Повторите синхронизацию.",
+            ),
+        ] {
+            click(&ctx, &mut view, &snapshot, "Синхронизировать", &mut commands);
+            let Some(Command::SyncTopics { reply }) = commands.pop() else {
+                panic!("missing sync command")
+            };
+            reply.send(outcome).unwrap();
+            let shown = labels(&draw(&ctx, &mut view, &snapshot));
+            assert!(
+                shown.iter().any(|text| text == expected),
+                "missing notice {expected}: {shown:?}"
+            );
+        }
+        click(&ctx, &mut view, &snapshot, "Синхронизировать", &mut commands);
+        let Some(Command::SyncTopics { reply }) = commands.pop() else {
+            panic!("missing sync command after hub shutdown")
+        };
+        drop(reply);
+        let shown = labels(&draw(&ctx, &mut view, &snapshot));
+        assert!(
+            shown.iter().any(|text| text == "Синхронизация прервана"),
+            "a dropped reply must render as a neutral notice: {shown:?}"
+        );
+    }
+
+    #[test]
+    fn topic_menu_offers_actions_and_confirms_destructive_ones() {
+        let ctx = egui::Context::default();
+        let mut view = TopicsView::default();
+        let snapshot = Snapshot {
+            topics: vec![topic(42, "Проект", BackendKind::Claude, TopicState::Waiting)],
+            ..Snapshot::default()
+        };
+        let mut commands = Vec::new();
+        click(&ctx, &mut view, &snapshot, "…", &mut commands);
+        let shown = labels(&draw(&ctx, &mut view, &snapshot));
+        for item in [
+            "Память темы",
+            "Параметры и прогресс",
+            "Открыть папку",
+            "Скопировать ссылку",
+            "Скопировать session_id",
+            "Сбросить сессию…",
+            "Удалить тему…",
+        ] {
+            assert!(shown.iter().any(|text| text == item), "missing menu item {item}: {shown:?}");
+        }
+        click(&ctx, &mut view, &snapshot, "Сбросить сессию…", &mut commands);
+        assert!(commands.is_empty(), "reset requires confirmation");
+        assert_eq!(view.resetting, Some(snapshot.topics[0].key));
+        click(&ctx, &mut view, &snapshot, "Сбросить", &mut commands);
+        assert!(matches!(commands.as_slice(), [Command::ResetTopic(key)] if key.thread.0 == 42));
+        commands.clear();
+        click(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click(&ctx, &mut view, &snapshot, "Удалить тему…", &mut commands);
+        assert!(commands.is_empty(), "delete requires confirmation");
+        assert!(view.deleting.is_some());
+        click(&ctx, &mut view, &snapshot, "Отмена", &mut commands);
+        assert!(view.deleting.is_none());
+    }
+
+    #[test]
     fn detailed_phase_filter_keeps_waiting_tasks_busy_and_stop_targets_the_topic() {
         let ctx = egui::Context::default();
         let mut view = TopicsView::default();
@@ -464,13 +664,16 @@ mod tests {
         click(&ctx, &mut view, &snapshot, "Фильтры", &mut commands);
         click(&ctx, &mut view, &snapshot, "Все этапы", &mut commands);
         click(&ctx, &mut view, &snapshot, "Ожидает разрешения", &mut commands);
-        click(&ctx, &mut view, &snapshot, "Параметры", &mut commands);
+        click(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click(&ctx, &mut view, &snapshot, "Параметры и прогресс", &mut commands);
         let shown = labels(&draw(&ctx, &mut view, &snapshot));
         assert!(shown.iter().any(|text| text == "Темы: 1 из 2"));
         assert!(!shown.iter().any(|text| text == "Stopped"));
         assert!(shown.iter().any(|text| text.starts_with("Длительность запуска:")));
-        click(&ctx, &mut view, &snapshot, "Сбросить сессию", &mut commands);
+        click(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click(&ctx, &mut view, &snapshot, "Сбросить сессию…", &mut commands);
         assert!(view.resetting.is_none(), "a waiting task is still busy");
+        click(&ctx, &mut view, &snapshot, "…", &mut commands);
         click(&ctx, &mut view, &snapshot, "Остановить", &mut commands);
         assert!(matches!(commands.as_slice(), [Command::StopTopic(key)] if key.thread.0 == 7));
     }
@@ -484,7 +687,7 @@ mod tests {
             ..Snapshot::default()
         };
         click(&ctx, &mut view, &snapshot, "Фильтры", &mut Vec::new());
-        click(&ctx, &mut view, &snapshot, "Параметры", &mut Vec::new());
+        click(&ctx, &mut view, &snapshot, "…", &mut Vec::new());
         let shown = labels(&draw(&ctx, &mut view, &snapshot));
         for label in [
             "Поиск по названию или каталогу",
@@ -547,7 +750,7 @@ mod tests {
         let shown = labels(&draw(&ctx, &mut view, &snapshot));
         assert!(shown.iter().any(|text| text == "Темы: 1 из 2"));
         assert!(!shown.iter().any(|text| text == "Фронтенд"));
-        click(&ctx, &mut view, &snapshot, "Параметры", &mut commands);
+        click(&ctx, &mut view, &snapshot, "…", &mut commands);
         let copied = click(&ctx, &mut view, &snapshot, "Скопировать ссылку", &mut commands);
         assert!(copied.platform_output.commands.iter().any(|command| matches!(command,
             egui::OutputCommand::CopyText(text) if text == "https://t.me/c/1234567890/42")));
@@ -555,7 +758,8 @@ mod tests {
         assert!(matches!(commands.as_slice(), [Command::StopTopic(key)] if key.thread.0 == 42));
         commands.clear();
         snapshot.topics.last_mut().unwrap().state = TopicState::Waiting;
-        click(&ctx, &mut view, &snapshot, "Сбросить сессию", &mut commands);
+        click(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click(&ctx, &mut view, &snapshot, "Сбросить сессию…", &mut commands);
         assert!(commands.is_empty(), "reset requires confirmation");
         click(&ctx, &mut view, &snapshot, "Сбросить", &mut commands);
         assert!(matches!(commands.as_slice(), [Command::ResetTopic(key)] if key.thread.0 == 42));
@@ -572,11 +776,12 @@ mod tests {
             ..Snapshot::default()
         };
         let mut commands = Vec::new();
-        click(&ctx, &mut view, &snapshot, "Параметры", &mut commands);
-        click(&ctx, &mut view, &snapshot, "Удалить тему", &mut commands);
+        click(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click(&ctx, &mut view, &snapshot, "Удалить тему…", &mut commands);
         click(&ctx, &mut view, &snapshot, "Отмена", &mut commands);
         assert!(commands.is_empty());
-        click(&ctx, &mut view, &snapshot, "Удалить тему", &mut commands);
+        click(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click(&ctx, &mut view, &snapshot, "Удалить тему…", &mut commands);
         click(&ctx, &mut view, &snapshot, "Удалить из Telegram", &mut commands);
         let Some(Command::DeleteTopic { key, reply }) = commands.pop() else {
             panic!("missing confirmed deletion")
@@ -623,7 +828,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut view = TopicsView::default();
         let snapshot = Snapshot { topics: vec![deleted], ..Snapshot::default() };
-        click(&ctx, &mut view, &snapshot, "Параметры", &mut Vec::new());
+        click(&ctx, &mut view, &snapshot, "…", &mut Vec::new());
         click(&ctx, &mut view, &snapshot, "Открыть папку", &mut Vec::new());
         let end = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
@@ -649,7 +854,8 @@ mod tests {
         draw(&ctx, &mut view, &snapshot);
         let closed = labels(&draw(&ctx, &mut view, &snapshot));
         assert!(!closed.iter().any(|line| line.contains("Модель: model")));
-        click(&ctx, &mut view, &snapshot, "Параметры", &mut Vec::new());
+        click(&ctx, &mut view, &snapshot, "…", &mut Vec::new());
+        click(&ctx, &mut view, &snapshot, "Параметры и прогресс", &mut Vec::new());
         let open = labels(&draw(&ctx, &mut view, &snapshot));
         assert!(open.iter().any(|line| line == "Модель: model · тема"));
         assert!(open.iter().any(|line| line == "Режим: plan · проект"));
