@@ -13,8 +13,8 @@ use hub_core::settings::{TelegramSettings, Token};
 use teloxide::dispatching::{Dispatcher, ShutdownToken, UpdateFilterExt};
 use teloxide::net::Download;
 use teloxide::payloads::{
-    AnswerCallbackQuerySetters, EditMessageReplyMarkupSetters, EditMessageTextSetters,
-    SendChatActionSetters, SendDocumentSetters, SendMessageSetters,
+    AnswerCallbackQuerySetters, EditForumTopicSetters, EditMessageReplyMarkupSetters,
+    EditMessageTextSetters, SendChatActionSetters, SendDocumentSetters, SendMessageSetters,
 };
 use teloxide::prelude::{Bot, CallbackQuery, Message, Requester, Update};
 use teloxide::types::{
@@ -382,18 +382,23 @@ fn thread(key: TopicKey) -> tg::ThreadId {
     tg::ThreadId(tg::MessageId(key.thread.0))
 }
 
+/// teloxide has no dedicated thread-not-found variant: every such reply lands in
+/// `ApiError::Unknown` as the full description, and the wording (prefix, casing, underscores)
+/// varies, so match on substrings.
+fn thread_not_found(reason: &str) -> bool {
+    let reason = reason.to_ascii_lowercase();
+    ["thread not found", "topic_deleted", "topic_not_found", "message_thread_not_found"]
+        .into_iter()
+        .any(|needle| reason.contains(needle))
+}
+
 impl Messenger for TelegramMessenger {
     fn delete_topic(&self, key: TopicKey) -> BoxFuture<'_, Result<(), SendError>> {
         Box::pin(async move {
             match self.topics.delete_forum_topic(tg::ChatId(key.chat.0), thread(key)).await {
                 Ok(_) => Ok(()),
                 // The remote deletion may have succeeded before a timeout or local write failure.
-                Err(RequestError::Api(ApiError::Unknown(reason)))
-                    if reason.eq_ignore_ascii_case("Bad Request: message thread not found")
-                        || reason.eq_ignore_ascii_case("Bad Request: TOPIC_DELETED")
-                        || reason.eq_ignore_ascii_case("Bad Request: TOPIC_NOT_FOUND")
-                        || reason.eq_ignore_ascii_case("Bad Request: MESSAGE_THREAD_NOT_FOUND") =>
-                {
+                Err(RequestError::Api(ApiError::Unknown(reason))) if thread_not_found(&reason) => {
                     Ok(())
                 }
                 Err(RequestError::RetryAfter(seconds)) => {
@@ -404,6 +409,33 @@ impl Messenger for TelegramMessenger {
                 )),
                 Err(_) => Err(SendError::Failed(
                     "Результат удаления неизвестен. Проверьте тему в Telegram.".into(),
+                )),
+            }
+        })
+    }
+
+    fn probe_topic(&self, key: TopicKey) -> BoxFuture<'_, Result<bool, SendError>> {
+        Box::pin(async move {
+            // An empty name keeps the current name, and an unspecified icon keeps the current
+            // icon, so this edit is invisible; only the error tells whether the topic exists.
+            match self
+                .topics
+                .edit_forum_topic(tg::ChatId(key.chat.0), thread(key))
+                .name(String::new())
+                .await
+            {
+                Ok(_) => Ok(true),
+                Err(RequestError::Api(ApiError::Unknown(reason))) if thread_not_found(&reason) => {
+                    Ok(false)
+                }
+                Err(RequestError::RetryAfter(seconds)) => {
+                    Err(SendError::RetryAfter(seconds.duration()))
+                }
+                Err(RequestError::Api(_)) => Err(SendError::Rejected(
+                    "Проверьте, что бот — администратор с правом управлять темами.".into(),
+                )),
+                Err(_) => Err(SendError::Failed(
+                    "Результат проверки темы неизвестен. Проверьте тему в Telegram.".into(),
                 )),
             }
         })
@@ -706,6 +738,24 @@ mod tests {
     use super::*;
 
     #[rstest::rstest]
+    #[case::spaced("Bad Request: message thread not found")]
+    #[case::deleted("Bad Request: TOPIC_DELETED")]
+    #[case::not_found("Bad Request: TOPIC_NOT_FOUND")]
+    #[case::thread("Bad Request: MESSAGE_THREAD_NOT_FOUND")]
+    #[case::prefixed("Bad Request: some prefix message thread not found")]
+    #[case::mixed_case("bad request: Message_Thread_Not_Found")]
+    fn stale_thread_reasons_are_detected(#[case] reason: &str) {
+        assert!(thread_not_found(reason));
+    }
+
+    #[rstest::rstest]
+    #[case::rights("Bad Request: not enough rights")]
+    #[case::chat("Bad Request: chat not found")]
+    fn other_reasons_are_not_stale_threads(#[case] reason: &str) {
+        assert!(!thread_not_found(reason));
+    }
+
+    #[rstest::rstest]
     #[case::created(
         json!({"ok": true, "result": {"message_thread_id": 41, "name": "Передача → Codex", "icon_color": 7_322_096}}),
         Ok(ThreadId(41))
@@ -805,6 +855,8 @@ mod tests {
     #[rstest::rstest]
     #[case(json!({"ok":true,"result":true}), true)]
     #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: message thread not found"}), true)]
+    #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_DELETED"}), true)]
+    #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: MESSAGE_THREAD_NOT_FOUND"}), true)]
     #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: CHAT_ADMIN_REQUIRED"}), false)]
     #[tokio::test]
     async fn topic_deletion_uses_bot_api_once(
@@ -822,6 +874,56 @@ mod tests {
                 "/bot1:test/deleteforumtopic".to_owned(),
                 json!({"chat_id":-100,"message_thread_id":42})
             )]
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::exists(json!({"ok":true,"result":true}), Ok(true))]
+    #[case::missing(json!({"ok":false,"error_code":400,"description":"Bad Request: message thread not found"}), Ok(false))]
+    #[case::deleted(json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_DELETED"}), Ok(false))]
+    #[case::retry(
+        json!({"ok":false,"error_code":429,"description":"Too Many Requests: retry after 2","parameters":{"retry_after":2}}),
+        Err(SendError::RetryAfter(Duration::from_secs(2)))
+    )]
+    #[case::rejected(
+        json!({"ok":false,"error_code":400,"description":"Bad Request: CHAT_ADMIN_REQUIRED"}),
+        Err(SendError::Rejected("Проверьте, что бот — администратор с правом управлять темами.".to_owned()))
+    )]
+    #[tokio::test]
+    async fn topic_probe_keeps_the_name_and_maps_existence(
+        #[case] response: serde_json::Value,
+        #[case] expected: Result<bool, SendError>,
+    ) {
+        let (messenger, requests, server) = topic_api(response).await;
+        let result =
+            messenger.probe_topic(TopicKey { chat: ChatId(-100), thread: ThreadId(42) }).await;
+        server.abort();
+        assert_eq!(
+            (result, requests.lock().unwrap().clone()),
+            (
+                expected,
+                vec![(
+                    "/bot1:test/editforumtopic".to_owned(),
+                    json!({"chat_id":-100,"message_thread_id":42,"name":""})
+                )]
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn topic_probe_transport_failure_does_not_expose_the_token_or_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let bot = topic_bot("1:secret")
+            .unwrap()
+            .set_api_url(format!("http://{address}/").parse().unwrap());
+        let messenger = TelegramMessenger { files: bot.clone(), topics: bot.clone(), bot };
+        assert_eq!(
+            messenger.probe_topic(TopicKey { chat: ChatId(-100), thread: ThreadId(42) }).await,
+            Err(SendError::Failed(
+                "Результат проверки темы неизвестен. Проверьте тему в Telegram.".to_owned()
+            ))
         );
     }
 

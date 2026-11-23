@@ -32,6 +32,7 @@ impl crate::actions::ActionRunner for FakeActionRunner {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Call {
     DeleteTopic(TopicKey),
+    ProbeTopic(TopicKey),
     CreateTopic { chat: ChatId, name: String, thread: ThreadId },
     Send { target: Target, message: Outgoing, id: MessageId },
     Edit { chat: ChatId, message: MessageId, text: String, format: Format },
@@ -50,6 +51,7 @@ pub(crate) struct FakeMessenger {
     topic_attempts: Mutex<Vec<(ChatId, String)>>,
     topics: Mutex<VecDeque<Result<ThreadId, SendError>>>,
     pub(crate) deletion: Mutex<Option<Result<(), SendError>>>,
+    pub(crate) probes: Mutex<Option<Result<bool, SendError>>>,
     sends: Mutex<VecDeque<Result<(), SendError>>>,
     edits: Mutex<VecDeque<Result<(), SendError>>>,
     edit_delay: Mutex<Option<oneshot::Receiver<()>>>,
@@ -145,6 +147,12 @@ impl Messenger for FakeMessenger {
     fn delete_topic(&self, key: TopicKey) -> BoxFuture<'_, Result<(), SendError>> {
         self.record(Call::DeleteTopic(key));
         let result = self.deletion.lock().unwrap().take().unwrap_or(Ok(()));
+        Box::pin(async { result })
+    }
+
+    fn probe_topic(&self, key: TopicKey) -> BoxFuture<'_, Result<bool, SendError>> {
+        self.record(Call::ProbeTopic(key));
+        let result = self.probes.lock().unwrap().take().unwrap_or(Ok(true));
         Box::pin(async { result })
     }
 
@@ -321,6 +329,28 @@ mod tests {
             Err(SendError::Failed("Не удалось получить файл".to_owned()))
         );
         assert!(messenger.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn probe_defaults_to_existing_and_records_every_call() {
+        let messenger = FakeMessenger::default();
+        let key = TopicKey { chat: ChatId(-100), thread: ThreadId(42) };
+        let outcomes = [messenger.probe_topic(key).await, messenger.probe_topic(key).await];
+        assert_eq!(
+            (outcomes, messenger.calls()),
+            ([Ok(true), Ok(true)], vec![Call::ProbeTopic(key), Call::ProbeTopic(key)])
+        );
+    }
+
+    #[tokio::test]
+    async fn scripted_probe_outcome_applies_once_then_defaults_back() {
+        use std::time::Duration;
+        let messenger = FakeMessenger::default();
+        let key = TopicKey { chat: ChatId(-100), thread: ThreadId(42) };
+        *messenger.probes.lock().unwrap() =
+            Some(Err(SendError::RetryAfter(Duration::from_secs(3))));
+        let outcomes = [messenger.probe_topic(key).await, messenger.probe_topic(key).await];
+        assert_eq!(outcomes, [Err(SendError::RetryAfter(Duration::from_secs(3))), Ok(true)]);
     }
 }
 
