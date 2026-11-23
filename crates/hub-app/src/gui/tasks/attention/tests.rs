@@ -501,18 +501,14 @@ fn narrow_inbox_stacks_action_below_content() {
 fn icon_plate_does_not_stretch_the_card_header() {
     for width in [1000.0, 400.0] {
         let mut book = hub_core::tasks::TaskBook::default();
-        let id = book
-            .create(std::env::temp_dir(), "codex", "Поиск по каталогу", "Проверь")
-            .unwrap();
+        let id =
+            book.create(std::env::temp_dir(), "codex", "Поиск по каталогу", "Проверь").unwrap();
         let row = TaskRow {
             reason: Some(Attention::Review),
             summary: "Готово".into(),
             ..TaskRow::from(book.get(id).unwrap())
         };
-        let mut screen = Screen::new(Snapshot {
-            task_index: Ok(vec![row]),
-            ..Default::default()
-        });
+        let mut screen = Screen::new(Snapshot { task_index: Ok(vec![row]), ..Default::default() });
         screen.size = egui::vec2(width, 800.0);
         let plate = screen.plate("√");
         assert!(
