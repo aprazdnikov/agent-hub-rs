@@ -1410,6 +1410,51 @@ mod tests {
     }
 
     #[test]
+    fn new_task_mode_flip_to_local_transfers_the_topic_project() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let (snapshot, mut view) = new_task_topic_form();
+        view.local_mode = Some(false);
+        let mut commands = Vec::new();
+        click_text(&ctx, &mut view, &snapshot, "В теме Telegram", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "Локально", &mut commands);
+        assert_eq!(
+            view.local_project.opened(),
+            Some(test_project().as_path()),
+            "flipping to «Локально» must transfer the topic's project into the catalog"
+        );
+        assert!(
+            view.resolved_scope(&snapshot).is_some_and(|(_, path, _)| path == test_project()),
+            "the local scope must stay resolved after the flip"
+        );
+        let output = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert!(
+            !labels(&output).contains(&"Выберите каталог проекта или тему Telegram."),
+            "the flip must not leave the form blocked on a missing catalog"
+        );
+    }
+
+    #[test]
+    fn new_task_mode_flip_to_topic_anchors_the_local_project() {
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
+        let (snapshot, mut view) = new_task_topic_form();
+        view.local_project.choose(&test_project());
+        view.local_mode = Some(true);
+        view.selected = None;
+        view.scope = Some((None, test_project(), BackendKind::Qwen));
+        let mut commands = Vec::new();
+        click_text(&ctx, &mut view, &snapshot, "Локально", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "В теме Telegram", &mut commands);
+        assert_eq!(
+            view.selected,
+            Some(key),
+            "flipping to «В теме Telegram» must anchor the topic of the local project"
+        );
+    }
+
+    #[test]
     fn drafts_return_to_their_own_task_after_project_switches() {
         let (book, id, snapshot, mut view) = review_fixture();
         let other = tempfile::tempdir().unwrap();

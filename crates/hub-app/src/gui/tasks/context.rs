@@ -200,14 +200,18 @@ impl TasksView {
         });
         self.local_project.backend = Some(agent);
         self.local_mode = Some(mode);
-        self.apply_context_selection(ui, snapshot, previous, choice);
+        self.apply_context_selection(ui, snapshot, previous, choice, project);
     }
+    // `project` is the scope captured before the row mutated `local_mode`, the same
+    // anchor the non-creating path uses: a mode flip transfers or anchors that project,
+    // never a scope re-resolved in the new mode (which may resolve to nothing).
     fn apply_context_selection(
         &mut self,
         ui: &mut egui::Ui,
         snapshot: &Snapshot,
         previous: Option<bool>,
         choice: Option<PathBuf>,
+        project: Option<PathBuf>,
     ) {
         if let Some(path) = choice {
             self.local_project.choose(&path);
@@ -221,7 +225,7 @@ impl TasksView {
         }
         let mode = self.local_mode == Some(true);
         if previous == Some(!mode)
-            && let Some(project) = self.resolved_scope(snapshot).map(|(_, path, _)| path)
+            && let Some(project) = project
         {
             if mode {
                 self.local_project.choose(&project);
