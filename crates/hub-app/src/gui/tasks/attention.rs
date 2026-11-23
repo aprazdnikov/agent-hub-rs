@@ -175,7 +175,7 @@ impl<'a> Item<'a> {
                 ui.push_id(key, |ui| {
                     let (glyph, chip_label, tone) = match &request.kind {
                         Kind::Questions(_) => ("?", "Вопрос", Tone::Accent),
-                        Kind::Permission(_) => ("⚠", "Разрешение", Tone::Warning),
+                        Kind::Permission(_) => ("!", "Разрешение", Tone::Warning),
                     };
                     let title = row.map_or_else(
                         || Cow::Owned(format!("Задача #{}", live.id)),
@@ -227,11 +227,11 @@ impl<'a> Item<'a> {
                     Attention::Queue => ("Открыть очередь", Tab::Parameters),
                 };
                 let (glyph, tone) = match reason {
-                    Attention::Review => ("✓", Tone::Accent),
+                    Attention::Review => ("√", Tone::Accent),
                     Attention::CheckFailed | Attention::AgentFailed | Attention::Interrupted => {
                         ("!", Tone::Error)
                     }
-                    Attention::Git | Attention::Queue => ("⚠", Tone::Warning),
+                    Attention::Git | Attention::Queue => ("!", Tone::Warning),
                 };
                 let summary = if row.summary.is_empty() { reason.label() } else { &row.summary };
                 ui.push_id((&row.project, row.id), |ui| {

@@ -447,7 +447,7 @@ fn narrow_inbox_stacks_action_below_content() {
     };
     let mut screen = Screen::new(Snapshot { task_index: Ok(vec![row]), ..Default::default() });
     screen.size = egui::vec2(400.0, 600.0);
-    assert!(screen.contains("✓"));
+    assert!(screen.contains("√"));
     assert!(screen.contains("Результаты на проверку · 1"));
     let title = screen.rect("Поиск по каталогу", 0);
     let action = screen.rect("Проверить", 0);

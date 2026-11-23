@@ -625,7 +625,7 @@ impl TasksView {
         let queued = task.queue.is_some();
         let first = task.runs.is_empty();
         let offers = if queued { Vec::new() } else { self.queue_offer(task, next) };
-        let _ = ui.menu_button("⋯", |ui| {
+        let _ = ui.menu_button("…", |ui| {
             if ui.button("Параметры задачи").clicked() {
                 self.result_view.select(result::Tab::Parameters, Some(task.id));
             }
@@ -938,7 +938,7 @@ impl TasksView {
             self.rules.saved.workflow.as_ref().filter(|p| p.implementer.name() == task.backend)
         {
             ui.label(format!(
-                "{} → {} → ревью {}",
+                "{} › {} › ревью {}",
                 plan.implementer.name(),
                 plan.command,
                 plan.reviewer.name()
@@ -947,7 +947,7 @@ impl TasksView {
         if ui.button("Правила проекта").clicked() {
             self.page = Page::Rules;
         }
-        // The «⋯» menu can ask to land here with the context already open.
+        // The «…» menu can ask to land here with the context already open.
         let open_context = self.result_view.take_context_open();
         egui::CollapsingHeader::new("Контекст следующего запуска")
             .open(open_context.then_some(true))

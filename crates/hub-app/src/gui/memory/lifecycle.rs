@@ -264,9 +264,9 @@ impl AdminUi {
         }
         ui.horizontal(|ui| {
             for (label, offset) in [
-                ("←", overview.page.offset.checked_sub(20)),
+                ("‹", overview.page.offset.checked_sub(20)),
                 (
-                    "→",
+                    "›",
                     (overview.page.offset + 20 < overview.page.matched_count)
                         .then_some(overview.page.offset + 20),
                 ),

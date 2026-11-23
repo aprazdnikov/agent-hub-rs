@@ -637,7 +637,7 @@ impl TasksView {
         ui.add_space(8.0);
     }
     /// Why a queued action is not available right now, shared by the Parameters
-    /// queue block and the chat «⋯» menu so both offer the same conditions.
+    /// queue block and the chat «…» menu so both offer the same conditions.
     fn queue_offer(
         &self,
         task: &Task,
@@ -1064,7 +1064,7 @@ mod tests {
         let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
         let texts = labels(&out);
         assert_eq!(
-            texts.iter().filter(|label| **label == "Результат →").count(),
+            texts.iter().filter(|label| **label == "Результат ›").count(),
             1,
             "only the latest reviewable run links to its result"
         );
@@ -1549,7 +1549,7 @@ mod tests {
                 .shapes
                 .iter()
                 .find_map(|shape| match &shape.shape {
-                    egui::Shape::Text(text) if text.galley.text() == "Результат →" => {
+                    egui::Shape::Text(text) if text.galley.text() == "Результат ›" => {
                         Some(shape.clip_rect)
                     }
                     _ => None,
@@ -1749,7 +1749,7 @@ mod tests {
             ..Default::default()
         };
         let mut commands = Vec::new();
-        click_text(&ctx, &mut view, &snapshot, "⋯", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Подготовить ветку Git", &mut commands);
         assert!(
@@ -1784,7 +1784,7 @@ mod tests {
         let mut commands = Vec::new();
         click_text(&ctx, &mut view, &snapshot, "Запустить", &mut commands);
         assert!(commands.is_empty());
-        click_text(&ctx, &mut view, &snapshot, "⋯", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Подготовить ветку Git", &mut commands);
         let Command::Tasks {
@@ -1931,7 +1931,7 @@ mod tests {
             ..Default::default()
         };
         let mut commands = Vec::new();
-        click_text(&ctx, &mut view, &snapshot, "⋯", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Правила проекта", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Rule", &mut commands);
@@ -1952,7 +1952,7 @@ mod tests {
         click_text(&ctx, &mut view, &snapshot, "В чат", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Запустить", &mut commands);
         assert!(commands.is_empty());
-        click_text(&ctx, &mut view, &snapshot, "⋯", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Правила проекта", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Сохранить правила", &mut commands);
@@ -2004,7 +2004,7 @@ mod tests {
             ..Default::default()
         };
         let mut commands = Vec::new();
-        click_text(&ctx, &mut view, &snapshot, "⋯", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Назначить", &mut commands);
         assert!(commands.is_empty());
@@ -2030,14 +2030,14 @@ mod tests {
             ..Default::default()
         };
         let mut commands = Vec::new();
-        click_text(&ctx, &mut view, &snapshot, "⋯", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "qwen", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "codex", &mut commands);
         assert!(commands.is_empty(), "choosing an agent is only a draft");
         click_text(&ctx, &mut view, &snapshot, "В чат", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Запустить", &mut commands);
-        click_text(&ctx, &mut view, &snapshot, "⋯", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         assert!(commands.is_empty(), "cannot launch with an unsaved agent choice");
         click_text(&ctx, &mut view, &snapshot, "Назначить", &mut commands);
@@ -2189,7 +2189,7 @@ mod tests {
         assert!(!labels(&output).contains(&"Управление задачей"));
         click_text(&ctx, &mut view, &snapshot, "Отправить", &mut commands);
         assert!(commands.is_empty(), "unassigned task must not launch");
-        click_text(&ctx, &mut view, &snapshot, "⋯", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         let output = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
         for section in ["Агент и память", "Контекст следующего запуска", "Управление задачей"]
@@ -2281,7 +2281,7 @@ mod tests {
             .send(Ok(TaskSnapshot { tasks: book.tasks().to_vec(), ..TaskSnapshot::default() }))
             .unwrap();
         input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
-        click_text(&ctx, &mut view, &snapshot, "⋯", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "codex", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "qwen", &mut commands);
@@ -2325,7 +2325,7 @@ mod tests {
         let mut commands = Vec::new();
         input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
         assert!(commands.is_empty(), "rendering a different topic agent must not assign it");
-        click_text(&ctx, &mut view, &snapshot, "⋯", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "codex", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "qwen", &mut commands);
@@ -2365,7 +2365,7 @@ mod tests {
             ..Default::default()
         };
         let mut commands = Vec::new();
-        click_text(&ctx, &mut view, &snapshot, "⋯", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Контекст следующего запуска", &mut commands);
         let output = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
@@ -2846,7 +2846,7 @@ mod tests {
         let (_, id, snapshot, mut view) = review_fixture();
         let ctx = egui::Context::default();
         let mut commands = Vec::new();
-        click_text(&ctx, &mut view, &snapshot, "⋯", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "В архив", &mut commands);
         let Command::Tasks {
             request: Request::Archive { id: archived, revision, archived: true },
@@ -2860,7 +2860,7 @@ mod tests {
         assert_eq!(revision, view.tasks[0].revision);
         reply.send(Ok(TaskSnapshot::default())).unwrap();
         view.update(&mut |c| commands.push(c));
-        click_text(&ctx, &mut view, &snapshot, "⋯", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Параметры задачи", &mut commands);
         assert_eq!(view.result_view.tab(&view.tasks[0]), result::Tab::Parameters);
     }
@@ -2888,7 +2888,7 @@ mod tests {
         let out = sized_frame(&ctx, &mut view, &snapshot, screen, vec![], &mut commands);
         let results = all_text_rects(&out, "Открыть результат");
         assert_eq!(results.len(), 2, "header primary + inline composer button at 300px");
-        assert!(!all_text_rects(&out, "⋯").is_empty(), "the menu survives compact mode");
+        assert!(!all_text_rects(&out, "…").is_empty(), "the menu survives compact mode");
         let accept = all_text_rects(&out, "Принять").into_iter().next().expect("header accept");
         let send = all_text_rects(&out, "Отправить").into_iter().next().expect("composer send");
         for header in [results[0], accept] {
@@ -2908,7 +2908,7 @@ mod tests {
         let (_, id, snapshot, mut view) = review_fixture();
         let ctx = egui::Context::default();
         let mut commands = Vec::new();
-        click_text(&ctx, &mut view, &snapshot, "⋯", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Удалить…", &mut commands);
         let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
         let texts = labels(&out);
@@ -2942,7 +2942,7 @@ mod tests {
                 })
                 .count()
         };
-        click_text(&ctx, &mut view, &snapshot, "⋯", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Удалить…", &mut commands);
         let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
         assert_eq!(rows(&out), 1, "chat: one confirm row");
@@ -2990,7 +2990,7 @@ mod tests {
         let (id, snapshot, mut view) = draft_telegram_fixture();
         let ctx = egui::Context::default();
         let mut commands = Vec::new();
-        click_text(&ctx, &mut view, &snapshot, "⋯", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
         let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
         let texts = labels(&out);
         assert!(texts.contains(&"В очередь") && texts.contains(&"В очередь в отдельном worktree"));
@@ -3012,7 +3012,7 @@ mod tests {
         let ctx = egui::Context::default();
         let mut commands = Vec::new();
         let expected = view.tasks[0].preview(None).unwrap();
-        click_text(&ctx, &mut view, &snapshot, "⋯", &mut commands);
+        click_text(&ctx, &mut view, &snapshot, "…", &mut commands);
         click_text(&ctx, &mut view, &snapshot, "Контекст следующего запуска", &mut commands);
         let out = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
         assert_eq!(view.result_view.tab(&view.tasks[0]), result::Tab::Parameters);

@@ -25,7 +25,7 @@ pub(super) struct View {
     run: Option<u32>,
     file_error: Option<String>,
     expanded: BTreeSet<u32>,
-    /// The «⋯» menu landed on Parameters and wants the next-run context open; consumed there.
+    /// The «…» menu landed on Parameters and wants the next-run context open; consumed there.
     context_open: bool,
 }
 impl View {
@@ -432,7 +432,7 @@ fn agent_contents(ui: &mut egui::Ui, task: &Task, run: &Run, view: &mut View, fl
                     let passed = checks.iter().filter(|check| check.passed).count();
                     chip(ui, Tone::Neutral, &format!("Проверки · {passed}/{}", checks.len()));
                 }
-                if latest && ui.link("Результат →").clicked() {
+                if latest && ui.link("Результат ›").clicked() {
                     view.select(Tab::Summary, Some(task.id));
                 }
             });

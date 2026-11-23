@@ -295,6 +295,40 @@ mod tests {
     }
 
     #[test]
+    fn gui_labels_use_only_covered_glyphs() {
+        // egui draws a character with no glyph in the installed font as the box '◻'.
+        // The bundled proportional family lacks several symbols, so any label using one
+        // showed that square; the GUI switched those labels to covered equivalents:
+        // '⚠'→'!', '✓'→'√', '→'→'›', '←'→'‹', '⋯'→'…', '▶'→'⏵'.
+        // This pins the font coverage behind that swap: the glyphs now in labels must be
+        // covered, and the removed ones must stay uncovered (so they are never reintroduced).
+        let ctx = egui::Context::default();
+        configure(&ctx);
+        let used = ['…', '›', '‹', '√', '⏵', '⏹', '!', '?', '·', '№', '⌘', '«', '»', '–', '—', '•', '○'];
+        let removed = ['⚠', '✓', '→', '←', '⋯', '▶'];
+        let drawn: String = used.iter().copied().collect();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.label(drawn.as_str());
+        });
+        output.textures_delta.clear();
+        let font = egui::FontId::proportional(14.0);
+        for ch in used {
+            assert!(
+                ctx.fonts_mut(|fonts| fonts.has_glyph(&font, ch)),
+                "label glyph {ch} (U+{:04X}) is missing from the proportional font",
+                u32::from(ch),
+            );
+        }
+        for ch in removed {
+            assert!(
+                !ctx.fonts_mut(|fonts| fonts.has_glyph(&font, ch)),
+                "{ch} (U+{:04X}) has no glyph and was replaced; keep it out of GUI labels",
+                u32::from(ch),
+            );
+        }
+    }
+
+    #[test]
     fn system_theme_changes_keep_custom_styles_and_system_preference() {
         let ctx = egui::Context::default();
         // Even a previously forced preference must follow the OS at startup.
