@@ -264,41 +264,66 @@ impl TopicsView {
         let tone = if running { Tone::Accent } else { Tone::Neutral };
         let url = topic_url(topic.key);
         let open = self.expanded == Some(topic.key);
+        // Below this width the pinned action column would starve the title column
+        // (as in `tasks/attention.rs`), so actions move to a second row instead.
+        let narrow = ui.available_width() < 440.0;
+        let title_column = |ui: &mut egui::Ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal_wrapped(|ui| {
+                let title = name(topic);
+                ui.strong(&title);
+                theme::chip(ui, tone, state_text(topic.state));
+                if running && phase != Phase::Unknown {
+                    theme::chip(ui, Tone::Neutral, phase.label());
+                }
+            });
+            ui.weak(format!("{project} · {}", topic.session.backend.name()))
+                .on_hover_text(path.display().to_string());
+        };
         theme::card(ui).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                icon_plate(ui, if running { "•" } else { "○" }, tone);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    self.menu(ui, topic, send);
-                    if ui
-                        .add_enabled(url.is_some(), egui::Button::new("Telegram"))
-                        .on_hover_text("Открыть тему в Telegram")
-                        .clicked()
-                    {
-                        self.opener.start(Destination::Topic(topic.key), ui.ctx());
-                    }
-                    if running && ui.button("Остановить").clicked() {
-                        send(Command::StopTopic(topic.key));
-                    }
-                    ui.vertical(|ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal_wrapped(|ui| {
-                            let title = name(topic);
-                            ui.strong(&title);
-                            theme::chip(ui, tone, state_text(topic.state));
-                            if running && phase != Phase::Unknown {
-                                theme::chip(ui, Tone::Neutral, phase.label());
-                            }
-                        });
-                        ui.weak(format!("{project} · {}", topic.session.backend.name()))
-                            .on_hover_text(path.display().to_string());
+            if narrow {
+                ui.horizontal(|ui| {
+                    icon_plate(ui, if running { "•" } else { "○" }, tone);
+                    ui.vertical(title_column);
+                });
+                ui.horizontal_wrapped(|ui| {
+                    self.card_actions(ui, topic, url.as_ref(), running, send);
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    icon_plate(ui, if running { "•" } else { "○" }, tone);
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        self.card_actions(ui, topic, url.as_ref(), running, send);
+                        ui.vertical(title_column);
                     });
                 });
-            });
+            }
             if open {
                 ui.separator();
                 details(ui, topic, running, phase, path);
             }
         });
+    }
+
+    fn card_actions(
+        &mut self,
+        ui: &mut egui::Ui,
+        topic: &TopicView,
+        url: Option<&String>,
+        running: bool,
+        send: &mut impl FnMut(Command),
+    ) {
+        self.menu(ui, topic, send);
+        if ui
+            .add_enabled(url.is_some(), egui::Button::new("Telegram"))
+            .on_hover_text("Открыть тему в Telegram")
+            .clicked()
+        {
+            self.opener.start(Destination::Topic(topic.key), ui.ctx());
+        }
+        if running && ui.button("Остановить").clicked() {
+            send(Command::StopTopic(topic.key));
+        }
     }
 
     fn menu(&mut self, ui: &mut egui::Ui, topic: &TopicView, send: &mut impl FnMut(Command)) {
@@ -481,12 +506,20 @@ mod tests {
         events: Vec<egui::Event>,
         commands: &mut Vec<Command>,
     ) -> egui::FullOutput {
+        frame_size(ctx, view, snapshot, egui::vec2(960.0, 640.0), events, commands)
+    }
+
+    fn frame_size(
+        ctx: &egui::Context,
+        view: &mut TopicsView,
+        snapshot: &Snapshot,
+        screen: egui::Vec2,
+        events: Vec<egui::Event>,
+        commands: &mut Vec<Command>,
+    ) -> egui::FullOutput {
         let mut output = ctx.run_ui(
             egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    egui::vec2(960.0, 640.0),
-                )),
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, screen)),
                 events,
                 ..Default::default()
             },
@@ -496,6 +529,23 @@ mod tests {
         );
         output.textures_delta.clear();
         output
+    }
+
+    fn galley_rect(output: &egui::FullOutput, label: &str) -> egui::Rect {
+        output
+            .shapes
+            .iter()
+            .rev()
+            .find_map(|shape| {
+                if let egui::Shape::Text(text) = &shape.shape
+                    && text.galley.text() == label
+                {
+                    Some(text.galley.rect.translate(text.pos.to_vec2()))
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(|| panic!("missing {label}: {:?}", labels(output)))
     }
 
     fn click(
@@ -646,6 +696,81 @@ mod tests {
         assert!(view.deleting.is_some());
         click(&ctx, &mut view, &snapshot, "Отмена", &mut commands);
         assert!(view.deleting.is_none());
+    }
+
+    #[test]
+    fn narrow_card_moves_actions_below_the_title() {
+        let ctx = egui::Context::default();
+        let mut view = TopicsView::default();
+        let mut running = topic(
+            7,
+            "Очень длинное название темы для узкого окна",
+            BackendKind::Claude,
+            TopicState::Running,
+        );
+        running.progress = hub_core::progress::TaskProgress::new(std::time::Instant::now());
+        let snapshot = Snapshot { topics: vec![running], ..Snapshot::default() };
+        frame_size(
+            &ctx,
+            &mut view,
+            &snapshot,
+            egui::vec2(400.0, 640.0),
+            Vec::new(),
+            &mut Vec::new(),
+        );
+        let output = frame_size(
+            &ctx,
+            &mut view,
+            &snapshot,
+            egui::vec2(400.0, 640.0),
+            Vec::new(),
+            &mut Vec::new(),
+        );
+        let title = galley_rect(&output, "Очень длинное название темы для узкого окна");
+        let stop = galley_rect(&output, "Остановить");
+        let menu = galley_rect(&output, "…");
+        assert!(stop.min.y >= title.max.y, "stop must sit below the title: {stop:?} vs {title:?}");
+        assert!(menu.min.y >= title.max.y, "menu must sit below the title: {menu:?} vs {title:?}");
+        assert!(title.width() > 150.0, "title must stay readable at 400px: {title:?}");
+    }
+
+    #[test]
+    fn sync_button_is_inert_while_a_reply_is_pending() {
+        let ctx = egui::Context::default();
+        let mut view = TopicsView::default();
+        let snapshot = Snapshot {
+            topics: vec![topic(42, "Проект", BackendKind::Claude, TopicState::Waiting)],
+            ..Snapshot::default()
+        };
+        let mut commands = Vec::new();
+        click(&ctx, &mut view, &snapshot, "Синхронизировать", &mut commands);
+        click(&ctx, &mut view, &snapshot, "Синхронизировать", &mut commands);
+        let syncs =
+            commands.iter().filter(|command| matches!(command, Command::SyncTopics { .. })).count();
+        assert_eq!(syncs, 1, "the button must stay inert until the reply arrives");
+    }
+
+    #[test]
+    fn memory_menu_sends_topic_memory_only_on_change() {
+        let ctx = egui::Context::default();
+        let mut view = TopicsView::default();
+        let snapshot = Snapshot {
+            topics: vec![topic(42, "Проект", BackendKind::Claude, TopicState::Waiting)],
+            ..Snapshot::default()
+        };
+        let mut commands = Vec::new();
+        click(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click(&ctx, &mut view, &snapshot, "Память темы", &mut commands);
+        click(&ctx, &mut view, &snapshot, "Наследовать", &mut commands);
+        assert!(commands.is_empty(), "re-picking the current mode must not send anything");
+        click(&ctx, &mut view, &snapshot, "…", &mut commands);
+        click(&ctx, &mut view, &snapshot, "Память темы", &mut commands);
+        click(&ctx, &mut view, &snapshot, "Включена", &mut commands);
+        assert!(
+            matches!(commands.as_slice(), [Command::TopicMemory { key, value: Some(true), .. }]
+                if key.thread.0 == 42),
+            "switching memory must send exactly one TopicMemory",
+        );
     }
 
     #[test]
