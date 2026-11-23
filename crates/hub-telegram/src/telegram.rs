@@ -322,7 +322,8 @@ pub struct TelegramMessenger {
     bot: Bot,
     /// The same bot with a longer timeout for file transfers.
     files: Bot,
-    /// Topic creation cannot be safely repeated after an uncertain response.
+    /// Topic creation cannot be safely repeated after an uncertain response, while
+    /// `probe_topic` on this bot is a repeatable read.
     topics: Bot,
 }
 

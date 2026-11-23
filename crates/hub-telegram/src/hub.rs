@@ -55,7 +55,7 @@ use crate::transfer::{
 
 mod deletion;
 pub mod tasks;
-pub use deletion::DeletionDone;
+pub use deletion::{DeletionDone, SyncDone};
 
 pub(crate) const INBOX: usize = 32;
 const MAILBOX: usize = 256;
@@ -179,6 +179,11 @@ pub enum HubMessage {
         reply: oneshot::Sender<Result<(), String>>,
     },
     DeletionDone(DeletionDone),
+    /// Compare every known topic with Telegram and drop the ones that no longer exist there.
+    SyncTopics {
+        reply: oneshot::Sender<Result<String, String>>,
+    },
+    SyncDone(SyncDone),
     /// A `/save` or `/restore` reached a decision point or finished its file work.
     Snapshot(SnapshotDone),
     /// A live session reported subscription limits.
@@ -563,11 +568,7 @@ impl<A: Agents> Hub<A> {
                 self.sender.clone(),
             ),
             HubMessage::ActionDone(done) => self.actions.complete(done, self.sender.clone()),
-            HubMessage::Inbound(inbound) => {
-                if self.shutdown.is_none() {
-                    self.inbound(inbound);
-                }
-            }
+            HubMessage::Inbound(inbound) => self.inbound(inbound),
             HubMessage::Press(pressed) => self.press(pressed),
             HubMessage::Quota(update) => self.quotas.apply(update, Timestamp::now()),
             HubMessage::Limits(LimitsDone(polled)) => self.limits_done(polled),
@@ -599,6 +600,8 @@ impl<A: Agents> Hub<A> {
             }
             HubMessage::DeleteTopic { key, reply } => self.delete_topic(key, reply),
             HubMessage::DeletionDone(done) => self.finish_deletion(done),
+            HubMessage::SyncTopics { reply } => self.sync_topics(reply),
+            HubMessage::SyncDone(done) => self.finish_sync(done),
             HubMessage::Reset(key) => {
                 if self.topic_unavailable(key) {
                     return;
@@ -662,6 +665,9 @@ impl<A: Agents> Hub<A> {
     }
 
     fn inbound(&mut self, inbound: Inbound) {
+        if self.shutdown.is_some() {
+            return;
+        }
         if inbound.key().is_some_and(|key| self.topic_unavailable(key)) {
             return;
         }
@@ -2739,6 +2745,93 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    async fn sync(world: &World) -> Result<String, String> {
+        let (reply, result) = oneshot::channel();
+        world.send(HubMessage::SyncTopics { reply }).await;
+        result.await.expect("sync reply")
+    }
+
+    fn probe_calls(world: &World) -> Vec<TopicKey> {
+        world
+            .messenger
+            .calls()
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::ProbeTopic(key) => Some(key),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn sync_removes_stale_topics_and_keeps_live() {
+        let world = world(FakeAgents::default());
+        world.send(inbound(Some(7), 1, Content::TopicCreated { name: "Старая".into() })).await;
+        world.send(inbound(Some(8), 2, Content::TopicCreated { name: "Живая".into() })).await;
+        let live = TopicKey { chat: KEY.chat, thread: ThreadId(8) };
+        // The one-shot script makes the first probe (thread 7, BTreeMap order) find the topic
+        // gone; the second falls back to the fake's default of a live topic.
+        *world.messenger.probes.lock().unwrap() = Some(Ok(false));
+        assert_eq!(sync(&world).await.unwrap(), "Удалено устаревших тем: 1");
+        assert_eq!(probe_calls(&world), [KEY, live]);
+        assert!(!world.messenger.calls().iter().any(|call| matches!(call, Call::DeleteTopic(_))));
+        let stored = world.store.last().unwrap();
+        assert!(!stored.contains_key(&KEY) && stored.contains_key(&live));
+    }
+
+    #[tokio::test]
+    async fn sync_skips_busy_and_deleted_topics() {
+        let world = world(FakeAgents::scripted(vec![Script::UntilStopped]));
+        world.send(inbound(Some(7), 1, Content::TopicCreated { name: "Занятая".into() })).await;
+        let stale = TopicKey { chat: KEY.chat, thread: ThreadId(8) };
+        world.send(inbound(Some(8), 2, Content::TopicCreated { name: "Удалённая".into() })).await;
+        world.send(text(Some(7), 5, "Работа")).await;
+        eventually("running", || world.running()).await;
+        // A deletion whose disk cleanup failed leaves the topic stored and marked as deleted.
+        world.store.fail.store(true, Ordering::SeqCst);
+        assert!(delete_topic(&world, stale).await.is_err());
+        world.store.fail.store(false, Ordering::SeqCst);
+        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны");
+        assert!(probe_calls(&world).is_empty());
+        let stored = world.store.last().unwrap();
+        assert!(stored.contains_key(&KEY) && stored.contains_key(&stale));
+    }
+
+    #[tokio::test]
+    async fn sync_stops_on_retry_after() {
+        let world = world(FakeAgents::default());
+        world.send(inbound(Some(7), 1, Content::TopicCreated { name: "Старая".into() })).await;
+        world.send(inbound(Some(8), 2, Content::TopicCreated { name: "Живая".into() })).await;
+        let live = TopicKey { chat: KEY.chat, thread: ThreadId(8) };
+        *world.messenger.probes.lock().unwrap() =
+            Some(Err(SendError::RetryAfter(Duration::from_secs(3))));
+        assert_eq!(
+            sync(&world).await.unwrap_err(),
+            "Telegram просит подождать 3 с, повторите позже"
+        );
+        // The walk stops at the first rate limit: one probe only, no further API hammering.
+        assert_eq!(probe_calls(&world), [KEY]);
+        let stored = world.store.last().unwrap();
+        assert!(stored.contains_key(&KEY) && stored.contains_key(&live));
+    }
+
+    #[tokio::test]
+    async fn sync_keeps_topic_when_probe_is_uncertain() {
+        let world = world(FakeAgents::default());
+        world
+            .send(inbound(Some(7), 1, Content::TopicCreated { name: "Сомнительная".into() }))
+            .await;
+        world.send(inbound(Some(8), 2, Content::TopicCreated { name: "Живая".into() })).await;
+        let live = TopicKey { chat: KEY.chat, thread: ThreadId(8) };
+        // Uncertainty must not remove the topic, but does not stop the walk either.
+        *world.messenger.probes.lock().unwrap() =
+            Some(Err(SendError::Rejected("проверьте права".into())));
+        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны");
+        assert_eq!(probe_calls(&world), [KEY, live]);
+        let stored = world.store.last().unwrap();
+        assert!(stored.contains_key(&KEY) && stored.contains_key(&live));
     }
 
     #[tokio::test]

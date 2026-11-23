@@ -1,9 +1,23 @@
-//! Desktop-initiated deletion. Reserve the topic until Telegram answers.
+//! Desktop-initiated deletion and topic synchronization. Reserve the topic until Telegram
+//! answers.
+use std::time::Duration;
+
+use crate::messenger::SendError;
+
 use super::{Agents, Hub, HubMessage, Target, TopicKey, oneshot};
 
 pub struct DeletionDone {
     key: TopicKey,
     result: Result<(), String>,
+}
+
+/// The probe results of one synchronization walk, handed back to the actor that started it.
+pub struct SyncDone {
+    /// Topics the probes proved missing, in probe order.
+    stale: Vec<TopicKey>,
+    /// The walk stopped early because Telegram asked to wait this long.
+    retry_after: Option<Duration>,
+    reply: oneshot::Sender<Result<String, String>>,
 }
 
 impl<A: Agents> Hub<A> {
@@ -128,5 +142,98 @@ impl<A: Agents> Hub<A> {
         self.last_progress.remove(&key);
         self.replace_topics(topics);
         Ok(())
+    }
+}
+
+impl<A: Agents> Hub<A> {
+    pub(super) fn sync_topics(&mut self, reply: oneshot::Sender<Result<String, String>>) {
+        if self.shutdown.is_some() || self.settings.borrow().telegram != self.telegram_identity {
+            let _ = reply.send(Err(
+                "Синхронизация недоступна: запустите бота с сохранёнными настройками Telegram."
+                    .into(),
+            ));
+            return;
+        }
+        let candidates: Vec<TopicKey> = self
+            .topics
+            .keys()
+            .copied()
+            .filter(|key| {
+                key.thread.0 > 1
+                    && key.chat == self.telegram_identity.chat
+                    && !self.topic_unavailable(*key)
+            })
+            // The same busy guards as deletion; undelivered answers are not a reason to skip,
+            // because a topic missing in Telegram cannot receive them anyway.
+            .filter(|key| self.check_deletion(*key).is_ok())
+            .collect();
+        if candidates.is_empty() {
+            let _ = reply.send(Ok("Все темы актуальны".to_owned()));
+            return;
+        }
+        let sender = self.sender.clone();
+        let mailbox = self.mailbox.clone();
+        let settings = self.settings.clone();
+        let identity = self.telegram_identity.clone();
+        tokio::spawn(async move {
+            let mut stale = Vec::new();
+            for key in candidates {
+                if mailbox.is_closed() {
+                    let _ = reply.send(Err("Бот остановлен. Синхронизация прервана.".into()));
+                    return;
+                }
+                if settings.borrow().telegram != identity {
+                    let _ = reply
+                        .send(Err("Настройки Telegram изменились. Обновите список тем.".into()));
+                    return;
+                }
+                match sender.messenger().probe_topic(key).await {
+                    Ok(false) => stale.push(key),
+                    // An uncertain answer must not drop local state: skip the topic and
+                    // keep checking the rest.
+                    Ok(true) | Err(SendError::Rejected(_) | SendError::Failed(_)) => {}
+                    Err(SendError::RetryAfter(retry_after)) => {
+                        // Telegram rate-limits the walk itself; stop instead of hammering.
+                        let _ = mailbox
+                            .send(HubMessage::SyncDone(SyncDone {
+                                stale,
+                                retry_after: Some(retry_after),
+                                reply,
+                            }))
+                            .await;
+                        return;
+                    }
+                }
+            }
+            let _ = mailbox
+                .send(HubMessage::SyncDone(SyncDone { stale, retry_after: None, reply }))
+                .await;
+        });
+    }
+
+    pub(super) fn finish_sync(&mut self, done: SyncDone) {
+        let mut removed = 0;
+        for key in done.stale {
+            // A probe answer is only a decision when the topic is still unbound and free;
+            // work may have arrived while the walk was running.
+            if !self.topics.contains_key(&key)
+                || self.topic_unavailable(key)
+                || self.check_deletion(key).is_err()
+            {
+                continue;
+            }
+            if self.clean_deleted_topic(key).is_ok() {
+                removed += 1;
+            }
+        }
+        let result = match done.retry_after {
+            Some(retry_after) => {
+                let error = SendError::RetryAfter(retry_after);
+                Err(format!("{error}, повторите позже"))
+            }
+            None if removed == 0 => Ok("Все темы актуальны".to_owned()),
+            None => Ok(format!("Удалено устаревших тем: {removed}")),
+        };
+        let _ = done.reply.send(result);
     }
 }
