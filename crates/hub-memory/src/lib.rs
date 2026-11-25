@@ -28,7 +28,7 @@ pub use store::portable::{
     MemoryExport, VerifiedExport,
 };
 
-pub use store::bindings::{BindingMode, BindingPreview};
+pub use store::bindings::{BindingMode, BindingPreview, PurgeReport, purge};
 
 mod project_cli;
 pub use project_cli::run_project_cli;

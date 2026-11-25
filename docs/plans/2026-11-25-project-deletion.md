@@ -120,14 +120,14 @@ worktree внутри него и темы Telegram не затрагивают�
   `identity` → записать реестр атомарно → удалить каталог `directory()` рекурсивно.
   Несовпадение префикса `base` после canonicalize → `Error::InvalidInput` (защита от symlink).
 
-- [ ] **Step 1: RED** — тесты: проект с записями + move-биндинг (два пути к одному
+- [x] **Step 1: RED** — тесты: проект с записями + move-биндинг (два пути к одному
   identity) → после purge реестр чист, каталог удалён, второй проект цел; повторный
   purge → `had_data:false, removed_paths:0`; нет каталога данных — только чистка реестра;
   путь вне base (symlink-ловушка) → ошибка.
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-memory --lib purge` → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: GREEN** — `cargo test -p hub-memory --locked` → PASS.
-- [ ] **Step 5: Commit** — `feat(memory): purge проекта из реестра и хранилища памяти`
+- [x] **Step 2: Verify RED** — `cargo test -p hub-memory --lib purge` → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: GREEN** — `cargo test -p hub-memory --locked` → PASS.
+- [x] **Step 5: Commit** — `feat(memory): purge проекта из реестра и хранилища памяти`
 
 ---
 

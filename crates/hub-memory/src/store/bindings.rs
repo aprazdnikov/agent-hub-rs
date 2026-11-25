@@ -241,6 +241,67 @@ impl BindingPreview {
         }
     }
 }
+/// Outcome of [`purge`]: registry records removed and whether the project had published
+/// memory data (the data directory is removed either way when it exists).
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PurgeReport {
+    pub removed_paths: usize,
+    pub had_data: bool,
+}
+
+/// Removes a project from hub memory: every registry record resolving to its identity
+/// (and the identity record itself) plus the data directory. Nothing outside `base` is
+/// deleted and the project directory itself is never touched. While another process
+/// holds the data-directory lock the call reports [`Error::Busy`] and changes nothing.
+pub fn purge(base: &Path, project: &Path) -> Result<PurgeReport, Error> {
+    let project = fs::canonicalize(project).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            Error::InvalidInput("project directory does not exist")
+        } else {
+            Error::Io(error)
+        }
+    })?;
+    if !project.is_dir() {
+        return Err(Error::InvalidInput("project must be a directory"));
+    }
+    let location = Location::resolve(base, &project)?;
+    let identity = path_text(&location.identity)?;
+    // The digest component may have been swapped for a symlink: refuse it and require
+    // every removed path to stay under the canonical base.
+    let directory = filesystem::destination(&location.directory()?)?;
+    if !directory.starts_with(&location.base) {
+        return Err(Error::UnsafePath(directory));
+    }
+    let existing = filesystem::Directory::existing(&directory)?;
+    let lock = existing.as_ref().map(lock).transpose()?;
+    let mut removed_paths = 0;
+    if let Some(registry) = filesystem::Directory::existing(&location.base.join(REGISTRY))? {
+        let mut current = Registry::read(&location.base)?;
+        let before = current.paths.len();
+        current.paths.retain(|path, bound| {
+            path != identity && bound.as_deref() != Some(location.identity.as_path())
+        });
+        removed_paths = before - current.paths.len();
+        if removed_paths > 0 {
+            registry.persist(&current.bytes()?)?;
+        }
+    }
+    // A binding preview may leave the directory seeded with only its lock file; that is
+    // still removed, while `had_data` reports published memory contents.
+    let had_data = existing
+        .as_ref()
+        .map(|directory| directory.open(DATA_FILE, filesystem::OpenMode::Read))
+        .transpose()?
+        .flatten()
+        .is_some();
+    if existing.is_some() {
+        // The recursive delete must not race an open handle kept alive by the lock.
+        drop(lock);
+        fs::remove_dir_all(&directory)?;
+    }
+    Ok(PurgeReport { removed_paths, had_data })
+}
+
 fn lock(directory: &filesystem::Directory) -> Result<File, Error> {
     let file = directory
         .open(LOCK_FILE, filesystem::OpenMode::Create)?

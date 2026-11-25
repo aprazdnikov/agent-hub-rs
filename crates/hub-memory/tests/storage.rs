@@ -12,5 +12,8 @@ mod portable;
 #[path = "storage/bindings.rs"]
 mod bindings;
 
+#[path = "storage/purge.rs"]
+mod purge;
+
 #[path = "storage/context.rs"]
 mod context;
