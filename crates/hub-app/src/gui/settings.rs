@@ -506,6 +506,7 @@ impl SettingsForm {
         ui.label("Сохраните каталог, бэкенд и параметры, затем выберите проект через /projects в Telegram.");
         ui.label("Пустые параметры наследуют общие настройки. Смена бэкенда сбрасывает модель и режим профиля.");
         ui.label("Связанные действия запускаются вручную через /actions. Изменения профиля не меняют существующие сессии.");
+        ui.small("Режим проверок настраивается на вкладке „Правила“ страницы „Задачи“.");
         let mut remove = None;
         for (index, project) in self.draft.projects.iter_mut().enumerate() {
             ui.push_id(egui::Id::new(&project.id), |ui| {
@@ -1558,6 +1559,14 @@ mod tests {
         assert_eq!(form.draft.projects.first().unwrap().id, second);
         click(&ctx, &mut form, "Добавить проект");
         assert_ne!(form.draft.projects.last().unwrap().id, first);
+        // Plan §3: the project card must point at where the check mode is configured.
+        assert!(
+            has_label(
+                &frame(&ctx, &mut form, Vec::new()),
+                "Режим проверок настраивается на вкладке „Правила“ страницы „Задачи“."
+            ),
+            "the profile description lacks the rules-tab hint"
+        );
     }
 
     #[test]
