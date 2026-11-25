@@ -8,7 +8,7 @@
 **Goal:** Тема, удалённая в Telegram, гарантированно уходит из списка после «Синхронизировать»,
 а отчёт синхронизации честно объясняет, что пропущено и почему.
 
-**Architecture:** Классификатор ответа Bot API `topic_gone()` заменяет точечный подбор
+**Architecture:** Классификатор ответа Bot API `topic_gone_evidence()` заменяет точечный подбор
 подстрок `thread_not_found()` в `crates/hub-telegram/src/telegram.rs`; обход синхронизации
 в `crates/hub-telegram/src/hub/deletion.rs` собирает категоризованный итог (удалено / живые /
 занятые / не удалось проверить) вместо «Все темы актуальны» по умолчанию; подтверждённо
@@ -24,7 +24,8 @@
    `"thread not found"`, `"topic_deleted"`, `"topic_not_found"`, `"message_thread_not_found"`
    **только** в `ApiError::Unknown(reason)` (`telegram.rs:402,429`). Реальные описания
    Telegram для удалённой темы приходят в форме `THREAD_NOT_FOUND` / `TOPIC_ID_INVALID`
-   (подчёркивания, другой регистр) — матчер их не ловит, проба даёт
+   (подчёркивания, другой регистр; вторая — гипотеза, её подтверждает только Task 4) —
+   матчер их не ловит, проба даёт
    `Err(Rejected)`, и `sync_topics` (`hub/deletion.rs:194`) **молча** пропускает тему.
    Тот же ложный отказ ломает и кнопку «Удалить» для уже отсутствующей темы
    (`delete_topic`, `telegram.rs:402`).
@@ -64,12 +65,18 @@
 
 - **D-3 (подтвердить):** доказанно отсутствующую тему удаляем из хаба даже с задачами в
   очереди (отвязка origin), пропуская только темы с активным запуском/резервированной сессией.
+- **D-4 (новое, после security-гейта):** чем для отзывов доступа должна быть отвязка — сейчас
+  `origin = None` выводит задачу из-под перепроверки allowlist на запуске и из-под настроек темы.
+  Варианты: пауза с ошибкой вместо отвязки для недоступных пользователей (`pause_queue`) или
+  отметка «тема утрачена», читаемая насосом. Вне объёма этого плана; требует решения владельца.
 - Наборы «gone»-строк фиксируются живой проверкой Task 4; в код попадают только
   подтверждённые описания (стандарт репозитория: «контракт сверялся с реальной сборкой»).
+  Подтверждённое множество — четыре формы релидного матчера v1.1.1; правдоподобные, но
+  невиданные живьём формы живут в `UNCONFIRMED_TOPIC_GONE_MARKERS` и на удаление не влияют.
 
 ---
 
-### Task 1: Классификатор `topic_gone` вместо точечного матчера (hub-telegram)
+### Task 1: Классификатор `topic_gone_evidence` вместо точечного матчера (hub-telegram)
 
 **Files:**
 - Modify: `crates/hub-telegram/src/telegram.rs` (`thread_not_found:389-394`, `delete_topic:397-416`, `probe_topic:418-443`, tests `:740-760`, `topic_api:830-880`)
@@ -78,26 +85,38 @@
 **Interfaces:**
 - Produces:
   ```rust
-  /// Нормализует описание ошибки Bot API и проверяет принадлежность к «тема отсутствует».
-  fn topic_gone(reason: &str) -> bool
+  /// Классифицирует описание ошибки Bot API: доказанное отсутствие, кандидат или ничего.
+  fn topic_gone_evidence(reason: &str) -> GoneEvidence
   ```
-  Срабатывает на нормализованные формы: `thread not found`, `message thread not found`,
-  `topic not found`, `topic deleted`, `topic id invalid`, `thread id invalid`
-  (финальный список — после Task 4; до подтверждения живьём элементы помечать в комментарии).
-- `delete_topic`/`probe_topic` матчат `Err(RequestError::Api(err))` через
-  `topic_gone(&err.to_string())` (покрывает и типизированные варианты, и `Unknown`),
+  Два множества нормализованных игл (финальный раунд ревью, Б1):
+  - `CONFIRMED_TOPIC_GONE_MARKERS` — формы, уже принятые релидным матчером v1.1.1:
+    `thread not found`, `message thread not found`, `topic not found`, `topic deleted`.
+    Только они дают `GoneEvidence::Proven` и разрешают локальную очистку.
+  - `UNCONFIRMED_TOPIC_GONE_MARKERS` — `topic id invalid`, `thread id invalid`: правдоподобные,
+    но невиданные живьём формы. Дают `GoneEvidence::Candidate` — только
+    `tracing::warn!(category = "unconfirmed_topic_gone")` с нормализованным описанием.
+  Переезд кандидата в confirmed — решение Task 4 (живой контракт владельца), не кода.
+- `delete_topic`/`probe_topic` классифицируют `Err(RequestError::Api(err))` через
+  `topic_gone_evidence(&err.to_string())` (покрывает и типизированные варианты, и `Unknown`):
+  `Proven` → `Ok(())`/`Ok(false)`, `Candidate` и `Unrelated` → тот же `Err(Rejected)`;
   ветки `RetryAfter`/иной `Api`/`_` сохраняются.
 
-- [x] **Step 1: Write failing tests** — unit-таблица `#[rstest] topic_gone_detects_missing_topic`
-  со строками `"Bad Request: THREAD_NOT_FOUND"`, `"Bad Request: MESSAGE_THREAD_NOT_FOUND"`,
-  `"Bad Request: TOPIC_ID_INVALID"`, `"Bad Request: topic not found"`,
-  `"Bad Request: TOPIC_DELETED"` и негативы `"Forbidden: CHAT_ADMIN_REQUIRED"`,
-  `"Bad Request: not enough rights"`; плюс через `topic_api`: ответ
+- [x] **Step 1: Write failing tests** — unit-таблица
+  `#[rstest] topic_gone_evidence_splits_confirmed_from_candidates` со строками
+  `"Bad Request: THREAD_NOT_FOUND"`, `"Bad Request: MESSAGE_THREAD_NOT_FOUND"`,
+  `"Bad Request: topic not found"`, `"Bad Request: TOPIC_DELETED"` → `Proven`,
+  `"Bad Request: TOPIC_ID_INVALID"`/`"Bad Request: THREAD_ID_INVALID"` → `Candidate`
+  (финальный раунд ревью, Б1) и негативы `"Forbidden: CHAT_ADMIN_REQUIRED"`,
+  `"Bad Request: not enough rights"` → `Unrelated`; плюс через `topic_api`: ответ
   `{"ok":false,"error_code":400,"description":"Bad Request: THREAD_NOT_FOUND"}` →
-  `delete_topic == Ok(())`, `probe_topic == Ok(false)`.
-- [x] **Step 2: Verify RED** — `cargo test -p hub-telegram --lib topic_gone` → FAIL (нет функции/кейсов).
+  `delete_topic == Ok(())`, `probe_topic == Ok(false)`, а `TOPIC_ID_INVALID`/`THREAD_ID_INVALID`
+  → `Err(Rejected)` в обоих вызовах и ровно два `warn` категории `unconfirmed_topic_gone`
+  (`unconfirmed_needle_is_reported_as_a_candidate_and_never_removes`).
+- [x] **Step 2: Verify RED** — `cargo test -p hub-telegram --lib topic_gone` → FAIL (нет функции/кейсов);
+  в финальном раунде — те же 5 кейсов FAIL на поведении (неподтверждённая игла давала `Ok`).
 - [x] **Step 3: Implement** — нормализация (`to_lowercase`, разделители → пробелы, сжатие),
-  константный список игл, замена матчеров в `delete_topic`/`probe_topic`.
+  два константных списка игл (`CONFIRMED_`/`UNCONFIRMED_TOPIC_GONE_MARKERS`) и warn кандидата,
+  замена матчеров в `delete_topic`/`probe_topic`.
 - [x] **Step 4: Verify GREEN** — `cargo test -p hub-telegram --locked` → PASS (в т.ч. старые
   тесты `topic_deletion_uses_bot_api_once`).
 - [x] **Step 5: Gates + commit** — `fix(telegram): надёжное распознавание удалённой темы в probe и delete`
@@ -204,24 +223,32 @@
   прогон сам печатает доказательство, в том числе при падении assert. Запуск:
   `cargo test -p hub-app --test live_telegram -- --ignored live_topic_gone`.
   Тест подготовлен и компилируется, но НЕ запускался (живые проверки — на владельце).
-- [ ] **Step 2: Зафиксировать evidence** — ⏳ ОЖИДАЕТ ВЛАДЕЛЬЦА. До этого прогона набор
-  «gone»-строк в `topic_gone` зафиксирован только нормализацией и unit-таблицей, живых строк
-  `topic api error … description=…` в ветке нет; `TOPIC_ID_INVALID`/`THREAD_ID_INVALID` помечены
-  в комментарии как неподтверждённые. Чек-лист живой проверки:
+- [ ] **Step 2: Зафиксировать evidence** — ⏳ ОЖИДАЕТ ВЛАДЕЛЬЦА. Разделение множеств (финальный
+  раунд ревью, Б1): удаление строки темы и маркер `deleted` возможны только по
+  `CONFIRMED_TOPIC_GONE_MARKERS` (четыре формы релидного матчера v1.1.1);
+  `UNCONFIRMED_TOPIC_GONE_MARKERS` (`topic id invalid`, `thread id invalid`) лишь пишут
+  `tracing::warn!` с категорией `unconfirmed_topic_gone`. Живой контракт этого прогона решает,
+  переезжают ли неподтверждённые иглы в подтверждённые: подтверждённая строка → перенос в
+  `CONFIRMED_TOPIC_GONE_MARKERS` (коммит `fix(telegram): …`), неподтверждённая или иная форма →
+  остаётся кандидатом либо выпадает из списка. Чек-лист живой проверки:
   1. Прогнать `cargo test -p hub-app --test live_telegram -- --ignored live_topic_gone_probe`
      (токен из keyring, группа `AGENT_HUB_LIVE_CHAT`) — или кнопку «Синхронизировать» в GUI на
      трёх реальных темах: живая, удалённая, удалённая с задачей в очереди.
   2. Из вывода вписать СЮДА, списком под этим пунктом, строки
-     `topic api error … description=…` (нормализованная форма — ровно то, что сравнивается с
-     `TOPIC_GONE_MARKERS`; сырое описание и тело запроса не писать — constraint «только
-     нормализованное описание») — коммитом `docs: живой контракт удалённой темы`.
-  3. Сверить каждую запись с `TOPIC_GONE_MARKERS`; если фактическая строка не покрыта —
+     `topic api error … description=…` и, если они есть, `unconfirmed_topic_gone …
+     description=…` (нормализованная форма — ровно то, с чем сравниваются оба множества;
+     сырое описание и тело запроса не писать — constraint «только нормализованное описание») —
+     коммитом `docs: живой контракт удалённой темы`.
+  3. Сверить каждую запись с `CONFIRMED_TOPIC_GONE_MARKERS`: покрыта — исходный баг закрыт;
+     только в виде кандидата — тема не удалится (в отчёте попадёт в «Не удалось проверить»), и
+     тогда перенести форму в подтверждённый набор отдельным коммитом с фиксом; вовсе не покрыта —
      дополнить список Task 1 отдельным коммитом с фиксом.
   4. Подтвердить, что проба `edit_forum_topic` с пустым именем не переименовывает живую тему и
      Telegram не отвечает `TOPIC_NAME_NOT_EMPTY`; иначе заменить пробу на read-вызов и повторить
      пункты 1–3.
   До записи доказательства исходный баг может остаться: при непокрытой строке проба даёт
   `uncertain`, а при отказе на пустое имя живые темы рискуют никогда не признаваться живыми.
+  Ложное «gone» при этом невозможно: частичное покрытие принесено в жертву сознательно.
 - [x] **Step 3: Docs** — обновить описание кнопки «Синхронизировать» в руководстве;
   регрессия меток GUI не затронута.
 - [x] **Step 4: Gates + commit** — полный gate-набор, `git status -s` чист.
@@ -229,13 +256,22 @@
 ## Security Review этого плана
 
 - Описание ошибки Telegram пишется в логи только нормализованным и без тела запроса —
-  утечки токена нет (паттерн уже использован в `telegram.rs:438-440`).
+  утечки токена нет (паттерн уже использован в `telegram.rs:438-440`); то же к
+  `warn` неподтверждённого кандидата.
 - `detach_topic_queue` меняет только поле `origin`, статус задач сохраняется — нет тихой
-  потери задач; модалка/отчёт сообщают число затронутых задач.
+  потери задач; число откреплённых видят только отчёт синхронизации (`Задач откреплено: D`),
+  модального подтверждения у кнопки «Синхронизировать» нет.
+- Не закрыто этим планом (вне Б1, на решении владельца): у отвязанной задачи
+  `origin == None`, поэтому перепроверка прав на запуске (`chat` + allowlist в
+  `hub/tasks/shared.rs`) и надстройки темы к ней уже не применяются — отзыв пользователя
+  из `telegram.users` не останавливает такую задачу, и она может уйти в насос рабочего
+  стола при остановленном боте. См. «Открытые решения владельца».
 
 ## Reliability Review этого плана
 
-- Классификатор расширяет множество «доказанное отсутствие»; ложное удаление живою темы
-  невозможно: `Ok(true)` и сетевые ошибки не удаляют. Решающее подтверждение — живая проба.
+- Классификатор расширяет множество «доказанное отсутствие» только формами релидного матчера;
+  ложное удаление живою темы невозможно: `Ok(true)`, сетевые ошибки и невиданные живьём формы
+  (`GoneEvidence::Candidate`) не удаляют и не ставят маркер — последние пишутся в `warn` как
+  кандидаты для Task 4. Решающее подтверждение — живая проба.
 - Повторная синхронизация идемпотентна (маркер `deleted` + повторная очистка диска —
   существующий паттерн `finish_deletion`).

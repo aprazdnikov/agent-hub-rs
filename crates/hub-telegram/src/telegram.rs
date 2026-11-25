@@ -388,17 +388,18 @@ fn thread(key: TopicKey) -> tg::ThreadId {
 /// `message thread not found`, …), so they are recognised by normalised substring matching over
 /// the whole [`teloxide::ApiError`] description rather than only `Unknown`.
 ///
-/// The needle list is fixed by normalisation and confirmed against a live Bot API build in
-/// Task 4 (the `live_topic_gone_probe` ignored test, pending the owner); entries awaiting that
-/// live contract are `TOPIC_ID_INVALID` and `THREAD_ID_INVALID`.
-const TOPIC_GONE_MARKERS: &[&str] = &[
-    "thread not found",
-    "message thread not found",
-    "topic not found",
-    "topic deleted",
-    "topic id invalid",
-    "thread id invalid",
-];
+/// A false «gone» is unrecoverable: `finish_sync` marks the row and unbinds its task queue, the
+/// marker is never cleared, and the inbound gate silences the live topic until restart. So the
+/// needle list is split, and only the confirmed half may drive local cleanup.
+///
+/// Forms the released matcher (v1.1.1) already accepted, in normalised form.
+const CONFIRMED_TOPIC_GONE_MARKERS: &[&str] =
+    &["thread not found", "message thread not found", "topic not found", "topic deleted"];
+
+/// Plausible missing-topic wording that no live Bot API answer has confirmed yet (plan Task 4,
+/// `live_topic_gone_probe`, pending the owner). Matched only to be logged as a candidate for that
+/// evidence; never deletes, never marks a row.
+const UNCONFIRMED_TOPIC_GONE_MARKERS: &[&str] = &["topic id invalid", "thread id invalid"];
 
 /// Lowercases the description and folds `_`, `-` and repeated whitespace into single spaces, so
 /// the underscore/caps forms Telegram returns match the space-separated needles.
@@ -406,11 +407,43 @@ fn normalize_error(reason: &str) -> String {
     reason.to_lowercase().replace(['_', '-'], " ").split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// `true` when a Bot API error description proves the topic no longer exists. Never fires on
-/// permission or transport wording, so a live topic cannot be dropped on a false positive.
-fn topic_gone(reason: &str) -> bool {
+/// How a Bot API error description speaks about a missing topic. Both answers on the right of
+/// `Proven` are legitimate paths — a candidate is kept but still reported — so the outcome is
+/// typed rather than returned as a `bool` "is gone" predicate.
+#[derive(Debug, PartialEq, Eq)]
+enum GoneEvidence {
+    /// A confirmed form: the topic is provably absent, local cleanup may run.
+    Proven,
+    /// A candidate form awaiting the live contract: reported, never acted upon.
+    Candidate,
+    /// Permission, transport or unrelated wording: the topic may well be alive.
+    Unrelated,
+}
+
+/// Classifies a raw or already normalized error description. Never reads permission or transport
+/// wording as a missing topic, so a live topic cannot be dropped on a false positive.
+#[must_use]
+fn topic_gone_evidence(reason: &str) -> GoneEvidence {
     let reason = normalize_error(reason);
-    TOPIC_GONE_MARKERS.iter().any(|marker| reason.contains(marker))
+    let matches = |markers: &[&str]| markers.iter().any(|marker| reason.contains(marker));
+    if matches(CONFIRMED_TOPIC_GONE_MARKERS) {
+        GoneEvidence::Proven
+    } else if matches(UNCONFIRMED_TOPIC_GONE_MARKERS) {
+        GoneEvidence::Candidate
+    } else {
+        GoneEvidence::Unrelated
+    }
+}
+
+/// Reports an unconfirmed needle as evidence for the live contract (plan Task 4). Only the
+/// normalized description is written — never a request body or URL, which could carry the token.
+fn warn_unconfirmed_gone(description: &str, key: TopicKey) {
+    tracing::warn!(
+        description = %description,
+        topic = ?key,
+        category = "unconfirmed_topic_gone",
+        "topic gone needle not confirmed by the live contract; the topic is kept"
+    );
 }
 
 impl Messenger for TelegramMessenger {
@@ -425,13 +458,21 @@ impl Messenger for TelegramMessenger {
                     // request body or URL.
                     let description = normalize_error(&err.to_string());
                     tracing::debug!(description = %description, topic = ?key, "topic api error");
-                    // The remote deletion may have succeeded before a timeout or local write failure.
-                    if topic_gone(&description) {
-                        Ok(())
-                    } else {
-                        Err(SendError::Rejected(
-                            "Проверьте, что бот — администратор с правом удалять сообщения.".into(),
-                        ))
+                    let evidence = topic_gone_evidence(&description);
+                    if evidence == GoneEvidence::Candidate {
+                        warn_unconfirmed_gone(&description, key);
+                    }
+                    // Only a confirmed needle proves the deletion; the remote deletion may have
+                    // succeeded before a timeout or local write failure, and an unconfirmed
+                    // wording must leave the row in place for a human to see.
+                    match evidence {
+                        GoneEvidence::Proven => Ok(()),
+                        GoneEvidence::Candidate | GoneEvidence::Unrelated => {
+                            Err(SendError::Rejected(
+                                "Проверьте, что бот — администратор с правом удалять сообщения."
+                                    .into(),
+                            ))
+                        }
                     }
                 }
                 Err(RequestError::RetryAfter(seconds)) => {
@@ -457,15 +498,23 @@ impl Messenger for TelegramMessenger {
                 Ok(_) => Ok(true),
                 Err(RequestError::Api(err)) => {
                     // See `delete_topic`: the normalized description is the evidence the live
-                    // contract probe records against `TOPIC_GONE_MARKERS`.
+                    // contract probe records against the confirmed markers.
                     let description = normalize_error(&err.to_string());
                     tracing::debug!(description = %description, topic = ?key, "topic api error");
-                    if topic_gone(&description) {
-                        Ok(false)
-                    } else {
-                        Err(SendError::Rejected(
-                            "Проверьте, что бот — администратор с правом управлять темами.".into(),
-                        ))
+                    let evidence = topic_gone_evidence(&description);
+                    if evidence == GoneEvidence::Candidate {
+                        warn_unconfirmed_gone(&description, key);
+                    }
+                    // `Ok(false)` is what removes a row in `finish_sync`, so an unconfirmed
+                    // wording counts as uncertainty and the topic stays.
+                    match evidence {
+                        GoneEvidence::Proven => Ok(false),
+                        GoneEvidence::Candidate | GoneEvidence::Unrelated => {
+                            Err(SendError::Rejected(
+                                "Проверьте, что бот — администратор с правом управлять темами."
+                                    .into(),
+                            ))
+                        }
                     }
                 }
                 Err(RequestError::RetryAfter(seconds)) => {
@@ -776,30 +825,35 @@ mod tests {
 
     #[rstest::rstest]
     // The real Bot API replies for a topic removed in Telegram arrive in underscore/caps forms
-    // that the old substring matcher missed; normalisation must catch all of them.
-    #[case::thread_underscore("Bad Request: THREAD_NOT_FOUND")]
-    #[case::message_thread_underscore("Bad Request: MESSAGE_THREAD_NOT_FOUND")]
-    #[case::message_thread_spaced("Bad Request: message thread not found")]
-    #[case::topic_underscore("Bad Request: TOPIC_NOT_FOUND")]
-    #[case::topic_spaced("Bad Request: topic not found")]
-    #[case::deleted_underscore("Bad Request: TOPIC_DELETED")]
-    #[case::topic_id_invalid("Bad Request: TOPIC_ID_INVALID")]
-    #[case::thread_id_invalid("Bad Request: THREAD_ID_INVALID")]
-    #[case::prefixed("Bad Request: some prefix message thread not found")]
-    #[case::mixed_case("bad request: Message_Thread_Not_Found")]
-    #[case::unknown_display("Unknown error: \"Bad Request: THREAD_NOT_FOUND\"")]
-    fn topic_gone_detects_missing_topic(#[case] reason: &str) {
-        assert!(topic_gone(reason));
-    }
-
-    #[rstest::rstest]
+    // that the old substring matcher missed; normalisation must catch all of them. The two
+    // `id invalid` forms are candidates until the live contract (plan Task 4) confirms them.
+    #[case::thread_underscore("Bad Request: THREAD_NOT_FOUND", GoneEvidence::Proven)]
+    #[case::message_thread_underscore(
+        "Bad Request: MESSAGE_THREAD_NOT_FOUND",
+        GoneEvidence::Proven
+    )]
+    #[case::message_thread_spaced("Bad Request: message thread not found", GoneEvidence::Proven)]
+    #[case::topic_underscore("Bad Request: TOPIC_NOT_FOUND", GoneEvidence::Proven)]
+    #[case::topic_spaced("Bad Request: topic not found", GoneEvidence::Proven)]
+    #[case::deleted_underscore("Bad Request: TOPIC_DELETED", GoneEvidence::Proven)]
+    #[case::prefixed("Bad Request: some prefix message thread not found", GoneEvidence::Proven)]
+    #[case::mixed_case("bad request: Message_Thread_Not_Found", GoneEvidence::Proven)]
+    #[case::unknown_display(
+        "Unknown error: \"Bad Request: THREAD_NOT_FOUND\"",
+        GoneEvidence::Proven
+    )]
+    #[case::topic_id_invalid("Bad Request: TOPIC_ID_INVALID", GoneEvidence::Candidate)]
+    #[case::thread_id_invalid("Bad Request: THREAD_ID_INVALID", GoneEvidence::Candidate)]
     // Permissions and unrelated errors must never read as a missing topic.
-    #[case::admin_required("Forbidden: CHAT_ADMIN_REQUIRED")]
-    #[case::rights("Bad Request: not enough rights")]
-    #[case::chat("Bad Request: chat not found")]
-    #[case::empty_name("Bad Request: TOPIC_NAME_NOT_EMPTY")]
-    fn other_reasons_are_not_gone_topics(#[case] reason: &str) {
-        assert!(!topic_gone(reason));
+    #[case::admin_required("Forbidden: CHAT_ADMIN_REQUIRED", GoneEvidence::Unrelated)]
+    #[case::rights("Bad Request: not enough rights", GoneEvidence::Unrelated)]
+    #[case::chat("Bad Request: chat not found", GoneEvidence::Unrelated)]
+    #[case::empty_name("Bad Request: TOPIC_NAME_NOT_EMPTY", GoneEvidence::Unrelated)]
+    fn topic_gone_evidence_splits_confirmed_from_candidates(
+        #[case] reason: &str,
+        #[case] expected: GoneEvidence,
+    ) {
+        assert_eq!(topic_gone_evidence(reason), expected);
     }
 
     #[rstest::rstest]
@@ -905,7 +959,9 @@ mod tests {
     #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_DELETED"}), true)]
     #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: MESSAGE_THREAD_NOT_FOUND"}), true)]
     #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: THREAD_NOT_FOUND"}), true)]
-    #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_ID_INVALID"}), true)]
+    // An unconfirmed needle must not report a deletion the bot API did not confirm.
+    #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_ID_INVALID"}), false)]
+    #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: THREAD_ID_INVALID"}), false)]
     #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: CHAT_ADMIN_REQUIRED"}), false)]
     #[tokio::test]
     async fn topic_deletion_uses_bot_api_once(
@@ -930,7 +986,12 @@ mod tests {
     #[case::exists(json!({"ok":true,"result":true}), Ok(true))]
     #[case::missing(json!({"ok":false,"error_code":400,"description":"Bad Request: message thread not found"}), Ok(false))]
     #[case::thread_not_found(json!({"ok":false,"error_code":400,"description":"Bad Request: THREAD_NOT_FOUND"}), Ok(false))]
-    #[case::topic_id_invalid(json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_ID_INVALID"}), Ok(false))]
+    // `TOPIC_ID_INVALID` has never been seen in a live answer, so it must not prove absence:
+    // an uncertain answer keeps the topic, exactly like a permission error.
+    #[case::topic_id_invalid(
+        json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_ID_INVALID"}),
+        Err(SendError::Rejected("Проверьте, что бот — администратор с правом управлять темами.".to_owned()))
+    )]
     #[case::deleted(json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_DELETED"}), Ok(false))]
     #[case::retry(
         json!({"ok":false,"error_code":429,"description":"Too Many Requests: retry after 2","parameters":{"retry_after":2}}),
@@ -993,13 +1054,17 @@ mod tests {
         );
     }
 
-    /// Keeps every event's rendered fields so a test can assert on emitted logs.
+    /// Keeps every event's target, level and rendered fields so a test can assert on emitted logs.
     #[derive(Default)]
-    struct LogCapture(std::sync::Mutex<Vec<(String, String)>>);
+    struct LogCapture(std::sync::Mutex<Vec<(String, tracing::Level, String)>>);
 
     impl LogCapture {
-        fn lines(&self) -> Vec<(String, String)> {
+        fn events(&self) -> Vec<(String, tracing::Level, String)> {
             self.0.lock().unwrap().clone()
+        }
+
+        fn lines(&self) -> Vec<(String, String)> {
+            self.events().into_iter().map(|(target, _level, fields)| (target, fields)).collect()
         }
     }
 
@@ -1041,7 +1106,12 @@ mod tests {
             }
             let mut fields = Vec::new();
             event.record(&mut Collector { fields: &mut fields });
-            self.0.lock().unwrap().push((event.metadata().target().to_owned(), fields.join(" ")));
+            let metadata = event.metadata();
+            self.0.lock().unwrap().push((
+                metadata.target().to_owned(),
+                *metadata.level(),
+                fields.join(" "),
+            ));
         }
     }
 
@@ -1096,6 +1166,49 @@ mod tests {
             .iter()
             .filter(|line| line.contains("topic api error") && line.contains(expected_description));
         assert_eq!(matching.count(), 2, "both api calls must log it; captured: {lines:?}");
+    }
+
+    #[rstest::rstest]
+    #[case::confirmed("Bad Request: THREAD_NOT_FOUND", true)]
+    #[case::topic_id_invalid("Bad Request: TOPIC_ID_INVALID", false)]
+    #[case::thread_id_invalid("Bad Request: THREAD_ID_INVALID", false)]
+    #[tokio::test]
+    async fn unconfirmed_needle_is_reported_as_a_candidate_and_never_removes(
+        #[case] description: &str,
+        #[case] confirmed: bool,
+    ) {
+        // A false «gone» is unrecoverable: it marks the row, unbinds the task queue and silences
+        // the topic for the rest of the run. A needle awaiting the live contract may only be
+        // reported as evidence, so neither call may claim the topic is gone.
+        let (messenger, _requests, server) =
+            topic_api(json!({"ok": false, "error_code": 400, "description": description})).await;
+        let capture = Arc::new(LogCapture::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&capture));
+        let key = TopicKey { chat: ChatId(-100), thread: ThreadId(42) };
+        let (delete, probe) = (messenger.delete_topic(key).await, messenger.probe_topic(key).await);
+        server.abort();
+        assert_eq!(delete.is_ok(), confirmed, "{delete:?}");
+        assert_eq!(probe.is_ok(), confirmed, "{probe:?}");
+        let candidates: Vec<String> = capture
+            .events()
+            .into_iter()
+            .filter(|(target, level, fields)| {
+                target == "hub_telegram::telegram"
+                    && *level == tracing::Level::WARN
+                    && fields.contains("unconfirmed_topic_gone")
+            })
+            .map(|(_, _, fields)| fields)
+            .collect();
+        // Both `delete_topic` and `probe_topic` see the same answer, so each reports it once.
+        let expected = if confirmed { 0 } else { 2 };
+        assert_eq!(candidates.len(), expected, "captured: {candidates:?}");
+        for line in &candidates {
+            assert!(
+                line.contains(&normalize_error(description)),
+                "the candidate warn must carry the normalized description: {line}"
+            );
+            assert!(!line.contains("bot1:test"), "token leaked: {line}");
+        }
     }
 
     #[rstest::rstest]

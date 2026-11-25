@@ -55,13 +55,16 @@ async fn live_result_card() {
 ///
 /// This test is intentionally `#[ignore]`d and is NOT run in CI or during plan execution. The
 /// exact Telegram `description` it is meant to record as the live contract is confirmed only by
-/// the owner (`AGENT_HUB_LIVE_CHAT` + keyring token); the matcher in `hub-telegram` is fixed by
-/// normalisation until that evidence is gathered (see the plan's Task 4, owner-pending).
+/// the owner (`AGENT_HUB_LIVE_CHAT` + keyring token); until that evidence is gathered
+/// `hub-telegram` removes topics only on `CONFIRMED_TOPIC_GONE_MARKERS` and reports
+/// `UNCONFIRMED_TOPIC_GONE_MARKERS` as candidates (see the plan's Task 4, owner-pending). The run
+/// decides whether a candidate joins the confirmed set.
 ///
 /// [`init_evidence_logging`] attaches a debug subscriber, so the run prints the `topic api
-/// error` lines — the normalized descriptions (the same form `TOPIC_GONE_MARKERS` matches, no
-/// token/URL per the plan constraint) — for every `Api` answer of `delete_topic`/`probe_topic`.
-/// If an assert fails, those lines are the evidence of what Telegram actually answered.
+/// error` lines — the normalized descriptions (the same form both marker sets are matched against,
+/// no token/URL per the plan constraint) — for every `Api` answer of
+/// `delete_topic`/`probe_topic`. A candidate wording also prints an `unconfirmed_topic_gone`
+/// warning. If an assert fails, those lines are the evidence of what Telegram actually answered.
 #[tokio::test]
 #[ignore = "creates and deletes a real forum topic in the configured Telegram group"]
 async fn live_topic_gone_probe() {
@@ -86,8 +89,10 @@ async fn live_topic_gone_probe() {
         .expect("Telegram did not create the probe topic");
     let key = TopicKey { chat, thread };
     messenger.delete_topic(key).await.expect("the first delete of a live topic must succeed");
-    // A removed topic must probe as gone and delete idempotently; the raw `description` behind
-    // `Ok(false)` is the evidence the owner records against the matcher's needle list.
+    // A removed topic must probe as gone and delete idempotently; the normalized `description`
+    // behind `Ok(false)` is the evidence the owner records. If Telegram answers with an
+    // unconfirmed wording instead, both asserts fail and the `unconfirmed_topic_gone` warnings
+    // name that wording — that is the candidate the owner promotes, or drops, in the plan.
     let probe = messenger.probe_topic(key).await;
     let delete = messenger.delete_topic(key).await;
     tracing::info!(?probe, ?delete, "live topic-gone probe outcomes for the matcher contract");
