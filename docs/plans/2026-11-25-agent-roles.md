@@ -191,14 +191,14 @@
   уточнить по вызовам `Editor::observe`; если не проброшено — добавить параметром)
 - Test: `rules.rs` render-тесты
 
-- [ ] **Step 1: RED** — тесты: выбор `Inherit` показывает строку факта с глобальными агентами
+- [x] **Step 1: RED** — тесты: выбор `Inherit` показывает строку факта с глобальными агентами
   и инпут команды; переключение `Custom` возвращает два комбобокса; `Off` скрывает всё;
   сохранение шлёт `Request::…` с корректным `WorkflowChoice`; валидация пустой команды
   блокирует кнопку.
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-app --lib workflow_modes` → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: GREEN** — `cargo test -p hub-app --locked` → PASS.
-- [ ] **Step 5: Commit** — `feat(gui): режим workflow проекта — выкл / общие роли / свой выбор`
+- [x] **Step 2: Verify RED** — `cargo test -p hub-app --lib workflow_modes` → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: GREEN** — `cargo test -p hub-app --locked` → PASS.
+- [x] **Step 5: Commit** — `feat(gui): режим workflow проекта — выкл / общие роли / свой выбор`
 
 ---
 

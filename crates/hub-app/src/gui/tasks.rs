@@ -3,6 +3,7 @@ use crate::supervisor::{BotStatus, Command, Snapshot};
 use eframe::egui;
 use hub_core::{
     domain::{BackendKind, TopicKey},
+    settings::AgentRoles,
     tasks::{Task, TaskFilter, TaskStatus},
 };
 use hub_telegram::hub::tasks::{Request, Snapshot as TaskSnapshot};
@@ -24,6 +25,11 @@ use std::{
 use tokio::sync::oneshot;
 
 type Scope = (Option<TopicKey>, PathBuf, BackendKind);
+
+/// The shared roles as currently saved: an inherited project is described by them.
+fn shared_roles(snapshot: &Snapshot) -> AgentRoles {
+    snapshot.saved.as_ref().map_or_else(AgentRoles::default, |draft| draft.roles)
+}
 type Reply = oneshot::Receiver<Result<TaskSnapshot, String>>;
 struct Pending {
     scope: Scope,
@@ -455,7 +461,8 @@ impl TasksView {
                         .as_ref()
                         .is_some_and(|p| matches!(p.effect, Effect::SaveRules));
                     let blocked = self.mutation_pending() || self.git_busy;
-                    if let Some(request) = self.rules.show(ui, &project, saving, blocked) {
+                    let roles = shared_roles(snapshot);
+                    if let Some(request) = self.rules.show(ui, &project, roles, saving, blocked) {
                         self.request(request, send);
                     }
                 });
@@ -2066,6 +2073,34 @@ mod tests {
             })
         ));
     }
+    #[test]
+    fn workflow_modes_chip_shows_the_resolved_preset() {
+        use hub_core::tasks::workflow::WorkflowChoice;
+        let (_, id, snapshot, mut view) = saved_prompt_fixture();
+        let ctx = egui::Context::default();
+        view.result_view.select(result::Tab::Parameters, Some(id));
+        view.rules.accept(hub_core::tasks::ProjectRules {
+            revision: 3,
+            enabled: true,
+            text: "Правила".into(),
+            git: None,
+            workflow: Some(WorkflowChoice::Inherit { command: "cargo test".into() }),
+        });
+        let snapshot = Snapshot {
+            saved: Some(hub_core::settings::Draft {
+                roles: AgentRoles { implementer: BackendKind::Qwen, reviewer: BackendKind::Hermes },
+                ..Default::default()
+            }),
+            ..snapshot
+        };
+        let mut commands = Vec::new();
+        let output = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert!(
+            labels(&output).contains(&"qwen › cargo test › ревью hermes"),
+            "the chip must show the shared roles the project inherits"
+        );
+    }
+
     #[test]
     fn project_rules_editor_has_separate_undo_state_for_each_project() {
         use hub_core::tasks::ProjectRules;

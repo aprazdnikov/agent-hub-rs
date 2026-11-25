@@ -9,7 +9,7 @@ use crate::gui::{
 };
 use eframe::egui;
 use egui::{Align, Layout, RichText};
-use hub_core::tasks::{RunState, workflow::WorkflowChoice};
+use hub_core::tasks::RunState;
 
 fn project_name(project: &std::path::Path) -> std::borrow::Cow<'_, str> {
     project.file_name().unwrap_or(project.as_os_str()).to_string_lossy()
@@ -984,9 +984,12 @@ impl TasksView {
         if self.selected_live(snapshot).is_some_and(|live| live.active) {
             self.local_panels(ui, snapshot, send);
         }
-        // The inherited mode has no chip until the editor resolves the shared roles.
-        if let Some(WorkflowChoice::Custom(plan)) = self.rules.saved.workflow.as_ref()
-            && plan.implementer.name() == task.backend
+        let roles = super::shared_roles(snapshot);
+        if let Some(plan) = self
+            .rules
+            .saved
+            .effective_workflow(&roles)
+            .filter(|plan| plan.implementer.name() == task.backend)
         {
             ui.label(format!(
                 "{} › {} › ревью {}",
