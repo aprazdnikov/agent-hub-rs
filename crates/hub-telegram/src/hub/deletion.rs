@@ -11,13 +11,46 @@ pub struct DeletionDone {
     result: Result<(), String>,
 }
 
-/// The probe results of one synchronization walk, handed back to the actor that started it.
+/// The categorized results of one synchronization walk, handed back to the actor that started it.
 pub struct SyncDone {
     /// Topics the probes proved missing, in probe order.
     stale: Vec<TopicKey>,
+    /// Topics the probes found still present.
+    alive: usize,
+    /// Topics whose probe answer could not be trusted (rejected/failed, not rate-limited).
+    uncertain: usize,
+    /// Topics the actor skipped before the walk because they were busy.
+    busy: usize,
     /// The walk stopped early because Telegram asked to wait this long.
     retry_after: Option<Duration>,
     reply: oneshot::Sender<Result<String, String>>,
+}
+
+/// Renders the synchronization report from the category counts.
+///
+/// Two single-purpose messages stay terse; anything mixed lists only the non-empty categories.
+/// The rate-limit and disk-failure tails are added by the caller, not here.
+fn sync_summary(removed: usize, alive: usize, busy: usize, uncertain: usize) -> String {
+    if busy == 0 && uncertain == 0 && (removed == 0 || alive == 0) {
+        return match removed {
+            0 => "Все темы актуальны.".to_owned(),
+            removed => format!("Удалено устаревших тем: {removed}."),
+        };
+    }
+    let mut parts = Vec::new();
+    if removed > 0 {
+        parts.push(format!("Удалено: {removed}"));
+    }
+    if alive > 0 {
+        parts.push(format!("Живых: {alive}"));
+    }
+    if busy > 0 {
+        parts.push(format!("Пропущено занятых: {busy}"));
+    }
+    if uncertain > 0 {
+        parts.push(format!("Не удалось проверить: {uncertain} — повторите синхронизацию"));
+    }
+    format!("{}.", parts.join(". "))
 }
 
 impl<A: Agents> Hub<A> {
@@ -154,7 +187,8 @@ impl<A: Agents> Hub<A> {
             ));
             return;
         }
-        let candidates: Vec<TopicKey> = self
+        // Eligible topics: a forum thread in the configured chat that is not already gone.
+        let eligible: Vec<TopicKey> = self
             .topics
             .keys()
             .copied()
@@ -163,12 +197,22 @@ impl<A: Agents> Hub<A> {
                     && key.chat == self.telegram_identity.chat
                     && !self.topic_unavailable(*key)
             })
-            // The same busy guards as deletion; undelivered answers are not a reason to skip,
-            // because a topic missing in Telegram cannot receive them anyway.
-            .filter(|key| self.check_deletion(*key).is_ok())
             .collect();
+        // The same busy guards as deletion; undelivered answers are not a reason to skip, because
+        // a topic missing in Telegram cannot receive them anyway. Anything rejected is reported as
+        // skipped rather than silently dropped from the count.
+        let mut candidates = Vec::new();
+        let mut busy = 0;
+        for key in eligible {
+            if self.check_deletion(key).is_ok() {
+                candidates.push(key);
+            } else {
+                busy += 1;
+                tracing::debug!(topic = ?key, category = "busy", "sync skipped a busy topic");
+            }
+        }
         if candidates.is_empty() {
-            let _ = reply.send(Ok("Все темы актуальны".to_owned()));
+            let _ = reply.send(Ok(sync_summary(0, 0, busy, 0)));
             return;
         }
         let sender = self.sender.clone();
@@ -177,6 +221,8 @@ impl<A: Agents> Hub<A> {
         let identity = self.telegram_identity.clone();
         tokio::spawn(async move {
             let mut stale = Vec::new();
+            let mut alive = 0;
+            let mut uncertain = 0;
             for key in candidates {
                 if mailbox.is_closed() {
                     let _ = reply.send(Err("Бот остановлен. Синхронизация прервана.".into()));
@@ -189,14 +235,25 @@ impl<A: Agents> Hub<A> {
                 }
                 match sender.messenger().probe_topic(key).await {
                     Ok(false) => stale.push(key),
+                    Ok(true) => alive += 1,
                     // An uncertain answer must not drop local state: skip the topic and
-                    // keep checking the rest.
-                    Ok(true) | Err(SendError::Rejected(_) | SendError::Failed(_)) => {}
+                    // keep checking the rest, but report it so the user knows it was not verified.
+                    Err(SendError::Rejected(_) | SendError::Failed(_)) => {
+                        uncertain += 1;
+                        tracing::debug!(
+                            topic = ?key,
+                            category = "uncertain",
+                            "sync could not verify a topic"
+                        );
+                    }
                     Err(SendError::RetryAfter(retry_after)) => {
                         // Telegram rate-limits the walk itself; stop instead of hammering.
                         let _ = mailbox
                             .send(HubMessage::SyncDone(SyncDone {
                                 stale,
+                                alive,
+                                uncertain,
+                                busy,
                                 retry_after: Some(retry_after),
                                 reply,
                             }))
@@ -206,7 +263,14 @@ impl<A: Agents> Hub<A> {
                 }
             }
             let _ = mailbox
-                .send(HubMessage::SyncDone(SyncDone { stale, retry_after: None, reply }))
+                .send(HubMessage::SyncDone(SyncDone {
+                    stale,
+                    alive,
+                    uncertain,
+                    busy,
+                    retry_after: None,
+                    reply,
+                }))
                 .await;
         });
     }
@@ -252,8 +316,7 @@ impl<A: Agents> Hub<A> {
                 0 => disk_failure,
                 removed => format!("Удалено устаревших тем: {removed}. {disk_failure}"),
             }),
-            (None, None) if removed == 0 => Ok("Все темы актуальны".to_owned()),
-            (None, None) => Ok(format!("Удалено устаревших тем: {removed}")),
+            (None, None) => Ok(sync_summary(removed, done.alive, done.busy, done.uncertain)),
         };
         let _ = done.reply.send(result);
     }

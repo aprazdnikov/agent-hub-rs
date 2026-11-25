@@ -120,14 +120,14 @@
   - к этому добавляются существующие хвосты про RetryAfter и сбой диска (не удалять).
 - Каждый пропуск/ошибка пробы пишется `tracing::debug!` с ключом темы и категорией.
 
-- [ ] **Step 1: Write failing tests** — в `hub.rs mod tests`: тема с `Ok(true)`, тема с ошибкой
+- [x] **Step 1: Write failing tests** — в `hub.rs mod tests`: тема с `Ok(true)`, тема с ошибкой
   пробы (`Err(Rejected)` из скрипта FakeMessenger) и занятая тема → ответ содержит «Не удалось
   проверить: 1» и не содержит «Все темы актуальны»; после второй успешной пробы тот же ключ
   удалён и счётчики пересчитаны.
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-telegram --lib sync_reports` → FAIL.
-- [ ] **Step 3: Implement** — категории в обходе; `finish_sync` собирает строку из частей.
-- [ ] **Step 4: Verify GREEN** — `cargo test -p hub-telegram --locked` → PASS.
-- [ ] **Step 5: Gates + commit** — `fix(telegram): синхронизация сообщает про пропущенные и непроверенные темы`
+- [x] **Step 2: Verify RED** — `cargo test -p hub-telegram --lib sync_reports` → FAIL.
+- [x] **Step 3: Implement** — категории в обходе; `finish_sync` собирает строку из частей.
+- [x] **Step 4: Verify GREEN** — `cargo test -p hub-telegram --locked` → PASS.
+- [x] **Step 5: Gates + commit** — `fix(telegram): синхронизация сообщает про пропущенные и непроверенные темы`
 
 ---
 

@@ -2766,6 +2766,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_reports_skipped_and_uncertain_topics() {
+        use hub_core::tasks::{queue::Origin, service::Access};
+        let world = world(FakeAgents::default());
+        let busy = TopicKey { chat: KEY.chat, thread: ThreadId(7) };
+        let uncertain = TopicKey { chat: KEY.chat, thread: ThreadId(8) };
+        let live = TopicKey { chat: KEY.chat, thread: ThreadId(9) };
+        for (thread, name) in [(7, "Занятая"), (8, "Сомнительная"), (9, "Живая")]
+        {
+            world
+                .send(inbound(Some(thread), thread, Content::TopicCreated { name: name.into() }))
+                .await;
+        }
+        // A queued task bound to `busy` makes check_deletion reject it; the walk never probes it.
+        world
+            .tasks
+            .access(Access::Edit, |book, _| {
+                let id =
+                    book.create(world.root.path().to_owned(), "claude", "Задача", "Проверь")?;
+                book.enqueue(
+                    id,
+                    book.get(id)?.revision,
+                    None,
+                    false,
+                    Some(Origin { chat: busy.chat.0, thread: busy.thread.0, user: Some(1) }),
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        // The one-shot script rejects the first probe (thread 8); thread 9 falls back to live.
+        *world.messenger.probes.lock().unwrap() = Some(Err(SendError::Rejected("права".into())));
+        let report = sync(&world).await.unwrap();
+        assert!(report.contains("Не удалось проверить: 1"), "got: {report}");
+        assert!(report.contains("Пропущено занятых: 1"), "got: {report}");
+        assert!(report.contains("Живых: 1"), "got: {report}");
+        assert!(!report.contains("Все темы актуальны"), "got: {report}");
+        assert_eq!(probe_calls(&world), [uncertain, live]);
+        let stored = world.store.last().unwrap();
+        assert!(
+            stored.contains_key(&busy)
+                && stored.contains_key(&uncertain)
+                && stored.contains_key(&live)
+        );
+        // Second round: the same key is now proved gone; it is removed and the counters recomputed.
+        *world.messenger.probes.lock().unwrap() = Some(Ok(false));
+        let report = sync(&world).await.unwrap();
+        assert!(report.contains("Удалено: 1"), "got: {report}");
+        assert!(report.contains("Живых: 1"), "got: {report}");
+        assert!(report.contains("Пропущено занятых: 1"), "got: {report}");
+        assert!(!world.store.last().unwrap().contains_key(&uncertain));
+    }
+
+    #[tokio::test]
     async fn sync_removes_stale_topics_and_keeps_live() {
         let world = world(FakeAgents::default());
         world.send(inbound(Some(7), 1, Content::TopicCreated { name: "Старая".into() })).await;
@@ -2774,7 +2826,8 @@ mod tests {
         // The one-shot script makes the first probe (thread 7, BTreeMap order) find the topic
         // gone; the second falls back to the fake's default of a live topic.
         *world.messenger.probes.lock().unwrap() = Some(Ok(false));
-        assert_eq!(sync(&world).await.unwrap(), "Удалено устаревших тем: 1");
+        // One removed and one still alive: the report breaks out both categories.
+        assert_eq!(sync(&world).await.unwrap(), "Удалено: 1. Живых: 1.");
         assert_eq!(probe_calls(&world), [KEY, live]);
         assert!(!world.messenger.calls().iter().any(|call| matches!(call, Call::DeleteTopic(_))));
         let stored = world.store.last().unwrap();
@@ -2793,7 +2846,7 @@ mod tests {
         world.store.fail.store(true, Ordering::SeqCst);
         assert!(delete_topic(&world, stale).await.is_err());
         world.store.fail.store(false, Ordering::SeqCst);
-        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны");
+        assert_eq!(sync(&world).await.unwrap(), "Пропущено занятых: 1.");
         assert!(probe_calls(&world).is_empty());
         let stored = world.store.last().unwrap();
         assert!(stored.contains_key(&KEY) && stored.contains_key(&stale));
@@ -2825,10 +2878,14 @@ mod tests {
             .await;
         world.send(inbound(Some(8), 2, Content::TopicCreated { name: "Живая".into() })).await;
         let live = TopicKey { chat: KEY.chat, thread: ThreadId(8) };
-        // Uncertainty must not remove the topic, but does not stop the walk either.
+        // Uncertainty must not remove the topic, but does not stop the walk either; the report
+        // now names it instead of silently claiming everything is current.
         *world.messenger.probes.lock().unwrap() =
             Some(Err(SendError::Rejected("проверьте права".into())));
-        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны");
+        assert_eq!(
+            sync(&world).await.unwrap(),
+            "Живых: 1. Не удалось проверить: 1 — повторите синхронизацию."
+        );
         assert_eq!(probe_calls(&world), [KEY, live]);
         let stored = world.store.last().unwrap();
         assert!(stored.contains_key(&KEY) && stored.contains_key(&live));
@@ -2839,12 +2896,12 @@ mod tests {
         let world = world(FakeAgents::default());
         world.send(inbound(Some(7), 1, Content::TopicCreated { name: "Старая".into() })).await;
         *world.messenger.probes.lock().unwrap() = Some(Ok(false));
-        assert_eq!(sync(&world).await.unwrap(), "Удалено устаревших тем: 1");
+        assert_eq!(sync(&world).await.unwrap(), "Удалено устаревших тем: 1.");
         // Delayed service events for a topic the sync proved missing must not resurrect it.
         world.send(inbound(Some(7), 50, Content::TopicCreated { name: "Призрак".into() })).await;
         world.send(text(Some(7), 51, "Оживи")).await;
         // The second sync round trip proves the actor processed the ghosts above.
-        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны");
+        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны.");
         assert!(!world.store.last().unwrap().contains_key(&KEY));
         assert!(!world.store.titles.lock().unwrap().contains_key(&KEY));
         assert!(!world.handle.views.borrow().iter().any(|topic| topic.key == KEY));
@@ -2860,7 +2917,7 @@ mod tests {
         let world = world(FakeAgents::default());
         world.send(inbound(Some(7), 1, Content::TopicCreated { name: "Старая".into() })).await;
         // The first sync round trip is the barrier: the topic is created and saved to disk.
-        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны");
+        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны.");
         world.store.fail.store(true, Ordering::SeqCst);
         *world.messenger.probes.lock().unwrap() = Some(Ok(false));
         let error = sync(&world).await.unwrap_err();
