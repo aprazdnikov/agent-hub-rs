@@ -182,12 +182,12 @@ worktree внутри него и темы Telegram не затрагивают�
   6. результат `save` остаётся штатным (SaveStatus/notice), reply не ждёт записи settings —
      в сводке указать «профиль снимается сохранением настроек».
 
-- [ ] **Step 1: RED** — тесты supervisor-harness: каскад зовёт все четыре хранилища (spy),
+- [x] **Step 1: RED** — тесты supervisor-harness: каскад зовёт все четыре хранилища (spy),
   активная задача блокирует без побочных эффектов, отсутствующий memory-каталог не ошибка.
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-app --lib delete_project` → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: GREEN** — `cargo test -p hub-app --locked` → PASS.
-- [ ] **Step 5: Commit** — `feat(app): каскадное удаление проекта с данными хаба`
+- [x] **Step 2: Verify RED** — `cargo test -p hub-app --lib delete_project` → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: GREEN** — `cargo test -p hub-app --locked` → PASS.
+- [x] **Step 5: Commit** — `feat(app): каскадное удаление проекта с данными хаба`
 
 ---
 
