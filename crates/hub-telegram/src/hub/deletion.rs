@@ -2,6 +2,8 @@
 //! answers.
 use std::time::Duration;
 
+use hub_core::tasks::{queue::Origin, service::Access};
+
 use crate::messenger::SendError;
 
 use super::{Agents, Hub, HubMessage, Target, TopicKey, oneshot};
@@ -11,13 +13,75 @@ pub struct DeletionDone {
     result: Result<(), String>,
 }
 
-/// The probe results of one synchronization walk, handed back to the actor that started it.
+/// The categorized results of one synchronization walk, handed back to the actor that started it.
 pub struct SyncDone {
     /// Topics the probes proved missing, in probe order.
     stale: Vec<TopicKey>,
+    /// Rows of topics an earlier walk already proved missing whose disk cleanup failed, retried
+    /// here without a new probe.
+    pending: Vec<TopicKey>,
+    /// Topics the probes found still present.
+    alive: usize,
+    /// Topics whose probe answer could not be trusted (rejected/failed, not rate-limited).
+    uncertain: usize,
+    /// Topics the actor skipped before the walk because they were busy.
+    busy: usize,
     /// The walk stopped early because Telegram asked to wait this long.
     retry_after: Option<Duration>,
     reply: oneshot::Sender<Result<String, String>>,
+}
+
+/// Which half of a proven-gone cleanup failed. The halves write different files, and a silently
+/// failed detach leaves bound `origin`s pointing at rows no later walk reaches — the exact
+/// orphan the synchronization exists to eliminate — so callers must branch on this.
+enum CleanupError {
+    /// The `topics.json` half could not be written; the row keeps its `deleted` marker for the
+    /// disk retry.
+    Disk(String),
+    /// The task store refused the detach; nothing was cleaned, so the retry runs both halves.
+    Queue(String),
+}
+
+/// Renders the synchronization report from the category counts.
+///
+/// Two single-purpose messages stay terse; anything mixed lists only the non-empty categories.
+/// The rate-limit and disk-failure tails are added by the caller, not here.
+fn sync_summary(
+    removed: usize,
+    alive: usize,
+    busy: usize,
+    uncertain: usize,
+    detached: usize,
+) -> String {
+    // Detached-task reporting is a suffix that only ever accompanies removals.
+    let detach_note = (detached > 0).then(|| format!("Задач откреплено: {detached}"));
+    if busy == 0 && uncertain == 0 && (removed == 0 || alive == 0) {
+        let base = match removed {
+            0 => "Все темы актуальны.".to_owned(),
+            removed => format!("Удалено устаревших тем: {removed}."),
+        };
+        return match detach_note {
+            Some(note) => format!("{base} {note}"),
+            None => base,
+        };
+    }
+    let mut parts = Vec::new();
+    if removed > 0 {
+        parts.push(format!("Удалено: {removed}"));
+    }
+    if alive > 0 {
+        parts.push(format!("Живых: {alive}"));
+    }
+    if busy > 0 {
+        parts.push(format!("Пропущено занятых: {busy}"));
+    }
+    if uncertain > 0 {
+        parts.push(format!("Не удалось проверить: {uncertain} — повторите синхронизацию"));
+    }
+    if let Some(note) = detach_note {
+        parts.push(note);
+    }
+    format!("{}.", parts.join(". "))
 }
 
 impl<A: Agents> Hub<A> {
@@ -39,8 +103,17 @@ impl<A: Agents> Hub<A> {
             let _ = reply.send(Err("Удаление недоступно: выберите обычную тему настроенной группы при работающем боте.".into()));
             return;
         }
+        // A marked row was already proved gone; the button finishes the sync cleanup —
+        // including the queue detach, idempotent and 0 when nothing is bound. Cleaning only
+        // the rows would leave a bound orphan `origin` that no later sync can reach.
         if self.deleted.contains(&key) {
-            let _ = reply.send(self.clean_deleted_topic(key));
+            let answer = self.clean_proven_gone(key).map(|_| ()).map_err(|error| match error {
+                CleanupError::Disk(message) => message,
+                CleanupError::Queue(error) => format!(
+                    "Тема удалена в Telegram. Не удалось открепить очередь задач: {error}. Повторите удаление для завершения очистки."
+                ),
+            });
+            let _ = reply.send(answer);
             return;
         }
         if let Err(error) = self.check_deletion(key) {
@@ -68,21 +141,11 @@ impl<A: Agents> Hub<A> {
         });
     }
 
-    fn check_deletion(&self, key: TopicKey) -> Result<(), String> {
-        let queued = self
-            .tasks
-            .inspect(|book| {
-                book.tasks().iter().any(|task| {
-                    task.queue.as_ref().and_then(|entry| entry.origin).is_some_and(|origin| {
-                        origin.chat == key.chat.0 && origin.thread == key.thread.0
-                    })
-                })
-            })
-            .map_err(|error| format!("Не удалось проверить очередь задач темы: {error}"))?;
-        if queued {
-            return Err("В очереди есть задачи из этой темы. Дождитесь их выполнения или снимите их с очереди.".into());
-        }
-        if self.deleting.contains_key(&key)
+    /// An in-flight launch, session reservation or destructive operation on the topic. These must
+    /// finish before the topic is touched at all, so they block even the forced cleanup of a topic
+    /// Telegram already proved missing.
+    fn active_operation(&self, key: TopicKey) -> bool {
+        self.deleting.contains_key(&key)
             || self.running.contains_key(&key)
             || self.task_runs.contains_key(&key)
             || self.handoff_busy(key)
@@ -97,13 +160,42 @@ impl<A: Agents> Hub<A> {
                             .is_some_and(|session| session.cwd.as_path() == live.project)
                 })
             })
-            || self.memory.busy_in(key)
+            || self.topics.get(&key).is_some_and(|s| self.is_reserved(s))
+    }
+
+    /// Auxiliary per-topic work (memory, voice, actions, doctor, album parts). It blocks a manual
+    /// deletion, but not the cleanup of a topic proved missing — such a topic cannot take part in
+    /// these operations meaningfully once it is gone remotely.
+    fn auxiliary_busy(&self, key: TopicKey) -> bool {
+        self.memory.busy_in(key)
             || self.voices.busy_in(key)
             || self.actions.busy_in(Target::Topic(key))
             || self.doctors.busy(key)
             || self.albums.values().flatten().any(|part| part.key() == Some(key))
-            || self.topics.get(&key).is_some_and(|s| self.is_reserved(s))
-        {
+    }
+
+    /// Blocks cleanup only on genuinely active states. A proven-missing topic whose task queue
+    /// still holds its intents is force-cleaned instead: the queue is detached rather than being a
+    /// permanent block.
+    fn check_force_cleanup(&self, key: TopicKey) -> Result<(), ()> {
+        if self.active_operation(key) { Err(()) } else { Ok(()) }
+    }
+
+    fn check_deletion(&self, key: TopicKey) -> Result<(), String> {
+        let queued = self
+            .tasks
+            .inspect(|book| {
+                book.tasks().iter().any(|task| {
+                    task.queue.as_ref().and_then(|entry| entry.origin).is_some_and(|origin| {
+                        origin.chat == key.chat.0 && origin.thread == key.thread.0
+                    })
+                })
+            })
+            .map_err(|error| format!("Не удалось проверить очередь задач темы: {error}"))?;
+        if queued {
+            return Err("В очереди есть задачи из этой темы. Дождитесь их выполнения или снимите их с очереди.".into());
+        }
+        if self.active_operation(key) || self.auxiliary_busy(key) {
             return Err(
                 "Дождитесь завершения активной задачи или операции и повторите удаление.".into()
             );
@@ -143,6 +235,22 @@ impl<A: Agents> Hub<A> {
         self.replace_topics(topics);
         Ok(())
     }
+
+    /// Finish a topic Telegram already proved missing: durable queue detach first, then the
+    /// disk rows. Only the queue origin changes; task status is preserved. The two writes are
+    /// not one atomic operation, and this order makes the crash window recoverable: the
+    /// surviving marked row is already unbound, so the next sync's detach returns 0 and the
+    /// cleanup finishes. A failed detach aborts before touching the disk — dropping the rows
+    /// with the queue still bound would strand the orphan outside every later walk.
+    fn clean_proven_gone(&mut self, key: TopicKey) -> Result<usize, CleanupError> {
+        let origin = Origin { chat: key.chat.0, thread: key.thread.0, user: None };
+        let detached = self
+            .tasks
+            .access(Access::Edit, |book, _| Ok(book.detach_topic_queue(&origin)))
+            .map_err(CleanupError::Queue)?;
+        self.clean_deleted_topic(key).map_err(CleanupError::Disk)?;
+        Ok(detached)
+    }
 }
 
 impl<A: Agents> Hub<A> {
@@ -154,7 +262,8 @@ impl<A: Agents> Hub<A> {
             ));
             return;
         }
-        let candidates: Vec<TopicKey> = self
+        // Eligible topics: a forum thread in the configured chat that is not already gone.
+        let eligible: Vec<TopicKey> = self
             .topics
             .keys()
             .copied()
@@ -163,12 +272,28 @@ impl<A: Agents> Hub<A> {
                     && key.chat == self.telegram_identity.chat
                     && !self.topic_unavailable(*key)
             })
-            // The same busy guards as deletion; undelivered answers are not a reason to skip,
-            // because a topic missing in Telegram cannot receive them anyway.
-            .filter(|key| self.check_deletion(*key).is_ok())
             .collect();
-        if candidates.is_empty() {
-            let _ = reply.send(Ok("Все темы актуальны".to_owned()));
+        // A proven-missing topic must be reachable even when its task queue still holds intents,
+        // so only genuinely active work (check_force_cleanup) skips a candidate; a queued-only topic
+        // is probed and, if gone, cleaned with its queue detached. Anything skipped is reported as
+        // busy rather than silently dropped from the count.
+        let mut candidates = Vec::new();
+        let mut busy = 0;
+        for key in eligible {
+            if self.check_force_cleanup(key).is_ok() {
+                candidates.push(key);
+            } else {
+                busy += 1;
+                tracing::debug!(topic = ?key, category = "busy", "sync skipped a busy topic");
+            }
+        }
+        // Rows a previous disk failure left behind: Telegram already proved them gone, so the
+        // retry finishes them without a new probe — that is what makes «повторите синхронизацию»
+        // a repeatable instruction rather than a dead end.
+        let pending: Vec<TopicKey> =
+            self.topics.keys().copied().filter(|key| self.deleted.contains(key)).collect();
+        if candidates.is_empty() && pending.is_empty() {
+            let _ = reply.send(Ok(sync_summary(0, 0, busy, 0, 0)));
             return;
         }
         let sender = self.sender.clone();
@@ -177,6 +302,8 @@ impl<A: Agents> Hub<A> {
         let identity = self.telegram_identity.clone();
         tokio::spawn(async move {
             let mut stale = Vec::new();
+            let mut alive = 0;
+            let mut uncertain = 0;
             for key in candidates {
                 if mailbox.is_closed() {
                     let _ = reply.send(Err("Бот остановлен. Синхронизация прервана.".into()));
@@ -189,14 +316,26 @@ impl<A: Agents> Hub<A> {
                 }
                 match sender.messenger().probe_topic(key).await {
                     Ok(false) => stale.push(key),
+                    Ok(true) => alive += 1,
                     // An uncertain answer must not drop local state: skip the topic and
-                    // keep checking the rest.
-                    Ok(true) | Err(SendError::Rejected(_) | SendError::Failed(_)) => {}
+                    // keep checking the rest, but report it so the user knows it was not verified.
+                    Err(SendError::Rejected(_) | SendError::Failed(_)) => {
+                        uncertain += 1;
+                        tracing::debug!(
+                            topic = ?key,
+                            category = "uncertain",
+                            "sync could not verify a topic"
+                        );
+                    }
                     Err(SendError::RetryAfter(retry_after)) => {
                         // Telegram rate-limits the walk itself; stop instead of hammering.
                         let _ = mailbox
                             .send(HubMessage::SyncDone(SyncDone {
                                 stale,
+                                pending,
+                                alive,
+                                uncertain,
+                                busy,
                                 retry_after: Some(retry_after),
                                 reply,
                             }))
@@ -206,7 +345,15 @@ impl<A: Agents> Hub<A> {
                 }
             }
             let _ = mailbox
-                .send(HubMessage::SyncDone(SyncDone { stale, retry_after: None, reply }))
+                .send(HubMessage::SyncDone(SyncDone {
+                    stale,
+                    pending,
+                    alive,
+                    uncertain,
+                    busy,
+                    retry_after: None,
+                    reply,
+                }))
                 .await;
         });
     }
@@ -214,46 +361,103 @@ impl<A: Agents> Hub<A> {
     pub(super) fn finish_sync(&mut self, done: SyncDone) {
         let mut removed = 0;
         let mut failed = 0;
+        let mut queue_failed = 0;
+        let mut detached = 0;
+        let mut skipped = 0;
+        // Retry the cleanups a previous disk failure left on disk. These keys keep the `deleted`
+        // marker, so no busy check applies: the topic is already proven gone and a manual delete
+        // never re-probes them (delete_topic short-circuits on the marker too); only an in-flight
+        // delete owns its row and answers with its own reply.
+        for key in done.pending {
+            if !self.topics.contains_key(&key) || self.deleting.contains_key(&key) {
+                continue;
+            }
+            match self.clean_proven_gone(key) {
+                Ok(count) => {
+                    removed += 1;
+                    detached += count;
+                }
+                Err(CleanupError::Disk(error)) => {
+                    failed += 1;
+                    tracing::warn!(topic = ?key, %error, "synced topic could not be cleaned on disk");
+                }
+                Err(CleanupError::Queue(error)) => {
+                    queue_failed += 1;
+                    tracing::warn!(topic = ?key, %error, "synced topic queue could not be detached");
+                }
+            }
+        }
         for key in done.stale {
-            // A probe answer is only a decision when the topic is still unbound and free;
-            // work may have arrived while the walk was running.
-            if !self.topics.contains_key(&key)
-                || self.topic_unavailable(key)
-                || self.check_deletion(key).is_err()
-            {
+            // A probe answer is only a decision when the topic is still unbound and free; an active
+            // operation may have started while the walk was running. A queued-only topic stays
+            // eligible here: its queue is detached below instead of blocking the proven removal.
+            if !self.topics.contains_key(&key) {
+                // Already cleaned by another path; local state matches Telegram, nothing to report.
+                continue;
+            }
+            if self.topic_unavailable(key) || self.check_force_cleanup(key).is_err() {
+                // The row still sits on disk for a topic Telegram proved gone. It must reach the
+                // busy count, or the report would claim "Все темы актуальны" over a real deferral.
+                skipped += 1;
+                tracing::debug!(
+                    topic = ?key,
+                    category = "skipped",
+                    "sync deferred a proven-missing topic"
+                );
                 continue;
             }
             // Mark deleted before cleanup, as finish_deletion does: the inbound gate drops
             // delayed TopicCreated/text for a topic the walk proved missing, and a cleanup
-            // that failed on disk stays retryable through the Delete button.
+            // that failed on disk stays retryable — by the Delete button or by the next sync.
             self.deleted.insert(key);
-            if let Err(error) = self.clean_deleted_topic(key) {
-                failed += 1;
-                tracing::warn!(topic = ?key, %error, "synced topic could not be cleaned on disk");
-            } else {
-                removed += 1;
+            match self.clean_proven_gone(key) {
+                Ok(count) => {
+                    removed += 1;
+                    detached += count;
+                }
+                Err(CleanupError::Disk(error)) => {
+                    failed += 1;
+                    tracing::warn!(topic = ?key, %error, "synced topic could not be cleaned on disk");
+                }
+                Err(CleanupError::Queue(error)) => {
+                    queue_failed += 1;
+                    tracing::warn!(topic = ?key, %error, "synced topic queue could not be detached");
+                }
             }
         }
-        // A stale topic left on disk is not "all topics are current"; report the failure the
-        // way deletion does: what broke and how to retry.
-        let disk_failure = (failed > 0).then(|| {
-            format!("Не удалось очистить {failed} тем на диске — повторите синхронизацию.")
-        });
-        let result = match (done.retry_after, disk_failure) {
-            (Some(retry_after), disk_failure) => {
+        // A stale topic or a still-bound queue left on disk is not "all topics are current";
+        // report each failed half the way deletion does: what broke and how to retry. Both
+        // halves stay retryable — the row keeps its `deleted` marker and detach is idempotent.
+        let mut failures = Vec::new();
+        if failed > 0 {
+            failures.push(format!(
+                "Не удалось очистить {failed} тем на диске — повторите синхронизацию."
+            ));
+        }
+        if queue_failed > 0 {
+            failures.push(format!(
+                "Не удалось открепить очередь задач {queue_failed} тем — повторите синхронизацию."
+            ));
+        }
+        let failures = (!failures.is_empty()).then(|| failures.join(" "));
+        let result = match (done.retry_after, failures) {
+            (Some(retry_after), failures) => {
                 let error = SendError::RetryAfter(retry_after);
                 let message = format!("{error}, повторите позже");
-                Err(match disk_failure {
-                    Some(disk_failure) => format!("{message}. {disk_failure}"),
+                Err(match failures {
+                    Some(failures) => format!("{message}. {failures}"),
                     None => message,
                 })
             }
-            (None, Some(disk_failure)) => Err(match removed {
-                0 => disk_failure,
-                removed => format!("Удалено устаревших тем: {removed}. {disk_failure}"),
+            (None, Some(failures)) => Err(match removed {
+                0 => failures,
+                removed => format!("Удалено устаревших тем: {removed}. {failures}"),
             }),
-            (None, None) if removed == 0 => Ok("Все темы актуальны".to_owned()),
-            (None, None) => Ok(format!("Удалено устаревших тем: {removed}")),
+            // Topics that turned busy or unavailable after their probe join the pre-walk
+            // busy count: both are deferrals the user has to see.
+            (None, None) => {
+                Ok(sync_summary(removed, done.alive, done.busy + skipped, done.uncertain, detached))
+            }
         };
         let _ = done.reply.send(result);
     }

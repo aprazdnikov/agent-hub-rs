@@ -52,6 +52,7 @@ pub(crate) struct FakeMessenger {
     topics: Mutex<VecDeque<Result<ThreadId, SendError>>>,
     pub(crate) deletion: Mutex<Option<Result<(), SendError>>>,
     pub(crate) probes: Mutex<Option<Result<bool, SendError>>>,
+    probe_delay: Mutex<Option<oneshot::Receiver<()>>>,
     sends: Mutex<VecDeque<Result<(), SendError>>>,
     edits: Mutex<VecDeque<Result<(), SendError>>>,
     edit_delay: Mutex<Option<oneshot::Receiver<()>>>,
@@ -104,6 +105,14 @@ impl FakeMessenger {
         self.card_attempts.lock().unwrap().clone()
     }
 
+    /// Hold the next probe until the test explicitly releases it; the attempt is recorded
+    /// immediately, so a caller can tell the walk reached the probe.
+    pub(crate) fn delay_next_probe(&self) -> oneshot::Sender<()> {
+        let (release, wait) = oneshot::channel();
+        *self.probe_delay.lock().unwrap() = Some(wait);
+        release
+    }
+
     /// Hold the next edit until the test explicitly releases it.
     pub(crate) fn delay_next_edit(&self) -> oneshot::Sender<()> {
         let (release, wait) = oneshot::channel();
@@ -153,7 +162,13 @@ impl Messenger for FakeMessenger {
     fn probe_topic(&self, key: TopicKey) -> BoxFuture<'_, Result<bool, SendError>> {
         self.record(Call::ProbeTopic(key));
         let result = self.probes.lock().unwrap().take().unwrap_or(Ok(true));
-        Box::pin(async { result })
+        let delay = self.probe_delay.lock().unwrap().take();
+        Box::pin(async move {
+            if let Some(delay) = delay {
+                let _ = delay.await;
+            }
+            result
+        })
     }
 
     fn create_topic(
