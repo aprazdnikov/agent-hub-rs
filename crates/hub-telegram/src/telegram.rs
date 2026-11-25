@@ -13,8 +13,8 @@ use hub_core::settings::{TelegramSettings, Token};
 use teloxide::dispatching::{Dispatcher, ShutdownToken, UpdateFilterExt};
 use teloxide::net::Download;
 use teloxide::payloads::{
-    AnswerCallbackQuerySetters, EditForumTopicSetters, EditMessageReplyMarkupSetters,
-    EditMessageTextSetters, SendChatActionSetters, SendDocumentSetters, SendMessageSetters,
+    AnswerCallbackQuerySetters, EditMessageReplyMarkupSetters, EditMessageTextSetters,
+    SendChatActionSetters, SendDocumentSetters, SendMessageSetters,
 };
 use teloxide::prelude::{Bot, CallbackQuery, Message, Requester, Update};
 use teloxide::types::{
@@ -454,6 +454,40 @@ fn warn_unconfirmed_gone(description: &str, key: TopicKey) {
     );
 }
 
+/// A probe answer that matched no needle at all is still contract evidence: without a warn the
+/// operator's default-level log stays silent while sync reports «Не удалось проверить», and the
+/// actual wording (the whole point of the live contract) never reaches anyone. Same token-safety
+/// rule as `warn_unconfirmed_gone`: normalized description only.
+fn warn_unclassified_probe_error(description: &str, key: TopicKey) {
+    tracing::warn!(
+        description = %description,
+        topic = ?key,
+        category = "unclassified_topic_error",
+        "topic probe got an answer that proves nothing; the topic is kept"
+    );
+}
+
+/// The user-visible answer to an unverifiable probe: uncertainty never deletes, and the hint
+/// stays permission-shaped because a non-admin bot is the dominant real cause.
+fn probe_uncertain() -> SendError {
+    SendError::Rejected("Проверьте, что бот — администратор с правом управлять темами.".into())
+}
+
+/// `getForumTopic` is part of the Bot API but teloxide-core 0.13 does not generate a payload
+/// for it, so the read-only existence probe sends the request manually through `JsonRequest`.
+/// Only the serialized parameters and the transport outcome are used; the returned `ForumTopic`
+/// object is deliberately kept unparsed.
+#[derive(Clone, Debug, serde::Serialize)]
+struct GetForumTopic {
+    chat_id: i64,
+    message_thread_id: i64,
+}
+
+impl teloxide::requests::Payload for GetForumTopic {
+    type Output = serde_json::Value;
+    const NAME: &'static str = "GetForumTopic";
+}
+
 impl Messenger for TelegramMessenger {
     fn delete_topic(&self, key: TopicKey) -> BoxFuture<'_, Result<(), SendError>> {
         Box::pin(async move {
@@ -495,14 +529,13 @@ impl Messenger for TelegramMessenger {
 
     fn probe_topic(&self, key: TopicKey) -> BoxFuture<'_, Result<bool, SendError>> {
         Box::pin(async move {
-            // An empty name keeps the current name, and an unspecified icon keeps the current
-            // icon, so this edit is invisible; only the error tells whether the topic exists.
-            match self
-                .topics
-                .edit_forum_topic(tg::ChatId(key.chat.0), thread(key))
-                .name(String::new())
-                .await
-            {
+            // A read-only existence check: `getForumTopic` cannot rename, close or otherwise
+            // mutate a live topic, so a wrong sync can never damage a real conversation.
+            let request = teloxide::requests::JsonRequest::new(
+                self.topics.clone(),
+                GetForumTopic { chat_id: key.chat.0, message_thread_id: i64::from(key.thread.0) },
+            );
+            match request.await {
                 Ok(_) => Ok(true),
                 Err(RequestError::Api(err)) => {
                     // See `delete_topic`: the normalized description is the evidence the live
@@ -510,18 +543,17 @@ impl Messenger for TelegramMessenger {
                     let description = normalize_error(&err.to_string());
                     tracing::debug!(description = %description, topic = ?key, "topic api error");
                     let evidence = topic_gone_evidence(&description);
-                    if evidence == GoneEvidence::Candidate {
-                        warn_unconfirmed_gone(&description, key);
-                    }
-                    // `Ok(false)` is what removes a row in `finish_sync`, so an unconfirmed
-                    // wording counts as uncertainty and the topic stays.
+                    // `Ok(false)` is what removes a row in `finish_sync`, so any wording short
+                    // of a confirmed needle counts as uncertainty and the topic stays.
                     match evidence {
                         GoneEvidence::Proven => Ok(false),
-                        GoneEvidence::Candidate | GoneEvidence::Unrelated => {
-                            Err(SendError::Rejected(
-                                "Проверьте, что бот — администратор с правом управлять темами."
-                                    .into(),
-                            ))
+                        GoneEvidence::Candidate => {
+                            warn_unconfirmed_gone(&description, key);
+                            Err(probe_uncertain())
+                        }
+                        GoneEvidence::Unrelated => {
+                            warn_unclassified_probe_error(&description, key);
+                            Err(probe_uncertain())
                         }
                     }
                 }
@@ -993,7 +1025,9 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::exists(json!({"ok":true,"result":true}), Ok(true))]
+    // `getForumTopic` answers with a `ForumTopic` object when the topic is alive; the probe
+    // must read existence off the transport outcome, never off the returned fields.
+    #[case::exists(json!({"ok":true,"result":{"name":"Релиз","icon_color":1234}}), Ok(true))]
     #[case::missing(json!({"ok":false,"error_code":400,"description":"Bad Request: message thread not found"}), Ok(false))]
     #[case::thread_not_found(json!({"ok":false,"error_code":400,"description":"Bad Request: THREAD_NOT_FOUND"}), Ok(false))]
     // The live contract (plan Task 4, 2026-11-25) saw exactly this wording for a removed
@@ -1012,10 +1046,14 @@ mod tests {
         Err(SendError::Rejected("Проверьте, что бот — администратор с правом управлять темами.".to_owned()))
     )]
     #[tokio::test]
-    async fn topic_probe_keeps_the_name_and_maps_existence(
+    async fn topic_probe_is_a_read_only_check_and_maps_existence(
         #[case] response: serde_json::Value,
         #[case] expected: Result<bool, SendError>,
     ) {
+        // The probe may not write: an `editForumTopic` with an empty name was never verified
+        // against the live contract, and any answer Telegram gives before the existence check
+        // (e.g. `TOPIC_NAME_NOT_EMPTY`) would classify every gone topic as "uncertain" and
+        // leave ghosts in the list. A read-only `getForumTopic` cannot rename or mutate.
         let (messenger, requests, server) = topic_api(response).await;
         let result =
             messenger.probe_topic(TopicKey { chat: ChatId(-100), thread: ThreadId(42) }).await;
@@ -1025,8 +1063,8 @@ mod tests {
             (
                 expected,
                 vec![(
-                    "/bot1:test/editforumtopic".to_owned(),
-                    json!({"chat_id":-100,"message_thread_id":42,"name":""})
+                    "/bot1:test/getforumtopic".to_owned(),
+                    json!({"chat_id":-100,"message_thread_id":42})
                 )]
             )
         );
@@ -1220,6 +1258,44 @@ mod tests {
             );
             assert!(!line.contains("bot1:test"), "token leaked: {line}");
         }
+    }
+
+    #[tokio::test]
+    async fn probe_unclassified_api_error_is_warned_for_operators() {
+        // The live run showed default-level logs stay silent while sync reports «Не удалось
+        // проверить» — the wording that would extend the contract never surfaces. A probe answer
+        // matching no needle must therefore be visible at WARN, token-sanitized.
+        let (messenger, _requests, server) = topic_api(json!({
+            "ok": false, "error_code": 400, "description": "Bad Request: CHAT_ADMIN_REQUIRED"
+        }))
+        .await;
+        let capture = Arc::new(LogCapture::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&capture));
+        let key = TopicKey { chat: ChatId(-100), thread: ThreadId(42) };
+        let (delete, probe) = (messenger.delete_topic(key).await, messenger.probe_topic(key).await);
+        server.abort();
+        assert!(delete.is_err() && probe.is_err(), "nothing unverifiable may succeed");
+        let unclassified: Vec<String> = capture
+            .events()
+            .into_iter()
+            .filter(|(target, level, fields)| {
+                target == "hub_telegram::telegram"
+                    && *level == tracing::Level::WARN
+                    && fields.contains("unclassified_topic_error")
+            })
+            .map(|(_, _, fields)| fields)
+            .collect();
+        assert_eq!(
+            unclassified.len(),
+            1,
+            "only the probe warns about an unclassified answer: {unclassified:?}"
+        );
+        assert!(
+            unclassified[0].contains(&normalize_error("Bad Request: CHAT_ADMIN_REQUIRED")),
+            "the warn must carry the exact wording for the live contract: {}",
+            unclassified[0]
+        );
+        assert!(!unclassified[0].contains("bot1:test"), "token leaked");
     }
 
     #[rstest::rstest]

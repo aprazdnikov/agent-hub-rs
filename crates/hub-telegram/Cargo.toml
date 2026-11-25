@@ -19,6 +19,8 @@ hub-opencode.workspace = true
 hub-core.workspace = true
 hub-memory.workspace = true
 reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 teloxide.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "macros", "rt", "sync", "time"] }

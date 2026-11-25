@@ -1947,6 +1947,7 @@ dependencies = [
  "jiff",
  "reqwest",
  "rstest",
+ "serde",
  "serde_json",
  "teloxide",
  "tempfile",
