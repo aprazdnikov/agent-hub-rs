@@ -316,14 +316,24 @@ impl<A: Agents> Hub<A> {
         let mut removed = 0;
         let mut failed = 0;
         let mut detached = 0;
+        let mut skipped = 0;
         for key in done.stale {
             // A probe answer is only a decision when the topic is still unbound and free; an active
             // operation may have started while the walk was running. A queued-only topic stays
             // eligible here: its queue is detached below instead of blocking the proven removal.
-            if !self.topics.contains_key(&key)
-                || self.topic_unavailable(key)
-                || self.check_force_cleanup(key).is_err()
-            {
+            if !self.topics.contains_key(&key) {
+                // Already cleaned by another path; local state matches Telegram, nothing to report.
+                continue;
+            }
+            if self.topic_unavailable(key) || self.check_force_cleanup(key).is_err() {
+                // The row still sits on disk for a topic Telegram proved gone. It must reach the
+                // busy count, or the report would claim "Все темы актуальны" over a real deferral.
+                skipped += 1;
+                tracing::debug!(
+                    topic = ?key,
+                    category = "skipped",
+                    "sync deferred a proven-missing topic"
+                );
                 continue;
             }
             // Mark deleted before cleanup, as finish_deletion does: the inbound gate drops
@@ -369,8 +379,10 @@ impl<A: Agents> Hub<A> {
                 0 => disk_failure,
                 removed => format!("Удалено устаревших тем: {removed}. {disk_failure}"),
             }),
+            // Topics that turned busy or unavailable after their probe join the pre-walk
+            // busy count: both are deferrals the user has to see.
             (None, None) => {
-                Ok(sync_summary(removed, done.alive, done.busy, done.uncertain, detached))
+                Ok(sync_summary(removed, done.alive, done.busy + skipped, done.uncertain, detached))
             }
         };
         let _ = done.reply.send(result);

@@ -2803,6 +2803,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sync_reports_topic_became_busy_after_probe() {
+        let world = world(FakeAgents::scripted(vec![Script::UntilStopped]));
+        world.send(inbound(Some(7), 1, Content::TopicCreated { name: "Гонка".into() })).await;
+        *world.messenger.probes.lock().unwrap() = Some(Ok(false));
+        // Hold the probe so the run starts strictly between the probe answer and SyncDone.
+        let release = world.messenger.delay_next_probe();
+        let (reply, result) = oneshot::channel();
+        world.send(HubMessage::SyncTopics { reply }).await;
+        eventually("probe recorded", || probe_calls(&world) == [KEY]).await;
+        world.send(text(Some(7), 5, "Работа")).await;
+        eventually("running", || world.running()).await;
+        release.send(()).unwrap();
+        let report = result.await.expect("sync reply").expect("sync succeeded");
+        // The row survived: Telegram proved the topic gone, but active work took over before
+        // cleanup. The report must name the deferral, not claim every topic is current.
+        assert_eq!(report, "Пропущено занятых: 1.");
+        assert!(world.store.last().unwrap().contains_key(&KEY));
+    }
+
+    #[tokio::test]
     async fn sync_gone_topic_with_queued_task_detaches_queue() {
         use hub_core::tasks::{queue::Origin, service::Access};
         let world = world(FakeAgents::default());
