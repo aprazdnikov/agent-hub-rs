@@ -290,7 +290,11 @@ pub fn purge(base: &Path, project: &Path, living: &[PathBuf]) -> Result<PurgeRep
         return Err(Error::UnsafePath(directory));
     }
     let existing = filesystem::Directory::existing(&directory)?;
-    let identity_is_held = identity != project && !is_tombstone && is_living(&living, &identity);
+    // The identity path itself still owns the storage unless its own record is a
+    // tombstone: a moved-away source cannot silently re-adopt the lineage by existing.
+    let identity_is_held = identity != project
+        && registry.paths.get(path_text(&identity)?).is_none_or(Option::is_some)
+        && is_living(&living, &identity);
     let shared = identity_is_held
         || registry.paths.iter().any(|(path, bound)| {
             bound.as_deref() == Some(identity.as_path())
