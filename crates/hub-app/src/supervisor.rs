@@ -871,7 +871,9 @@ impl<C: Connector> Supervisor<C> {
         };
         let settings = Arc::clone(&live.borrow());
         let Some(project) = settings.projects.iter().find(|saved| saved.id() == id) else {
-            let _ = reply.send(Ok("Профиль проекта уже удалён из настроек.".into()));
+            let _ = reply.send(Ok(
+                "Профиль проекта уже удалён из настроек. Данные хаба (задачи, память) могли остаться — проверьте их вручную.".into(),
+            ));
             return;
         };
         let name = project.name().to_owned();
@@ -992,7 +994,10 @@ impl<C: Connector> Supervisor<C> {
         {
             Ok(Ok(report)) => report,
             Ok(Err(error)) => {
-                return Err((format!("Не удалось удалить память проекта: {error}"), done));
+                return Err((
+                    format!("Не удалось удалить память проекта: {}", error.user_message()),
+                    done,
+                ));
             }
             Err(error) => {
                 return Err((format!("Память проекта не проверена: {error}"), done));

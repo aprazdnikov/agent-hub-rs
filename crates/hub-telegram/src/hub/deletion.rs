@@ -231,7 +231,11 @@ impl<A: Agents> Hub<A> {
         if self.projects.recent.ids() != recent.ids() {
             self.store
                 .save_recent_projects(&recent)
-                .map_err(|error| format!("Не удалось обновить последние проекты: {error}"))?;
+                .map_err(|error| {
+                    format!(
+                        "Не удалось обновить последние проекты: {error}. Темы уже отвязаны — {detached}."
+                    )
+                })?;
             self.projects.recent = recent;
         }
         Ok(detached)
@@ -314,9 +318,18 @@ impl<A: Agents> Hub<A> {
         }
         // Rows a previous disk failure left behind: Telegram already proved them gone, so the
         // retry finishes them without a new probe — that is what makes «повторите синхронизацию»
-        // a repeatable instruction rather than a dead end.
-        let pending: Vec<TopicKey> =
-            self.topics.keys().copied().filter(|key| self.deleted.contains(key)).collect();
+        // a repeatable instruction rather than a dead end. The marker is only ever set by proven
+        // sync deletions, but the eligible guards are re-checked so the invariant stays explicit.
+        let pending: Vec<TopicKey> = self
+            .topics
+            .keys()
+            .copied()
+            .filter(|key| {
+                self.deleted.contains(key)
+                    && key.thread.0 > 1
+                    && key.chat == self.telegram_identity.chat
+            })
+            .collect();
         if candidates.is_empty() && pending.is_empty() {
             let _ = reply.send(Ok(sync_summary(0, 0, busy, 0, 0)));
             return;
@@ -465,19 +478,26 @@ impl<A: Agents> Hub<A> {
             ));
         }
         let failures = (!failures.is_empty()).then(|| failures.join(" "));
+        // Partial progress stays visible even when the sync ends in Err: what the walk already
+        // removed and detached must not disappear behind the failure tail.
+        let progress = match (removed, detached) {
+            (0, 0) => String::new(),
+            (removed, 0) => format!("Удалено устаревших тем: {removed}. "),
+            (0, detached) => format!("Задач откреплено: {detached}. "),
+            (removed, detached) => {
+                format!("Удалено устаревших тем: {removed}. Задач откреплено: {detached}. ")
+            }
+        };
         let result = match (done.retry_after, failures) {
             (Some(retry_after), failures) => {
                 let error = SendError::RetryAfter(retry_after);
-                let message = format!("{error}, повторите позже");
+                let message = format!("{progress}{error}, повторите позже");
                 Err(match failures {
                     Some(failures) => format!("{message}. {failures}"),
                     None => message,
                 })
             }
-            (None, Some(failures)) => Err(match removed {
-                0 => failures,
-                removed => format!("Удалено устаревших тем: {removed}. {failures}"),
-            }),
+            (None, Some(failures)) => Err(format!("{progress}{failures}")),
             // Topics that turned busy or unavailable after their probe join the pre-walk
             // busy count: both are deferrals the user has to see.
             (None, None) => {

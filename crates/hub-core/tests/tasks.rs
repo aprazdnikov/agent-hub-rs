@@ -536,6 +536,36 @@ fn begin_freezes_the_resolved_shared_roles_into_the_attempt() {
 }
 
 #[test]
+fn a_mismatched_backend_attempt_names_no_check_agents() {
+    use hub_core::domain::BackendKind;
+    let mut book = TaskBook::default();
+    let project = std::env::temp_dir().join("agent-hub-roles-mismatch");
+    // A codex attempt never runs the hermes-implementer check, whatever the shared roles say.
+    let id = book.create(project.clone(), "codex", "Правки", "Сделай").unwrap();
+    book.configure_rules(
+        project,
+        0,
+        ProjectRules {
+            revision: 0,
+            enabled: true,
+            text: "Правила".into(),
+            git: None,
+            workflow: Some(WorkflowChoice::Inherit { command: "cargo test".into() }),
+        },
+    )
+    .unwrap();
+    let hermes = AgentRoles { implementer: BackendKind::Hermes, reviewer: BackendKind::Claude };
+    book.begin(id, 1, None, ts(), &hermes).unwrap();
+    let run = book.get(id).unwrap().runs[0].clone();
+    assert_eq!(run.workflow.as_ref().unwrap().implementer, BackendKind::Hermes);
+    let described = run.described_rules().unwrap();
+    assert!(!described.contains("Исправить и проверить"), "{described}");
+    assert!(!described.contains("ревью"), "{described}");
+    assert!(described.contains("Правила проекта"), "{described}");
+    assert_eq!(run.check_command(), Some("cargo test"));
+}
+
+#[test]
 fn a_workflowless_attempt_stays_byte_compatible_and_legacy_records_fall_back() {
     let mut book = TaskBook::default();
     let id = book

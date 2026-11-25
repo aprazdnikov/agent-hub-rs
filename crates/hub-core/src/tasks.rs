@@ -195,11 +195,21 @@ impl Run {
     #[must_use]
     pub fn described_rules(&self) -> Option<String> {
         let rules = self.rules.as_ref()?;
-        Some(match &self.workflow {
-            Some(preset) => rules.described(Some(&preset.describe())),
-            // Attempts saved before roles were frozen keep their previous wording.
-            None => rules.describe(),
-        })
+        // The check line names the agents that actually ran: it applies only when the attempt's
+        // backend is the preset's implementer — otherwise (e.g. a Telegram attempt) the local
+        // check never started and naming a reviewer would be a lie.
+        Some(
+            match self
+                .workflow
+                .as_ref()
+                .filter(|preset| self.backend.as_deref() == Some(preset.implementer.name()))
+            {
+                Some(preset) => rules.described(Some(&preset.describe())),
+                None if self.workflow.is_some() => rules.described(None),
+                // Attempts saved before roles were frozen keep their previous wording.
+                None => rules.describe(),
+            },
+        )
     }
     /// The trusted check command this attempt was started with.
     #[must_use]

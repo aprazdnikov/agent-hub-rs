@@ -334,7 +334,9 @@ pub fn purge(base: &Path, project: &Path, living: &[PathBuf]) -> Result<PurgeRep
         // On Unix the lock's open file does not block the recursive delete, and the guard
         // is held until it finishes: releasing it earlier would let a live store grab the
         // lock and recreate the directory between unlock and unlink. Windows cannot remove
-        // a tree that holds an open handle, so the lock is dropped there first.
+        // a tree that holds an open handle, so the lock is dropped there first. Accepted
+        // risk on Windows: a store opening between the drop and the unlink races into a
+        // recreated directory that the cascade then removes; hub restart avoids it.
         #[cfg(not(unix))]
         drop(data_lock);
         fs::remove_dir_all(&directory)?;

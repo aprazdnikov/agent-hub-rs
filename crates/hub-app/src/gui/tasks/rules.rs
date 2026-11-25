@@ -118,6 +118,7 @@ impl Editor {
                 ui.label("Доверенная команда проверки на этом компьютере");
                 ui.add(
                     egui::TextEdit::singleline(&mut plan.command)
+                        .id_salt(("workflow_command_custom", project))
                         .hint_text("cargo test")
                         .char_limit(2048),
                 );

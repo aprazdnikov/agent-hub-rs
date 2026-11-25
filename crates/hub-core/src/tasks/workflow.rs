@@ -147,10 +147,14 @@ mod tests {
         ] {
             assert!(rules(raw).is_err(), "expected a parse error for workflow {raw}");
             let book = format!(
-                r#"{{"version":1,"next_id":1,"tasks":[],"project_rules":[{{"project":"/tmp","rules":{{"revision":0,"enabled":false,"text":"x","workflow":{raw}}}}}]}}"#
+                // Revision 1+ so the only reason the book can fail is the workflow itself.
+                r#"{{"version":1,"next_id":1,"tasks":[],"project_rules":[{{"project":"/tmp","rules":{{"revision":1,"enabled":false,"text":"x","workflow":{raw}}}}}]}}"#
             );
             assert!(TaskBook::decode(book.as_bytes()).is_err(), "expected a broken book for {raw}");
         }
+        // Positive control: the bare-command inherit form is a valid book value.
+        let ok = r#"{"version":1,"next_id":1,"tasks":[],"project_rules":[{"project":"/tmp","rules":{"revision":1,"enabled":false,"text":"x","workflow":{"command":"cargo test"}}}]}"#;
+        assert!(TaskBook::decode(ok.as_bytes()).is_ok(), "a valid inherit form must decode");
     }
 
     #[test]

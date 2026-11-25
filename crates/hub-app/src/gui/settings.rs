@@ -393,7 +393,7 @@ impl SettingsForm {
             Section::Diagnostics => {}
             Section::Agents => match self.agent_page {
                 AgentPage::General => {
-                    self.agent(ui);
+                    self.agent(ui, errors);
                     ui.add_space(16.0);
                     self.timeouts(ui, errors);
                     ui.checkbox(
@@ -769,7 +769,7 @@ impl SettingsForm {
         messages(ui, errors, Field::SnapshotsDir);
     }
 
-    fn agent(&mut self, ui: &mut egui::Ui) {
+    fn agent(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
         ui.strong("Новые темы");
         field_row(ui, "Агент по умолчанию", |ui| {
             egui::ComboBox::from_id_salt("default_backend")
@@ -781,6 +781,7 @@ impl SettingsForm {
                 });
         });
         ui.label("Используется в /new без имени агента; /backend меняет агента в теме.");
+        messages(ui, errors, Field::DefaultBackend);
         ui.add_space(16.0);
         ui.strong("Роли в задачах");
         for (label, role) in [
@@ -800,6 +801,15 @@ impl SettingsForm {
         ui.label(
             "Используется проектами в режиме „Наследовать общие роли“. Команда проверки остаётся своей у проекта.",
         );
+        messages(ui, errors, Field::Role("implementer"));
+        messages(ui, errors, Field::Role("reviewer"));
+        if self.draft.roles.implementer == self.draft.roles.reviewer {
+            let tone = super::theme::tone_colors(ui, super::theme::Tone::Warning);
+            ui.colored_label(
+                tone.1,
+                "Исполнитель и ревьюер совпадают: проверка станет самопроверкой.",
+            );
+        }
     }
 
     fn claude(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
@@ -1392,6 +1402,25 @@ mod tests {
                         }
             ),
             "roles must reach the save command"
+        );
+    }
+
+    #[test]
+    fn equal_roles_warn_about_self_review() {
+        let ctx = egui::Context::default();
+        super::super::theme::configure(&ctx);
+        let mut form = SettingsForm::default();
+        form.sync(Some(&Draft {
+            workspace_root: home_or_root().display().to_string(),
+            roles: AgentRoles { implementer: BackendKind::Codex, reviewer: BackendKind::Codex },
+            ..Draft::default()
+        }));
+        let mut commands = Vec::new();
+        click_label(&ctx, &mut form, "Агенты", &mut commands);
+        let output = render(&ctx, &mut form, egui::vec2(960.0, 900.0), vec![], &mut commands);
+        assert!(
+            has_label(&output, "Исполнитель и ревьюер совпадают: проверка станет самопроверкой."),
+            "equal roles must warn"
         );
     }
 
