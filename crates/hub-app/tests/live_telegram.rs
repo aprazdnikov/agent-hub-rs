@@ -83,9 +83,8 @@ async fn live_topic_gone_probe() {
     };
     let settings = draft.parse(&std::env::temp_dir()).unwrap();
     let messenger = connect(&settings.telegram.token, chat).await.unwrap().messenger;
-    let title = format!("probe-{}", Uuid::new_v4());
     let thread = messenger
-        .create_topic(chat, title.clone())
+        .create_topic(chat, format!("probe-{}", Uuid::new_v4()))
         .await
         .expect("Telegram did not create the probe topic");
     let key = TopicKey { chat, thread };
@@ -94,7 +93,7 @@ async fn live_topic_gone_probe() {
     // behind `Ok(false)` is the evidence the owner records. If Telegram answers with an
     // unconfirmed wording instead, both asserts fail and the `unconfirmed_topic_gone` warnings
     // name that wording — that is the candidate the owner promotes, or drops, in the plan.
-    let probe = messenger.probe_topic(key, &title).await;
+    let probe = messenger.probe_topic(key).await;
     let delete = messenger.delete_topic(key).await;
     tracing::info!(?probe, ?delete, "live topic-gone probe outcomes for the matcher contract");
     assert_eq!(probe, Ok(false), "a topic removed in Telegram must probe as gone");

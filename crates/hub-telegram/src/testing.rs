@@ -159,7 +159,7 @@ impl Messenger for FakeMessenger {
         Box::pin(async { result })
     }
 
-    fn probe_topic(&self, key: TopicKey, _name: &str) -> BoxFuture<'_, Result<bool, SendError>> {
+    fn probe_topic(&self, key: TopicKey) -> BoxFuture<'_, Result<bool, SendError>> {
         self.record(Call::ProbeTopic(key));
         let result = self.probes.lock().unwrap().take().unwrap_or(Ok(true));
         let delay = self.probe_delay.lock().unwrap().take();
@@ -350,7 +350,7 @@ mod tests {
     async fn probe_defaults_to_existing_and_records_every_call() {
         let messenger = FakeMessenger::default();
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(42) };
-        let outcomes = [messenger.probe_topic(key, "").await, messenger.probe_topic(key, "").await];
+        let outcomes = [messenger.probe_topic(key).await, messenger.probe_topic(key).await];
         assert_eq!(
             (outcomes, messenger.calls()),
             ([Ok(true), Ok(true)], vec![Call::ProbeTopic(key), Call::ProbeTopic(key)])
@@ -364,7 +364,7 @@ mod tests {
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(42) };
         *messenger.probes.lock().unwrap() =
             Some(Err(SendError::RetryAfter(Duration::from_secs(3))));
-        let outcomes = [messenger.probe_topic(key, "").await, messenger.probe_topic(key, "").await];
+        let outcomes = [messenger.probe_topic(key).await, messenger.probe_topic(key).await];
         assert_eq!(outcomes, [Err(SendError::RetryAfter(Duration::from_secs(3))), Ok(true)]);
     }
 }

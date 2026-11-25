@@ -13,8 +13,8 @@ use hub_core::settings::{TelegramSettings, Token};
 use teloxide::dispatching::{Dispatcher, ShutdownToken, UpdateFilterExt};
 use teloxide::net::Download;
 use teloxide::payloads::{
-    AnswerCallbackQuerySetters, EditForumTopicSetters, EditMessageReplyMarkupSetters,
-    EditMessageTextSetters, SendChatActionSetters, SendDocumentSetters, SendMessageSetters,
+    AnswerCallbackQuerySetters, EditMessageReplyMarkupSetters, EditMessageTextSetters,
+    SendChatActionSetters, SendDocumentSetters, SendMessageSetters,
 };
 use teloxide::prelude::{Bot, CallbackQuery, Message, Requester, Update};
 use teloxide::types::{
@@ -512,18 +512,19 @@ impl Messenger for TelegramMessenger {
         })
     }
 
-    fn probe_topic(&self, key: TopicKey, name: &str) -> BoxFuture<'_, Result<bool, SendError>> {
-        // Owned before the future: `BoxFuture<'_>` may not borrow the caller's `name` slice.
-        let name = name.to_owned();
+    fn probe_topic(&self, key: TopicKey) -> BoxFuture<'_, Result<bool, SendError>> {
         Box::pin(async move {
-            // An edit with the hub's stored title: when the title matches Telegram the write is
-            // a no-op (the hub tracks renames via service messages), and a removed topic answers
-            // with one of the gone needles. Without a stored title no name is sent at all, so
-            // the probe cannot rename anything; whatever wording comes back unclassified is
-            // warned for the live contract.
-            let edit = self.topics.edit_forum_topic(tg::ChatId(key.chat.0), thread(key));
-            let edit = if name.is_empty() { edit } else { edit.name(name) };
-            match edit.await {
+            // The existence check must ride the same thread validation as a normal message send:
+            // the live contract (plan Step 2quater) proved `editForumTopic` answers success for a
+            // removed topic and `TOPIC_NOT_MODIFIED` for a live same-name one, so an edit can
+            // establish nothing. `sendChatAction(Typing)` validates the topic; its only visible
+            // effect is the transient "печатает…" on live topics.
+            match self
+                .topics
+                .send_chat_action(tg::ChatId(key.chat.0), ChatAction::Typing)
+                .message_thread_id(thread(key))
+                .await
+            {
                 Ok(_) => Ok(true),
                 Err(RequestError::Api(err)) => {
                     // See `delete_topic`: the normalized description is the evidence the live
@@ -1033,44 +1034,26 @@ mod tests {
         Err(SendError::Rejected("Проверьте, что бот — администратор с правом управлять темами.".to_owned()))
     )]
     #[tokio::test]
-    async fn topic_probe_edits_the_stored_title_and_maps_existence(
+    async fn topic_probe_pings_the_thread_and_maps_existence(
         #[case] response: serde_json::Value,
         #[case] expected: Result<bool, SendError>,
     ) {
-        // The probe must carry the hub's title: an edit to the same name is a no-op, while an
-        // empty `name` parameter was never verified live and any pre-existence validation
-        // answer (e.g. `TOPIC_NAME_NOT_EMPTY`) would leave every gone topic "uncertain".
+        // The probe must use the send-validation path: the live contract (plan Step 2quater)
+        // proved `editForumTopic` answers success for removed topics, so only a send-shaped
+        // call (`sendChatAction`) can distinguish alive from gone with the existing needles.
         let (messenger, requests, server) = topic_api(response).await;
-        let result = messenger
-            .probe_topic(TopicKey { chat: ChatId(-100), thread: ThreadId(42) }, "Релиз")
-            .await;
+        let result =
+            messenger.probe_topic(TopicKey { chat: ChatId(-100), thread: ThreadId(42) }).await;
         server.abort();
         assert_eq!(
             (result, requests.lock().unwrap().clone()),
             (
                 expected,
                 vec![(
-                    "/bot1:test/editforumtopic".to_owned(),
-                    json!({"chat_id":-100,"message_thread_id":42,"name":"Релиз"})
+                    "/bot1:test/sendchataction".to_owned(),
+                    json!({"chat_id":-100,"message_thread_id":42,"action":"typing"})
                 )]
             )
-        );
-    }
-
-    #[tokio::test]
-    async fn topic_probe_without_a_stored_title_sends_no_name() {
-        // Missing title must degrade to "no name in the payload" — never to an empty rename.
-        let (messenger, requests, server) = topic_api(json!({"ok":true,"result":true})).await;
-        let result =
-            messenger.probe_topic(TopicKey { chat: ChatId(-100), thread: ThreadId(42) }, "").await;
-        server.abort();
-        assert_eq!(result, Ok(true));
-        assert_eq!(
-            *requests.lock().unwrap(),
-            vec![(
-                "/bot1:test/editforumtopic".to_owned(),
-                json!({"chat_id":-100,"message_thread_id":42})
-            )]
         );
     }
 
@@ -1084,7 +1067,7 @@ mod tests {
             .set_api_url(format!("http://{address}/").parse().unwrap());
         let messenger = TelegramMessenger { files: bot.clone(), topics: bot.clone(), bot };
         assert_eq!(
-            messenger.probe_topic(TopicKey { chat: ChatId(-100), thread: ThreadId(42) }, "").await,
+            messenger.probe_topic(TopicKey { chat: ChatId(-100), thread: ThreadId(42) }).await,
             Err(SendError::Failed(
                 "Результат проверки темы неизвестен. Проверьте тему в Telegram.".to_owned()
             ))
@@ -1191,8 +1174,7 @@ mod tests {
         let capture = Arc::new(LogCapture::default());
         let _guard = tracing::subscriber::set_default(Arc::clone(&capture));
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(42) };
-        let (delete, probe) =
-            (messenger.delete_topic(key).await, messenger.probe_topic(key, "Тема").await);
+        let (delete, probe) = (messenger.delete_topic(key).await, messenger.probe_topic(key).await);
         server.abort();
         assert_eq!(delete.is_ok(), gone, "{delete:?}");
         assert_eq!(
@@ -1239,8 +1221,7 @@ mod tests {
         let capture = Arc::new(LogCapture::default());
         let _guard = tracing::subscriber::set_default(Arc::clone(&capture));
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(42) };
-        let (delete, probe) =
-            (messenger.delete_topic(key).await, messenger.probe_topic(key, "Тема").await);
+        let (delete, probe) = (messenger.delete_topic(key).await, messenger.probe_topic(key).await);
         server.abort();
         assert_eq!(delete.is_ok(), confirmed, "{delete:?}");
         assert_eq!(probe.is_ok(), confirmed, "{probe:?}");
@@ -1278,8 +1259,7 @@ mod tests {
         let capture = Arc::new(LogCapture::default());
         let _guard = tracing::subscriber::set_default(Arc::clone(&capture));
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(42) };
-        let (delete, probe) =
-            (messenger.delete_topic(key).await, messenger.probe_topic(key, "Тема").await);
+        let (delete, probe) = (messenger.delete_topic(key).await, messenger.probe_topic(key).await);
         server.abort();
         assert!(delete.is_err() && probe.is_err(), "nothing unverifiable may succeed");
         let unclassified: Vec<String> = capture
