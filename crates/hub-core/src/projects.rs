@@ -163,6 +163,9 @@ impl RecentProjects {
         self.ids.insert(0, id.to_owned());
         self.ids.truncate(MAX_RECENT);
     }
+    pub fn forget(&mut self, id: &str) {
+        self.ids.retain(|saved| saved != id);
+    }
     pub fn parse(raw: &str) -> Result<Self, String> {
         let file: RecentFile = serde_json::from_str(raw).map_err(|error| error.to_string())?;
         let mut seen = HashSet::new();
@@ -217,6 +220,20 @@ mod tests {
         assert_eq!(project.to_draft(), draft());
         assert_eq!(project.backend(), BackendKind::Codex);
         assert!(parse(&[], &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn recent_forget_is_idempotent_and_leaves_other_ids() {
+        let mut recent = RecentProjects::default();
+        for id in ["a", "b", "c"] {
+            recent.remember(id);
+        }
+        recent.forget("b");
+        assert_eq!(recent.ids(), ["c", "a"]);
+        recent.forget("b");
+        recent.forget("missing");
+        assert_eq!(recent.ids(), ["c", "a"]);
+        assert_eq!(RecentProjects::parse(&recent.dump().unwrap()).unwrap(), recent);
     }
 
     #[test]

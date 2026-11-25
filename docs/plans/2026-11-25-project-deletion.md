@@ -88,14 +88,14 @@ worktree внутри него и темы Telegram не затрагивают�
   `forget_project` сравнивает `fs-нормализованные` пути так же, как это делает
   `rules(&Path)` (тот же канонический вид); удаляет и `tasks`, и запись `rules`.
 
-- [ ] **Step 1: RED** — тесты: `detach_project` чистит `preferences.project`, не трогает
+- [x] **Step 1: RED** — тесты: `detach_project` чистит `preferences.project`, не трогает
   `overrides`/`memory` и корректно сериализуется обратно (`dump_state/parse_state`);
   `forget_project` удаляет две задачи+правила одного пути и оставляет другой проект;
   повторный вызов → `(0,false)`; `RecentProjects::forget` идемпотентен.
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-core --lib detach_project forget_project` → FAIL.
-- [ ] **Step 3: Implement** — три метода, минимально, без IO.
-- [ ] **Step 4: GREEN** — `cargo test -p hub-core --locked` → PASS.
-- [ ] **Step 5: Commit** — `feat(core): примитивы отвязки и забывания проекта`
+- [x] **Step 2: Verify RED** — `cargo test -p hub-core --lib detach_project forget_project` → FAIL.
+- [x] **Step 3: Implement** — три метода, минимально, без IO.
+- [x] **Step 4: GREEN** — `cargo test -p hub-core --locked` → PASS.
+- [x] **Step 5: Commit** — `feat(core): примитивы отвязки и забывания проекта`
 
 ---
 
