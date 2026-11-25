@@ -2892,10 +2892,12 @@ mod tests {
         world.store.fail.store(true, Ordering::SeqCst);
         assert!(delete_topic(&world, stale).await.is_err());
         world.store.fail.store(false, Ordering::SeqCst);
-        assert_eq!(sync(&world).await.unwrap(), "Пропущено занятых: 1.");
+        // The sync retries that failed cleanup without probing it again, and still counts the
+        // topic that is busy from an active run.
+        assert_eq!(sync(&world).await.unwrap(), "Удалено: 1. Пропущено занятых: 1.");
         assert!(probe_calls(&world).is_empty());
         let stored = world.store.last().unwrap();
-        assert!(stored.contains_key(&KEY) && stored.contains_key(&stale));
+        assert!(stored.contains_key(&KEY) && !stored.contains_key(&stale));
     }
 
     #[tokio::test]
@@ -2972,12 +2974,19 @@ mod tests {
         assert!(!error.contains("Все темы актуальны"), "got: {error}");
         // Nothing was cleaned durably, so the reply must not claim a removal count.
         assert!(!error.contains("Удалено"), "got: {error}");
-        // The failed cleanup keeps the row for a retry, and the Delete button now reaches it
-        // through the `deleted` marker without another Telegram call.
+        // The failed cleanup keeps the row for a retry.
         assert!(world.store.last().unwrap().contains_key(&KEY));
         world.store.fail.store(false, Ordering::SeqCst);
-        delete_topic(&world, KEY).await.unwrap();
+        // «Повторите синхронизацию» is a real recovery path: the next sync finishes the cleanup
+        // of the already-proven-missing topic without a new probe or a Telegram delete.
+        let probes_before_retry = probe_calls(&world);
+        assert_eq!(sync(&world).await.unwrap(), "Удалено устаревших тем: 1.");
         assert!(!world.store.last().unwrap().contains_key(&KEY));
+        assert_eq!(
+            probe_calls(&world),
+            probes_before_retry,
+            "the retry must not probe the topic again"
+        );
         assert!(
             !world.messenger.calls().iter().any(|call| matches!(call, Call::DeleteTopic(_))),
             "the retry must reuse the proven-missing answer, not delete in Telegram again"

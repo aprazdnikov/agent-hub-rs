@@ -17,6 +17,9 @@ pub struct DeletionDone {
 pub struct SyncDone {
     /// Topics the probes proved missing, in probe order.
     stale: Vec<TopicKey>,
+    /// Rows of topics an earlier walk already proved missing whose disk cleanup failed, retried
+    /// here without a new probe.
+    pending: Vec<TopicKey>,
     /// Topics the probes found still present.
     alive: usize,
     /// Topics whose probe answer could not be trusted (rejected/failed, not rate-limited).
@@ -212,6 +215,22 @@ impl<A: Agents> Hub<A> {
         self.replace_topics(topics);
         Ok(())
     }
+
+    /// Finish a topic Telegram already proved missing: durable disk cleanup plus queue detach.
+    /// Only the queue origin changes; task status is preserved. A detach error warns but never
+    /// rolls back the already-durable removal.
+    fn clean_proven_gone(&mut self, key: TopicKey) -> Result<usize, String> {
+        self.clean_deleted_topic(key)?;
+        let origin = Origin { chat: key.chat.0, thread: key.thread.0, user: None };
+        let detached = self
+            .tasks
+            .access(Access::Edit, |book, _| Ok(book.detach_topic_queue(&origin)))
+            .unwrap_or_else(|error| {
+                tracing::warn!(topic = ?key, %error, "synced topic queue could not be detached");
+                0
+            });
+        Ok(detached)
+    }
 }
 
 impl<A: Agents> Hub<A> {
@@ -248,7 +267,12 @@ impl<A: Agents> Hub<A> {
                 tracing::debug!(topic = ?key, category = "busy", "sync skipped a busy topic");
             }
         }
-        if candidates.is_empty() {
+        // Rows a previous disk failure left behind: Telegram already proved them gone, so the
+        // retry finishes them without a new probe — that is what makes «повторите синхронизацию»
+        // a repeatable instruction rather than a dead end.
+        let pending: Vec<TopicKey> =
+            self.topics.keys().copied().filter(|key| self.deleted.contains(key)).collect();
+        if candidates.is_empty() && pending.is_empty() {
             let _ = reply.send(Ok(sync_summary(0, 0, busy, 0, 0)));
             return;
         }
@@ -288,6 +312,7 @@ impl<A: Agents> Hub<A> {
                         let _ = mailbox
                             .send(HubMessage::SyncDone(SyncDone {
                                 stale,
+                                pending,
                                 alive,
                                 uncertain,
                                 busy,
@@ -302,6 +327,7 @@ impl<A: Agents> Hub<A> {
             let _ = mailbox
                 .send(HubMessage::SyncDone(SyncDone {
                     stale,
+                    pending,
                     alive,
                     uncertain,
                     busy,
@@ -317,6 +343,25 @@ impl<A: Agents> Hub<A> {
         let mut failed = 0;
         let mut detached = 0;
         let mut skipped = 0;
+        // Retry the cleanups a previous disk failure left on disk. These keys keep the `deleted`
+        // marker, so no busy check applies: the topic is already proven gone and a manual delete
+        // never re-probes them (delete_topic short-circuits on the marker too); only an in-flight
+        // delete owns its row and answers with its own reply.
+        for key in done.pending {
+            if !self.topics.contains_key(&key) || self.deleting.contains_key(&key) {
+                continue;
+            }
+            match self.clean_proven_gone(key) {
+                Ok(count) => {
+                    removed += 1;
+                    detached += count;
+                }
+                Err(error) => {
+                    failed += 1;
+                    tracing::warn!(topic = ?key, %error, "synced topic could not be cleaned on disk");
+                }
+            }
+        }
         for key in done.stale {
             // A probe answer is only a decision when the topic is still unbound and free; an active
             // operation may have started while the walk was running. A queued-only topic stays
@@ -338,26 +383,16 @@ impl<A: Agents> Hub<A> {
             }
             // Mark deleted before cleanup, as finish_deletion does: the inbound gate drops
             // delayed TopicCreated/text for a topic the walk proved missing, and a cleanup
-            // that failed on disk stays retryable through the Delete button.
+            // that failed on disk stays retryable — by the Delete button or by the next sync.
             self.deleted.insert(key);
-            if let Err(error) = self.clean_deleted_topic(key) {
-                failed += 1;
-                tracing::warn!(topic = ?key, %error, "synced topic could not be cleaned on disk");
-            } else {
-                removed += 1;
-                // Unbind the topic's queued tasks so they survive as detached work. Only the queue
-                // origin changes; task status is preserved.
-                let origin = Origin { chat: key.chat.0, thread: key.thread.0, user: None };
-                match self
-                    .tasks
-                    .access(Access::Edit, |book, _| Ok(book.detach_topic_queue(&origin)))
-                {
-                    Ok(count) => detached += count,
-                    Err(error) => tracing::warn!(
-                        topic = ?key,
-                        %error,
-                        "synced topic queue could not be detached"
-                    ),
+            match self.clean_proven_gone(key) {
+                Ok(count) => {
+                    removed += 1;
+                    detached += count;
+                }
+                Err(error) => {
+                    failed += 1;
+                    tracing::warn!(topic = ?key, %error, "synced topic could not be cleaned on disk");
                 }
             }
         }
