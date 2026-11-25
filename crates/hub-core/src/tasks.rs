@@ -178,12 +178,38 @@ pub struct Run {
     pub backend: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rules: Option<ProjectRules>,
+    /// The workflow resolved from the shared roles when the attempt started. History renders
+    /// the agents that actually ran; editing the global roles afterwards must not rewrite it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workflow: Option<workflow::WorkflowPreset>,
     #[serde(default, skip_serializing_if = "workflow::WorkflowReport::is_empty")]
     pub workflow_report: workflow::WorkflowReport,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub started_at: Option<Timestamp>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub finished_at: Option<Timestamp>,
+}
+impl Run {
+    /// The frozen rules block of the attempt: the workflow line names the agents recorded at
+    /// its start. GUI history and the Telegram attempt report render through this one method.
+    #[must_use]
+    pub fn described_rules(&self) -> Option<String> {
+        let rules = self.rules.as_ref()?;
+        Some(match &self.workflow {
+            Some(preset) => rules.described(Some(&preset.describe())),
+            // Attempts saved before roles were frozen keep their previous wording.
+            None => rules.describe(),
+        })
+    }
+    /// The trusted check command this attempt was started with.
+    #[must_use]
+    pub fn check_command(&self) -> Option<&str> {
+        match (&self.workflow, &self.rules) {
+            (Some(preset), _) => Some(&preset.command),
+            (None, Some(rules)) => rules.workflow.as_ref().map(workflow::WorkflowChoice::command),
+            (None, None) => None,
+        }
+    }
 }
 fn explicit_backend<'de, D: serde::Deserializer<'de>>(
     deserializer: D,
@@ -565,6 +591,9 @@ impl TaskBook {
             }
             for (index, run) in task.runs.iter().enumerate() {
                 run.workflow_report.validate()?;
+                if let Some(preset) = &run.workflow {
+                    preset.validate()?;
+                }
                 if let Some(rules) = &run.rules {
                     rules.validate()?;
                     if rules.revision == 0 {
@@ -742,15 +771,19 @@ impl TaskBook {
         }
         Ok(())
     }
+    /// Starts an attempt and freezes the workflow resolution with it: `workflow` records the
+    /// agents the shared roles produced at this instant, so later settings edits cannot rename
+    /// the participants of a finished report.
     pub fn begin(
         &mut self,
         id: u64,
         revision: u64,
         next: Option<&str>,
         now: Timestamp,
+        roles: &AgentRoles,
     ) -> Result<u32, String> {
-        let rules = self.rules(&self.get(id)?.project);
-        if let Some(policy) = &rules.git {
+        let project_rules = self.rules(&self.get(id)?.project);
+        if let Some(policy) = &project_rules.git {
             let prepared = self.get(id)?.git.as_ref().is_some_and(|git| {
                 git.state == git::PreparationState::Ready && git.policy == *policy
             });
@@ -792,6 +825,7 @@ impl TaskBook {
             git.message.clear();
         }
         task.queue = None;
+        let workflow = project_rules.effective_workflow(roles).map(std::borrow::Cow::into_owned);
         task.runs.push(Run {
             id,
             step,
@@ -801,7 +835,8 @@ impl TaskBook {
             files: Vec::new(),
             diagnostic: String::new(),
             backend: Some(task.backend.clone()),
-            rules: (rules.revision != 0).then_some(rules),
+            rules: (project_rules.revision != 0).then_some(project_rules),
+            workflow,
             workflow_report: workflow::WorkflowReport::default(),
             started_at: Some(now),
             finished_at: None,

@@ -6331,7 +6331,15 @@ mod tests {
             for (revision, step, result) in
                 [(1, None, "First result"), (3, Some("Next"), "Second result")]
             {
-                let run = book.begin(task.id, revision, step, ts()).unwrap();
+                let run = book
+                    .begin(
+                        task.id,
+                        revision,
+                        step,
+                        ts(),
+                        &hub_core::settings::AgentRoles::default(),
+                    )
+                    .unwrap();
                 book.record(task.id, run, result).unwrap();
                 book.finish(task.id, run, hub_core::tasks::RunState::Completed, ts()).unwrap();
             }
@@ -6340,8 +6348,7 @@ mod tests {
         let before = world.store.tasks.lock().unwrap().encode().unwrap();
         let tasks =
             task_op(&world, KEY, tasks::Request::Attempt { id: task.id, run: 1 }).await.unwrap();
-        let text = tasks::describe_attempt(&tasks[0], 1, hub_core::settings::AgentRoles::default())
-            .unwrap();
+        let text = tasks::describe_attempt(&tasks[0], 1).unwrap();
         assert!(text.contains("First result") && !text.contains("Second result"));
         assert!(
             task_op(&world, KEY, tasks::Request::Attempt { id: task.id, run: 3 }).await.is_err()
@@ -6355,7 +6362,9 @@ mod tests {
         let target = if task.backend == "qwen" { BackendKind::Codex } else { BackendKind::Qwen };
         {
             let mut book = world.store.tasks.lock().unwrap();
-            let run = book.begin(task.id, 1, None, ts()).unwrap();
+            let run = book
+                .begin(task.id, 1, None, ts(), &hub_core::settings::AgentRoles::default())
+                .unwrap();
             book.record(task.id, run, "Previous result").unwrap();
             book.finish(task.id, run, hub_core::tasks::RunState::Completed, ts()).unwrap();
         }
@@ -6537,7 +6546,13 @@ mod tests {
         let mut world = world(FakeAgents::default());
         let task = create_managed(&world).await;
         // Simulate a durable intent left by a crash before an outcome was saved.
-        world.store.tasks.lock().unwrap().begin(task.id, 1, None, ts()).unwrap();
+        world
+            .store
+            .tasks
+            .lock()
+            .unwrap()
+            .begin(task.id, 1, None, ts(), &hub_core::settings::AgentRoles::default())
+            .unwrap();
         world.restart().await;
         let tasks = task_op(&world, KEY, tasks::Request::Get(task.id)).await.unwrap();
         assert_eq!(
@@ -6714,7 +6729,9 @@ mod tests {
         let mut world = world;
         {
             let mut book = world.store.tasks.lock().unwrap();
-            let run = book.begin(task.id, 1, None, ts()).unwrap();
+            let run = book
+                .begin(task.id, 1, None, ts(), &hub_core::settings::AgentRoles::default())
+                .unwrap();
             book.record(task.id, run, &"secret ".repeat(2000)).unwrap();
             book.finish(task.id, run, hub_core::tasks::RunState::Completed, ts()).unwrap();
         }
@@ -6769,7 +6786,13 @@ mod tests {
                 if queued {
                     book.claim_queue(id, revision)?;
                 }
-                book.begin(id, revision, next.as_deref(), ts())
+                book.begin(
+                    id,
+                    revision,
+                    next.as_deref(),
+                    ts(),
+                    &hub_core::settings::AgentRoles::default(),
+                )
             })?;
             self.launches.fetch_add(1, Ordering::SeqCst);
             *live = Some(crate::execution::Live {

@@ -385,17 +385,17 @@ pub fn describe(task: &Task) -> String {
         task.revision
     )
 }
-pub fn describe_attempt(task: &Task, run: u32, roles: AgentRoles) -> Result<String, String> {
+pub fn describe_attempt(task: &Task, run: u32) -> Result<String, String> {
     let attempt = task.runs.iter().find(|attempt| attempt.id == run).ok_or("Попытка не найдена")?;
     let result = if attempt.result.is_empty() {
         "Сохранённого текста результата нет"
     } else {
         &attempt.result
     };
-    let described = attempt.rules.as_ref().map_or(
-        "Редакция правил не сохранена (старый запуск или правила ещё не задавались)".into(),
-        |rules| rules.describe_with_roles(&roles),
-    );
+    // The report names the agents frozen when the attempt started, never the current settings.
+    let described = attempt.described_rules().unwrap_or_else(|| {
+        "Редакция правил не сохранена (старый запуск или правила ещё не задавались)".into()
+    });
     let report = attempt.workflow_report.describe();
     let changes = if attempt.diff.is_empty() {
         String::new()
@@ -660,6 +660,7 @@ impl<A: Agents> Hub<A> {
             return Err("Тема или сессия занята. Дождитесь завершения либо остановите её.".into());
         }
         let expected_rules = book.rules(project).revision;
+        let roles = self.settings.borrow().roles;
         let (task, run, prompt) = self.tasks.access(Access::Internal, |book, _| {
             if book.rules(project).revision != expected_rules {
                 return Err("Правила изменились. Проверьте контекст перед запуском.".into());
@@ -667,7 +668,7 @@ impl<A: Agents> Hub<A> {
             let prompt =
                 Prompt::new(book.get(id)?.preview_with_rules(next, &book.rules(project))?, vec![])
                     .ok_or("Пустое поручение")?;
-            let run = book.begin(id, revision, next, Timestamp::now())?;
+            let run = book.begin(id, revision, next, Timestamp::now(), &roles)?;
             Ok((book.get(id)?.clone(), run, prompt))
         })?; // Durable attempt BEFORE launching the model.
         self.launch(key, First::Task(prompt, task.memory), None);
@@ -849,7 +850,7 @@ fn render_reply(
             tasks
                 .first()
                 .ok_or_else(|| "Задача не найдена".to_owned())
-                .and_then(|task| describe_attempt(task, run, roles))
+                .and_then(|task| describe_attempt(task, run))
                 .unwrap_or_else(|error| format!("Задачи: {error}"))
         }
         Ok(Snapshot { tasks, rules, .. }) if matches!(request, Ok(Request::Preview { .. })) => {
@@ -944,6 +945,55 @@ mod tests {
             manage::manage(&service, &project, BackendKind::Qwen, Request::Rules).unwrap();
         let text = render_reply(Ok(Request::Rules), Ok(snapshot), roles);
         assert!(!text.contains("Исправить"), "{text}");
+    }
+
+    #[test]
+    fn attempt_report_names_the_agents_frozen_when_the_attempt_started() {
+        use super::*;
+        use hub_core::tasks::service::{TaskService, TaskStorage};
+        use hub_core::tasks::workflow::WorkflowChoice;
+        struct Store;
+        impl TaskStorage for Store {
+            fn load_tasks(&mut self) -> Result<TaskBook, String> {
+                Ok(TaskBook::default())
+            }
+            fn save_tasks(&mut self, _: &TaskBook) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let service = TaskService::new(Box::new(Store));
+        let project = std::env::temp_dir();
+        service
+            .access(Access::Edit, |book, _| {
+                book.configure_rules(
+                    project.clone(),
+                    0,
+                    ProjectRules {
+                        revision: 0,
+                        enabled: true,
+                        text: "Правила".into(),
+                        git: None,
+                        workflow: Some(WorkflowChoice::Inherit { command: "cargo test".into() }),
+                    },
+                )?;
+                let id = book.create(project.clone(), "hermes", "Правки", "Сделай")?;
+                // The attempt starts while Hermes is the shared implementer.
+                book.begin(
+                    id,
+                    1,
+                    None,
+                    Timestamp::now(),
+                    &AgentRoles { implementer: BackendKind::Hermes, reviewer: BackendKind::Claude },
+                )?;
+                Ok(id)
+            })
+            .unwrap();
+        // The shared roles move to Qwen after the attempt has already started; the report
+        // takes no settings at all, so the frozen Hermes must survive.
+        let task = service.access(Access::Read, |book, _| book.get(1).cloned()).unwrap();
+        let text = describe_attempt(&task, 1).unwrap();
+        assert!(text.contains("для hermes") && text.contains("ревью claude"), "{text}");
+        assert!(!text.contains("qwen"), "{text}");
     }
 
     #[test]

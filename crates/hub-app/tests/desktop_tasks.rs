@@ -78,7 +78,7 @@ mod tests {
         std::fs::write(project.path().join(name), "original").unwrap();
         service
             .access(Access::Internal, |book, _| {
-                book.begin(id, 1, None, ts())?;
+                book.begin(id, 1, None, ts(), &hub_core::settings::AgentRoles::default())?;
                 book.record_file(
                     id,
                     1,
@@ -157,7 +157,8 @@ mod tests {
             let id = t.tasks[0].id;
             service
                 .access(Access::Internal, |b, _| {
-                    let run = b.begin(id, 1, None, ts())?;
+                    let run =
+                        b.begin(id, 1, None, ts(), &hub_core::settings::AgentRoles::default())?;
                     if n == 0 {
                         b.unavailable(id, run, "Нет подключения к исполнителю")?;
                     } else {
