@@ -224,11 +224,11 @@ worktree внутри него и темы Telegram не затрагивают�
 **Files:**
 - Modify: `docs/guide/projects.md`, `docs/guide/settings.md` (раздел проектов), `docs/guide/memory.md`
   (purge памяти), `docs/history.md`-строка не нужна до релиза.
-- [ ] **Step 1:** обновить тексты: как удалить проект, что удаляется, что остаётся;
+- [x] **Step 1:** обновить тексты: как удалить проект, что удаляется, что остаётся;
   сверить якоря ссылок по правилу doc-link (русские заголовки, slug без знаков препинания).
-- [ ] **Step 2:** `cargo test --workspace --locked && cargo clippy --workspace --all-targets
+- [x] **Step 2:** `cargo test --workspace --locked && cargo clippy --workspace --all-targets
   --locked -- -D warnings && cargo fmt --all --check && cargo deny check && git diff --check`.
-- [ ] **Step 3: Commit** — `docs: удаление проекта вместе с данными хаба`
+- [x] **Step 3: Commit** — `docs: удаление проекта вместе с данными хаба`
 
 ## Security Review этого плана
 
