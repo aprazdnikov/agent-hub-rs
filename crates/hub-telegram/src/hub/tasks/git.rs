@@ -114,7 +114,7 @@ impl<A: Agents> Hub<A> {
         let rules_revision = book.rules(session.cwd.as_path()).revision;
         // Validate all pure preconditions without publishing an attempt before verification.
         let task = book.get(id)?.clone();
-        book.begin(id, revision, next, Timestamp::now())?;
+        book.begin(id, revision, next, Timestamp::now(), &self.settings.borrow().roles)?;
         self.spawn_git(
             key,
             session,

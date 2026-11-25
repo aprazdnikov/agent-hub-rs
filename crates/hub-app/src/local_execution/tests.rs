@@ -449,7 +449,10 @@ impl Executor for ScriptedWorkflow {
 
 #[tokio::test]
 async fn host_workflow_repairs_once_preserves_evidence_and_requires_human_acceptance() {
-    use hub_core::tasks::{ProjectRules, TaskStatus, workflow::WorkflowPreset};
+    use hub_core::tasks::{
+        ProjectRules, TaskStatus,
+        workflow::{WorkflowChoice, WorkflowPreset},
+    };
     for fixable in [true, false] {
         let project = tempfile::tempdir().unwrap();
         let file = if fixable { "ready.txt" } else { "missing.txt" };
@@ -464,11 +467,11 @@ async fn host_workflow_repairs_once_preserves_evidence_and_requires_human_accept
             project.path().into(),
             0,
             ProjectRules {
-                workflow: Some(WorkflowPreset {
+                workflow: Some(WorkflowChoice::Custom(WorkflowPreset {
                     implementer: BackendKind::Qwen,
                     command,
                     reviewer: BackendKind::Claude,
-                }),
+                })),
                 ..Default::default()
             },
         )
@@ -536,7 +539,10 @@ async fn host_workflow_repairs_once_preserves_evidence_and_requires_human_accept
 #[cfg(unix)]
 #[tokio::test]
 async fn stopping_check_does_not_request_a_repair_or_review() {
-    use hub_core::tasks::{ProjectRules, workflow::WorkflowPreset};
+    use hub_core::tasks::{
+        ProjectRules,
+        workflow::{WorkflowChoice, WorkflowPreset},
+    };
     let project = tempfile::tempdir().unwrap();
     let mut book = TaskBook::default();
     let id = book.create(project.path().into(), "qwen", "Stop", "Check cancellation").unwrap();
@@ -544,11 +550,11 @@ async fn stopping_check_does_not_request_a_repair_or_review() {
         project.path().into(),
         0,
         ProjectRules {
-            workflow: Some(WorkflowPreset {
+            workflow: Some(WorkflowChoice::Custom(WorkflowPreset {
                 implementer: BackendKind::Qwen,
                 command: "touch check-started && exec sleep 60".into(),
                 reviewer: BackendKind::Claude,
-            }),
+            })),
             ..Default::default()
         },
     )
@@ -579,6 +585,138 @@ async fn stopping_check_does_not_request_a_repair_or_review() {
     assert_eq!(run.workflow_report.checks.len(), 1);
     assert!(!run.workflow_report.checks[0].passed);
     assert_eq!(executor.calls.lock().unwrap().len(), 1);
+}
+
+/// Runs one attempt against a scripted agent and reports the agents it actually called.
+async fn inherit_roles_run(
+    workflow: Option<hub_core::tasks::workflow::WorkflowChoice>,
+    backend: &str,
+    roles: hub_core::settings::AgentRoles,
+) -> (hub_core::tasks::Run, Vec<BackendKind>) {
+    use hub_core::tasks::{ProjectRules, service::TaskService};
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("ready.txt"), "ok").unwrap();
+    let mut book = TaskBook::default();
+    let id = book.create(project.path().into(), backend, "Roles", "Do the work").unwrap();
+    book.configure_rules(
+        project.path().into(),
+        0,
+        ProjectRules {
+            workflow,
+            enabled: true,
+            text: "Правила проекта".into(),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let service = Arc::new(TaskService::new(Box::new(Store(book))));
+    let executor = Arc::new(ScriptedWorkflow::default());
+    let mut runtime =
+        Runtime::new(service.clone(), executor.clone(), Arc::new(crate::git::LocalGitRunner));
+    let mut settings = hub_core::settings::Draft::default().execution(project.path()).unwrap();
+    settings.roles = roles;
+    runtime
+        .dispatch(
+            project.path(),
+            Request::StartChecked { id, revision: 1, next: None, rules_revision: 1 },
+            Arc::new(settings),
+        )
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while runtime.busy() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    runtime.shutdown().await;
+    let run = service
+        .read()
+        .unwrap()
+        .get(id)
+        .unwrap()
+        .runs
+        .first()
+        .cloned()
+        .expect("the attempt is stored");
+    let called = executor.calls.lock().unwrap().iter().map(|(kind, _)| *kind).collect();
+    (run, called)
+}
+
+#[tokio::test]
+async fn inherit_roles_run_the_shared_reviewer_and_filter() {
+    let inherited = |command: &str| {
+        Some(hub_core::tasks::workflow::WorkflowChoice::Inherit { command: command.into() })
+    };
+    #[cfg(unix)]
+    let command = "cat ready.txt";
+    #[cfg(windows)]
+    let command = "type ready.txt";
+    // The project inherits both agents, so the review runs with the shared reviewer.
+    let roles = hub_core::settings::AgentRoles {
+        implementer: BackendKind::Qwen,
+        reviewer: BackendKind::Hermes,
+    };
+    let (run, called) = inherit_roles_run(inherited(command), "qwen", roles).await;
+    assert_eq!(called, [BackendKind::Qwen, BackendKind::Hermes]);
+    assert_eq!(run.workflow_report.checks.len(), 1);
+    assert!(run.workflow_report.checks.first().is_some_and(|check| check.passed));
+    assert!(!run.workflow_report.review.is_empty());
+    assert_eq!(run.state, RunState::Completed);
+    // The parent filter runs on the resolved preset: another shared implementer
+    // means this session is not the executor, so no check is scheduled.
+    let other = hub_core::settings::AgentRoles {
+        implementer: BackendKind::Opencode,
+        reviewer: BackendKind::Claude,
+    };
+    let (run, called) = inherit_roles_run(inherited(command), "qwen", other).await;
+    assert_eq!(called, [BackendKind::Qwen]);
+    assert!(run.workflow_report.checks.is_empty());
+    assert!(run.workflow_report.review.is_empty());
+    assert_eq!(run.state, RunState::Completed);
+}
+
+#[tokio::test]
+async fn inherit_roles_leave_a_project_without_workflow_off() {
+    let roles = hub_core::settings::AgentRoles {
+        implementer: BackendKind::Qwen,
+        reviewer: BackendKind::Hermes,
+    };
+    let (run, called) = inherit_roles_run(None, "qwen", roles).await;
+    assert_eq!(called, [BackendKind::Qwen]);
+    assert!(run.workflow_report.checks.is_empty());
+    assert!(run.workflow_report.review.is_empty());
+}
+
+#[tokio::test]
+async fn inherit_roles_do_not_override_a_custom_preset_filter() {
+    use hub_core::tasks::workflow::{WorkflowChoice, WorkflowPreset};
+    #[cfg(unix)]
+    let command = "cat ready.txt";
+    #[cfg(windows)]
+    let command = "type ready.txt";
+    // A project's own preset still applies to its own implementer and reviewer.
+    let roles = hub_core::settings::AgentRoles {
+        implementer: BackendKind::Hermes,
+        reviewer: BackendKind::Opencode,
+    };
+    let own = WorkflowChoice::Custom(WorkflowPreset {
+        implementer: BackendKind::Codex,
+        command: command.into(),
+        reviewer: BackendKind::Claude,
+    });
+    let (run, called) = inherit_roles_run(Some(own), "codex", roles).await;
+    assert_eq!(called, [BackendKind::Codex, BackendKind::Claude]);
+    assert_eq!(run.workflow_report.checks.len(), 1);
+    // The same preset does nothing for a session of another agent.
+    let other = WorkflowChoice::Custom(WorkflowPreset {
+        implementer: BackendKind::Qwen,
+        command: command.into(),
+        reviewer: BackendKind::Claude,
+    });
+    let (run, called) = inherit_roles_run(Some(other), "codex", roles).await;
+    assert_eq!(called, [BackendKind::Codex]);
+    assert!(run.workflow_report.checks.is_empty());
 }
 
 #[tokio::test]
@@ -671,7 +809,11 @@ fn result_file_survives_project_removal_and_reopening_task_store() {
     let id = book.create(project.path().into(), "codex", "Отчёт", "Сохранить").unwrap();
     store.save_tasks(&book).unwrap();
     let service = Arc::new(TaskService::new(Box::new(store)));
-    let run = service.access(Access::Internal, |book, _| book.begin(id, 1, None, ts())).unwrap();
+    let run = service
+        .access(Access::Internal, |book, _| {
+            book.begin(id, 1, None, ts(), &hub_core::settings::AgentRoles::default())
+        })
+        .unwrap();
     let target = files::FileTarget {
         service: service.clone(),
         task: id,

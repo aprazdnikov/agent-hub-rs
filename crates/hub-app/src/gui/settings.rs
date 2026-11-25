@@ -566,6 +566,7 @@ impl SettingsForm {
         ui.label("Сохраните каталог, бэкенд и параметры, затем выберите проект через /projects в Telegram.");
         ui.label("Пустые параметры наследуют общие настройки. Смена бэкенда сбрасывает модель и режим профиля.");
         ui.label("Связанные действия запускаются вручную через /actions. Изменения профиля не меняют существующие сессии.");
+        ui.small("Режим проверок настраивается на вкладке „Правила“ страницы „Задачи“.");
         self.project_deletion_state(ui);
         let mut remove = None;
         for (index, project) in self.draft.projects.iter_mut().enumerate() {
@@ -780,6 +781,25 @@ impl SettingsForm {
                 });
         });
         ui.label("Используется в /new без имени агента; /backend меняет агента в теме.");
+        ui.add_space(16.0);
+        ui.strong("Роли в задачах");
+        for (label, role) in [
+            ("Исполнитель по умолчанию", &mut self.draft.roles.implementer),
+            ("Ревьюер по умолчанию", &mut self.draft.roles.reviewer),
+        ] {
+            field_row(ui, label, |ui| {
+                egui::ComboBox::from_id_salt(("task_role", label))
+                    .selected_text(role.name())
+                    .show_ui(ui, |ui| {
+                        for kind in BackendKind::ALL {
+                            ui.selectable_value(role, kind, kind.name());
+                        }
+                    });
+            });
+        }
+        ui.label(
+            "Используется проектами в режиме „Наследовать общие роли“. Команда проверки остаётся своей у проекта.",
+        );
     }
 
     fn claude(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
@@ -1129,6 +1149,7 @@ pub fn home_or_root() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hub_core::settings::AgentRoles;
 
     fn render(
         ctx: &egui::Context,
@@ -1325,6 +1346,52 @@ mod tests {
         click_label(&ctx, &mut form, "Сохранить", &mut commands);
         assert!(
             matches!(commands.as_slice(), [Command::Save(saved)] if saved.chat == "-100" && saved.codex.model == "custom-model")
+        );
+    }
+
+    #[test]
+    fn roles_section_renders_both_roles_and_saves_the_choice() {
+        let ctx = egui::Context::default();
+        super::super::theme::configure(&ctx);
+        let mut form = SettingsForm::default();
+        // A distinct agent in every combo keeps each closed combo a unique click target.
+        form.sync(Some(&Draft {
+            token: "123:test-token".to_owned(),
+            chat: "0".to_owned(),
+            users: "1".to_owned(),
+            workspace_root: home_or_root().display().to_string(),
+            default_backend: BackendKind::Qwen,
+            ..Draft::default()
+        }));
+        let mut commands = Vec::new();
+        click_label(&ctx, &mut form, "Агенты", &mut commands);
+        let output = render(&ctx, &mut form, egui::vec2(960.0, 900.0), vec![], &mut commands);
+        assert!(has_label(&output, "Роли в задачах"));
+        assert!(has_label(&output, "Исполнитель по умолчанию"));
+        assert!(has_label(&output, "Ревьюер по умолчанию"));
+        assert!(has_label(&output, "codex"));
+        assert!(has_label(&output, "claude"));
+        assert!(commands.is_empty());
+        assert!(!form.has_unsaved(), "a freshly synced draft is not dirty");
+        click_label(&ctx, &mut form, "codex", &mut commands);
+        click_label(&ctx, &mut form, "opencode", &mut commands);
+        assert_eq!(form.draft.roles.implementer, BackendKind::Opencode);
+        assert!(form.has_unsaved(), "picking a role must dirty the draft");
+        click_label(&ctx, &mut form, "claude", &mut commands);
+        click_label(&ctx, &mut form, "hermes", &mut commands);
+        assert_eq!(form.draft.roles.reviewer, BackendKind::Hermes);
+        click_label(&ctx, &mut form, "Сохранить", &mut commands);
+        assert!(
+            matches!(
+                commands.as_slice(),
+                [Command::Save(saved)]
+                    if saved.roles
+                        == AgentRoles {
+                            implementer: BackendKind::Opencode,
+                            reviewer: BackendKind::Hermes,
+                        }
+            ),
+            "roles must reach the save command"
         );
     }
 
@@ -1681,6 +1748,14 @@ mod tests {
         assert_eq!(form.draft.projects.first().unwrap().id, second);
         click(&ctx, &mut form, "Добавить проект");
         assert_ne!(form.draft.projects.last().unwrap().id, first);
+        // Plan §3: the project card must point at where the check mode is configured.
+        assert!(
+            has_label(
+                &frame(&ctx, &mut form, Vec::new()),
+                "Режим проверок настраивается на вкладке „Правила“ страницы „Задачи“."
+            ),
+            "the profile description lacks the rules-tab hint"
+        );
     }
 
     #[test]

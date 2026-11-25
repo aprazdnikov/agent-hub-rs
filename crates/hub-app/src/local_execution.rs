@@ -223,6 +223,7 @@ impl Runtime {
         );
         // Reservation covers Git check and the durable begin, not the agent's entire run.
         let lease = self.service.reserve()?;
+        let roles = settings.roles;
         let task = self.service.access(Access::Internal, |book, _| {
             if book.get(id)?.revision != revision || book.rules(project).revision != rules_revision
             {
@@ -236,8 +237,7 @@ impl Runtime {
                     book.prepare_git(id, revision, branch)?;
                 }
                 Action::Start(next) => {
-                    let mut check = book.clone();
-                    check.begin(id, revision, next.as_deref(), Timestamp::now())?;
+                    book.clone().begin(id, revision, next.as_deref(), Timestamp::now(), &roles)?;
                 }
             }
             Ok(book.get(id)?.clone())
@@ -443,12 +443,17 @@ impl Worker {
                 .get(task.id)?
                 .preview_with_rules(next.as_deref(), &book.rules(&task.project))?;
             let prompt = Prompt::new(text, vec![]).ok_or("Пустое поручение")?;
-            let run = book.begin(task.id, task.revision, next.as_deref(), Timestamp::now())?;
-            Ok((
-                run,
-                prompt,
-                book.rules(&task.project).workflow.filter(|p| p.implementer == session.backend),
-            ))
+            let roles = settings.roles;
+            let now = Timestamp::now();
+            let run = book.begin(task.id, task.revision, next.as_deref(), now, &roles)?;
+            // Roles resolve once, at the start of the attempt: a later edit of the shared
+            // roles cannot change a run that is already under way.
+            let workflow = book
+                .rules(&task.project)
+                .effective_workflow(&settings.roles)
+                .filter(|preset| preset.implementer == session.backend)
+                .map(std::borrow::Cow::into_owned);
+            Ok((run, prompt, workflow))
         })?;
         self.view.send_modify(|view| {
             if let Some(view) = view {

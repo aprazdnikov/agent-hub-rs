@@ -2,7 +2,10 @@
 use super::*;
 use hub_core::{
     settings::{Approval, Draft, Sandbox},
-    tasks::{ProjectRules, TaskStatus, workflow::WorkflowPreset},
+    tasks::{
+        ProjectRules, TaskStatus,
+        workflow::{WorkflowChoice, WorkflowPreset},
+    },
 };
 
 fn git(cwd: &Path, args: &[&str]) {
@@ -34,11 +37,11 @@ async fn workflow(
         cwd.into(),
         0,
         ProjectRules {
-            workflow: Some(WorkflowPreset {
+            workflow: Some(WorkflowChoice::Custom(WorkflowPreset {
                 implementer: BackendKind::Codex,
                 command: command.into(),
                 reviewer: BackendKind::Codex,
-            }),
+            })),
             ..Default::default()
         },
     )

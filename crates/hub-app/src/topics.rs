@@ -264,7 +264,7 @@ mod tests {
         let mut tasks = store.load_tasks().unwrap();
         assert!(!path.with_extension("tasks.json").exists());
         let id = tasks.create(root.path().to_path_buf(), "qwen", "Check", "Read README").unwrap();
-        tasks.begin(id, 1, None, ts()).unwrap();
+        tasks.begin(id, 1, None, ts(), &hub_core::settings::AgentRoles::default()).unwrap();
         store.save_tasks(&tasks).unwrap();
         assert_eq!(FileTopics::new(path.clone()).load_tasks().unwrap(), tasks);
         assert!(!path.exists(), "task state is independent of topic bindings");

@@ -132,8 +132,8 @@ impl View {
                 ),
                 |ui| {
                     ui.label(&attempt.step);
-                    if let Some(rules) = &attempt.rules {
-                        ui.label(rules.describe());
+                    if let Some(described) = attempt.described_rules() {
+                        ui.label(described);
                     }
                     if !attempt.diagnostic.is_empty() {
                         ui.label(&attempt.diagnostic);
@@ -491,8 +491,8 @@ fn report(ui: &mut egui::Ui, run: &Run) {
     if run.workflow_report.is_empty() {
         ui.weak("Результатов автоматических проверок пока нет.");
     } else {
-        if let Some(preset) = run.rules.as_ref().and_then(|rules| rules.workflow.as_ref()) {
-            ui.monospace(&preset.command);
+        if let Some(command) = run.check_command() {
+            ui.monospace(command);
         }
         for (index, check) in run.workflow_report.checks.iter().enumerate() {
             ui.strong(format!(
@@ -599,7 +599,8 @@ mod tests {
         let mut book = TaskBook::default();
         let id =
             book.create(std::env::temp_dir(), "qwen", "Вкладки результата", "Проверь").unwrap();
-        let run = book.begin(id, 1, None, ts()).unwrap();
+        let run =
+            book.begin(id, 1, None, ts(), &hub_core::settings::AgentRoles::default()).unwrap();
         book.record(id, run, "Итог попытки").unwrap();
         book.finish(id, run, RunState::Completed, ts()).unwrap();
         let mut task = book.get(id).unwrap().clone();
@@ -747,5 +748,48 @@ mod tests {
         let out = frame(&ctx, &mut view, &task, vec![]);
         let texts = labels(&out);
         assert!(texts.contains(&"Итог попытки"), "Сводка returns with the result label");
+    }
+
+    #[test]
+    fn history_names_the_agents_frozen_at_start_and_not_the_shared_role_wording() {
+        use hub_core::domain::BackendKind;
+        use hub_core::settings::AgentRoles;
+        use hub_core::tasks::{ProjectRules, workflow::WorkflowChoice};
+        let mut book = TaskBook::default();
+        let project = std::env::temp_dir().join("agent-hub-gui-frozen-history");
+        let id = book.create(project.clone(), "hermes", "История", "Проверь").unwrap();
+        book.configure_rules(
+            project,
+            0,
+            ProjectRules {
+                revision: 0,
+                enabled: true,
+                text: "Правила".into(),
+                git: None,
+                workflow: Some(WorkflowChoice::Inherit { command: "cargo test".into() }),
+            },
+        )
+        .unwrap();
+        // The attempt starts while Hermes is the shared implementer; settings may move on.
+        let hermes = AgentRoles { implementer: BackendKind::Hermes, reviewer: BackendKind::Claude };
+        let run = book.begin(id, 1, None, ts(), &hermes).unwrap();
+        book.record(id, run, "Итог").unwrap();
+        book.finish(id, run, RunState::Completed, ts()).unwrap();
+        let task = book.get(id).unwrap().clone();
+        let ctx = egui::Context::default();
+        let mut view = View::default();
+        view.select(Tab::History, Some(task.id));
+        frame(&ctx, &mut view, &task, vec![]);
+        click(&ctx, &mut view, &task, "Попытка 1 · Запуск завершён · hermes");
+        let out = frame(&ctx, &mut view, &task, vec![]);
+        let texts = labels(&out);
+        assert!(
+            texts.iter().any(|text| text.contains("для hermes") && text.contains("ревью claude")),
+            "the frozen agents must be named: {texts:?}"
+        );
+        assert!(
+            !texts.iter().any(|text| text.contains("по общим ролям")),
+            "history never renders the unresolved shared-role wording: {texts:?}"
+        );
     }
 }

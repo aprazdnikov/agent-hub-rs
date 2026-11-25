@@ -56,8 +56,11 @@
 3. **Карточка проекта в настройках** — без изменений (роли не дублируем в профиль проекта:
    один источник — Правила проекта на странице задач), в описании профиля добавить строку
    «Режим проверок настраивается на вкладке „Правила“ страницы „Задачи“».
-4. Отчёт запуска (`WorkflowReport::describe`, `gui/tasks/result.rs:494`) показывает
-   фактических агентов попытки — данные уже лежат в `run.rules`/preset, менять формат не нужно.
+4. Отчёт запуска показывает фактических агентов попытки: результат резолвинга
+   (`effective_workflow` на текущих ролях) фиксируется при старте попытки в новом
+   wire-совместимом поле `Run.workflow`, история и отчёт рендерятся по нему общим
+   рендерером (`Run::described_rules`); «живые» роли остаются только в превью
+   (`describe_with_roles`).
 
 ## Global Constraints
 
@@ -129,7 +132,7 @@
   тестах round-trip оба направления. Дефолты `AgentRoles::default() = { Codex, Claude }`;
   парсинг строк — как `default_backend` через `choice()` (`settings.rs:1297`).
 
-- [ ] **Step 1: RED** — тесты round-trip `ProjectRules`: отсутствие поля → None (выключено);
+- [x] **Step 1: RED** — тесты round-trip `ProjectRules`: отсутствие поля → None (выключено);
   `workflow = { command = "cargo test" }` → Inherit; старый трёхполевой объект → Custom;
   `{}` и `42` → ошибка разбора книги. `effective_workflow`: None → `None`;
   `Custom(p)` → `Some(Cow::Borrowed(p))`; `Inherit{command}` →
@@ -138,10 +141,10 @@
   с командой > 2048 байт или с `\0` → ошибка. Настройки: секция `[agents]` с
   `implementer`/`reviewer` парсится, неизвестное имя агента → `Field::Role`,
   `Draft::from_settings` round-trip, старый TOML без новых ключей читается.
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-core --lib workflow_choice agents_roles` → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: GREEN** — `cargo test -p hub-core --locked` → PASS.
-- [ ] **Step 5: Commit** — `feat(core): трёхрежимный workflow проекта и общие роли агентов`
+- [x] **Step 2: Verify RED** — `cargo test -p hub-core --lib workflow_choice agents_roles` → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: GREEN** — `cargo test -p hub-core --locked` → PASS.
+- [x] **Step 5: Commit** — `feat(core): трёхрежимный workflow проекта и общие роли агентов`
 
 ---
 
@@ -151,12 +154,12 @@
 - Modify: `crates/hub-app/src/gui/settings.rs` (`agent():688-700`, Draft-поля, `page()` `:343`)
 - Test: там же `mod tests`
 
-- [ ] **Step 1: RED** — render-тест: на странице «Агенты → Общие» есть два комбобокса ролей;
+- [x] **Step 1: RED** — render-тест: на странице «Агенты → Общие» есть два комбобокса ролей;
   смена значения помечает черновик грязным и попадает в `Command::Save`.
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-app --lib roles_section` → FAIL.
-- [ ] **Step 3: Implement** — по образцу блока «Новые темы» (`field_row` + `ComboBox`).
-- [ ] **Step 4: GREEN** — `cargo test -p hub-app --locked` → PASS.
-- [ ] **Step 5: Commit** — `feat(gui): общие роли исполнителя и ревьюера`
+- [x] **Step 2: Verify RED** — `cargo test -p hub-app --lib roles_section` → FAIL.
+- [x] **Step 3: Implement** — по образцу блока «Новые темы» (`field_row` + `ComboBox`).
+- [x] **Step 4: GREEN** — `cargo test -p hub-app --locked` → PASS.
+- [x] **Step 5: Commit** — `feat(gui): общие роли исполнителя и ревьюера`
 
 ---
 
@@ -170,15 +173,15 @@
   отдельный `describe_with_roles`)
 - Test: `local_execution/tests.rs` (паттерн `ScriptedWorkflow:408+`), `hub.rs` tests
 
-- [ ] **Step 1: RED** — тест: проект `Inherit{command}` + `ExecutionSettings.roles = {Qwen,
+- [x] **Step 1: RED** — тест: проект `Inherit{command}` + `ExecutionSettings.roles = {Qwen,
   Hermes}` → запускается verify с исполнителем Qwen (backend сессии Qwen) и ревьюером Hermes;
   тот же проект с `Off` → verify нет; `Custom{implementer=Codex,...}` при сессии Codex →
   прежний фильтр сработал; глобальные роли не включают workflow у проекта `Off`.
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-app --lib inherit` → FAIL.
-- [ ] **Step 3: Implement** — во всех точках `rules.workflow` → `effective_workflow(&settings.roles)`;
+- [x] **Step 2: Verify RED** — `cargo test -p hub-app --lib inherit` → FAIL.
+- [x] **Step 3: Implement** — во всех точках `rules.workflow` → `effective_workflow(&settings.roles)`;
   в telegram-хьюке роли берутся из watch-канала настроек (`self.settings`).
-- [ ] **Step 4: GREEN** — `cargo test -p hub-app -p hub-telegram --locked` → PASS.
-- [ ] **Step 5: Commit** — `feat(app,telegram): исполнение учитывает общие роли агентов`
+- [x] **Step 4: GREEN** — `cargo test -p hub-app -p hub-telegram --locked` → PASS.
+- [x] **Step 5: Commit** — `feat(app,telegram): исполнение учитывает общие роли агентов`
 
 ---
 
@@ -191,14 +194,14 @@
   уточнить по вызовам `Editor::observe`; если не проброшено — добавить параметром)
 - Test: `rules.rs` render-тесты
 
-- [ ] **Step 1: RED** — тесты: выбор `Inherit` показывает строку факта с глобальными агентами
+- [x] **Step 1: RED** — тесты: выбор `Inherit` показывает строку факта с глобальными агентами
   и инпут команды; переключение `Custom` возвращает два комбобокса; `Off` скрывает всё;
   сохранение шлёт `Request::…` с корректным `WorkflowChoice`; валидация пустой команды
   блокирует кнопку.
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-app --lib workflow_modes` → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: GREEN** — `cargo test -p hub-app --locked` → PASS.
-- [ ] **Step 5: Commit** — `feat(gui): режим workflow проекта — выкл / общие роли / свой выбор`
+- [x] **Step 2: Verify RED** — `cargo test -p hub-app --lib workflow_modes` → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: GREEN** — `cargo test -p hub-app --locked` → PASS.
+- [x] **Step 5: Commit** — `feat(gui): режим workflow проекта — выкл / общие роли / свой выбор`
 
 ---
 
@@ -207,9 +210,9 @@
 **Files:**
 - Modify: `docs/guide/tasks.md` (раздел правил проекта), `docs/guide/settings.md`
   (страница «Агенты»), `docs/guide/projects.md` (строка про вкладку «Правила»)
-- [ ] **Step 1:** тексты по дизайн-блоку; сверка якорей рус. заголовков (правило doc-link).
-- [ ] **Step 2:** полный gate + `git diff --check`; `git status -s` чист.
-- [ ] **Step 3: Commit** — `docs: общие роли агентов и режимы проверок проекта`
+- [x] **Step 1:** тексты по дизайн-блоку; сверка якорей рус. заголовков (правило doc-link).
+- [x] **Step 2:** полный gate + `git diff --check`; `git status -s` чист.
+- [x] **Step 3: Commit** — `docs: общие роли агентов и режимы проверок проекта`
 
 ## Security Review этого плана
 

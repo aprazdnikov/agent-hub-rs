@@ -375,6 +375,20 @@ pub struct Timeouts {
     pub background: Duration,
 }
 
+/// Shared task roles a project inherits when it does not pick its own agents.
+/// The defaults match the values the project rules editor offered before roles existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentRoles {
+    pub implementer: BackendKind,
+    pub reviewer: BackendKind,
+}
+
+impl Default for AgentRoles {
+    fn default() -> Self {
+        Self { implementer: BackendKind::Codex, reviewer: BackendKind::Claude }
+    }
+}
+
 /// Parsed settings. `workspace_root` is absolute; whether it exists is checked by the shell.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Settings {
@@ -387,6 +401,7 @@ pub struct Settings {
     pub workspace_root: PathBuf,
     pub snapshots_dir: PathBuf,
     pub default_backend: BackendKind,
+    pub roles: AgentRoles,
     pub claude: ClaudeSettings,
     pub codex: CodexSettings,
     pub qwen: QwenSettings,
@@ -413,6 +428,7 @@ pub enum Field {
     ApprovalTimeout,
     BackgroundTimeout,
     DefaultBackend,
+    Role(&'static str),
     Codex(CodexField),
     Qwen(QwenField),
     Hermes(HermesField),
@@ -585,6 +601,7 @@ pub struct Draft {
     pub workspace_root: String,
     pub snapshots_dir: String,
     pub default_backend: BackendKind,
+    pub roles: AgentRoles,
     pub cli: String,
     pub model: String,
     pub permission_mode: PermissionMode,
@@ -612,6 +629,7 @@ impl Default for Draft {
             workspace_root: String::new(),
             snapshots_dir: String::new(),
             default_backend: BackendKind::Claude,
+            roles: AgentRoles::default(),
             cli: String::new(),
             model: String::new(),
             permission_mode: PermissionMode::Default,
@@ -641,6 +659,7 @@ impl fmt::Debug for Draft {
             workspace_root,
             snapshots_dir,
             default_backend,
+            roles,
             cli,
             model,
             permission_mode,
@@ -665,6 +684,7 @@ impl fmt::Debug for Draft {
             .field("workspace_root", workspace_root)
             .field("snapshots_dir", snapshots_dir)
             .field("default_backend", default_backend)
+            .field("roles", roles)
             .field("cli", cli)
             .field("model", model)
             .field("permission_mode", permission_mode)
@@ -738,6 +758,7 @@ impl Draft {
         Ok(ExecutionSettings {
             memory_project: None,
             memory: self.memory,
+            roles: self.roles,
             claude: ClaudeSettings { cli, model, permission_mode: self.permission_mode, budget },
             codex,
             qwen: QwenSettings {
@@ -818,6 +839,7 @@ impl Draft {
             workspace_root,
             snapshots_dir,
             default_backend: self.default_backend,
+            roles: self.roles,
             claude: ClaudeSettings { cli, model, permission_mode: self.permission_mode, budget },
             codex,
             qwen: QwenSettings {
@@ -857,6 +879,7 @@ impl Draft {
             workspace_root: settings.workspace_root.display().to_string(),
             snapshots_dir: settings.snapshots_dir.display().to_string(),
             default_backend: settings.default_backend,
+            roles: settings.roles,
             cli: settings
                 .claude
                 .cli
@@ -1143,6 +1166,35 @@ pub struct ClaudeFile {
 #[serde(deny_unknown_fields)]
 pub struct AgentsFile {
     pub default: Option<String>,
+    /// Both role keys are left out when they hold the defaults: versions before 1.1.2
+    /// refuse an unknown key inside `[agents]`, so a downgrade keeps reading the file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub implementer: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reviewer: Option<String>,
+}
+
+impl AgentsFile {
+    /// Both roles parse through the same choice as `default`, so an unknown agent names its field.
+    fn roles(&self) -> Result<AgentRoles, FieldError> {
+        let defaults = AgentRoles::default();
+        Ok(AgentRoles {
+            implementer: choice(
+                self.implementer.as_deref(),
+                defaults.implementer,
+                BackendKind::parse,
+                Field::Role("implementer"),
+                "Неизвестный бэкенд",
+            )?,
+            reviewer: choice(
+                self.reviewer.as_deref(),
+                defaults.reviewer,
+                BackendKind::parse,
+                Field::Role("reviewer"),
+                "Неизвестный бэкенд",
+            )?,
+        })
+    }
 }
 
 /// The API key is kept in the OS keyring, not here.
@@ -1234,7 +1286,13 @@ impl SettingsFile {
                 users: settings.telegram.users.iter().map(|user| user.0).collect(),
             },
             workspace: WorkspaceFile { root: settings.workspace_root.display().to_string() },
-            agents: AgentsFile { default: Some(settings.default_backend.name().to_owned()) },
+            agents: AgentsFile {
+                default: Some(settings.default_backend.name().to_owned()),
+                implementer: (settings.roles.implementer != AgentRoles::default().implementer)
+                    .then(|| settings.roles.implementer.name().to_owned()),
+                reviewer: (settings.roles.reviewer != AgentRoles::default().reviewer)
+                    .then(|| settings.roles.reviewer.name().to_owned()),
+            },
             claude: ClaudeFile {
                 cli: settings.claude.cli.as_ref().map(|cli| cli.display().to_string()),
                 model: settings.claude.model.clone(),
@@ -1301,6 +1359,7 @@ impl SettingsFile {
             Field::DefaultBackend,
             "Неизвестный бэкенд",
         )?;
+        let roles = self.agents.roles()?;
         let sandbox = choice(
             self.codex.sandbox.as_deref(),
             Sandbox::WorkspaceWrite,
@@ -1342,6 +1401,7 @@ impl SettingsFile {
             workspace_root: self.workspace.root.clone(),
             snapshots_dir: self.snapshots.dir.clone().unwrap_or_default(),
             default_backend,
+            roles,
             cli: self.claude.cli.clone().unwrap_or_default(),
             model: self.claude.model.clone().unwrap_or_default(),
             permission_mode,
@@ -1457,6 +1517,79 @@ mod tests {
         assert_eq!(settings.speech, SpeechSettings::default());
         let encoded = toml::to_string(&SettingsFile::from_settings(&settings, &home())).unwrap();
         assert!(!encoded.contains("[speech]"));
+    }
+
+    #[test]
+    fn agents_roles_section_parses_and_old_files_keep_defaults() {
+        let keys = || Keys {
+            token: "1:a".to_owned(),
+            api_key: String::new(),
+            speech_key: String::new(),
+            qwen_key: String::new(),
+        };
+        let raw = "[telegram]\nchat = -100\nusers = [1]\n[workspace]\nroot = \"~/Projects\"\n\
+                   [agents]\ndefault = \"hermes\"\nimplementer = \"qwen\"\nreviewer = \"hermes\"\n";
+        let file: SettingsFile = toml::from_str(raw).unwrap();
+        let form = file.to_draft(keys()).unwrap();
+        let roles = AgentRoles { implementer: BackendKind::Qwen, reviewer: BackendKind::Hermes };
+        assert_eq!(form.roles, roles);
+        assert_eq!(form.default_backend, BackendKind::Hermes);
+        let settings = form.parse(&home()).unwrap();
+        assert_eq!(settings.roles, roles);
+        assert_eq!(ExecutionSettings::from(&settings).roles, roles);
+        assert_eq!(form.execution(&home()).unwrap().roles, roles);
+        let old: SettingsFile = toml::from_str(
+            "[telegram]\nchat = -100\nusers = [1]\n[workspace]\nroot = \"~/Projects\"\n",
+        )
+        .unwrap();
+        let restored = old.to_draft(keys()).unwrap();
+        assert_eq!(restored.roles, AgentRoles::default());
+        assert_eq!(restored.roles.implementer, BackendKind::Codex);
+        assert_eq!(restored.roles.reviewer, BackendKind::Claude);
+    }
+
+    #[test]
+    fn agents_roles_unknown_backend_reports_the_role_field() {
+        let keys = || Keys {
+            token: "1:a".to_owned(),
+            api_key: String::new(),
+            speech_key: String::new(),
+            qwen_key: String::new(),
+        };
+        let raw = "[telegram]\nchat = -100\nusers = [1]\n[workspace]\nroot = \"~/Projects\"\n\
+                   [agents]\nimplementer = \"grok\"\n";
+        let file: SettingsFile = toml::from_str(raw).unwrap();
+        let error = file.to_draft(keys()).unwrap_err();
+        assert_eq!(error.field, Field::Role("implementer"));
+        assert!(error.message.contains("grok"));
+        let reversed = raw.replace("implementer = \"grok\"", "reviewer = \"grok\"");
+        let file: SettingsFile = toml::from_str(&reversed).unwrap();
+        assert_eq!(file.to_draft(keys()).unwrap_err().field, Field::Role("reviewer"));
+        // An unknown key in the section is refused by the file, never read as a role.
+        assert!(toml::from_str::<SettingsFile>(&raw.replace("implementer", "reviwer")).is_err());
+    }
+
+    #[test]
+    fn agents_roles_round_trip_hides_defaults_from_old_readers() {
+        let keys = || Keys {
+            token: "1:a".to_owned(),
+            api_key: String::new(),
+            speech_key: String::new(),
+            qwen_key: String::new(),
+        };
+        let roles = AgentRoles { implementer: BackendKind::Hermes, reviewer: BackendKind::Qwen };
+        let settings = Draft { roles, ..draft() }.parse(&home()).unwrap();
+        let encoded = toml::to_string(&SettingsFile::from_settings(&settings, &home())).unwrap();
+        assert!(encoded.contains("implementer = \"hermes\""), "{encoded}");
+        assert!(encoded.contains("reviewer = \"qwen\""), "{encoded}");
+        let restored: SettingsFile = toml::from_str(&encoded).unwrap();
+        assert_eq!(restored.to_draft(keys()).unwrap().roles, roles);
+        assert_eq!(Draft::from_settings(&settings).roles, roles);
+        let untouched = draft().parse(&home()).unwrap();
+        let written = toml::to_string(&SettingsFile::from_settings(&untouched, &home())).unwrap();
+        assert!(!written.contains("implementer"), "{written}");
+        assert!(!written.contains("reviewer"), "{written}");
+        assert_eq!(Draft::from_settings(&untouched).roles, AgentRoles::default());
     }
 
     #[test]
@@ -2317,6 +2450,8 @@ pub struct ExecutionSettings {
     /// Owning task project, including when the process runs in a temporary worktree.
     pub memory_project: Option<crate::domain::AbsolutePath>,
     pub memory: MemorySettings,
+    /// Shared roles a project inherits; frozen with the rest of the run configuration.
+    pub roles: AgentRoles,
     pub claude: ClaudeSettings,
     pub codex: CodexSettings,
     pub qwen: QwenSettings,
@@ -2329,6 +2464,7 @@ impl From<&Settings> for ExecutionSettings {
         Self {
             memory_project: None,
             memory: settings.memory,
+            roles: settings.roles,
             claude: settings.claude.clone(),
             codex: settings.codex.clone(),
             qwen: settings.qwen.clone(),

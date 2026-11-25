@@ -3,6 +3,7 @@ use crate::supervisor::{BotStatus, Command, Snapshot};
 use eframe::egui;
 use hub_core::{
     domain::{BackendKind, TopicKey},
+    settings::AgentRoles,
     tasks::{Task, TaskFilter, TaskStatus},
 };
 use hub_telegram::hub::tasks::{Request, Snapshot as TaskSnapshot};
@@ -24,6 +25,11 @@ use std::{
 use tokio::sync::oneshot;
 
 type Scope = (Option<TopicKey>, PathBuf, BackendKind);
+
+/// The shared roles as currently saved: an inherited project is described by them.
+fn shared_roles(snapshot: &Snapshot) -> AgentRoles {
+    snapshot.saved.as_ref().map_or_else(AgentRoles::default, |draft| draft.roles)
+}
 type Reply = oneshot::Receiver<Result<TaskSnapshot, String>>;
 struct Pending {
     scope: Scope,
@@ -455,7 +461,8 @@ impl TasksView {
                         .as_ref()
                         .is_some_and(|p| matches!(p.effect, Effect::SaveRules));
                     let blocked = self.mutation_pending() || self.git_busy;
-                    if let Some(request) = self.rules.show(ui, &project, saving, blocked) {
+                    let roles = shared_roles(snapshot);
+                    if let Some(request) = self.rules.show(ui, &project, roles, saving, blocked) {
                         self.request(request, send);
                     }
                 });
@@ -887,7 +894,7 @@ mod tests {
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut book = hub_core::tasks::TaskBook::default();
         let id = book.create(project.clone(), "qwen", "Проверка чата", "Исходный вопрос").unwrap();
-        book.begin(id, 1, None, ts()).unwrap();
+        book.begin(id, 1, None, ts(), &hub_core::settings::AgentRoles::default()).unwrap();
         book.record(id, 1, "Ответ агента").unwrap();
         book.finish(id, 1, RunState::Completed, ts()).unwrap();
         let snapshot = Snapshot {
@@ -1063,7 +1070,15 @@ mod tests {
     fn result_link_only_on_latest_reviewable_run() {
         let (mut book, id, snapshot, mut view) = review_fixture();
         let revision = view.tasks[0].revision;
-        let second = book.begin(id, revision, Some("Второй шаг"), ts()).unwrap();
+        let second = book
+            .begin(
+                id,
+                revision,
+                Some("Второй шаг"),
+                ts(),
+                &hub_core::settings::AgentRoles::default(),
+            )
+            .unwrap();
         book.record(id, second, "Ответ второго запуска").unwrap();
         book.finish(id, second, RunState::Completed, ts()).unwrap();
         view.tasks = book.tasks().to_vec();
@@ -1230,7 +1245,14 @@ mod tests {
             assert_eq!((requested, next.as_deref()), (id, Some("Проверьте итог")));
             assert!(!view.take_inbox_return());
             if succeeds {
-                book.begin(id, revision, next.as_deref(), ts()).unwrap();
+                book.begin(
+                    id,
+                    revision,
+                    next.as_deref(),
+                    ts(),
+                    &hub_core::settings::AgentRoles::default(),
+                )
+                .unwrap();
                 reply
                     .send(Ok(TaskSnapshot { tasks: book.tasks().to_vec(), ..Default::default() }))
                     .unwrap();
@@ -1565,7 +1587,9 @@ mod tests {
         };
         let mut other_book = hub_core::tasks::TaskBook::default();
         let other_id = other_book.create(other_path, "qwen", "Соседний проект", "Шаг").unwrap();
-        other_book.begin(other_id, 1, None, ts()).unwrap();
+        other_book
+            .begin(other_id, 1, None, ts(), &hub_core::settings::AgentRoles::default())
+            .unwrap();
         other_book.finish(other_id, 1, RunState::Completed, ts()).unwrap();
         assert_eq!(id, other_id, "distinct projects with the same id must remain isolated");
         reply
@@ -1930,7 +1954,8 @@ mod tests {
         book.configure_rules(project.clone(), 0, rules).unwrap();
         book.prepare_git(id, 1, "task/first").unwrap();
         book.finish_git(id, 2, Ok("a".repeat(40))).unwrap();
-        let run = book.begin(id, 3, None, ts()).unwrap();
+        let run =
+            book.begin(id, 3, None, ts(), &hub_core::settings::AgentRoles::default()).unwrap();
         book.finish(id, run, RunState::Completed, ts()).unwrap();
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut view = TasksView {
@@ -2066,6 +2091,34 @@ mod tests {
             })
         ));
     }
+    #[test]
+    fn workflow_modes_chip_shows_the_resolved_preset() {
+        use hub_core::tasks::workflow::WorkflowChoice;
+        let (_, id, snapshot, mut view) = saved_prompt_fixture();
+        let ctx = egui::Context::default();
+        view.result_view.select(result::Tab::Parameters, Some(id));
+        view.rules.accept(hub_core::tasks::ProjectRules {
+            revision: 3,
+            enabled: true,
+            text: "Правила".into(),
+            git: None,
+            workflow: Some(WorkflowChoice::Inherit { command: "cargo test".into() }),
+        });
+        let snapshot = Snapshot {
+            saved: Some(hub_core::settings::Draft {
+                roles: AgentRoles { implementer: BackendKind::Qwen, reviewer: BackendKind::Hermes },
+                ..Default::default()
+            }),
+            ..snapshot
+        };
+        let mut commands = Vec::new();
+        let output = input_frame(&ctx, &mut view, &snapshot, vec![], &mut commands);
+        assert!(
+            labels(&output).contains(&"qwen › cargo test › ревью hermes"),
+            "the chip must show the shared roles the project inherits"
+        );
+    }
+
     #[test]
     fn project_rules_editor_has_separate_undo_state_for_each_project() {
         use hub_core::tasks::ProjectRules;
@@ -2226,7 +2279,7 @@ mod tests {
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut book = hub_core::tasks::TaskBook::default();
         let id = book.create(test_project(), "qwen", "Task", "Read").unwrap();
-        book.begin(id, 1, None, ts()).unwrap();
+        book.begin(id, 1, None, ts(), &hub_core::settings::AgentRoles::default()).unwrap();
         let mut view = TasksView {
             selected: Some(key),
             scope: Some((Some(key), test_project(), BackendKind::Qwen)),
@@ -2307,7 +2360,7 @@ mod tests {
         let project = test_project();
         let mut book = hub_core::tasks::TaskBook::default();
         let id = book.create(project.clone(), "qwen", "Task", "Первый вопрос").unwrap();
-        book.begin(id, 1, None, ts()).unwrap();
+        book.begin(id, 1, None, ts(), &hub_core::settings::AgentRoles::default()).unwrap();
         book.record(id, 1, "Первый ответ").unwrap();
         book.finish(id, 1, RunState::Completed, ts()).unwrap();
         let revision = book.get(id).unwrap().revision;
@@ -2355,7 +2408,9 @@ mod tests {
         assert_eq!(view.next[&id], draft);
         click_text(&ctx, &mut view, &snapshot, "Отправить", &mut commands);
         let Command::Tasks { reply, .. } = commands.pop().unwrap() else { panic!("retry") };
-        let run = book.begin(id, revision, Some(draft), ts()).unwrap();
+        let run = book
+            .begin(id, revision, Some(draft), ts(), &hub_core::settings::AgentRoles::default())
+            .unwrap();
         book.record(id, run, "Промежуточный ответ").unwrap();
         reply
             .send(Ok(TaskSnapshot { tasks: book.tasks().to_vec(), ..Default::default() }))
@@ -2395,7 +2450,7 @@ mod tests {
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut book = hub_core::tasks::TaskBook::default();
         let id = book.create(test_project(), "codex", "Task", "Read").unwrap();
-        book.begin(id, 1, None, ts()).unwrap();
+        book.begin(id, 1, None, ts(), &hub_core::settings::AgentRoles::default()).unwrap();
         book.record(id, 1, "Готовый результат").unwrap();
         book.finish(id, 1, RunState::Completed, ts()).unwrap();
         let mut view = TasksView {
@@ -2476,7 +2531,7 @@ mod tests {
         let receiving = TopicKey { chat: key.chat, thread: ThreadId(8) };
         let mut book = hub_core::tasks::TaskBook::default();
         let id = book.create(test_project(), "codex", "Task", "Read").unwrap();
-        book.begin(id, 1, None, ts()).unwrap();
+        book.begin(id, 1, None, ts(), &hub_core::settings::AgentRoles::default()).unwrap();
         book.record(id, 1, "Previous result").unwrap();
         book.finish(id, 1, RunState::Completed, ts()).unwrap();
         let mut raw = serde_json::to_value(&book).unwrap();
@@ -2755,7 +2810,7 @@ mod tests {
         let mut view = TasksView::default();
         let available = view.availability(book.get(id).unwrap(), BackendKind::Qwen, true);
         assert!(available.edit && !available.launch);
-        book.begin(id, 1, None, ts()).unwrap();
+        book.begin(id, 1, None, ts(), &hub_core::settings::AgentRoles::default()).unwrap();
         assert!(!view.availability(book.get(id).unwrap(), BackendKind::Qwen, false).edit);
         book.finish(id, 1, RunState::Completed, ts()).unwrap();
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
@@ -2885,7 +2940,7 @@ mod tests {
         let mut commands = Vec::new();
         view.request(Request::List, &mut |command| commands.push(command));
         let Command::Tasks { reply, .. } = commands.pop().unwrap() else { panic!("task request") };
-        book.begin(id, 1, None, ts()).unwrap();
+        book.begin(id, 1, None, ts(), &hub_core::settings::AgentRoles::default()).unwrap();
         reply
             .send(Ok(TaskSnapshot { tasks: book.tasks().to_vec(), ..TaskSnapshot::default() }))
             .unwrap();
@@ -2898,7 +2953,7 @@ mod tests {
         let mut book = hub_core::tasks::TaskBook::default();
         let id =
             book.create(project.clone(), "qwen", "Локальный запуск", "Прочитать README").unwrap();
-        book.begin(id, 1, None, ts()).unwrap();
+        book.begin(id, 1, None, ts(), &hub_core::settings::AgentRoles::default()).unwrap();
         let token = uuid::Uuid::new_v4();
         let snapshot = Snapshot {
             local: Some(crate::local_execution::Live {
@@ -2943,7 +2998,7 @@ mod tests {
         let mut book = hub_core::tasks::TaskBook::default();
         let id =
             book.create(project.clone(), "qwen", "Решение в чате", "Прочитать README").unwrap();
-        book.begin(id, 1, None, ts()).unwrap();
+        book.begin(id, 1, None, ts(), &hub_core::settings::AgentRoles::default()).unwrap();
         let snapshot = Snapshot {
             local: Some(crate::local_execution::Live {
                 token: uuid::Uuid::new_v4(),
@@ -3010,7 +3065,7 @@ mod tests {
         let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
         let mut book = hub_core::tasks::TaskBook::default();
         let id = book.create(project.clone(), "qwen", "Тема в работе", "Прочитать README").unwrap();
-        book.begin(id, 1, None, ts()).unwrap();
+        book.begin(id, 1, None, ts(), &hub_core::settings::AgentRoles::default()).unwrap();
         let mut running = topic(key);
         running.state = TopicState::Running;
         let snapshot = Snapshot {
@@ -3291,7 +3346,7 @@ mod tests {
         let mut book = hub_core::tasks::TaskBook::default();
         let id =
             book.create(project.clone(), "qwen", "Упавший запуск", "Прочитать README").unwrap();
-        book.begin(id, 1, None, ts()).unwrap();
+        book.begin(id, 1, None, ts(), &hub_core::settings::AgentRoles::default()).unwrap();
         book.finish(id, 1, RunState::Failed, ts()).unwrap();
         let snapshot = Snapshot {
             bot: BotStatus::Running { username: "bot".into() },
@@ -3322,7 +3377,8 @@ mod tests {
         let project = test_project();
         let mut book = hub_core::tasks::TaskBook::default();
         let id = book.create(project.clone(), "qwen", "Упавшая проверка", "Проверь").unwrap();
-        let run = book.begin(id, 1, None, ts()).unwrap();
+        let run =
+            book.begin(id, 1, None, ts(), &hub_core::settings::AgentRoles::default()).unwrap();
         book.record(id, run, "Ответ с упавшей проверкой").unwrap();
         book.finish(id, run, RunState::Completed, ts()).unwrap();
         let mut tasks = book.tasks().to_vec();

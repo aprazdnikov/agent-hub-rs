@@ -1,5 +1,6 @@
 #[cfg(test)]
 mod tests {
+    use hub_core::settings::AgentRoles;
     use hub_core::tasks::{
         RunState, TaskBook,
         service::{Access, TaskService, TaskStorage},
@@ -34,7 +35,11 @@ mod tests {
                 book.create(std::env::temp_dir(), "qwen", "Task", "Read")
             })
             .unwrap();
-        service.access(Access::Internal, |book, _| book.begin(id, 1, None, ts())).unwrap();
+        service
+            .access(Access::Internal, |book, _| {
+                book.begin(id, 1, None, ts(), &AgentRoles::default())
+            })
+            .unwrap();
         let other = service.clone();
         let writer = std::thread::spawn(move || {
             for n in 0..20 {

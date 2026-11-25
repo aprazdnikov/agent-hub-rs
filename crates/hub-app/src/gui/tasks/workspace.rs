@@ -984,8 +984,12 @@ impl TasksView {
         if self.selected_live(snapshot).is_some_and(|live| live.active) {
             self.local_panels(ui, snapshot, send);
         }
-        if let Some(plan) =
-            self.rules.saved.workflow.as_ref().filter(|p| p.implementer.name() == task.backend)
+        let roles = super::shared_roles(snapshot);
+        if let Some(plan) = self
+            .rules
+            .saved
+            .effective_workflow(&roles)
+            .filter(|plan| plan.implementer.name() == task.backend)
         {
             ui.label(format!(
                 "{} › {} › ревью {}",

@@ -73,6 +73,7 @@ impl Section {
             | Field::ApprovalTimeout
             | Field::BackgroundTimeout
             | Field::DefaultBackend
+            | Field::Role(_)
             | Field::Codex(_)
             | Field::Qwen(_)
             | Field::Hermes(_)
@@ -103,9 +104,10 @@ impl AgentPage {
             Field::Qwen(_) => Self::Backend(BackendKind::Qwen),
             Field::Hermes(_) => Self::Backend(BackendKind::Hermes),
             Field::Opencode(_) => Self::Backend(BackendKind::Opencode),
-            Field::ApprovalTimeout | Field::BackgroundTimeout | Field::DefaultBackend => {
-                Self::General
-            }
+            Field::ApprovalTimeout
+            | Field::BackgroundTimeout
+            | Field::DefaultBackend
+            | Field::Role(_) => Self::General,
             Field::Token
             | Field::Chat
             | Field::Users

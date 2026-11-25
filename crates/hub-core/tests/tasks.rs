@@ -1,4 +1,8 @@
-use hub_core::tasks::{Run, RunState, TaskBook};
+use hub_core::settings::AgentRoles;
+use hub_core::tasks::{
+    ProjectRules, Run, RunState, TaskBook,
+    workflow::{WorkflowChoice, WorkflowPreset},
+};
 use jiff::Timestamp;
 use std::path::PathBuf;
 
@@ -12,7 +16,7 @@ fn run_timestamps_are_injected_and_recovery_leaves_finish_empty() {
     let mut book = TaskBook::default();
     let id = book.create(std::env::temp_dir(), "qwen", "T", "Read").unwrap();
     let now = ts();
-    let run = book.begin(id, 1, None, now).unwrap();
+    let run = book.begin(id, 1, None, now, &AgentRoles::default()).unwrap();
     assert_eq!(book.get(id).unwrap().runs[0].started_at, Some(now));
     assert_eq!(book.get(id).unwrap().runs[0].finished_at, None);
     book.finish(id, run, RunState::Completed, now).unwrap();
@@ -23,7 +27,7 @@ fn run_timestamps_are_injected_and_recovery_leaves_finish_empty() {
 fn recover_does_not_stamp_finish_time() {
     let mut book = TaskBook::default();
     let id = book.create(std::env::temp_dir(), "qwen", "T", "Read").unwrap();
-    book.begin(id, 1, None, ts()).unwrap();
+    book.begin(id, 1, None, ts(), &AgentRoles::default()).unwrap();
     assert!(book.recover());
     assert_eq!(book.get(id).unwrap().runs[0].state, RunState::Interrupted);
     assert_eq!(book.get(id).unwrap().runs[0].finished_at, None);
@@ -46,17 +50,23 @@ fn explicit_runs_are_revision_checked_and_recovered_without_replay() {
     let b = book
         .create(std::env::temp_dir().join("project"), "codex", "Other", "Inspect tests")
         .unwrap();
-    let run = book.begin(a, 1, None, ts()).unwrap();
-    assert!(book.begin(a, 1, None, ts()).is_err());
-    assert!(book.begin(b, 1, None, ts()).is_err());
+    let run = book.begin(a, 1, None, ts(), &AgentRoles::default()).unwrap();
+    assert!(book.begin(a, 1, None, ts(), &AgentRoles::default()).is_err());
+    assert!(book.begin(b, 1, None, ts(), &AgentRoles::default()).is_err());
     let mut recovered = TaskBook::decode(&book.encode().unwrap()).unwrap();
     assert!(recovered.recover());
     let task = recovered.get(a).unwrap();
     assert_eq!(task.runs.last().unwrap().state, RunState::Interrupted);
     let revision = task.revision;
-    assert!(recovered.begin(a, revision, None, ts()).is_err());
+    assert!(recovered.begin(a, revision, None, ts(), &AgentRoles::default()).is_err());
     let second = recovered
-        .begin(a, revision, Some("Verify prior effects, then inspect tests"), ts())
+        .begin(
+            a,
+            revision,
+            Some("Verify prior effects, then inspect tests"),
+            ts(),
+            &AgentRoles::default(),
+        )
         .unwrap();
     assert_ne!(run, second);
     assert!(recovered.finish(a, run, RunState::Completed, ts()).is_err());
@@ -82,7 +92,13 @@ fn task_and_run_limits_refuse_without_truncating_or_losing_history() {
     for attempt in 0..32 {
         let revision = book.get(id).unwrap().revision;
         let run = book
-            .begin(id, revision, if attempt == 0 { None } else { Some("Next step") }, ts())
+            .begin(
+                id,
+                revision,
+                if attempt == 0 { None } else { Some("Next step") },
+                ts(),
+                &AgentRoles::default(),
+            )
             .unwrap();
         let oversized = "x".repeat(64 * 1024 + 1);
         assert!(book.record(id, run, &oversized).is_err());
@@ -90,7 +106,16 @@ fn task_and_run_limits_refuse_without_truncating_or_losing_history() {
         book.finish(id, run, RunState::Completed, ts()).unwrap();
     }
     let prior = book.encode().unwrap();
-    assert!(book.begin(id, book.get(id).unwrap().revision, Some("Another"), ts()).is_err());
+    assert!(
+        book.begin(
+            id,
+            book.get(id).unwrap().revision,
+            Some("Another"),
+            ts(),
+            &AgentRoles::default()
+        )
+        .is_err()
+    );
     assert_eq!(book.encode().unwrap(), prior);
     for _ in 1..100 {
         book.create(std::env::temp_dir(), "qwen", "Other", "Inspect").unwrap();
@@ -127,7 +152,7 @@ fn legacy_tasks_gain_review_state_without_losing_history() {
     use hub_core::tasks::TaskStatus;
     let mut book = TaskBook::default();
     let id = book.create(std::env::temp_dir(), "qwen", "Проверка", "Прочитать файл").unwrap();
-    let run = book.begin(id, 1, None, ts()).unwrap();
+    let run = book.begin(id, 1, None, ts(), &AgentRoles::default()).unwrap();
     book.record(id, run, "Полный результат").unwrap();
     book.finish(id, run, RunState::Completed, ts()).unwrap();
     let mut raw = serde_json::to_value(&book).unwrap();
@@ -147,19 +172,19 @@ fn acceptance_archive_and_reopen_are_explicit_revision_checked_actions() {
     let mut book = TaskBook::default();
     let id = book.create(std::env::temp_dir(), "qwen", "Task", "Read").unwrap();
     assert_eq!(book.get(id).unwrap().status, TaskStatus::Planned);
-    let run = book.begin(id, 1, None, ts()).unwrap();
+    let run = book.begin(id, 1, None, ts(), &AgentRoles::default()).unwrap();
     assert!(book.set_status(id, 2, TaskStatus::Accepted).is_err());
     assert!(book.set_archived(id, 2, true).is_err());
     book.finish(id, run, RunState::Completed, ts()).unwrap();
     assert_eq!(book.get(id).unwrap().status, TaskStatus::NeedsReview);
     assert!(book.set_status(id, 2, TaskStatus::Accepted).is_err());
     book.set_status(id, 3, TaskStatus::Accepted).unwrap();
-    assert!(book.begin(id, 4, Some("Next"), ts()).is_err());
+    assert!(book.begin(id, 4, Some("Next"), ts(), &AgentRoles::default()).is_err());
     book.set_status(id, 4, TaskStatus::Planned).unwrap();
     book.set_archived(id, 5, true).unwrap();
-    assert!(book.begin(id, 6, Some("Next"), ts()).is_err());
+    assert!(book.begin(id, 6, Some("Next"), ts(), &AgentRoles::default()).is_err());
     book.set_archived(id, 6, false).unwrap();
-    book.begin(id, 7, Some("Next"), ts()).unwrap();
+    book.begin(id, 7, Some("Next"), ts(), &AgentRoles::default()).unwrap();
     assert!(book.recover());
     assert_eq!(book.get(id).unwrap().status, TaskStatus::NeedsReview);
 }
@@ -213,7 +238,7 @@ fn explicit_null_status_is_corruption_not_a_legacy_default() {
 fn transfer_preserves_legacy_run_authorship_and_never_starts_a_model() {
     let mut book = TaskBook::default();
     let id = book.create(std::env::temp_dir(), "qwen", "Task", "Read").unwrap();
-    let run = book.begin(id, 1, None, ts()).unwrap();
+    let run = book.begin(id, 1, None, ts(), &AgentRoles::default()).unwrap();
     book.record(id, run, "Old answer").unwrap();
     book.finish(id, run, RunState::Completed, ts()).unwrap();
     let mut raw = serde_json::to_value(&book).unwrap();
@@ -227,7 +252,8 @@ fn transfer_preserves_legacy_run_authorship_and_never_starts_a_model() {
     assert_eq!(task.runs.len(), 1);
     assert_eq!(task.runs[0].backend.as_deref(), Some("qwen"));
     assert_eq!(task.runs[0].result, "Old answer");
-    let run = book.begin(id, 5, Some("Verify prior effects"), ts()).unwrap();
+    let run =
+        book.begin(id, 5, Some("Verify prior effects"), ts(), &AgentRoles::default()).unwrap();
     assert_eq!(book.get(id).unwrap().runs[1].backend.as_deref(), Some("hermes"));
     book.finish(id, run, RunState::Completed, ts()).unwrap();
     assert_eq!(TaskBook::decode(&book.encode().unwrap()).unwrap(), book);
@@ -242,7 +268,7 @@ fn transfer_requires_editable_task_current_revision_and_known_agent() {
     assert!(book.assign(id, 0, "codex").is_err());
     assert!(book.assign(id, 1, "invalid").is_err());
     assert_eq!(book, before);
-    book.begin(id, 1, None, ts()).unwrap();
+    book.begin(id, 1, None, ts(), &AgentRoles::default()).unwrap();
     assert!(book.assign(id, 2, "codex").is_err());
     book.finish(id, 1, RunState::Completed, ts()).unwrap();
     book.set_archived(id, 3, true).unwrap();
@@ -264,7 +290,7 @@ fn task_preview_is_read_only_and_preserves_multiline_step_and_previous_result() 
     let preview = book.get(id).unwrap().preview(None).unwrap();
     assert!(preview.contains("Read\n  code"));
     assert_eq!(book, before);
-    book.begin(id, 1, None, ts()).unwrap();
+    book.begin(id, 1, None, ts(), &AgentRoles::default()).unwrap();
     book.record(id, 1, "Answer\n  exact").unwrap();
     book.finish(id, 1, RunState::Completed, ts()).unwrap();
     let task = book.get(id).unwrap();
@@ -280,7 +306,7 @@ fn continuation_includes_recent_turns_in_order_and_keeps_large_latest_reply_inta
     let id = book.create(std::env::temp_dir(), "qwen", "Chat", "First").unwrap();
     for (next, result) in [(None, "One"), (Some("Second"), "Two"), (Some("Third"), "Three")] {
         let revision = book.get(id).unwrap().revision;
-        let run = book.begin(id, revision, next, ts()).unwrap();
+        let run = book.begin(id, revision, next, ts(), &AgentRoles::default()).unwrap();
         book.record(id, run, result).unwrap();
         book.finish(id, run, RunState::Completed, ts()).unwrap();
     }
@@ -289,12 +315,14 @@ fn continuation_includes_recent_turns_in_order_and_keeps_large_latest_reply_inta
     assert!(context.find("qwen: One").unwrap() < context.find("Пользователь: Second").unwrap());
     assert!(context.find("qwen: Two").unwrap() < context.find("Пользователь: Third").unwrap());
     let revision = task.revision;
-    let run = book.begin(id, revision, Some("Fourth"), ts()).unwrap();
+    let run = book.begin(id, revision, Some("Fourth"), ts(), &AgentRoles::default()).unwrap();
     let large = "я".repeat(32768);
     book.record(id, run, &large).unwrap();
     book.finish(id, run, RunState::Completed, ts()).unwrap();
     assert!(book.get(id).unwrap().preview(Some("Next")).unwrap().contains(&large));
-    let run = book.begin(id, book.get(id).unwrap().revision, Some("Fifth"), ts()).unwrap();
+    let run = book
+        .begin(id, book.get(id).unwrap().revision, Some("Fifth"), ts(), &AgentRoles::default())
+        .unwrap();
     book.record(id, run, "Five").unwrap();
     book.finish(id, run, RunState::Completed, ts()).unwrap();
     let context = book.get(id).unwrap().preview(Some("Next")).unwrap();
@@ -317,7 +345,7 @@ fn project_rules_are_revisioned_isolated_and_snapshotted_per_run() {
     let preview = book.get(id).unwrap().preview_with_rules(None, &book.rules(&project)).unwrap();
     assert!(preview.contains("Сначала обнови Dev"));
     assert!(preview.contains("редакция 1"));
-    let run = book.begin(id, 1, None, ts()).unwrap();
+    let run = book.begin(id, 1, None, ts(), &AgentRoles::default()).unwrap();
     book.set_rules(project.clone(), 1, false, "Новое правило").unwrap();
     assert_eq!(book.get(id).unwrap().runs[0].rules.as_ref().unwrap().text, "Сначала обнови Dev");
     book.finish(id, run, RunState::Completed, ts()).unwrap();
@@ -352,7 +380,7 @@ fn git_preparation_requires_durable_success_and_recovers_without_replay() {
     let mut rules = book.rules(&project);
     rules.git = Some(GitPolicy { remote: "origin".into(), base: "Dev".into() });
     book.configure_rules(project, 0, rules).unwrap();
-    assert!(book.begin(id, 1, None, ts()).is_err());
+    assert!(book.begin(id, 1, None, ts(), &AgentRoles::default()).is_err());
     book.prepare_git(id, 1, "feat/test").unwrap();
     assert!(book.get(id).unwrap().active());
     let mut recovered = TaskBook::decode(&book.encode().unwrap()).unwrap();
@@ -362,12 +390,12 @@ fn git_preparation_requires_durable_success_and_recovers_without_replay() {
         PreparationState::Interrupted
     );
     assert!(!recovered.recover());
-    assert!(recovered.begin(id, 3, None, ts()).is_err());
+    assert!(recovered.begin(id, 3, None, ts(), &AgentRoles::default()).is_err());
     book.finish_git(id, 2, Ok("a".repeat(40))).unwrap();
     assert_eq!(book.get(id).unwrap().revision, 3);
     assert!(book.finish_git(id, 2, Ok("b".repeat(40))).is_err());
     book.note_git(id, 3, "Выбрана другая ветка").unwrap();
-    book.begin(id, 4, None, ts()).unwrap();
+    book.begin(id, 4, None, ts(), &AgentRoles::default()).unwrap();
     assert!(book.get(id).unwrap().git.as_ref().unwrap().message.is_empty());
     assert!(book.prepare_git(id, 5, "feat/other").is_err());
     assert!(TaskBook::decode(&book.encode().unwrap()).is_ok());
@@ -461,9 +489,72 @@ fn editing_a_saved_prompt_checks_revision_and_keeps_the_first_run_immutable() {
     assert!(book.edit_prompt(id, 5, "В архиве").is_err());
     book.set_archived(id, 5, false).unwrap();
     let mut book = TaskBook::decode(&book.encode().unwrap()).unwrap();
-    let run = book.begin(id, 6, None, ts()).unwrap();
+    let run = book.begin(id, 6, None, ts(), &AgentRoles::default()).unwrap();
     assert_eq!(book.get(id).unwrap().runs[0].step, "Исправленное");
     book.finish(id, run, RunState::Completed, ts()).unwrap();
     assert!(book.edit_prompt(id, 8, "После запуска").is_err());
     assert_eq!(book.get(id).unwrap().prompt, "Исправленное");
+}
+
+#[test]
+fn begin_freezes_the_resolved_shared_roles_into_the_attempt() {
+    use hub_core::domain::BackendKind;
+    let mut book = TaskBook::default();
+    let project = std::env::temp_dir().join("agent-hub-roles-frozen");
+    let id = book.create(project.clone(), "hermes", "Правки", "Сделай").unwrap();
+    book.configure_rules(
+        project,
+        0,
+        ProjectRules {
+            revision: 0,
+            enabled: true,
+            text: "Правила".into(),
+            git: None,
+            workflow: Some(WorkflowChoice::Inherit { command: "cargo test".into() }),
+        },
+    )
+    .unwrap();
+    // The attempt starts while Hermes is the shared implementer.
+    let hermes = AgentRoles { implementer: BackendKind::Hermes, reviewer: BackendKind::Claude };
+    book.begin(id, 1, None, ts(), &hermes).unwrap();
+    let run = TaskBook::decode(&book.encode().unwrap()).unwrap().get(id).unwrap().runs[0].clone();
+    assert_eq!(
+        run.workflow,
+        Some(WorkflowPreset {
+            implementer: BackendKind::Hermes,
+            command: "cargo test".into(),
+            reviewer: BackendKind::Claude,
+        }),
+        "the resolution must survive the save round-trip"
+    );
+    // History is rendered from the frozen record even though settings moved on to Qwen:
+    // the renderer no longer takes roles at all.
+    let described = run.described_rules().unwrap();
+    assert!(described.contains("для hermes") && described.contains("ревью claude"), "{described}");
+    assert!(!described.contains("qwen"), "{described}");
+    assert_eq!(run.check_command(), Some("cargo test"));
+}
+
+#[test]
+fn a_workflowless_attempt_stays_byte_compatible_and_legacy_records_fall_back() {
+    let mut book = TaskBook::default();
+    let id = book
+        .create(std::env::temp_dir().join("agent-hub-roles-off"), "codex", "T", "Read")
+        .unwrap();
+    book.begin(id, 1, None, ts(), &AgentRoles::default()).unwrap();
+    let encoded = String::from_utf8(book.encode().unwrap()).unwrap();
+    assert!(
+        !encoded.contains(r#""workflow""#),
+        "an attempt without a check must not store the field"
+    );
+    assert_eq!(book.get(id).unwrap().runs[0].workflow, None);
+    assert_eq!(book.get(id).unwrap().runs[0].described_rules(), None);
+    // A record saved before the field existed still decodes; its inherited mode keeps
+    // the previous unresolved wording because no agents were frozen there.
+    let json = r#"{"id":1,"step":"s","state":"completed","result":"r","rules":{"revision":1,"enabled":false,"text":"x","workflow":{"command":"cargo test"}}}"#;
+    let run: Run = serde_json::from_str(json).unwrap();
+    assert_eq!(run.workflow, None);
+    let described = run.described_rules().unwrap();
+    assert!(described.contains("по общим ролям: cargo test"), "{described}");
+    assert_eq!(run.check_command(), Some("cargo test"));
 }
