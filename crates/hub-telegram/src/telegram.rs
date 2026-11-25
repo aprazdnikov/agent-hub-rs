@@ -514,18 +514,20 @@ impl Messenger for TelegramMessenger {
 
     fn probe_topic(&self, key: TopicKey) -> BoxFuture<'_, Result<bool, SendError>> {
         Box::pin(async move {
-            // The existence check must ride the same thread validation as a normal message send:
-            // the live contract (plan Step 2quater) proved `editForumTopic` answers success for a
-            // removed topic and `TOPIC_NOT_MODIFIED` for a live same-name one, so an edit can
-            // establish nothing. `sendChatAction(Typing)` validates the topic; its only visible
-            // effect is the transient "печатает…" on live topics.
-            match self
-                .topics
-                .send_chat_action(tg::ChatId(key.chat.0), ChatAction::Typing)
-                .message_thread_id(thread(key))
-                .await
-            {
-                Ok(_) => Ok(true),
+            // The live matrix (plan Step 2sexter, run 2026-11-25 against the owner's chat)
+            // disqualified both earlier candidates: `sendChatAction` and a no-field
+            // `editForumTopic` answer success for removed topics. `reopenForumTopic` is the
+            // one non-destructive call that validates the thread: a removed topic answers
+            // `TOPIC_ID_INVALID` (a confirmed gone marker), and an open live topic answers
+            // `TOPIC_NOT_MODIFIED` — an error that changes nothing and proves existence.
+            // Success means the topic was deliberately closed: the probe re-closes it so the
+            // user's state survives the sweep, and reports the topic alive.
+            match self.topics.reopen_forum_topic(tg::ChatId(key.chat.0), thread(key)).await {
+                Ok(_) => {
+                    let _ =
+                        self.topics.close_forum_topic(tg::ChatId(key.chat.0), thread(key)).await;
+                    Ok(true)
+                }
                 Err(RequestError::Api(err)) => {
                     // See `delete_topic`: the normalized description is the evidence the live
                     // contract probe records against the confirmed markers.
@@ -541,8 +543,14 @@ impl Messenger for TelegramMessenger {
                             Err(probe_uncertain())
                         }
                         GoneEvidence::Unrelated => {
-                            warn_unclassified_probe_error(&description, key);
-                            Err(probe_uncertain())
+                            if description.contains("topic not modified") {
+                                // Measured live: the reopen of an open thread is rejected
+                                // exactly this way — the thread exists, nothing changed.
+                                Ok(true)
+                            } else {
+                                warn_unclassified_probe_error(&description, key);
+                                Err(probe_uncertain())
+                            }
                         }
                     }
                 }
@@ -1014,47 +1022,71 @@ mod tests {
     }
 
     #[rstest::rstest]
-    #[case::exists(json!({"ok":true,"result":true}), Ok(true))]
-    #[case::missing(json!({"ok":false,"error_code":400,"description":"Bad Request: message thread not found"}), Ok(false))]
-    #[case::thread_not_found(json!({"ok":false,"error_code":400,"description":"Bad Request: THREAD_NOT_FOUND"}), Ok(false))]
+    #[case::exists(
+        json!({"ok":true,"result":true}),
+        Ok(true),
+        vec![
+            ("/bot1:test/reopenforumtopic", json!({"chat_id":-100,"message_thread_id":42})),
+            ("/bot1:test/closeforumtopic", json!({"chat_id":-100,"message_thread_id":42})),
+        ]
+    )]
+    // Measured live 2026-11-25: reopening an open thread answers TOPIC_NOT_MODIFIED — the
+    // rejection itself proves the topic exists.
+    #[case::alive_not_modified(
+        json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_NOT_MODIFIED"}),
+        Ok(true),
+        vec![("/bot1:test/reopenforumtopic", json!({"chat_id":-100,"message_thread_id":42}))]
+    )]
+    #[case::missing(
+        json!({"ok":false,"error_code":400,"description":"Bad Request: message thread not found"}),
+        Ok(false),
+        vec![("/bot1:test/reopenforumtopic", json!({"chat_id":-100,"message_thread_id":42}))]
+    )]
+    #[case::thread_not_found(
+        json!({"ok":false,"error_code":400,"description":"Bad Request: THREAD_NOT_FOUND"}),
+        Ok(false),
+        vec![("/bot1:test/reopenforumtopic", json!({"chat_id":-100,"message_thread_id":42}))]
+    )]
     // The live contract (plan Task 4, 2026-11-25) saw exactly this wording for a removed
     // topic via `deleteForumTopic`; the probe shares the thread validation, and its answer is
     // verified live by the owner run (plan Step 2bis).
     #[case::topic_id_invalid(
         json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_ID_INVALID"}),
-        Ok(false)
+        Ok(false),
+        vec![("/bot1:test/reopenforumtopic", json!({"chat_id":-100,"message_thread_id":42}))]
     )]
-    #[case::deleted(json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_DELETED"}), Ok(false))]
+    #[case::deleted(
+        json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_DELETED"}),
+        Ok(false),
+        vec![("/bot1:test/reopenforumtopic", json!({"chat_id":-100,"message_thread_id":42}))]
+    )]
     #[case::retry(
         json!({"ok":false,"error_code":429,"description":"Too Many Requests: retry after 2","parameters":{"retry_after":2}}),
-        Err(SendError::RetryAfter(Duration::from_secs(2)))
+        Err(SendError::RetryAfter(Duration::from_secs(2))),
+        vec![("/bot1:test/reopenforumtopic", json!({"chat_id":-100,"message_thread_id":42}))]
     )]
     #[case::rejected(
         json!({"ok":false,"error_code":400,"description":"Bad Request: CHAT_ADMIN_REQUIRED"}),
-        Err(SendError::Rejected("Проверьте, что бот — администратор с правом управлять темами.".to_owned()))
+        Err(SendError::Rejected("Проверьте, что бот — администратор с правом управлять темами.".to_owned())),
+        vec![("/bot1:test/reopenforumtopic", json!({"chat_id":-100,"message_thread_id":42}))]
     )]
     #[tokio::test]
     async fn topic_probe_pings_the_thread_and_maps_existence(
         #[case] response: serde_json::Value,
         #[case] expected: Result<bool, SendError>,
+        #[case] expected_calls: Vec<(&str, serde_json::Value)>,
     ) {
-        // The probe must use the send-validation path: the live contract (plan Step 2quater)
-        // proved `editForumTopic` answers success for removed topics, so only a send-shaped
-        // call (`sendChatAction`) can distinguish alive from gone with the existing needles.
+        // The probe must be `reopenForumTopic`: the live matrix (plan Step 2sexter) proved
+        // `sendChatAction` and a no-field `editForumTopic` answer success for removed topics,
+        // while reopen errors on them with a confirmed needle and changes nothing when alive.
         let (messenger, requests, server) = topic_api(response).await;
         let result =
             messenger.probe_topic(TopicKey { chat: ChatId(-100), thread: ThreadId(42) }).await;
         server.abort();
-        assert_eq!(
-            (result, requests.lock().unwrap().clone()),
-            (
-                expected,
-                vec![(
-                    "/bot1:test/sendchataction".to_owned(),
-                    json!({"chat_id":-100,"message_thread_id":42,"action":"typing"})
-                )]
-            )
-        );
+        let guard = requests.lock().unwrap();
+        let recorded =
+            guard.iter().map(|(path, body)| (path.as_str(), body.clone())).collect::<Vec<_>>();
+        assert_eq!((result, recorded), (expected, expected_calls));
     }
 
     #[tokio::test]
