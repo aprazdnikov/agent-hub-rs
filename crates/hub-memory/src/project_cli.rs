@@ -62,7 +62,7 @@ impl Options {
         let base = base.map_or_else(
             || {
                 directories::BaseDirs::new()
-                    .map(|dirs| dirs.home_dir().join(".agent-hub/memory"))
+                    .map(|dirs| crate::base_in(dirs.home_dir()))
                     .ok_or("Не найден домашний каталог")
             },
             |path| Ok(PathBuf::from(path)),

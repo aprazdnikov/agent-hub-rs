@@ -13,6 +13,7 @@ use std::{
 
 const REGISTRY: &str = ".projects";
 const MAX_REGISTRY: u64 = 1024 * 1024;
+const REGISTRY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
 pub enum BindingMode {
@@ -205,7 +206,9 @@ impl BindingPreview {
         let registry_directory = filesystem::Directory::create(&self.location.base, REGISTRY)?;
         #[cfg(unix)]
         registry_directory.sync_parent()?;
-        let _registry_lock = lock(&registry_directory)?;
+        // Same brief wait as `purge` uses: the two writers of `.projects` serialize on it
+        // and both publications are short.
+        let _registry_lock = registry_lock(&registry_directory)?;
         let source = self.location.store()?;
         let destination = Location::resolve(&self.location.base, &self.target)?;
         let target_id = portable::digest(path_text(&destination.identity)?.as_bytes());
@@ -271,7 +274,7 @@ pub fn purge(base: &Path, project: &Path, living: &[PathBuf]) -> Result<PurgeRep
     let registry_directory = filesystem::Directory::create(&base, REGISTRY)?;
     #[cfg(unix)]
     registry_directory.sync_parent()?;
-    let _registry_lock = lock(&registry_directory)?;
+    let _registry_lock = registry_lock(&registry_directory)?;
     let mut registry = Registry::read(&base)?;
     let project_text = path_text(&project)?;
     // A moved-away source is tombstoned `Some(None)`: it has no reachable identity, but
@@ -362,6 +365,22 @@ fn living_paths(living: &[PathBuf]) -> std::collections::BTreeSet<PathBuf> {
 fn is_living(living: &std::collections::BTreeSet<PathBuf>, path: &Path) -> bool {
     living.contains(path)
         || fs::canonicalize(path).is_ok_and(|canonical| living.contains(&canonical))
+}
+
+/// The registry publication is short (`apply` holds the lock only while it prepares and
+/// persists), so waiting briefly for it beats turning the whole cascade into a user retry.
+/// The data-directory lock is never waited on: a live MCP store holds it for the duration
+/// of the session.
+fn registry_lock(directory: &filesystem::Directory) -> Result<File, Error> {
+    let deadline = std::time::Instant::now() + REGISTRY_WAIT;
+    loop {
+        match lock(directory) {
+            Err(Error::Busy) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+            result => return result,
+        }
+    }
 }
 
 fn lock(directory: &filesystem::Directory) -> Result<File, Error> {

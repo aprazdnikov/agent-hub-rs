@@ -61,15 +61,15 @@ struct PendingDelete {
     typed: String,
 }
 
-/// Preview of the cascade size: tasks are stored under the canonical project path, so both
-/// candidate and canonical shapes are matched.
+/// Preview of the cascade size: matches exactly the shapes the supervisor will forget,
+/// so the modal counter and the completion summary cannot disagree.
 fn project_task_count(snapshot: &Snapshot, draft: &Draft, home: &Path, cwd: &str) -> usize {
     let root = hub_core::workspace::expand_home(&draft.workspace_root, home);
-    let path = hub_core::workspace::candidate(&root, home, Some(cwd));
-    let real = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
-    snapshot.task_index.as_ref().map_or(0, |rows| {
-        rows.iter().filter(|row| row.project == path || row.project == real).count()
-    })
+    let shapes = crate::supervisor::task_path_shapes(&root, home, cwd);
+    snapshot
+        .task_index
+        .as_ref()
+        .map_or(0, |rows| rows.iter().filter(|row| shapes.contains(&row.project)).count())
 }
 
 fn project_options(ui: &mut egui::Ui, project: &mut ProjectDraft) {
@@ -1090,7 +1090,7 @@ impl SettingsForm {
             ui.label(format!("· задачи и правила проекта (сейчас: {tasks});"));
             ui.label("· память проекта в хранилище хаба;");
             ui.label(format!("· привязка к темам (сейчас: {topics}) — сессии тем сохранятся."));
-            ui.label("Каталог проекта не удаляется.");
+            ui.label(format!("Каталог проекта {} не удаляется.", pending.cwd));
             ui.label("Темы в Telegram и файлы проекта остаются на месте.");
             ui.add_space(8.0);
             ui.horizontal(|ui| {
@@ -1240,7 +1240,7 @@ mod tests {
         click_label(&ctx, &mut form, "Удалить проект…", &mut commands);
         let output = render(&ctx, &mut form, egui::vec2(960.0, 900.0), Vec::new(), &mut commands);
         assert!(has_label(&output, "Удалить безвозвратно"), "modal must open on click");
-        assert!(has_label(&output, "Каталог проекта не удаляется."));
+        assert!(has_label(&output, "Каталог проекта /projects/alfa не удаляется."));
         assert!(commands.is_empty());
         // Without the typed name the destructive button stays inert.
         click_label(&ctx, &mut form, "Удалить безвозвратно", &mut commands);
