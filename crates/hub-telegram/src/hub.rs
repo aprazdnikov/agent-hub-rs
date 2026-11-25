@@ -6340,7 +6340,8 @@ mod tests {
         let before = world.store.tasks.lock().unwrap().encode().unwrap();
         let tasks =
             task_op(&world, KEY, tasks::Request::Attempt { id: task.id, run: 1 }).await.unwrap();
-        let text = tasks::describe_attempt(&tasks[0], 1).unwrap();
+        let text = tasks::describe_attempt(&tasks[0], 1, hub_core::settings::AgentRoles::default())
+            .unwrap();
         assert!(text.contains("First result") && !text.contains("Second result"));
         assert!(
             task_op(&world, KEY, tasks::Request::Attempt { id: task.id, run: 3 }).await.is_err()

@@ -15,6 +15,16 @@ impl WorkflowPreset {
     pub(super) fn validate(&self) -> Result<(), String> {
         validate_command(&self.command)
     }
+    /// One line naming the agents and the check this preset runs.
+    #[must_use]
+    pub(super) fn describe(&self) -> String {
+        format!(
+            "Исправить и проверить для {}: {} → ревью {}.",
+            self.implementer.name(),
+            self.command,
+            self.reviewer.name()
+        )
+    }
 }
 
 fn validate_command(command: &str) -> Result<(), String> {
@@ -161,6 +171,27 @@ mod tests {
                 reviewer: BackendKind::Hermes,
             }))
         );
+    }
+
+    #[test]
+    fn workflow_choice_describe_resolves_shared_roles() {
+        let rules = project(Some(WorkflowChoice::Inherit { command: "cargo test".into() }));
+        let shared = AgentRoles { implementer: BackendKind::Qwen, reviewer: BackendKind::Hermes };
+        let plain = rules.describe();
+        assert!(plain.contains("по общим ролям"), "{plain}");
+        assert!(plain.contains("cargo test"), "{plain}");
+        let resolved = rules.describe_with_roles(&shared);
+        assert!(resolved.contains("для qwen"), "{resolved}");
+        assert!(resolved.contains("ревью hermes"), "{resolved}");
+        let off = project(None);
+        assert!(!off.describe_with_roles(&shared).contains("Исправить и проверить"));
+        assert!(!off.describe().contains("Исправить и проверить"));
+        // A new shared role shows up in the report without re-saving the project rules.
+        let moved = rules.describe_with_roles(&AgentRoles {
+            implementer: BackendKind::Opencode,
+            reviewer: BackendKind::Claude,
+        });
+        assert!(moved.contains("для opencode") && moved.contains("ревью claude"), "{moved}");
     }
 
     #[test]

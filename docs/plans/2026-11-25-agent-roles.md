@@ -170,15 +170,15 @@
   отдельный `describe_with_roles`)
 - Test: `local_execution/tests.rs` (паттерн `ScriptedWorkflow:408+`), `hub.rs` tests
 
-- [ ] **Step 1: RED** — тест: проект `Inherit{command}` + `ExecutionSettings.roles = {Qwen,
+- [x] **Step 1: RED** — тест: проект `Inherit{command}` + `ExecutionSettings.roles = {Qwen,
   Hermes}` → запускается verify с исполнителем Qwen (backend сессии Qwen) и ревьюером Hermes;
   тот же проект с `Off` → verify нет; `Custom{implementer=Codex,...}` при сессии Codex →
   прежний фильтр сработал; глобальные роли не включают workflow у проекта `Off`.
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-app --lib inherit` → FAIL.
-- [ ] **Step 3: Implement** — во всех точках `rules.workflow` → `effective_workflow(&settings.roles)`;
+- [x] **Step 2: Verify RED** — `cargo test -p hub-app --lib inherit` → FAIL.
+- [x] **Step 3: Implement** — во всех точках `rules.workflow` → `effective_workflow(&settings.roles)`;
   в telegram-хьюке роли берутся из watch-канала настроек (`self.settings`).
-- [ ] **Step 4: GREEN** — `cargo test -p hub-app -p hub-telegram --locked` → PASS.
-- [ ] **Step 5: Commit** — `feat(app,telegram): исполнение учитывает общие роли агентов`
+- [x] **Step 4: GREEN** — `cargo test -p hub-app -p hub-telegram --locked` → PASS.
+- [x] **Step 5: Commit** — `feat(app,telegram): исполнение учитывает общие роли агентов`
 
 ---
 

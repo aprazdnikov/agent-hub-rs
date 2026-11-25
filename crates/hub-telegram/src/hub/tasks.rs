@@ -8,6 +8,7 @@ use hub_core::tasks::service::Access;
 use hub_core::{
     domain::{BackendKind, Prompt, TopicSession},
     questions::Button,
+    settings::AgentRoles,
     tasks::{ProjectRules, RunState, Task, TaskBook, TaskFilter, TaskStatus},
 };
 use jiff::Timestamp;
@@ -384,16 +385,16 @@ pub fn describe(task: &Task) -> String {
         task.revision
     )
 }
-pub fn describe_attempt(task: &Task, run: u32) -> Result<String, String> {
+pub fn describe_attempt(task: &Task, run: u32, roles: AgentRoles) -> Result<String, String> {
     let attempt = task.runs.iter().find(|attempt| attempt.id == run).ok_or("Попытка не найдена")?;
     let result = if attempt.result.is_empty() {
         "Сохранённого текста результата нет"
     } else {
         &attempt.result
     };
-    let rules = attempt.rules.as_ref().map_or(
+    let described = attempt.rules.as_ref().map_or(
         "Редакция правил не сохранена (старый запуск или правила ещё не задавались)".into(),
-        ProjectRules::describe,
+        |rules| rules.describe_with_roles(&roles),
     );
     let report = attempt.workflow_report.describe();
     let changes = if attempt.diff.is_empty() {
@@ -402,7 +403,7 @@ pub fn describe_attempt(task: &Task, run: u32) -> Result<String, String> {
         format!("\nИзменения:\n{}", attempt.diff)
     };
     Ok(format!(
-        "Задача #{} · попытка {} · {} · {}\nШаг:\n{}\nРезультат:\n{}\n{}\n{rules}\n{report}{changes}",
+        "Задача #{} · попытка {} · {} · {}\nШаг:\n{}\nРезультат:\n{}\n{}\n{described}\n{report}{changes}",
         task.id,
         run,
         attempt.state.label(),
@@ -479,7 +480,7 @@ impl<A: Agents> Hub<A> {
         {
             self.shared_command(key, user, &format!("follow {id}"));
         }
-        let text = render_reply(request, result);
+        let text = render_reply(request, result, self.settings.borrow().roles);
         self.task_deliveries.send(
             key,
             user,
@@ -792,7 +793,11 @@ impl Drop for Deliveries {
     }
 }
 
-fn render_reply(request: Result<Request, String>, result: Result<Snapshot, String>) -> String {
+fn render_reply(
+    request: Result<Request, String>,
+    result: Result<Snapshot, String>,
+    roles: AgentRoles,
+) -> String {
     match result {
         Ok(_) if matches!(request, Ok(Request::CancelGit)) => {
             "Остановка Git запрошена. Дождитесь результата и проверьте репозиторий.".into()
@@ -805,7 +810,7 @@ fn render_reply(request: Result<Request, String>, result: Result<Snapshot, Strin
         {
             format!(
                 "{}\n\nСохранённый текст:\n{}\n\nТекст правил передаётся агенту как инструкции; подготовка Git включается отдельно.",
-                rules.describe(),
+                rules.describe_with_roles(&roles),
                 rules.text
             )
         }
@@ -844,7 +849,7 @@ fn render_reply(request: Result<Request, String>, result: Result<Snapshot, Strin
             tasks
                 .first()
                 .ok_or_else(|| "Задача не найдена".to_owned())
-                .and_then(|task| describe_attempt(task, run))
+                .and_then(|task| describe_attempt(task, run, roles))
                 .unwrap_or_else(|error| format!("Задачи: {error}"))
         }
         Ok(Snapshot { tasks, rules, .. }) if matches!(request, Ok(Request::Preview { .. })) => {
@@ -885,13 +890,62 @@ mod tests {
         service
             .access(Access::Edit, |book, _| book.set_rules(project.clone(), 1, true, "New rules"))
             .unwrap();
-        let text = render_reply(Ok(Request::Rules), Ok(snapshot));
+        let text = render_reply(Ok(Request::Rules), Ok(snapshot), AgentRoles::default());
         assert!(text.contains("Captured rules"));
         assert!(!text.contains("New rules"));
-        let error = render_reply(Ok(Request::Rules), Err("storage unavailable".into()));
+        let error = render_reply(
+            Ok(Request::Rules),
+            Err("storage unavailable".into()),
+            AgentRoles::default(),
+        );
         assert!(error.contains("storage unavailable"));
         assert!(!error.contains("Сохранённый текст"));
     }
+    #[test]
+    fn inherit_roles_rules_reply_names_the_shared_agents() {
+        use super::*;
+        use hub_core::settings::AgentRoles;
+        use hub_core::tasks::service::{Access, TaskService, TaskStorage};
+        use hub_core::tasks::workflow::WorkflowChoice;
+        struct Store;
+        impl TaskStorage for Store {
+            fn load_tasks(&mut self) -> Result<TaskBook, String> {
+                Ok(TaskBook::default())
+            }
+            fn save_tasks(&mut self, _: &TaskBook) -> Result<(), String> {
+                Ok(())
+            }
+        }
+        let service = TaskService::new(Box::new(Store));
+        let project = std::env::temp_dir();
+        let inherited = ProjectRules {
+            revision: 0,
+            enabled: true,
+            text: "Правила".into(),
+            git: None,
+            workflow: Some(WorkflowChoice::Inherit { command: "cargo test".into() }),
+        };
+        service
+            .access(Access::Edit, |book, _| {
+                book.configure_rules(project.clone(), 0, inherited.clone())
+            })
+            .unwrap();
+        let roles = AgentRoles { implementer: BackendKind::Qwen, reviewer: BackendKind::Hermes };
+        let snapshot =
+            manage::manage(&service, &project, BackendKind::Qwen, Request::Rules).unwrap();
+        let text = render_reply(Ok(Request::Rules), Ok(snapshot), roles);
+        assert!(text.contains("для qwen"), "{text}");
+        assert!(text.contains("ревью hermes"), "{text}");
+        let off = ProjectRules { revision: 1, workflow: None, ..inherited.clone() };
+        service
+            .access(Access::Edit, |book, _| book.configure_rules(project.clone(), 1, off))
+            .unwrap();
+        let snapshot =
+            manage::manage(&service, &project, BackendKind::Qwen, Request::Rules).unwrap();
+        let text = render_reply(Ok(Request::Rules), Ok(snapshot), roles);
+        assert!(!text.contains("Исправить"), "{text}");
+    }
+
     #[test]
     fn preview_parts_are_numbered_without_losing_prompt_text() {
         let text = "Полный контекст 😀\n".repeat(700);

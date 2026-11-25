@@ -1,5 +1,6 @@
 //! Durable task state. Starting a model is deliberately outside this module.
 use crate::domain::BackendKind;
+use crate::settings::AgentRoles;
 pub mod git;
 pub mod queue;
 pub mod workflow;
@@ -38,8 +39,8 @@ impl ProjectRules {
         }
         Ok(())
     }
-    #[must_use]
-    pub fn describe(&self) -> String {
+    /// The rules header every description shares, plus the workflow line when there is one.
+    fn described(&self, workflow: Option<&str>) -> String {
         let text = if self.enabled {
             format!("Правила проекта · редакция {} (включены):\n{}", self.revision, self.text)
         } else {
@@ -51,17 +52,24 @@ impl ProjectRules {
             .map_or("Подготовка Git выключена".to_owned(), |policy| {
                 format!("Подготовка Git обязательна: {}/{}", policy.remote, policy.base)
             });
+        workflow.map_or_else(|| format!("{text}\n{git}"), |plan| format!("{text}\n{git}\n{plan}"))
+    }
+    #[must_use]
+    pub fn describe(&self) -> String {
         match &self.workflow {
-            Some(workflow::WorkflowChoice::Custom(plan)) => format!(
-                "{text}\n{git}\nИсправить и проверить для {}: {} → ревью {}.",
-                plan.implementer.name(),
-                plan.command,
-                plan.reviewer.name()
-            ),
+            Some(workflow::WorkflowChoice::Custom(plan)) => self.described(Some(&plan.describe())),
             Some(workflow::WorkflowChoice::Inherit { command }) => {
-                format!("{text}\n{git}\nИсправить и проверить по общим ролям: {command}.")
+                self.described(Some(&format!("Исправить и проверить по общим ролям: {command}.")))
             }
-            None => format!("{text}\n{git}"),
+            None => self.described(None),
+        }
+    }
+    /// The same description for a reader: the inherited mode already resolved to its agents.
+    #[must_use]
+    pub fn describe_with_roles(&self, roles: &AgentRoles) -> String {
+        match self.effective_workflow(roles) {
+            Some(plan) => self.described(Some(&plan.describe())),
+            None => self.described(None),
         }
     }
 }
