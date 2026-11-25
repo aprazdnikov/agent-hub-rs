@@ -31,6 +31,17 @@ pub struct SyncDone {
     reply: oneshot::Sender<Result<String, String>>,
 }
 
+/// Which half of a proven-gone cleanup failed. The halves write different files, and a silently
+/// failed detach leaves bound `origin`s pointing at rows no later walk reaches — the exact
+/// orphan the synchronization exists to eliminate — so callers must branch on this.
+enum CleanupError {
+    /// The `topics.json` half could not be written; the row keeps its `deleted` marker for the
+    /// disk retry.
+    Disk(String),
+    /// The task store refused the detach; nothing was cleaned, so the retry runs both halves.
+    Queue(String),
+}
+
 /// Renders the synchronization report from the category counts.
 ///
 /// Two single-purpose messages stay terse; anything mixed lists only the non-empty categories.
@@ -96,7 +107,13 @@ impl<A: Agents> Hub<A> {
         // including the queue detach, idempotent and 0 when nothing is bound. Cleaning only
         // the rows would leave a bound orphan `origin` that no later sync can reach.
         if self.deleted.contains(&key) {
-            let _ = reply.send(self.clean_proven_gone(key).map(|_| ()));
+            let answer = self.clean_proven_gone(key).map(|_| ()).map_err(|error| match error {
+                CleanupError::Disk(message) => message,
+                CleanupError::Queue(error) => format!(
+                    "Тема удалена в Telegram. Не удалось открепить очередь задач: {error}. Повторите удаление для завершения очистки."
+                ),
+            });
+            let _ = reply.send(answer);
             return;
         }
         if let Err(error) = self.check_deletion(key) {
@@ -219,19 +236,19 @@ impl<A: Agents> Hub<A> {
         Ok(())
     }
 
-    /// Finish a topic Telegram already proved missing: durable disk cleanup plus queue detach.
-    /// Only the queue origin changes; task status is preserved. A detach error warns but never
-    /// rolls back the already-durable removal.
-    fn clean_proven_gone(&mut self, key: TopicKey) -> Result<usize, String> {
-        self.clean_deleted_topic(key)?;
+    /// Finish a topic Telegram already proved missing: durable queue detach first, then the
+    /// disk rows. Only the queue origin changes; task status is preserved. The two writes are
+    /// not one atomic operation, and this order makes the crash window recoverable: the
+    /// surviving marked row is already unbound, so the next sync's detach returns 0 and the
+    /// cleanup finishes. A failed detach aborts before touching the disk — dropping the rows
+    /// with the queue still bound would strand the orphan outside every later walk.
+    fn clean_proven_gone(&mut self, key: TopicKey) -> Result<usize, CleanupError> {
         let origin = Origin { chat: key.chat.0, thread: key.thread.0, user: None };
         let detached = self
             .tasks
             .access(Access::Edit, |book, _| Ok(book.detach_topic_queue(&origin)))
-            .unwrap_or_else(|error| {
-                tracing::warn!(topic = ?key, %error, "synced topic queue could not be detached");
-                0
-            });
+            .map_err(CleanupError::Queue)?;
+        self.clean_deleted_topic(key).map_err(CleanupError::Disk)?;
         Ok(detached)
     }
 }
@@ -344,6 +361,7 @@ impl<A: Agents> Hub<A> {
     pub(super) fn finish_sync(&mut self, done: SyncDone) {
         let mut removed = 0;
         let mut failed = 0;
+        let mut queue_failed = 0;
         let mut detached = 0;
         let mut skipped = 0;
         // Retry the cleanups a previous disk failure left on disk. These keys keep the `deleted`
@@ -359,9 +377,13 @@ impl<A: Agents> Hub<A> {
                     removed += 1;
                     detached += count;
                 }
-                Err(error) => {
+                Err(CleanupError::Disk(error)) => {
                     failed += 1;
                     tracing::warn!(topic = ?key, %error, "synced topic could not be cleaned on disk");
+                }
+                Err(CleanupError::Queue(error)) => {
+                    queue_failed += 1;
+                    tracing::warn!(topic = ?key, %error, "synced topic queue could not be detached");
                 }
             }
         }
@@ -393,29 +415,43 @@ impl<A: Agents> Hub<A> {
                     removed += 1;
                     detached += count;
                 }
-                Err(error) => {
+                Err(CleanupError::Disk(error)) => {
                     failed += 1;
                     tracing::warn!(topic = ?key, %error, "synced topic could not be cleaned on disk");
                 }
+                Err(CleanupError::Queue(error)) => {
+                    queue_failed += 1;
+                    tracing::warn!(topic = ?key, %error, "synced topic queue could not be detached");
+                }
             }
         }
-        // A stale topic left on disk is not "all topics are current"; report the failure the
-        // way deletion does: what broke and how to retry.
-        let disk_failure = (failed > 0).then(|| {
-            format!("Не удалось очистить {failed} тем на диске — повторите синхронизацию.")
-        });
-        let result = match (done.retry_after, disk_failure) {
-            (Some(retry_after), disk_failure) => {
+        // A stale topic or a still-bound queue left on disk is not "all topics are current";
+        // report each failed half the way deletion does: what broke and how to retry. Both
+        // halves stay retryable — the row keeps its `deleted` marker and detach is idempotent.
+        let mut failures = Vec::new();
+        if failed > 0 {
+            failures.push(format!(
+                "Не удалось очистить {failed} тем на диске — повторите синхронизацию."
+            ));
+        }
+        if queue_failed > 0 {
+            failures.push(format!(
+                "Не удалось открепить очередь задач {queue_failed} тем — повторите синхронизацию."
+            ));
+        }
+        let failures = (!failures.is_empty()).then(|| failures.join(" "));
+        let result = match (done.retry_after, failures) {
+            (Some(retry_after), failures) => {
                 let error = SendError::RetryAfter(retry_after);
                 let message = format!("{error}, повторите позже");
-                Err(match disk_failure {
-                    Some(disk_failure) => format!("{message}. {disk_failure}"),
+                Err(match failures {
+                    Some(failures) => format!("{message}. {failures}"),
                     None => message,
                 })
             }
-            (None, Some(disk_failure)) => Err(match removed {
-                0 => disk_failure,
-                removed => format!("Удалено устаревших тем: {removed}. {disk_failure}"),
+            (None, Some(failures)) => Err(match removed {
+                0 => failures,
+                removed => format!("Удалено устаревших тем: {removed}. {failures}"),
             }),
             // Topics that turned busy or unavailable after their probe join the pre-walk
             // busy count: both are deferrals the user has to see.

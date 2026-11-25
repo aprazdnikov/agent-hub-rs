@@ -2286,6 +2286,9 @@ mod tests {
         recent: Arc<StdMutex<RecentProjects>>,
         fail_recent: Arc<AtomicBool>,
         fail: Arc<AtomicBool>,
+        /// Fails only the topic-side files (`topics.json`, titles), leaving the task store
+        /// writable — the crash window between queue detach and row cleanup.
+        fail_topics: Arc<AtomicBool>,
     }
 
     impl MemoryStore {
@@ -2317,14 +2320,14 @@ mod tests {
         }
 
         fn save_titles(&mut self, titles: &Titles) -> Result<(), String> {
-            if self.fail.load(Ordering::SeqCst) {
+            if self.fail.load(Ordering::SeqCst) || self.fail_topics.load(Ordering::SeqCst) {
                 return Err("диск полон".to_owned());
             }
             *self.titles.lock().unwrap() = titles.clone();
             Ok(())
         }
         fn save(&mut self, topics: &Topics) -> Result<(), String> {
-            if self.fail.load(Ordering::SeqCst) {
+            if self.fail.load(Ordering::SeqCst) || self.fail_topics.load(Ordering::SeqCst) {
                 return Err("диск полон".to_owned());
             }
             self.saved.lock().unwrap().push(topics.clone());
@@ -2889,13 +2892,13 @@ mod tests {
                 Ok(id)
             })
             .unwrap();
-        // A sync that proved the topic gone but failed on disk leaves exactly the dead-end
-        // state the Delete button is expected to finish: `deleted` marker, stored row and a
-        // queue still bound to the removed topic.
-        world.store.fail.store(true, Ordering::SeqCst);
+        // A refused detach (Git preparation holds the task store) aborts the cleanup and leaves
+        // exactly the dead-end state the Delete button is expected to finish: `deleted` marker,
+        // stored row and a queue still bound to the removed topic.
+        let lease = world.tasks.reserve().unwrap();
         *world.messenger.probes.lock().unwrap() = Some(Ok(false));
         assert!(sync(&world).await.is_err());
-        world.store.fail.store(false, Ordering::SeqCst);
+        drop(lease);
         // «Удалить» on a marker must run the same idempotent cleanup as the sync retry, queue
         // detach included: the row alone leaves a bound orphan `origin` that no path reaches
         // again — `pending` walks only stored rows, the later task result goes to a dead thread.
@@ -2905,6 +2908,101 @@ mod tests {
         assert!(book.get(id).unwrap().queue.is_some());
         assert_eq!(book.get(id).unwrap().queue.as_ref().unwrap().origin, None);
         assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны.");
+    }
+
+    #[tokio::test]
+    async fn sync_detaches_queue_before_disk_cleanup() {
+        use hub_core::tasks::{queue::Origin, service::Access};
+        let world = world(FakeAgents::default());
+        world
+            .send(inbound(
+                Some(7),
+                1,
+                Content::TopicCreated { name: "Удалённая с очередью".into() },
+            ))
+            .await;
+        let id = world
+            .tasks
+            .access(Access::Edit, |book, _| {
+                let id =
+                    book.create(world.root.path().to_owned(), "claude", "Задача", "Проверь")?;
+                book.enqueue(
+                    id,
+                    book.get(id)?.revision,
+                    None,
+                    false,
+                    Some(Origin { chat: KEY.chat.0, thread: KEY.thread.0, user: Some(1) }),
+                )?;
+                Ok(id)
+            })
+            .unwrap();
+        // The first sync round trip is the barrier: the topic row reached the "disk".
+        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны.");
+        // Crash between the two durable writes of `clean_proven_gone`: the task store is
+        // writable, `topics.json` is not. Only the detach-first order leaves the surviving row
+        // already unbound, so the next sync can finish what the crash interrupted; the reverse
+        // order recreates the bound orphan the whole feature exists to eliminate.
+        world.store.fail_topics.store(true, Ordering::SeqCst);
+        *world.messenger.probes.lock().unwrap() = Some(Ok(false));
+        let error = sync(&world).await.unwrap_err();
+        assert!(error.contains("Не удалось очистить 1 тем на диске"), "got: {error}");
+        assert!(world.store.last().unwrap().contains_key(&KEY));
+        let book = world.tasks.read().unwrap();
+        assert_eq!(book.get(id).unwrap().queue.as_ref().unwrap().origin, None);
+        drop(book);
+        world.store.fail_topics.store(false, Ordering::SeqCst);
+        assert_eq!(sync(&world).await.unwrap(), "Удалено устаревших тем: 1.");
+        assert!(!world.store.last().unwrap().contains_key(&KEY));
+        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны.");
+    }
+
+    #[tokio::test]
+    async fn sync_reports_queue_detach_failure() {
+        use hub_core::tasks::{queue::Origin, service::Access};
+        let world = world(FakeAgents::default());
+        world
+            .send(inbound(
+                Some(7),
+                1,
+                Content::TopicCreated { name: "Удалённая с очередью".into() },
+            ))
+            .await;
+        let id = world
+            .tasks
+            .access(Access::Edit, |book, _| {
+                let id =
+                    book.create(world.root.path().to_owned(), "claude", "Задача", "Проверь")?;
+                book.enqueue(
+                    id,
+                    book.get(id)?.revision,
+                    None,
+                    false,
+                    Some(Origin { chat: KEY.chat.0, thread: KEY.thread.0, user: Some(1) }),
+                )?;
+                Ok(id)
+            })
+            .unwrap();
+        // The first sync round trip is the barrier: the topic row reached the "disk".
+        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны.");
+        // Git preparation holds the task store, so every Edit access — including the detach —
+        // is refused while the lease lives.
+        let lease = world.tasks.reserve().unwrap();
+        *world.messenger.probes.lock().unwrap() = Some(Ok(false));
+        let error = sync(&world).await.unwrap_err();
+        // The refusal is reported as its own category, not swallowed into `Ok(0)`: the topic
+        // is not counted as removed, the row keeps its `deleted` marker and its bound origin
+        // survives, so «повторите синхронизацию» is the real recovery instruction.
+        assert!(
+            error.contains("Не удалось открепить очередь задач 1 тем — повторите синхронизацию"),
+            "got: {error}"
+        );
+        assert!(!error.contains("Удалено"), "got: {error}");
+        assert!(!error.contains("Задач откреплено"), "got: {error}");
+        assert!(world.store.last().unwrap().contains_key(&KEY));
+        drop(lease);
+        assert_eq!(sync(&world).await.unwrap(), "Удалено устаревших тем: 1. Задач откреплено: 1");
+        let book = world.tasks.read().unwrap();
+        assert_eq!(book.get(id).unwrap().queue.as_ref().unwrap().origin, None);
     }
 
     #[tokio::test]
