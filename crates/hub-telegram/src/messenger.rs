@@ -86,9 +86,12 @@ pub enum SendError {
 
 pub trait Messenger: Send + Sync {
     fn delete_topic(&self, key: TopicKey) -> BoxFuture<'_, Result<(), SendError>>;
-    /// Checks whether the topic still exists remotely. `Ok(false)` means Telegram reports the
-    /// thread missing; `Err` means the answer is unknown and the topic must not be dropped.
-    fn probe_topic(&self, key: TopicKey) -> BoxFuture<'_, Result<bool, SendError>>;
+    /// Checks whether the topic still exists remotely. The probe is an `editForumTopic` with the
+    /// hub's stored title — invisible when the title matches Telegram (the hub tracks renames
+    /// through service messages) and never sent when the title is empty. `Ok(false)` means
+    /// Telegram reports the thread missing; `Err` means the answer is unknown and the topic
+    /// must not be dropped.
+    fn probe_topic(&self, key: TopicKey, name: &str) -> BoxFuture<'_, Result<bool, SendError>>;
     /// Creates one forum topic without automatic retries. An uncertain result may leave a topic.
     fn create_topic(
         &self,

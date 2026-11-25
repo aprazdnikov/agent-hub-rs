@@ -338,6 +338,9 @@ impl<A: Agents> Hub<A> {
         let mailbox = self.mailbox.clone();
         let settings = self.settings.clone();
         let identity = self.telegram_identity.clone();
+        // The probe edits with the stored title, so the walk carries a snapshot; renames during
+        // the walk only make the next sync re-probe with the newer title.
+        let titles = self.titles.clone();
         tokio::spawn(async move {
             let mut stale = Vec::new();
             let mut alive = 0;
@@ -352,7 +355,8 @@ impl<A: Agents> Hub<A> {
                         .send(Err("Настройки Telegram изменились. Обновите список тем.".into()));
                     return;
                 }
-                match sender.messenger().probe_topic(key).await {
+                let name = titles.get(&key).map_or("", String::as_str);
+                match sender.messenger().probe_topic(key, name).await {
                     Ok(false) => stale.push(key),
                     Ok(true) => alive += 1,
                     // An uncertain answer must not drop local state: skip the topic and
