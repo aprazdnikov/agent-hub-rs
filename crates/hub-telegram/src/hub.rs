@@ -2864,6 +2864,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_button_on_gone_marker_detaches_queue() {
+        use hub_core::tasks::{queue::Origin, service::Access};
+        let world = world(FakeAgents::default());
+        world
+            .send(inbound(
+                Some(7),
+                1,
+                Content::TopicCreated { name: "Удалённая с очередью".into() },
+            ))
+            .await;
+        let id = world
+            .tasks
+            .access(Access::Edit, |book, _| {
+                let id =
+                    book.create(world.root.path().to_owned(), "claude", "Задача", "Проверь")?;
+                book.enqueue(
+                    id,
+                    book.get(id)?.revision,
+                    None,
+                    false,
+                    Some(Origin { chat: KEY.chat.0, thread: KEY.thread.0, user: Some(1) }),
+                )?;
+                Ok(id)
+            })
+            .unwrap();
+        // A sync that proved the topic gone but failed on disk leaves exactly the dead-end
+        // state the Delete button is expected to finish: `deleted` marker, stored row and a
+        // queue still bound to the removed topic.
+        world.store.fail.store(true, Ordering::SeqCst);
+        *world.messenger.probes.lock().unwrap() = Some(Ok(false));
+        assert!(sync(&world).await.is_err());
+        world.store.fail.store(false, Ordering::SeqCst);
+        // «Удалить» on a marker must run the same idempotent cleanup as the sync retry, queue
+        // detach included: the row alone leaves a bound orphan `origin` that no path reaches
+        // again — `pending` walks only stored rows, the later task result goes to a dead thread.
+        delete_topic(&world, KEY).await.unwrap();
+        assert!(!world.store.last().unwrap().contains_key(&KEY));
+        let book = world.tasks.read().unwrap();
+        assert!(book.get(id).unwrap().queue.is_some());
+        assert_eq!(book.get(id).unwrap().queue.as_ref().unwrap().origin, None);
+        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны.");
+    }
+
+    #[tokio::test]
     async fn sync_removes_stale_topics_and_keeps_live() {
         let world = world(FakeAgents::default());
         world.send(inbound(Some(7), 1, Content::TopicCreated { name: "Старая".into() })).await;

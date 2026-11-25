@@ -92,8 +92,11 @@ impl<A: Agents> Hub<A> {
             let _ = reply.send(Err("Удаление недоступно: выберите обычную тему настроенной группы при работающем боте.".into()));
             return;
         }
+        // A marked row was already proved gone; the button finishes the sync cleanup —
+        // including the queue detach, idempotent and 0 when nothing is bound. Cleaning only
+        // the rows would leave a bound orphan `origin` that no later sync can reach.
         if self.deleted.contains(&key) {
-            let _ = reply.send(self.clean_deleted_topic(key));
+            let _ = reply.send(self.clean_proven_gone(key).map(|_| ()));
             return;
         }
         if let Err(error) = self.check_deletion(key) {
