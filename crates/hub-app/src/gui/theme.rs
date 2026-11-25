@@ -304,8 +304,10 @@ mod tests {
         // covered, and the removed ones must stay uncovered (so they are never reintroduced).
         let ctx = egui::Context::default();
         configure(&ctx);
-        let used =
-            ['…', '›', '‹', '√', '⏵', '⏹', '!', '?', '·', '№', '⌘', '«', '»', '–', '—', '•', '○'];
+        let used = [
+            '…', '›', '‹', '√', '⏵', '⏹', '!', '?', '·', '№', '⌘', '«', '»', '–', '—', '•', '○',
+            '„', '“',
+        ];
         // '●' was tried for the topics icon plate and found uncovered; the plate uses '•'.
         let removed = ['⚠', '✓', '→', '←', '⋯', '▶', '●'];
         let drawn: String = used.iter().copied().collect();

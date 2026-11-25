@@ -151,12 +151,12 @@
 - Modify: `crates/hub-app/src/gui/settings.rs` (`agent():688-700`, Draft-поля, `page()` `:343`)
 - Test: там же `mod tests`
 
-- [ ] **Step 1: RED** — render-тест: на странице «Агенты → Общие» есть два комбобокса ролей;
+- [x] **Step 1: RED** — render-тест: на странице «Агенты → Общие» есть два комбобокса ролей;
   смена значения помечает черновик грязным и попадает в `Command::Save`.
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-app --lib roles_section` → FAIL.
-- [ ] **Step 3: Implement** — по образцу блока «Новые темы» (`field_row` + `ComboBox`).
-- [ ] **Step 4: GREEN** — `cargo test -p hub-app --locked` → PASS.
-- [ ] **Step 5: Commit** — `feat(gui): общие роли исполнителя и ревьюера`
+- [x] **Step 2: Verify RED** — `cargo test -p hub-app --lib roles_section` → FAIL.
+- [x] **Step 3: Implement** — по образцу блока «Новые темы» (`field_row` + `ComboBox`).
+- [x] **Step 4: GREEN** — `cargo test -p hub-app --locked` → PASS.
+- [x] **Step 5: Commit** — `feat(gui): общие роли исполнителя и ревьюера`
 
 ---
 
