@@ -241,65 +241,127 @@ impl BindingPreview {
         }
     }
 }
-/// Outcome of [`purge`]: registry records removed and whether the project had published
-/// memory data (the data directory is removed either way when it exists).
+/// Outcome of [`purge`]: registry records removed, whether the data directory was deleted
+/// with published memory inside, and whether the storage was kept because other living
+/// projects still resolve to the same identity.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct PurgeReport {
     pub removed_paths: usize,
     pub had_data: bool,
+    pub shared: bool,
 }
 
-/// Removes a project from hub memory: every registry record resolving to its identity
-/// (and the identity record itself) plus the data directory. Nothing outside `base` is
-/// deleted and the project directory itself is never touched. While another process
-/// holds the data-directory lock the call reports [`Error::Busy`] and changes nothing.
-pub fn purge(base: &Path, project: &Path) -> Result<PurgeReport, Error> {
-    let project = fs::canonicalize(project).map_err(|error| {
-        if error.kind() == std::io::ErrorKind::NotFound {
-            Error::InvalidInput("project directory does not exist")
-        } else {
-            Error::Io(error)
-        }
-    })?;
-    if !project.is_dir() {
-        return Err(Error::InvalidInput("project must be a directory"));
-    }
-    let location = Location::resolve(base, &project)?;
-    let identity = path_text(&location.identity)?;
+/// Removes a project from hub memory: its own registry records and — unless [`purge`]
+/// receives another living project that resolves to the same identity — the alias records
+/// and the data directory. `living` lists the projects that must keep working afterwards
+/// (the saved settings minus the deleted one): a storage shared with any of them stays
+/// intact together with their records, so deleting one profile never destroys another's
+/// memory. Nothing outside `base` is deleted and the project directory itself is never
+/// touched. A project directory that has already vanished stays purgeable, so the cascade
+/// is retryable to the end. While another process holds the registry or the data lock (a
+/// live MCP store or a concurrent binding apply) the call reports [`Error::Busy`] and
+/// changes nothing.
+pub fn purge(base: &Path, project: &Path, living: &[PathBuf]) -> Result<PurgeReport, Error> {
+    let base = filesystem::destination(base)?;
+    let project = former_path(project)?;
+    let living = living_paths(living);
+    // The registry is shared with `BindingPreview::apply`, which publishes `.projects`
+    // under this lock and through the same staging name: the whole read-modify-write of
+    // both writers must serialize on it.
+    let registry_directory = filesystem::Directory::create(&base, REGISTRY)?;
+    #[cfg(unix)]
+    registry_directory.sync_parent()?;
+    let _registry_lock = lock(&registry_directory)?;
+    let mut registry = Registry::read(&base)?;
+    let project_text = path_text(&project)?;
+    // A moved-away source is tombstoned `Some(None)`: it has no reachable identity, but
+    // its records still key the former path.
+    let is_tombstone = registry.paths.get(project_text).is_some_and(Option::is_none);
+    let identity =
+        registry.paths.get(project_text).cloned().flatten().unwrap_or_else(|| project.clone());
     // The digest component may have been swapped for a symlink: refuse it and require
     // every removed path to stay under the canonical base.
-    let directory = filesystem::destination(&location.directory()?)?;
-    if !directory.starts_with(&location.base) {
+    let directory =
+        filesystem::destination(&base.join(portable::digest(path_text(&identity)?.as_bytes())))?;
+    if !directory.starts_with(&base) {
         return Err(Error::UnsafePath(directory));
     }
     let existing = filesystem::Directory::existing(&directory)?;
-    let lock = existing.as_ref().map(lock).transpose()?;
-    let mut removed_paths = 0;
-    if let Some(registry) = filesystem::Directory::existing(&location.base.join(REGISTRY))? {
-        let mut current = Registry::read(&location.base)?;
-        let before = current.paths.len();
-        current.paths.retain(|path, bound| {
-            path != identity && bound.as_deref() != Some(location.identity.as_path())
+    let identity_is_held = identity != project && !is_tombstone && is_living(&living, &identity);
+    let shared = identity_is_held
+        || registry.paths.iter().any(|(path, bound)| {
+            bound.as_deref() == Some(identity.as_path())
+                && Path::new(path.as_str()) != project
+                && is_living(&living, Path::new(path.as_str()))
         });
-        removed_paths = before - current.paths.len();
-        if removed_paths > 0 {
-            registry.persist(&current.bytes()?)?;
-        }
+    let mut removed_paths = 0;
+    // The purged project's own binding goes in both outcomes; its tombstone only when the
+    // lineage itself is removed — while the storage stays for a neighbour the tombstone is
+    // what keeps the former path from silently reclaiming it.
+    let keep_own = shared && is_tombstone;
+    if !keep_own && registry.paths.remove(project_text).is_some() {
+        removed_paths += 1;
+    }
+    if !shared {
+        let identity_text = path_text(&identity)?;
+        let before = registry.paths.len();
+        registry.paths.retain(|path, bound| {
+            path != identity_text && bound.as_deref() != Some(identity.as_path())
+        });
+        removed_paths += before - registry.paths.len();
+    }
+    let data_lock = if shared { None } else { existing.as_ref().map(lock).transpose()? };
+    if removed_paths > 0 {
+        registry_directory.persist(&registry.bytes()?)?;
     }
     // A binding preview may leave the directory seeded with only its lock file; that is
     // still removed, while `had_data` reports published memory contents.
-    let had_data = existing
-        .as_ref()
-        .map(|directory| directory.open(DATA_FILE, filesystem::OpenMode::Read))
-        .transpose()?
-        .flatten()
-        .is_some();
-    if existing.is_some() {
-        // The recursive delete must not race an open handle kept alive by the lock.
-        drop(lock);
+    let had_data = !shared
+        && existing
+            .as_ref()
+            .map(|directory| directory.open(DATA_FILE, filesystem::OpenMode::Read))
+            .transpose()?
+            .flatten()
+            .is_some();
+    if data_lock.is_some() {
+        // On Unix the lock's open file does not block the recursive delete, and the guard
+        // is held until it finishes: releasing it earlier would let a live store grab the
+        // lock and recreate the directory between unlock and unlink. Windows cannot remove
+        // a tree that holds an open handle, so the lock is dropped there first.
+        #[cfg(not(unix))]
+        drop(data_lock);
         fs::remove_dir_all(&directory)?;
     }
-    Ok(PurgeReport { removed_paths, had_data })
+    Ok(PurgeReport { removed_paths, had_data, shared })
+}
+
+/// Canonical form when the folder still exists, the former path otherwise: the vanished
+/// project keeps its records addressable exactly the way `source_path` lets a moved
+/// source stay previewable.
+fn former_path(path: &Path) -> Result<PathBuf, Error> {
+    match fs::canonicalize(path) {
+        Ok(path) if path.is_dir() => Ok(path),
+        Ok(_) => Err(Error::InvalidInput("project must be a directory")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            validate_path(path)?;
+            Ok(path.to_owned())
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Both spellings of every living project path: settings and registry keys meet at the
+/// canonical form, while a folder that vanished mid-life keeps the recorded one.
+fn living_paths(living: &[PathBuf]) -> std::collections::BTreeSet<PathBuf> {
+    living
+        .iter()
+        .flat_map(|path| [path.clone(), fs::canonicalize(path).unwrap_or_else(|_| path.clone())])
+        .collect()
+}
+
+fn is_living(living: &std::collections::BTreeSet<PathBuf>, path: &Path) -> bool {
+    living.contains(path)
+        || fs::canonicalize(path).is_ok_and(|canonical| living.contains(&canonical))
 }
 
 fn lock(directory: &filesystem::Directory) -> Result<File, Error> {
