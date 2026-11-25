@@ -2,6 +2,8 @@
 //! answers.
 use std::time::Duration;
 
+use hub_core::tasks::{queue::Origin, service::Access};
+
 use crate::messenger::SendError;
 
 use super::{Agents, Hub, HubMessage, Target, TopicKey, oneshot};
@@ -30,11 +32,23 @@ pub struct SyncDone {
 ///
 /// Two single-purpose messages stay terse; anything mixed lists only the non-empty categories.
 /// The rate-limit and disk-failure tails are added by the caller, not here.
-fn sync_summary(removed: usize, alive: usize, busy: usize, uncertain: usize) -> String {
+fn sync_summary(
+    removed: usize,
+    alive: usize,
+    busy: usize,
+    uncertain: usize,
+    detached: usize,
+) -> String {
+    // Detached-task reporting is a suffix that only ever accompanies removals.
+    let detach_note = (detached > 0).then(|| format!("Задач откреплено: {detached}"));
     if busy == 0 && uncertain == 0 && (removed == 0 || alive == 0) {
-        return match removed {
+        let base = match removed {
             0 => "Все темы актуальны.".to_owned(),
             removed => format!("Удалено устаревших тем: {removed}."),
+        };
+        return match detach_note {
+            Some(note) => format!("{base} {note}"),
+            None => base,
         };
     }
     let mut parts = Vec::new();
@@ -49,6 +63,9 @@ fn sync_summary(removed: usize, alive: usize, busy: usize, uncertain: usize) -> 
     }
     if uncertain > 0 {
         parts.push(format!("Не удалось проверить: {uncertain} — повторите синхронизацию"));
+    }
+    if let Some(note) = detach_note {
+        parts.push(note);
     }
     format!("{}.", parts.join(". "))
 }
@@ -101,21 +118,11 @@ impl<A: Agents> Hub<A> {
         });
     }
 
-    fn check_deletion(&self, key: TopicKey) -> Result<(), String> {
-        let queued = self
-            .tasks
-            .inspect(|book| {
-                book.tasks().iter().any(|task| {
-                    task.queue.as_ref().and_then(|entry| entry.origin).is_some_and(|origin| {
-                        origin.chat == key.chat.0 && origin.thread == key.thread.0
-                    })
-                })
-            })
-            .map_err(|error| format!("Не удалось проверить очередь задач темы: {error}"))?;
-        if queued {
-            return Err("В очереди есть задачи из этой темы. Дождитесь их выполнения или снимите их с очереди.".into());
-        }
-        if self.deleting.contains_key(&key)
+    /// An in-flight launch, session reservation or destructive operation on the topic. These must
+    /// finish before the topic is touched at all, so they block even the forced cleanup of a topic
+    /// Telegram already proved missing.
+    fn active_operation(&self, key: TopicKey) -> bool {
+        self.deleting.contains_key(&key)
             || self.running.contains_key(&key)
             || self.task_runs.contains_key(&key)
             || self.handoff_busy(key)
@@ -130,13 +137,42 @@ impl<A: Agents> Hub<A> {
                             .is_some_and(|session| session.cwd.as_path() == live.project)
                 })
             })
-            || self.memory.busy_in(key)
+            || self.topics.get(&key).is_some_and(|s| self.is_reserved(s))
+    }
+
+    /// Auxiliary per-topic work (memory, voice, actions, doctor, album parts). It blocks a manual
+    /// deletion, but not the cleanup of a topic proved missing — such a topic cannot take part in
+    /// these operations meaningfully once it is gone remotely.
+    fn auxiliary_busy(&self, key: TopicKey) -> bool {
+        self.memory.busy_in(key)
             || self.voices.busy_in(key)
             || self.actions.busy_in(Target::Topic(key))
             || self.doctors.busy(key)
             || self.albums.values().flatten().any(|part| part.key() == Some(key))
-            || self.topics.get(&key).is_some_and(|s| self.is_reserved(s))
-        {
+    }
+
+    /// Blocks cleanup only on genuinely active states. A proven-missing topic whose task queue
+    /// still holds its intents is force-cleaned instead: the queue is detached rather than being a
+    /// permanent block.
+    fn check_force_cleanup(&self, key: TopicKey) -> Result<(), ()> {
+        if self.active_operation(key) { Err(()) } else { Ok(()) }
+    }
+
+    fn check_deletion(&self, key: TopicKey) -> Result<(), String> {
+        let queued = self
+            .tasks
+            .inspect(|book| {
+                book.tasks().iter().any(|task| {
+                    task.queue.as_ref().and_then(|entry| entry.origin).is_some_and(|origin| {
+                        origin.chat == key.chat.0 && origin.thread == key.thread.0
+                    })
+                })
+            })
+            .map_err(|error| format!("Не удалось проверить очередь задач темы: {error}"))?;
+        if queued {
+            return Err("В очереди есть задачи из этой темы. Дождитесь их выполнения или снимите их с очереди.".into());
+        }
+        if self.active_operation(key) || self.auxiliary_busy(key) {
             return Err(
                 "Дождитесь завершения активной задачи или операции и повторите удаление.".into()
             );
@@ -198,13 +234,14 @@ impl<A: Agents> Hub<A> {
                     && !self.topic_unavailable(*key)
             })
             .collect();
-        // The same busy guards as deletion; undelivered answers are not a reason to skip, because
-        // a topic missing in Telegram cannot receive them anyway. Anything rejected is reported as
-        // skipped rather than silently dropped from the count.
+        // A proven-missing topic must be reachable even when its task queue still holds intents,
+        // so only genuinely active work (check_force_cleanup) skips a candidate; a queued-only topic
+        // is probed and, if gone, cleaned with its queue detached. Anything skipped is reported as
+        // busy rather than silently dropped from the count.
         let mut candidates = Vec::new();
         let mut busy = 0;
         for key in eligible {
-            if self.check_deletion(key).is_ok() {
+            if self.check_force_cleanup(key).is_ok() {
                 candidates.push(key);
             } else {
                 busy += 1;
@@ -212,7 +249,7 @@ impl<A: Agents> Hub<A> {
             }
         }
         if candidates.is_empty() {
-            let _ = reply.send(Ok(sync_summary(0, 0, busy, 0)));
+            let _ = reply.send(Ok(sync_summary(0, 0, busy, 0, 0)));
             return;
         }
         let sender = self.sender.clone();
@@ -278,12 +315,14 @@ impl<A: Agents> Hub<A> {
     pub(super) fn finish_sync(&mut self, done: SyncDone) {
         let mut removed = 0;
         let mut failed = 0;
+        let mut detached = 0;
         for key in done.stale {
-            // A probe answer is only a decision when the topic is still unbound and free;
-            // work may have arrived while the walk was running.
+            // A probe answer is only a decision when the topic is still unbound and free; an active
+            // operation may have started while the walk was running. A queued-only topic stays
+            // eligible here: its queue is detached below instead of blocking the proven removal.
             if !self.topics.contains_key(&key)
                 || self.topic_unavailable(key)
-                || self.check_deletion(key).is_err()
+                || self.check_force_cleanup(key).is_err()
             {
                 continue;
             }
@@ -296,6 +335,20 @@ impl<A: Agents> Hub<A> {
                 tracing::warn!(topic = ?key, %error, "synced topic could not be cleaned on disk");
             } else {
                 removed += 1;
+                // Unbind the topic's queued tasks so they survive as detached work. Only the queue
+                // origin changes; task status is preserved.
+                let origin = Origin { chat: key.chat.0, thread: key.thread.0, user: None };
+                match self
+                    .tasks
+                    .access(Access::Edit, |book, _| Ok(book.detach_topic_queue(&origin)))
+                {
+                    Ok(count) => detached += count,
+                    Err(error) => tracing::warn!(
+                        topic = ?key,
+                        %error,
+                        "synced topic queue could not be detached"
+                    ),
+                }
             }
         }
         // A stale topic left on disk is not "all topics are current"; report the failure the
@@ -316,7 +369,9 @@ impl<A: Agents> Hub<A> {
                 0 => disk_failure,
                 removed => format!("Удалено устаревших тем: {removed}. {disk_failure}"),
             }),
-            (None, None) => Ok(sync_summary(removed, done.alive, done.busy, done.uncertain)),
+            (None, None) => {
+                Ok(sync_summary(removed, done.alive, done.busy, done.uncertain, detached))
+            }
         };
         let _ = done.reply.send(result);
     }

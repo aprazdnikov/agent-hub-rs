@@ -134,4 +134,53 @@ impl TaskBook {
             })
             .min_by_key(|(_, q)| q.sequence)
     }
+    /// Clears the queue origin of every task bound to a Telegram topic, leaving the queued work
+    /// itself intact so it can run detached. Returns the number of entries unbound.
+    pub fn detach_topic_queue(&mut self, origin: &Origin) -> usize {
+        let mut detached = 0;
+        for task in &mut self.tasks {
+            // Only the origin is touched; status, revision and sequence are preserved.
+            if let Some(entry) = &mut task.queue
+                && entry
+                    .origin
+                    .is_some_and(|bound| bound.chat == origin.chat && bound.thread == origin.thread)
+            {
+                entry.origin = None;
+                detached += 1;
+            }
+        }
+        detached
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn bound(chat: i64, thread: i32) -> Origin {
+        Origin { chat, thread, user: Some(1) }
+    }
+
+    #[test]
+    fn detach_topic_queue_clears_only_the_matching_topic_and_keeps_the_rest() {
+        let mut book = TaskBook::default();
+        let gone = book.create(std::env::temp_dir(), "qwen", "gone", "Inspect").unwrap();
+        let other = book.create(std::env::temp_dir(), "qwen", "other", "Inspect").unwrap();
+        let unbound = book.create(std::env::temp_dir(), "qwen", "plain", "Inspect").unwrap();
+        book.enqueue(gone, 1, None, false, Some(bound(-100, 7))).unwrap();
+        book.enqueue(other, book.get(other).unwrap().revision, None, false, Some(bound(-100, 8)))
+            .unwrap();
+        book.enqueue(unbound, book.get(unbound).unwrap().revision, None, false, None).unwrap();
+
+        assert_eq!(book.detach_topic_queue(&bound(-100, 7)), 1);
+
+        assert_eq!(book.get(gone).unwrap().queue.as_ref().unwrap().origin, None);
+        assert_eq!(book.get(other).unwrap().queue.as_ref().unwrap().origin, Some(bound(-100, 8)));
+        assert_eq!(book.get(unbound).unwrap().queue.as_ref().unwrap().origin, None);
+        // The detached task stays queued and unchanged apart from its origin.
+        assert_eq!(book.get(gone).unwrap().queue.as_ref().unwrap().error, None);
+        assert!(book.get(other).unwrap().queue.as_ref().is_some());
+        // Idempotent: nothing is bound to the topic any more.
+        assert_eq!(book.detach_topic_queue(&bound(-100, 7)), 0);
+    }
 }

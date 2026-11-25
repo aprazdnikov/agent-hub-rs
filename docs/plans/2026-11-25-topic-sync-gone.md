@@ -160,14 +160,14 @@
   `tasks.access(Access::Edit, detach_topic_queue)` (через существующий `self.tasks`),
   число отвязок попадает в отчёт («Задач откреплено: {d}»); иначе — категория «занятые».
 
-- [ ] **Step 1: Write failing tests** — hub: тема в `stale`, у задачи `queue.origin == Some(..)` →
+- [x] **Step 1: Write failing tests** — hub: тема в `stale`, у задачи `queue.origin == Some(..)` →
   тема удалена, `book.tasks()[0].queue.as_ref().unwrap().origin == None`; активный
   `running[&key]` → тема осталась и попала в «Пропущено занятых». Unit в hub-core:
   `detach_topic_queue` трогает только совпадающий origin и не меняет остальные очереди.
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-core --lib detach && cargo test -p hub-telegram --lib sync_gone` → FAIL.
-- [ ] **Step 3: Implement** — оба метода; сообщение sync дополняется счётчиком откреплённых задач.
-- [ ] **Step 4: Verify GREEN** — `cargo test -p hub-core -p hub-telegram --locked` → PASS.
-- [ ] **Step 5: Gates + commit** — `fix(telegram): удалённая в telegram тема чистится с отвязкой очереди`
+- [x] **Step 2: Verify RED** — `cargo test -p hub-core --lib detach && cargo test -p hub-telegram --lib sync_gone` → FAIL.
+- [x] **Step 3: Implement** — оба метода; сообщение sync дополняется счётчиком откреплённых задач.
+- [x] **Step 4: Verify GREEN** — `cargo test -p hub-core -p hub-telegram --locked` → PASS.
+- [x] **Step 5: Gates + commit** — `fix(telegram): удалённая в telegram тема чистится с отвязкой очереди`
 
 ---
 

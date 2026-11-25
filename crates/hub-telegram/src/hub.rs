@@ -2767,33 +2767,18 @@ mod tests {
 
     #[tokio::test]
     async fn sync_reports_skipped_and_uncertain_topics() {
-        use hub_core::tasks::{queue::Origin, service::Access};
-        let world = world(FakeAgents::default());
+        let world = world(FakeAgents::scripted(vec![Script::UntilStopped]));
         let busy = TopicKey { chat: KEY.chat, thread: ThreadId(7) };
         let uncertain = TopicKey { chat: KEY.chat, thread: ThreadId(8) };
         let live = TopicKey { chat: KEY.chat, thread: ThreadId(9) };
-        for (thread, name) in [(7, "Занятая"), (8, "Сомнительная"), (9, "Живая")]
-        {
-            world
-                .send(inbound(Some(thread), thread, Content::TopicCreated { name: name.into() }))
-                .await;
-        }
-        // A queued task bound to `busy` makes check_deletion reject it; the walk never probes it.
+        world.send(inbound(Some(7), 1, Content::TopicCreated { name: "Занятая".into() })).await;
         world
-            .tasks
-            .access(Access::Edit, |book, _| {
-                let id =
-                    book.create(world.root.path().to_owned(), "claude", "Задача", "Проверь")?;
-                book.enqueue(
-                    id,
-                    book.get(id)?.revision,
-                    None,
-                    false,
-                    Some(Origin { chat: busy.chat.0, thread: busy.thread.0, user: Some(1) }),
-                )?;
-                Ok(())
-            })
-            .unwrap();
+            .send(inbound(Some(8), 2, Content::TopicCreated { name: "Сомнительная".into() }))
+            .await;
+        world.send(inbound(Some(9), 3, Content::TopicCreated { name: "Живая".into() })).await;
+        // An active run makes `busy` an in-flight topic; the walk never probes an active topic.
+        world.send(text(Some(7), 5, "Работа")).await;
+        eventually("running", || world.running()).await;
         // The one-shot script rejects the first probe (thread 8); thread 9 falls back to live.
         *world.messenger.probes.lock().unwrap() = Some(Err(SendError::Rejected("права".into())));
         let report = sync(&world).await.unwrap();
@@ -2815,6 +2800,47 @@ mod tests {
         assert!(report.contains("Живых: 1"), "got: {report}");
         assert!(report.contains("Пропущено занятых: 1"), "got: {report}");
         assert!(!world.store.last().unwrap().contains_key(&uncertain));
+    }
+
+    #[tokio::test]
+    async fn sync_gone_topic_with_queued_task_detaches_queue() {
+        use hub_core::tasks::{queue::Origin, service::Access};
+        let world = world(FakeAgents::default());
+        world
+            .send(inbound(
+                Some(7),
+                1,
+                Content::TopicCreated { name: "Удалённая с очередью".into() },
+            ))
+            .await;
+        let id = world
+            .tasks
+            .access(Access::Edit, |book, _| {
+                let id =
+                    book.create(world.root.path().to_owned(), "claude", "Задача", "Проверь")?;
+                book.enqueue(
+                    id,
+                    book.get(id)?.revision,
+                    None,
+                    false,
+                    Some(Origin { chat: KEY.chat.0, thread: KEY.thread.0, user: Some(1) }),
+                )?;
+                Ok(id)
+            })
+            .unwrap();
+        // Telegram proves the topic gone; its queued task must not block the cleanup.
+        *world.messenger.probes.lock().unwrap() = Some(Ok(false));
+        let report = sync(&world).await.unwrap();
+        assert!(report.contains("Удалено устаревших тем: 1"), "got: {report}");
+        assert!(report.contains("Задач откреплено: 1"), "got: {report}");
+        assert!(!world.store.last().unwrap().contains_key(&KEY));
+        // The task survives; only its topic origin is cleared.
+        let book = world.tasks.read().unwrap();
+        let task = book.get(id).unwrap();
+        assert!(task.queue.is_some());
+        assert_eq!(task.queue.as_ref().unwrap().origin, None);
+        // Re-running the sync is idempotent: the proven-gone topic is already gone.
+        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны.");
     }
 
     #[tokio::test]
