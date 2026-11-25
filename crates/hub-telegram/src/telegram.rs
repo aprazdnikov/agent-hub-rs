@@ -393,13 +393,21 @@ fn thread(key: TopicKey) -> tg::ThreadId {
 /// needle list is split, and only the confirmed half may drive local cleanup.
 ///
 /// Forms the released matcher (v1.1.1) already accepted, in normalised form.
-const CONFIRMED_TOPIC_GONE_MARKERS: &[&str] =
-    &["thread not found", "message thread not found", "topic not found", "topic deleted"];
+/// `topic id invalid` was confirmed by the live contract run (plan Task 4, owner's GUI,
+/// 2026-11-25): both deleting and probing a removed topic answered
+/// `unknown error: "bad request: topic id invalid"`.
+const CONFIRMED_TOPIC_GONE_MARKERS: &[&str] = &[
+    "thread not found",
+    "message thread not found",
+    "topic not found",
+    "topic deleted",
+    "topic id invalid",
+];
 
 /// Plausible missing-topic wording that no live Bot API answer has confirmed yet (plan Task 4,
-/// `live_topic_gone_probe`, pending the owner). Matched only to be logged as a candidate for that
+/// `live_topic_gone_probe`). Matched only to be logged as a candidate for that
 /// evidence; never deletes, never marks a row.
-const UNCONFIRMED_TOPIC_GONE_MARKERS: &[&str] = &["topic id invalid", "thread id invalid"];
+const UNCONFIRMED_TOPIC_GONE_MARKERS: &[&str] = &["thread id invalid"];
 
 /// Lowercases the description and folds `_`, `-` and repeated whitespace into single spaces, so
 /// the underscore/caps forms Telegram returns match the space-separated needles.
@@ -825,8 +833,9 @@ mod tests {
 
     #[rstest::rstest]
     // The real Bot API replies for a topic removed in Telegram arrive in underscore/caps forms
-    // that the old substring matcher missed; normalisation must catch all of them. The two
-    // `id invalid` forms are candidates until the live contract (plan Task 4) confirms them.
+    // that the old substring matcher missed; normalisation must catch all of them. The live
+    // contract (plan Task 4, 2026-11-25) confirmed `TOPIC_ID_INVALID`; `THREAD_ID_INVALID`
+    // remains an unconfirmed candidate.
     #[case::thread_underscore("Bad Request: THREAD_NOT_FOUND", GoneEvidence::Proven)]
     #[case::message_thread_underscore(
         "Bad Request: MESSAGE_THREAD_NOT_FOUND",
@@ -842,7 +851,7 @@ mod tests {
         "Unknown error: \"Bad Request: THREAD_NOT_FOUND\"",
         GoneEvidence::Proven
     )]
-    #[case::topic_id_invalid("Bad Request: TOPIC_ID_INVALID", GoneEvidence::Candidate)]
+    #[case::topic_id_invalid("Bad Request: TOPIC_ID_INVALID", GoneEvidence::Proven)]
     #[case::thread_id_invalid("Bad Request: THREAD_ID_INVALID", GoneEvidence::Candidate)]
     // Permissions and unrelated errors must never read as a missing topic.
     #[case::admin_required("Forbidden: CHAT_ADMIN_REQUIRED", GoneEvidence::Unrelated)]
@@ -959,8 +968,9 @@ mod tests {
     #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_DELETED"}), true)]
     #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: MESSAGE_THREAD_NOT_FOUND"}), true)]
     #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: THREAD_NOT_FOUND"}), true)]
+    // Confirmed live 2026-11-25: a removed topic answers TOPIC_ID_INVALID to delete_forum_topic.
+    #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_ID_INVALID"}), true)]
     // An unconfirmed needle must not report a deletion the bot API did not confirm.
-    #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_ID_INVALID"}), false)]
     #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: THREAD_ID_INVALID"}), false)]
     #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: CHAT_ADMIN_REQUIRED"}), false)]
     #[tokio::test]
@@ -986,11 +996,11 @@ mod tests {
     #[case::exists(json!({"ok":true,"result":true}), Ok(true))]
     #[case::missing(json!({"ok":false,"error_code":400,"description":"Bad Request: message thread not found"}), Ok(false))]
     #[case::thread_not_found(json!({"ok":false,"error_code":400,"description":"Bad Request: THREAD_NOT_FOUND"}), Ok(false))]
-    // `TOPIC_ID_INVALID` has never been seen in a live answer, so it must not prove absence:
-    // an uncertain answer keeps the topic, exactly like a permission error.
+    // The live contract (plan Task 4, 2026-11-25) saw exactly this wording for a removed
+    // topic, so it now proves absence just like the legacy needles.
     #[case::topic_id_invalid(
         json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_ID_INVALID"}),
-        Err(SendError::Rejected("Проверьте, что бот — администратор с правом управлять темами.".to_owned()))
+        Ok(false)
     )]
     #[case::deleted(json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_DELETED"}), Ok(false))]
     #[case::retry(
@@ -1170,7 +1180,8 @@ mod tests {
 
     #[rstest::rstest]
     #[case::confirmed("Bad Request: THREAD_NOT_FOUND", true)]
-    #[case::topic_id_invalid("Bad Request: TOPIC_ID_INVALID", false)]
+    // Promoted by the live contract run (plan Task 4, 2026-11-25).
+    #[case::topic_id_invalid("Bad Request: TOPIC_ID_INVALID", true)]
     #[case::thread_id_invalid("Bad Request: THREAD_ID_INVALID", false)]
     #[tokio::test]
     async fn unconfirmed_needle_is_reported_as_a_candidate_and_never_removes(
