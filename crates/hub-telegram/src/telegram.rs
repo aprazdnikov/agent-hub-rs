@@ -418,14 +418,25 @@ impl Messenger for TelegramMessenger {
         Box::pin(async move {
             match self.topics.delete_forum_topic(tg::ChatId(key.chat.0), thread(key)).await {
                 Ok(_) => Ok(()),
-                // The remote deletion may have succeeded before a timeout or local write failure.
-                Err(RequestError::Api(err)) if topic_gone(&err.to_string()) => Ok(()),
+                Err(RequestError::Api(err)) => {
+                    // Logged before classification so the live contract probe
+                    // (`hub-app` `live_topic_gone_probe`) can record the exact wording the
+                    // matcher saw. Only the normalized description is written, never a
+                    // request body or URL.
+                    let description = normalize_error(&err.to_string());
+                    tracing::debug!(description = %description, topic = ?key, "topic api error");
+                    // The remote deletion may have succeeded before a timeout or local write failure.
+                    if topic_gone(&description) {
+                        Ok(())
+                    } else {
+                        Err(SendError::Rejected(
+                            "Проверьте, что бот — администратор с правом удалять сообщения.".into(),
+                        ))
+                    }
+                }
                 Err(RequestError::RetryAfter(seconds)) => {
                     Err(SendError::RetryAfter(seconds.duration()))
                 }
-                Err(RequestError::Api(_)) => Err(SendError::Rejected(
-                    "Проверьте, что бот — администратор с правом удалять сообщения.".into(),
-                )),
                 Err(_) => Err(SendError::Failed(
                     "Результат удаления неизвестен. Проверьте тему в Telegram.".into(),
                 )),
@@ -444,13 +455,22 @@ impl Messenger for TelegramMessenger {
                 .await
             {
                 Ok(_) => Ok(true),
-                Err(RequestError::Api(err)) if topic_gone(&err.to_string()) => Ok(false),
+                Err(RequestError::Api(err)) => {
+                    // See `delete_topic`: the normalized description is the evidence the live
+                    // contract probe records against `TOPIC_GONE_MARKERS`.
+                    let description = normalize_error(&err.to_string());
+                    tracing::debug!(description = %description, topic = ?key, "topic api error");
+                    if topic_gone(&description) {
+                        Ok(false)
+                    } else {
+                        Err(SendError::Rejected(
+                            "Проверьте, что бот — администратор с правом управлять темами.".into(),
+                        ))
+                    }
+                }
                 Err(RequestError::RetryAfter(seconds)) => {
                     Err(SendError::RetryAfter(seconds.duration()))
                 }
-                Err(RequestError::Api(_)) => Err(SendError::Rejected(
-                    "Проверьте, что бот — администратор с правом управлять темами.".into(),
-                )),
                 Err(_) => Err(SendError::Failed(
                     "Результат проверки темы неизвестен. Проверьте тему в Telegram.".into(),
                 )),
@@ -971,6 +991,111 @@ mod tests {
             messenger.create_topic(ChatId(-100), "topic".to_owned()).await,
             Err(SendError::Failed("Не удалось получить ответ о создании темы".to_owned()))
         );
+    }
+
+    /// Keeps every event's rendered fields so a test can assert on emitted logs.
+    #[derive(Default)]
+    struct LogCapture(std::sync::Mutex<Vec<(String, String)>>);
+
+    impl LogCapture {
+        fn lines(&self) -> Vec<(String, String)> {
+            self.0.lock().unwrap().clone()
+        }
+    }
+
+    impl std::fmt::Debug for LogCapture {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "LogCapture({} events)", self.0.lock().unwrap().len())
+        }
+    }
+
+    impl tracing::Subscriber for LogCapture {
+        fn enabled(&self, _meta: &tracing::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn new_span(&self, _attrs: &tracing::span::Attributes<'_>) -> tracing::Id {
+            tracing::Id::from_u64(1)
+        }
+
+        fn record(&self, _span: &tracing::Id, _values: &tracing::span::Record<'_>) {}
+
+        fn record_follows_from(&self, _span: &tracing::Id, _follows: &tracing::Id) {}
+
+        fn enter(&self, _span: &tracing::Id) {}
+
+        fn exit(&self, _span: &tracing::Id) {}
+
+        fn event(&self, event: &tracing::Event<'_>) {
+            struct Collector<'a> {
+                fields: &'a mut Vec<String>,
+            }
+            impl tracing::field::Visit for Collector<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    self.fields.push(format!("{}={:?}", field.name(), value));
+                }
+            }
+            let mut fields = Vec::new();
+            event.record(&mut Collector { fields: &mut fields });
+            self.0.lock().unwrap().push((event.metadata().target().to_owned(), fields.join(" ")));
+        }
+    }
+
+    #[rstest::rstest]
+    #[case::rejected(
+        json!({"ok":false,"error_code":400,"description":"Bad Request: CHAT_ADMIN_REQUIRED"}),
+        "bad request: chat admin required",
+        false
+    )]
+    #[case::gone(
+        json!({"ok":false,"error_code":400,"description":"Bad Request: THREAD_NOT_FOUND"}),
+        "bad request: thread not found",
+        true
+    )]
+    #[tokio::test]
+    async fn topic_api_errors_log_the_normalized_description(
+        #[case] response: serde_json::Value,
+        #[case] expected_description: &str,
+        #[case] gone: bool,
+    ) {
+        // The live contract probe (hub-app `live_topic_gone_probe`) records the matcher's
+        // evidence from these debug lines; without them the exact Telegram wording is
+        // unprovable, so the normalized description must be logged for every `Api` answer.
+        let (messenger, _requests, server) = topic_api(response).await;
+        let capture = Arc::new(LogCapture::default());
+        let _guard = tracing::subscriber::set_default(Arc::clone(&capture));
+        let key = TopicKey { chat: ChatId(-100), thread: ThreadId(42) };
+        let (delete, probe) = (messenger.delete_topic(key).await, messenger.probe_topic(key).await);
+        server.abort();
+        assert_eq!(delete.is_ok(), gone, "{delete:?}");
+        assert_eq!(
+            probe,
+            if gone {
+                Ok(false)
+            } else {
+                Err(SendError::Rejected(
+                    "Проверьте, что бот — администратор с правом управлять темами.".into(),
+                ))
+            }
+        );
+        // Only this module's events; the capture sees the whole dispatcher.
+        let lines: Vec<String> = capture
+            .lines()
+            .into_iter()
+            .filter(|(target, _)| target == "hub_telegram::telegram")
+            .map(|(_, line)| line)
+            .collect();
+        for line in &lines {
+            assert!(!line.contains("bot1:test"), "token leaked: {line}");
+        }
+        let matching = lines
+            .iter()
+            .filter(|line| line.contains("topic api error") && line.contains(expected_description));
+        assert_eq!(matching.count(), 2, "both api calls must log it; captured: {lines:?}");
     }
 
     #[rstest::rstest]

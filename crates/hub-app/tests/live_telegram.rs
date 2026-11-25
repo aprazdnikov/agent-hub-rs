@@ -57,9 +57,15 @@ async fn live_result_card() {
 /// exact Telegram `description` it is meant to record as the live contract is confirmed only by
 /// the owner (`AGENT_HUB_LIVE_CHAT` + keyring token); the matcher in `hub-telegram` is fixed by
 /// normalisation until that evidence is gathered (see the plan's Task 4, owner-pending).
+///
+/// [`init_evidence_logging`] attaches a debug subscriber, so the run prints the `topic api
+/// error` lines — the normalized descriptions (the same form `TOPIC_GONE_MARKERS` matches, no
+/// token/URL per the plan constraint) — for every `Api` answer of `delete_topic`/`probe_topic`.
+/// If an assert fails, those lines are the evidence of what Telegram actually answered.
 #[tokio::test]
 #[ignore = "creates and deletes a real forum topic in the configured Telegram group"]
 async fn live_topic_gone_probe() {
+    init_evidence_logging();
     let chat = ChatId(std::env::var("AGENT_HUB_LIVE_CHAT").unwrap().parse().unwrap());
     let file: SettingsFile =
         toml::from_str(&std::fs::read_to_string(AppDirs::locate().unwrap().settings()).unwrap())
@@ -87,4 +93,19 @@ async fn live_topic_gone_probe() {
     tracing::info!(?probe, ?delete, "live topic-gone probe outcomes for the matcher contract");
     assert_eq!(probe, Ok(false), "a topic removed in Telegram must probe as gone");
     assert_eq!(delete, Ok(()), "deleting an already-removed topic must be idempotent");
+}
+
+/// Prints the matcher's evidence for this manual run: `hub_telegram::telegram` debug (the
+/// normalized `topic api error` descriptions) plus this test's own info lines. Scoped to those
+/// targets so no third-party debug output (which could carry request URLs) reaches the log.
+fn init_evidence_logging() {
+    use tracing_subscriber::layer::Layer as _;
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+    let filter = tracing_subscriber::filter::Targets::new()
+        .with_target("hub_telegram::telegram", tracing::Level::DEBUG)
+        .with_target(module_path!(), tracing::Level::INFO);
+    let _ = tracing_subscriber::registry()
+        .with(tracing_subscriber::fmt::layer().with_test_writer().with_filter(filter))
+        .try_init();
 }
