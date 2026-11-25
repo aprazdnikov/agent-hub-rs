@@ -207,9 +207,9 @@
 **Files:**
 - Modify: `docs/guide/tasks.md` (раздел правил проекта), `docs/guide/settings.md`
   (страница «Агенты»), `docs/guide/projects.md` (строка про вкладку «Правила»)
-- [ ] **Step 1:** тексты по дизайн-блоку; сверка якорей рус. заголовков (правило doc-link).
-- [ ] **Step 2:** полный gate + `git diff --check`; `git status -s` чист.
-- [ ] **Step 3: Commit** — `docs: общие роли агентов и режимы проверок проекта`
+- [x] **Step 1:** тексты по дизайн-блоку; сверка якорей рус. заголовков (правило doc-link).
+- [x] **Step 2:** полный gate + `git diff --check`; `git status -s` чист.
+- [x] **Step 3: Commit** — `docs: общие роли агентов и режимы проверок проекта`
 
 ## Security Review этого плана
 
