@@ -1,0 +1,183 @@
+<style>
+  .ah { --canvas:#F8F9F7; --surface:#FFFFFF; --text:#1C2521; --muted:#54645C; --border:#D5DDD7; --accent:#0D644F; --selected:#DCEEE5;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--text); font-size: 13px; line-height: 1.45; }
+  .ah * { box-sizing: border-box; }
+  .ah-win { background: var(--canvas); border: 1px solid var(--border); border-radius: 10px; padding: 18px; max-width: 860px; margin: 0 auto; }
+  .ah-title { font-size: 20px; font-weight: 700; margin: 0; }
+  .ah-weak { color: var(--muted); }
+  .ah-small { font-size: 11px; }
+  .ah-btn { display: inline-block; border: 1px solid var(--border); background: var(--surface); color: var(--text);
+            border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: pointer; }
+  .ah-btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .ah-btn-ghost { border-color: transparent; background: transparent; color: var(--muted); }
+  .ah-btn-danger { color: #94312F; border-color: #E5C6C4; }
+  .ah-chip { display: inline-block; border-radius: 999px; padding: 2px 9px; font-size: 11px; font-weight: 600; }
+  .ah-chip-q { background: var(--selected); color: var(--accent); }
+  .ah-chip-perm { background: #FBF0DC; color: #8A5A00; }
+  .ah-chip-ok { background: var(--selected); color: var(--accent); }
+  .ah-row { display: flex; align-items: center; gap: 8px; }
+  .ah-grow { flex: 1; min-width: 0; }
+  .ah-group { font-size: 12px; font-weight: 700; color: var(--muted); margin: 14px 0 8px; }
+  .ah-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }
+  .ah-ico { width: 26px; height: 26px; border-radius: 8px; display: flex; align-items: center; justify-content: center;
+            font-size: 13px; font-weight: 700; flex: none; }
+  .ah-ico-q { background: var(--selected); color: var(--accent); }
+  .ah-ico-perm { background: #FBF0DC; color: #8A5A00; }
+  .ah-ico-ok { background: var(--selected); color: var(--accent); }
+  .ah-card-title { font-weight: 700; font-size: 14px; }
+  .ah-opt { display: inline-block; border: 1px solid var(--border); border-radius: 999px; padding: 4px 14px;
+            font-size: 12px; cursor: pointer; background: var(--surface); margin-right: 6px; }
+  .ah-opt-on { background: var(--selected); border-color: var(--accent); color: var(--accent); font-weight: 600; }
+  .ah-answer { border: 1px solid var(--border); border-radius: 8px; background: var(--canvas); padding: 7px 10px;
+               font-size: 12px; color: var(--muted); flex: 1; }
+  .ah-mono { font-family: ui-monospace, monospace; font-size: 11px; background: var(--canvas); border: 1px solid var(--border);
+             border-radius: 6px; padding: 6px 9px; color: var(--muted); }
+  .ah-link { color: var(--accent); font-size: 12px; font-weight: 600; cursor: pointer; }
+  .ah-menu { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 5px; width: 250px;
+             box-shadow: 0 6px 18px rgba(28,37,33,.10); }
+  .ah-menu-item { padding: 6px 10px; border-radius: 6px; font-size: 12px; cursor: pointer; }
+  .ah-menu-item:hover { background: var(--selected); }
+  .ah-menu-sep { border-top: 1px solid var(--border); margin: 5px 4px; }
+  .ah-menu-danger { color: #94312F; }
+  .ah-select { border: 1px solid var(--border); border-radius: 6px; background: var(--surface); padding: 5px 12px; font-size: 12px; }
+  table.ah-t { border-collapse: collapse; font-size: 12px; width: 100%; }
+  table.ah-t td, table.ah-t th { border: 1px solid var(--border); padding: 6px 10px; text-align: left; }
+  table.ah-t th { background: var(--canvas); font-weight: 600; }
+</style>
+
+<h2>Входящие: строки → карточки, ответ без раскрытия</h2>
+<p class="subtitle">Вопрос и варианты ответа живут прямо на карточке — без «Ответить → раскрыть → Свернуть». Фильтр проектов и группы остаются.</p>
+
+<div class="mockup">
+  <div class="mockup-header">Входящие · предлагаю</div>
+  <div class="mockup-body">
+    <div class="ah">
+      <div class="ah-win">
+        <div class="ah-row">
+          <div class="ah-grow"><h3 class="ah-title">Входящие</h3></div>
+          <span class="ah-select">Все проекты ▾</span>
+        </div>
+
+        <div class="ah-group">ЖДУТ ВАШЕГО ОТВЕТА · 2</div>
+
+        <div class="ah-card">
+          <div class="ah-row">
+            <span class="ah-ico ah-ico-q">?</span>
+            <div class="ah-grow">
+              <div class="ah-card-title">Отчёт по очереди</div>
+              <div class="ah-weak ah-small">Atlas · Claude Code</div>
+            </div>
+            <span class="ah-chip ah-chip-q">Вопрос</span>
+          </div>
+          <div style="margin:9px 0 7px">Какие задачи включить в отчёт?</div>
+          <div style="margin-bottom:9px">
+            <span class="ah-opt" onclick="this.classList.toggle('ah-opt-on')">Все</span>
+            <span class="ah-opt ah-opt-on" onclick="this.classList.toggle('ah-opt-on')">В очереди</span>
+            <span class="ah-opt" onclick="this.classList.toggle('ah-opt-on')">Только завершённые</span>
+          </div>
+          <div class="ah-row">
+            <span class="ah-answer">Ответ или свой вариант</span>
+            <span class="ah-btn ah-btn-primary">Отправить ответ</span>
+            <span class="ah-btn ah-btn-ghost">Отказаться</span>
+          </div>
+        </div>
+
+        <div class="ah-card">
+          <div class="ah-row">
+            <span class="ah-ico ah-ico-perm">⚠</span>
+            <div class="ah-grow">
+              <div class="ah-card-title">Поиск по каталогу</div>
+              <div class="ah-weak ah-small">Витрина · Codex</div>
+            </div>
+            <span class="ah-chip ah-chip-perm">Разрешение</span>
+          </div>
+          <div style="margin:9px 0 7px">Разрешить действие «Bash»?</div>
+          <div class="ah-mono">npm test -- --filter catalog …</div>
+          <div class="ah-row" style="margin-top:9px">
+            <span class="ah-btn ah-btn-primary">Разрешить один раз</span>
+            <span class="ah-btn">Отклонить</span>
+            <span class="ah-link">Подробнее</span>
+          </div>
+        </div>
+
+        <div class="ah-group">РЕЗУЛЬТАТЫ НА ПРОВЕРКУ · 1</div>
+
+        <div class="ah-card">
+          <div class="ah-row">
+            <span class="ah-ico ah-ico-ok">✓</span>
+            <div class="ah-grow">
+              <div class="ah-card-title">Поиск по каталогу</div>
+              <div class="ah-weak ah-small">Витрина · Codex · проверки 2/2 · 2 файла</div>
+            </div>
+            <span class="ah-btn ah-btn-primary">Проверить</span>
+          </div>
+          <div class="ah-weak" style="margin-top:7px">Проверил на ширине 375 и 1280 пикселей. В обоих случаях можно сразу печатать следующий запрос. Обе проверки прошли.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<h2 style="margin-top:26px">Действия задачи — без похода в «Параметры»</h2>
+<p class="subtitle">Главное действие по состоянию — кнопкой в шапке чата. Редкое — в меню «⋯». Страница «Параметры» остаётся для настроек (агент, Git, память).</p>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">Шапка чата · меню «⋯»</div>
+    <div class="mockup-body">
+      <div class="ah">
+        <div class="ah-win" style="max-width:none">
+          <div class="ah-row">
+            <div class="ah-grow ah-row">
+              <strong style="font-size:16px">Поиск по каталогу</strong>
+              <span class="ah-chip ah-chip-ok">Нужна проверка</span>
+            </div>
+            <span class="ah-btn ah-btn-primary">Открыть результат</span>
+            <span class="ah-btn ah-btn-ghost">⋯</span>
+          </div>
+          <div style="display:flex; justify-content:flex-end; margin-top:6px">
+            <div class="ah-menu">
+              <div class="ah-menu-item">Параметры задачи</div>
+              <div class="ah-menu-item">Правила проекта</div>
+              <div class="ah-menu-item">Контекст следующего запуска</div>
+              <div class="ah-menu-sep"></div>
+              <div class="ah-menu-item">В очередь</div>
+              <div class="ah-menu-item">В архив</div>
+              <div class="ah-menu-sep"></div>
+              <div class="ah-menu-item ah-menu-danger">Удалить…</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+  <div class="mockup">
+    <div class="mockup-header">Главная кнопка по состоянию</div>
+    <div class="mockup-body">
+      <div class="ah">
+        <table class="ah-t">
+          <tr><th>Состояние</th><th>В шапке</th></tr>
+          <tr><td>Выполняется</td><td><span class="ah-btn ah-btn-danger">Остановить</span></td></tr>
+          <tr><td>Нужна проверка</td><td><span class="ah-btn ah-btn-primary">Открыть результат</span></td></tr>
+          <tr><td>В очереди</td><td><span class="ah-btn">Снять с очереди</span></td></tr>
+          <tr><td>Ошибка / прерван</td><td><span class="ah-btn">Разобрать запуск</span></td></tr>
+          <tr><td>Черновик</td><td>кнопка «Запустить» у поля ввода (как сейчас)</td></tr>
+        </table>
+        <p class="ah-small ah-weak" style="margin-top:8px">«Принять» / «На доработку» — на экране результата, как сейчас.</p>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Что вы чаще всего делаете с задачей? (отметьте кликом)</h3>
+  <div class="options" data-multiselect>
+    <div class="option" data-choice="stop" onclick="toggleSelect(this)"><div class="letter">1</div><div class="content"><h3>Остановить работу</h3></div></div>
+    <div class="option" data-choice="accept" onclick="toggleSelect(this)"><div class="letter">2</div><div class="content"><h3>Принять / на доработку</h3></div></div>
+    <div class="option" data-choice="queue" onclick="toggleSelect(this)"><div class="letter">3</div><div class="content"><h3>Очередь: поставить / снять</h3></div></div>
+    <div class="option" data-choice="archive" onclick="toggleSelect(this)"><div class="letter">4</div><div class="content"><h3>В архив / удалить</h3></div></div>
+    <div class="option" data-choice="agent" onclick="toggleSelect(this)"><div class="letter">5</div><div class="content"><h3>Сменить агента / модель</h3></div></div>
+    <div class="option" data-choice="context" onclick="toggleSelect(this)"><div class="letter">6</div><div class="content"><h3>Посмотреть контекст запуска</h3></div></div>
+  </div>
+  <p class="ah-small ah-weak">Это решит, что живёт кнопкой в шапке, а что — в меню. Направление в целом — напишите в терминале.</p>
+</div>

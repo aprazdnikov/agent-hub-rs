@@ -55,7 +55,7 @@ use crate::transfer::{
 
 mod deletion;
 pub mod tasks;
-pub use deletion::{DeletionDone, SyncDone};
+pub use deletion::{DEFAULT_SYNC_ALIVE_TTL, DEFAULT_SYNC_PROBE_PACING, DeletionDone, SyncDone};
 
 pub(crate) const INBOX: usize = 32;
 const MAILBOX: usize = 256;
@@ -230,6 +230,11 @@ pub struct HubSetup<A> {
     pub recent_projects: RecentProjects,
     pub store: Box<dyn TopicStore>,
     pub home: PathBuf,
+    /// Flood-control pacing of the sync walk and the freshness window of its alive cache;
+    /// production passes `DEFAULT_SYNC_PROBE_PACING`/`DEFAULT_SYNC_ALIVE_TTL`, tests may shrink
+    /// or zero them.
+    pub sync_probe_pacing: Duration,
+    pub sync_alive_ttl: Duration,
     /// The bot's username, to accept `/command@bot`.
     pub bot: String,
 }
@@ -293,6 +298,10 @@ struct Hub<A> {
     telegram_identity: hub_core::settings::TelegramSettings,
     deleting: HashMap<TopicKey, oneshot::Sender<Result<(), String>>>,
     deleted: HashSet<TopicKey>,
+    /// Topics Telegram confirmed alive during a recent sync walk; see `sync_topics`.
+    alive_verified: HashMap<TopicKey, std::time::Instant>,
+    sync_probe_pacing: Duration,
+    sync_alive_ttl: Duration,
     /// Names being written now, so two topics cannot race for one name.
     naming: HashSet<SnapshotName>,
     /// Agent sessions a snapshot job works on, and the topic that asked: no second job and
@@ -323,6 +332,8 @@ pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
         recent_projects,
         store,
         home,
+        sync_probe_pacing,
+        sync_alive_ttl,
         bot,
     } = setup;
     let (mailbox, inbox) = mpsc::channel(MAILBOX);
@@ -384,6 +395,9 @@ pub fn spawn<A: Agents>(setup: HubSetup<A>) -> HubHandle {
         snapshotting: HashSet::new(),
         deleting: HashMap::new(),
         deleted: HashSet::new(),
+        alive_verified: HashMap::new(),
+        sync_probe_pacing,
+        sync_alive_ttl,
         naming: HashSet::new(),
         reserved: HashMap::new(),
         quotas: QuotaCache::default(),
@@ -2490,6 +2504,7 @@ mod tests {
         git: Arc<TestGit>,
         tasks: Arc<hub_core::tasks::service::TaskService>,
         root: tempfile::TempDir,
+        sync_alive_ttl: Duration,
     }
 
     impl World {
@@ -2520,6 +2535,9 @@ mod tests {
                 recent_projects: self.store.recent.lock().unwrap().clone(),
                 store: Box::new(self.store.clone()),
                 home: std::env::temp_dir(),
+                // Test knobs: instant sweeps, short cache window (expiry tests sleep past it).
+                sync_probe_pacing: Duration::ZERO,
+                sync_alive_ttl: self.sync_alive_ttl,
                 bot: "agent_hub_bot".to_owned(),
             });
         }
@@ -2542,13 +2560,16 @@ mod tests {
     }
 
     fn world_with(agents: FakeAgents, messenger: FakeMessenger) -> World {
-        world_from(agents, messenger, BackendKind::Claude)
+        world_from(agents, messenger, BackendKind::Claude, Duration::ZERO)
     }
 
+    /// `sync_alive_ttl` = 0 disables the sync alive-cache, which is what nearly every test wants:
+    /// each sync must re-probe. Cache-sensitive tests pass a real window.
     fn world_from(
         agents: FakeAgents,
         messenger: FakeMessenger,
         default_backend: BackendKind,
+        sync_alive_ttl: Duration,
     ) -> World {
         let root = tempfile::tempdir().unwrap();
         std::fs::create_dir(root.path().join("project")).unwrap();
@@ -2590,6 +2611,8 @@ mod tests {
             recent_projects: RecentProjects::default(),
             store: Box::new(store.clone()),
             home: std::env::temp_dir(),
+            sync_probe_pacing: Duration::ZERO,
+            sync_alive_ttl,
             bot: "agent_hub_bot".to_owned(),
         });
         World {
@@ -2604,6 +2627,7 @@ mod tests {
             transcriber,
             git,
             tasks,
+            sync_alive_ttl,
         }
     }
 
@@ -3029,6 +3053,29 @@ mod tests {
         assert!(!world.messenger.calls().iter().any(|call| matches!(call, Call::DeleteTopic(_))));
         let stored = world.store.last().unwrap();
         assert!(!stored.contains_key(&KEY) && stored.contains_key(&live));
+    }
+
+    #[tokio::test]
+    async fn sync_reuses_recent_alive_answers() {
+        // Regression: 85 topics pinged one by one ran the group straight into a 429 after ~2
+        // probes/s. A topic Telegram just confirmed alive must not be re-pinged on the next press.
+        let world = world_from(
+            FakeAgents::default(),
+            FakeMessenger::default(),
+            BackendKind::Claude,
+            Duration::from_millis(250),
+        );
+        world.send(inbound(Some(8), 1, Content::TopicCreated { name: "Живая".into() })).await;
+        let live = TopicKey { chat: KEY.chat, thread: ThreadId(8) };
+        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны.");
+        assert_eq!(probe_calls(&world), [live]);
+        // The second press answers from the TTL cache: no new probe, same honest count.
+        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны.");
+        assert_eq!(probe_calls(&world), [live], "a fresh alive answer must not be re-pinged");
+        // Once the entry ages out, the walk re-probes the topic.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert_eq!(sync(&world).await.unwrap(), "Все темы актуальны.");
+        assert_eq!(probe_calls(&world).len(), 2);
     }
 
     #[tokio::test]
@@ -3573,6 +3620,7 @@ mod tests {
                 "offline".into(),
             ))]),
             BackendKind::Claude,
+            Duration::ZERO,
         );
         compact(&world);
         world.send(text(Some(7), 1, "work")).await;
@@ -3758,7 +3806,12 @@ mod tests {
 
     #[tokio::test]
     async fn options_qwen_cancel_and_disk_failure_keep_history_until_explicit_apply() {
-        let world = world_from(FakeAgents::default(), FakeMessenger::default(), BackendKind::Qwen);
+        let world = world_from(
+            FakeAgents::default(),
+            FakeMessenger::default(),
+            BackendKind::Qwen,
+            Duration::ZERO,
+        );
         bound(&world, KEY, "old-qwen").await;
         let before = world.store.last().unwrap();
         let preview = option_preview(&world, "/model qwen-model").await;
@@ -4675,7 +4728,8 @@ mod tests {
             )),
         );
         let agents = FakeAgents::polling(vec![vec![claude_max(1), codex]]);
-        let world = world_from(agents, FakeMessenger::default(), BackendKind::Codex);
+        let world =
+            world_from(agents, FakeMessenger::default(), BackendKind::Codex, Duration::ZERO);
         world.send(text(Some(7), 1, "/limits")).await;
         eventually("card", || has_card(&world, 1, "<b>Claude</b>")).await;
         let (card, _) =
@@ -4894,7 +4948,12 @@ mod tests {
 
     #[tokio::test]
     async fn new_without_a_backend_uses_the_default_from_settings() {
-        let world = world_from(FakeAgents::default(), FakeMessenger::default(), BackendKind::Codex);
+        let world = world_from(
+            FakeAgents::default(),
+            FakeMessenger::default(),
+            BackendKind::Codex,
+            Duration::ZERO,
+        );
         world.send(text(Some(7), 1, "/new project")).await;
         eventually("new", || {
             world

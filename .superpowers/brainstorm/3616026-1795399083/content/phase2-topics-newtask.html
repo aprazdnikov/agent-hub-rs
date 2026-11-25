@@ -1,0 +1,122 @@
+<style>
+  .ah { --canvas:#F8F9F7; --surface:#FFFFFF; --text:#1C2521; --muted:#54645C; --border:#D5DDD7; --accent:#0D644F; --selected:#DCEEE5;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--text); font-size: 13px; line-height: 1.45; }
+  .ah * { box-sizing: border-box; }
+  .ah-win { background: var(--canvas); border: 1px solid var(--border); border-radius: 10px; padding: 18px; max-width: 860px; margin: 0 auto; }
+  .ah-title { font-size: 20px; font-weight: 700; margin: 0; }
+  .ah-weak { color: var(--muted); }
+  .ah-small { font-size: 11px; }
+  .ah-btn { display: inline-block; border: 1px solid var(--border); background: var(--surface); color: var(--text);
+            border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: pointer; }
+  .ah-btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .ah-btn-ghost { border-color: transparent; background: transparent; color: var(--muted); }
+  .ah-btn-danger { color: #94312F; border-color: #E5C6C4; }
+  .ah-chip { display: inline-block; border-radius: 999px; padding: 2px 9px; font-size: 11px; font-weight: 600; }
+  .ah-chip-run { background: var(--selected); color: var(--accent); }
+  .ah-chip-idle { background: var(--canvas); color: var(--muted); border: 1px solid var(--border); }
+  .ah-row { display: flex; align-items: center; gap: 8px; }
+  .ah-grow { flex: 1; min-width: 0; }
+  .ah-card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 12px 14px; margin-bottom: 10px; }
+  .ah-ico { width: 26px; height: 26px; border-radius: 8px; display: flex; align-items: center; justify-content: center;
+            font-size: 13px; font-weight: 700; flex: none; background: var(--selected); color: var(--accent); }
+  .ah-select { border: 1px solid var(--border); border-radius: 6px; background: var(--surface); padding: 5px 12px; font-size: 12px; }
+  .ah-field { border: 1px solid var(--border); border-radius: 8px; background: var(--surface); padding: 8px 12px; font-size: 13px; color: var(--muted); }
+  .ah-menu { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 5px; width: 240px;
+             box-shadow: 0 6px 18px rgba(28,37,33,.10); }
+  .ah-menu-item { padding: 6px 10px; border-radius: 6px; font-size: 12px; }
+  .ah-menu-sep { border-top: 1px solid var(--border); margin: 5px 4px; }
+  .ah-menu-danger { color: #94312F; }
+  .ah-label { font-size: 12px; font-weight: 600; margin-bottom: 4px; }
+</style>
+
+<h2>Фаза 2 · Темы Telegram и Новая задача</h2>
+<p class="subtitle">Тот же язык: карточки, чипы, меню «…», только покрытые шрифтом символы. Навигация и фильтры остаются.</p>
+
+<div class="mockup">
+  <div class="mockup-header">Темы Telegram · предлагаю</div>
+  <div class="mockup-body">
+    <div class="ah">
+      <div class="ah-win">
+        <div class="ah-row">
+          <div class="ah-grow"><h3 class="ah-title">Темы Telegram</h3></div>
+        </div>
+        <div class="ah-row" style="margin:10px 0 14px">
+          <span class="ah-field" style="width:250px">Поиск по названию или каталогу</span>
+          <span class="ah-btn">Фильтры</span>
+        </div>
+
+        <div class="ah-card">
+          <div class="ah-row">
+            <span class="ah-ico">●</span>
+            <div class="ah-grow">
+              <div class="ah-row"><strong style="font-size:14px">Поиск по каталогу</strong>
+                <span class="ah-chip ah-chip-run">работает · реализация</span></div>
+              <div class="ah-weak ah-small">Витрина · Codex</div>
+            </div>
+            <span class="ah-btn">Telegram</span>
+            <span class="ah-btn ah-btn-ghost">…</span>
+          </div>
+          <div class="ah-weak ah-small" style="margin-top:8px">Запущен 2 мин назад · память включена · шаг 3/5</div>
+          <div class="ah-row" style="margin-top:8px">
+            <span class="ah-btn ah-btn-danger">Остановить</span>
+          </div>
+        </div>
+
+        <div class="ah-card">
+          <div class="ah-row">
+            <span class="ah-ico" style="background:var(--canvas);color:var(--muted);border:1px solid var(--border)">○</span>
+            <div class="ah-grow">
+              <div class="ah-row"><strong style="font-size:14px">Отчёт по очереди</strong>
+                <span class="ah-chip ah-chip-idle">свободна</span></div>
+              <div class="ah-weak ah-small">Atlas · Claude Code</div>
+            </div>
+            <span class="ah-btn">Telegram</span>
+            <span class="ah-btn ah-btn-ghost">…</span>
+          </div>
+        </div>
+
+        <div style="display:flex; justify-content:flex-end">
+          <div class="ah-menu">
+            <div class="ah-menu-item">Память темы · включена √</div>
+            <div class="ah-menu-item">Параметры и прогресс</div>
+            <div class="ah-menu-item">Открыть папку</div>
+            <div class="ah-menu-item">Скопировать ссылку</div>
+            <div class="ah-menu-item">Скопировать session_id</div>
+            <div class="ah-menu-sep"></div>
+            <div class="ah-menu-item">Сбросить сессию…</div>
+            <div class="ah-menu-item ah-menu-danger">Удалить тему…</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="mockup" style="margin-top:22px">
+  <div class="mockup-header">Новая задача · предлагаю</div>
+  <div class="mockup-body">
+    <div class="ah">
+      <div class="ah-win">
+        <h3 class="ah-title">Новая задача</h3>
+        <div class="ah-row" style="margin:12px 0; flex-wrap:wrap">
+          <span class="ah-label" style="margin:0">Проект</span><span class="ah-select">Витрина ▾</span>
+          <span class="ah-label" style="margin:0">Где</span><span class="ah-select">Локально ▾</span>
+          <span class="ah-label" style="margin:0">Агент</span><span class="ah-select">Codex ▾</span>
+        </div>
+        <div class="ah-label">Что поручить агенту</div>
+        <div class="ah-field" style="min-height:64px">После сброса фильтра верни фокус в поле поиска…</div>
+        <div class="ah-label" style="margin-top:12px">Название <span class="ah-weak" style="font-weight:400">· необязательно, по умолчанию — первая строка поручения</span></div>
+        <div class="ah-field">Поиск по каталогу</div>
+        <div class="ah-row" style="margin-top:14px">
+          <span class="ah-btn ah-btn-primary">Начать задачу</span>
+          <span class="ah-btn">Сохранить черновик</span>
+          <span class="ah-grow"></span>
+          <span class="ah-link ah-weak ah-small">Правила проекта ›</span>
+        </div>
+        <div class="ah-weak ah-small" style="margin-top:8px">Причина блокировки (если есть) — подсказкой здесь, у кнопки.</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<p class="ah-small ah-weak" style="margin-top:12px">Меню «…» тем заменяет inline-раскрытие «Параметры»; подтверждения сброса/удаления остаются модалами. В «Новой задаче» название больше не в раскрытии, поле поручения растёт как композер чата. Что поправить — напишите в терминале.</p>

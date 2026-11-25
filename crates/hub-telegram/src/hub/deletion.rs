@@ -22,6 +22,9 @@ pub struct SyncDone {
     pending: Vec<TopicKey>,
     /// Topics the probes found still present.
     alive: usize,
+    /// Topics this walk actually pinged and found alive — the actor refreshes their TTL entries
+    /// from these keys, so cached-alive topics are not re-credited on every sync.
+    verified_alive: Vec<TopicKey>,
     /// Topics whose probe answer could not be trusted (rejected/failed, not rate-limited).
     uncertain: usize,
     /// Topics the actor skipped before the walk because they were busy.
@@ -30,6 +33,17 @@ pub struct SyncDone {
     retry_after: Option<Duration>,
     reply: oneshot::Sender<Result<String, String>>,
 }
+
+/// Telegram's group flood control answers the topic pings with 429 once the walk sends more than
+/// roughly one request per second; the pacing keeps the sweep under that ceiling (the observed
+/// live 429 asked for 18 s after ~2 probes/s).
+pub const DEFAULT_SYNC_PROBE_PACING: Duration = Duration::from_millis(1500);
+
+/// How long a «живая» probe answer is trusted without re-pinging. A second sync press must not
+/// re-probe the whole group (that is what burns the flood budget); a topic deleted externally
+/// inside this window is still caught by the next sync or by the Delete button, so the freshness
+/// cost is bounded and invisible in practice.
+pub const DEFAULT_SYNC_ALIVE_TTL: Duration = Duration::from_mins(10);
 
 /// Which half of a proven-gone cleanup failed. The halves write different files, and a silently
 /// failed detach leaves bound `origin`s pointing at rows no later walk reaches — the exact
@@ -261,6 +275,7 @@ impl<A: Agents> Hub<A> {
         self.projects.invalidate(key);
         self.options.invalidate(key);
         self.last_progress.remove(&key);
+        self.alive_verified.remove(&key);
         self.replace_topics(topics);
         Ok(())
     }
@@ -283,44 +298,43 @@ impl<A: Agents> Hub<A> {
 }
 
 impl<A: Agents> Hub<A> {
-    pub(super) fn sync_topics(&mut self, reply: oneshot::Sender<Result<String, String>>) {
-        if self.shutdown.is_some() || self.settings.borrow().telegram != self.telegram_identity {
-            let _ = reply.send(Err(
-                "Синхронизация недоступна: запустите бота с сохранёнными настройками Telegram."
-                    .into(),
-            ));
-            return;
-        }
-        // Eligible topics: a forum thread in the configured chat that is not already gone.
-        let eligible: Vec<TopicKey> = self
-            .topics
-            .keys()
-            .copied()
-            .filter(|key| {
-                key.thread.0 > 1
-                    && key.chat == self.telegram_identity.chat
-                    && !self.topic_unavailable(*key)
-            })
-            .collect();
-        // A proven-missing topic must be reachable even when its task queue still holds intents,
-        // so only genuinely active work (check_force_cleanup) skips a candidate; a queued-only topic
-        // is probed and, if gone, cleaned with its queue detached. Anything skipped is reported as
-        // busy rather than silently dropped from the count.
+    /// Splits stored topics for one sync walk: `(candidates, pending, cached_alive, busy)`.
+    ///
+    /// Eligible topics are forum threads in the configured chat that are not already gone.
+    /// A proven-missing topic must be reachable even when its task queue still holds intents,
+    /// so only genuinely active work (`check_force_cleanup`) skips a candidate; a queued-only
+    /// topic is probed and, if gone, cleaned with its queue detached. Anything skipped is
+    /// reported as busy rather than silently dropped from the count. A topic Telegram just
+    /// confirmed alive is not pinged again inside the TTL: the button pressed twice must not
+    /// burn the group's flood budget on unchanged answers — only an actual `Ok(true)` from a
+    /// probe credits an entry (see `finish_sync`).
+    ///
+    /// `pending` are rows a previous disk failure left behind: Telegram already proved them
+    /// gone, so the retry finishes them without a new probe — that is what makes «повторите
+    /// синхронизацию» a repeatable instruction rather than a dead end. The marker is only ever
+    /// set by proven sync deletions, but the eligible guards are re-checked here so the
+    /// invariant stays explicit.
+    fn split_sync_candidates(&self) -> (Vec<TopicKey>, Vec<TopicKey>, usize, usize) {
+        let mut cached_alive = 0usize;
         let mut candidates = Vec::new();
         let mut busy = 0;
-        for key in eligible {
-            if self.check_force_cleanup(key).is_ok() {
-                candidates.push(key);
-            } else {
+        for key in self.topics.keys().copied().filter(|key| {
+            key.thread.0 > 1
+                && key.chat == self.telegram_identity.chat
+                && !self.topic_unavailable(*key)
+        }) {
+            if self.check_force_cleanup(key).is_err() {
                 busy += 1;
                 tracing::debug!(topic = ?key, category = "busy", "sync skipped a busy topic");
+                continue;
+            }
+            if self.alive_verified.get(&key).is_some_and(|at| at.elapsed() < self.sync_alive_ttl) {
+                cached_alive += 1;
+            } else {
+                candidates.push(key);
             }
         }
-        // Rows a previous disk failure left behind: Telegram already proved them gone, so the
-        // retry finishes them without a new probe — that is what makes «повторите синхронизацию»
-        // a repeatable instruction rather than a dead end. The marker is only ever set by proven
-        // sync deletions, but the eligible guards are re-checked so the invariant stays explicit.
-        let pending: Vec<TopicKey> = self
+        let pending = self
             .topics
             .keys()
             .copied()
@@ -330,19 +344,33 @@ impl<A: Agents> Hub<A> {
                     && key.chat == self.telegram_identity.chat
             })
             .collect();
+        (candidates, pending, cached_alive, busy)
+    }
+
+    pub(super) fn sync_topics(&mut self, reply: oneshot::Sender<Result<String, String>>) {
+        if self.shutdown.is_some() || self.settings.borrow().telegram != self.telegram_identity {
+            let _ = reply.send(Err(
+                "Синхронизация недоступна: запустите бота с сохранёнными настройками Telegram."
+                    .into(),
+            ));
+            return;
+        }
+        let (candidates, pending, cached_alive, busy) = self.split_sync_candidates();
         if candidates.is_empty() && pending.is_empty() {
-            let _ = reply.send(Ok(sync_summary(0, 0, busy, 0, 0)));
+            let _ = reply.send(Ok(sync_summary(0, cached_alive, busy, 0, 0)));
             return;
         }
         let sender = self.sender.clone();
         let mailbox = self.mailbox.clone();
         let settings = self.settings.clone();
         let identity = self.telegram_identity.clone();
+        let pacing = self.sync_probe_pacing;
         tokio::spawn(async move {
             let mut stale = Vec::new();
-            let mut alive = 0;
+            let mut verified_alive = Vec::new();
+            let mut alive = cached_alive;
             let mut uncertain = 0;
-            for key in candidates {
+            for (probed, key) in candidates.into_iter().enumerate() {
                 if mailbox.is_closed() {
                     let _ = reply.send(Err("Бот остановлен. Синхронизация прервана.".into()));
                     return;
@@ -352,9 +380,17 @@ impl<A: Agents> Hub<A> {
                         .send(Err("Настройки Telegram изменились. Обновите список тем.".into()));
                     return;
                 }
+                // Telegram counts topic pings against the group's flood budget; sweep them at a
+                // distance that does not invite 429 into the middle of an 85-topic walk.
+                if probed > 0 && !pacing.is_zero() {
+                    tokio::time::sleep(pacing).await;
+                }
                 match sender.messenger().probe_topic(key).await {
                     Ok(false) => stale.push(key),
-                    Ok(true) => alive += 1,
+                    Ok(true) => {
+                        alive += 1;
+                        verified_alive.push(key);
+                    }
                     // An uncertain answer must not drop local state: skip the topic and
                     // keep checking the rest, but report it so the user knows it was not verified.
                     Err(SendError::Rejected(_) | SendError::Failed(_)) => {
@@ -372,6 +408,7 @@ impl<A: Agents> Hub<A> {
                                 stale,
                                 pending,
                                 alive,
+                                verified_alive,
                                 uncertain,
                                 busy,
                                 retry_after: Some(retry_after),
@@ -387,6 +424,7 @@ impl<A: Agents> Hub<A> {
                     stale,
                     pending,
                     alive,
+                    verified_alive,
                     uncertain,
                     busy,
                     retry_after: None,
@@ -397,6 +435,13 @@ impl<A: Agents> Hub<A> {
     }
 
     pub(super) fn finish_sync(&mut self, done: SyncDone) {
+        // Refresh the TTL cache from this walk's real answers: rows that vanished or whose entry
+        // aged out without a fresh ping drop, keys the walk just proved alive get a fresh stamp.
+        let ttl = self.sync_alive_ttl;
+        self.alive_verified.retain(|key, at| self.topics.contains_key(key) && at.elapsed() < ttl);
+        for key in &done.verified_alive {
+            self.alive_verified.insert(*key, std::time::Instant::now());
+        }
         let mut removed = 0;
         let mut failed = 0;
         let mut queue_failed = 0;

@@ -364,6 +364,8 @@ impl Connector for TelegramConnector {
                     recent_projects,
                     store: Box::new(FileTopics::new(topic_path)),
                     home,
+                    sync_probe_pacing: hub::DEFAULT_SYNC_PROBE_PACING,
+                    sync_alive_ttl: hub::DEFAULT_SYNC_ALIVE_TTL,
                     bot: username.clone(),
                 });
             let listener = telegram::listen(bot, current.telegram.clone(), mailbox.clone());

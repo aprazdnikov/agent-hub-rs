@@ -1,0 +1,154 @@
+<style>
+  .ah { --canvas:#F8F9F7; --surface:#FFFFFF; --text:#1C2521; --muted:#54645C; --border:#D5DDD7; --accent:#0D644F; --selected:#DCEEE5;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--text); font-size: 13px; line-height: 1.45; }
+  .ah * { box-sizing: border-box; }
+  .ah-win { background: var(--canvas); border: 1px solid var(--border); border-radius: 10px; padding: 16px; height: 100%; }
+  .ah-crumb { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  .ah-title { font-size: 20px; font-weight: 700; margin: 0; }
+  .ah-weak { color: var(--muted); }
+  .ah-small { font-size: 11px; }
+  .ah-hr { border: none; border-top: 1px solid var(--border); margin: 10px 0; }
+  .ah-btn { display: inline-block; border: 1px solid var(--border); background: var(--surface); color: var(--text);
+            border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: default; }
+  .ah-btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .ah-btn-ghost { border-color: transparent; background: transparent; color: var(--muted); }
+  .ah-chip { display: inline-block; border-radius: 999px; padding: 2px 9px; font-size: 11px; font-weight: 600; }
+  .ah-chip-wait { background: #FBF0DC; color: #8A5A00; }
+  .ah-chip-ok { background: var(--selected); color: var(--accent); }
+  .ah-chip-run { background: var(--selected); color: var(--accent); }
+  .ah-row { display: flex; align-items: center; gap: 8px; }
+  .ah-grow { flex: 1; min-width: 0; }
+  .ah-msg { border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; }
+  .ah-msg-user { background: var(--selected); }
+  .ah-msg-agent { background: var(--surface); border: 1px solid var(--border); }
+  .ah-msg-head { display: flex; align-items: center; gap: 7px; margin-bottom: 5px; font-size: 12px; }
+  .ah-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
+  .ah-time { margin-left: auto; color: var(--muted); font-size: 11px; font-weight: 400; }
+  .ah-clamp { position: relative; max-height: 62px; overflow: hidden; }
+  .ah-clamp::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 26px;
+                     background: linear-gradient(transparent, var(--surface)); }
+  .ah-link { color: var(--accent); font-size: 12px; font-weight: 600; }
+  .ah-filechip { display: inline-block; border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px;
+                 font-size: 11px; color: var(--muted); background: var(--canvas); margin-right: 6px; }
+  .ah-composer { border: 1px solid var(--border); border-radius: 10px; background: var(--surface);
+                 display: flex; align-items: center; padding: 6px 6px 6px 12px; gap: 8px; }
+  .ah-composer input { border: none; outline: none; flex: 1; font-size: 13px; background: transparent; color: var(--text); }
+  .ah-old-label { font-weight: 700; margin: 10px 0 2px; }
+  .ah-note { font-size: 12px; color: var(--muted); margin-top: 10px; }
+</style>
+
+<h2>Чат задачи: простыня → переписка</h2>
+<p class="subtitle">Область чата (вкладки и сайдбар не меняем). Палитра текущая. Слева — как сейчас, справа — предложение.</p>
+
+<div class="split">
+  <div class="mockup">
+    <div class="mockup-header">Сейчас</div>
+    <div class="mockup-body">
+      <div class="ah">
+        <div class="ah-win">
+          <div class="ah-crumb">Витрина&nbsp;&nbsp;/&nbsp;&nbsp;#3</div>
+          <div class="ah-row">
+            <div class="ah-grow"><h3 class="ah-title">Поиск по каталогу</h3></div>
+            <span class="ah-btn">Параметры</span>
+          </div>
+          <div class="ah-weak ah-small" style="margin-top:4px">Codex · локально · Нужна проверка</div>
+          <div class="ah-weak ah-small">Память выключена · общие настройки</div>
+          <hr class="ah-hr">
+          <div class="ah-old-label">Вы</div>
+          <div>После сброса фильтра верни фокус в поле поиска. Проверь сценарий с клавиатуры.</div>
+          <div class="ah-old-label">codex · Запуск завершён</div>
+          <div>После сброса фильтра курсор возвращается в поле поиска. Добавил тест, который вводит новый запрос с клавиатуры.</div>
+          <div class="ah-old-label">Вы</div>
+          <div>Проверь тот же сценарий в узком окне.</div>
+          <div class="ah-old-label">codex · Запуск завершён</div>
+          <div>Проверил на ширине 375 и 1280 пикселей. В обоих случаях можно сразу печатать следующий запрос. Обе проверки прошли.</div>
+          <div style="margin-top:14px"><span class="ah-btn">Открыть результат</span></div>
+          <hr class="ah-hr">
+          <div class="ah-composer" style="border-radius:6px; padding:8px 12px">
+            <input placeholder="Сообщение агенту" disabled>
+          </div>
+          <div class="ah-row" style="margin-top:8px">
+            <div class="ah-grow ah-weak ah-small" style="text-align:center">Ctrl+Enter для отправки</div>
+            <span class="ah-btn ah-btn-primary" style="opacity:.55">Отправить</span>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="mockup">
+    <div class="mockup-header">Предлагаю</div>
+    <div class="mockup-body">
+      <div class="ah">
+        <div class="ah-win">
+          <div class="ah-crumb">Витрина&nbsp;&nbsp;/&nbsp;&nbsp;#3</div>
+          <div class="ah-row">
+            <div class="ah-grow ah-row">
+              <h3 class="ah-title">Поиск по каталогу</h3>
+              <span class="ah-chip ah-chip-wait">Нужна проверка</span>
+            </div>
+            <span class="ah-btn ah-btn-primary">Открыть результат</span>
+            <span class="ah-btn ah-btn-ghost" title="Параметры, правила, архив…">⋯</span>
+          </div>
+          <div class="ah-weak ah-small" style="margin-top:4px">Codex · локально · память выключена</div>
+          <hr class="ah-hr">
+
+          <div class="ah-msg ah-msg-user">
+            <div class="ah-msg-head"><strong>Вы</strong><span class="ah-time">14:02</span></div>
+            После сброса фильтра верни фокус в поле поиска. Проверь сценарий с клавиатуры.
+          </div>
+
+          <div class="ah-msg ah-msg-agent">
+            <div class="ah-msg-head">
+              <span class="ah-dot"></span><strong>Codex</strong>
+              <span class="ah-chip ah-chip-ok">Завершён</span>
+              <span class="ah-time">14:05</span>
+            </div>
+            После сброса фильтра курсор возвращается в поле поиска. Добавил тест, который вводит новый запрос с клавиатуры.
+            <div style="margin-top:8px">
+              <span class="ah-filechip">📄 2 файла</span>
+              <span class="ah-filechip">✓ проверки 2/2</span>
+              <span class="ah-link">Результат →</span>
+            </div>
+          </div>
+
+          <div class="ah-msg ah-msg-user">
+            <div class="ah-msg-head"><strong>Вы</strong><span class="ah-time">14:11</span></div>
+            Проверь тот же сценарий в узком окне.
+          </div>
+
+          <div class="ah-msg ah-msg-agent">
+            <div class="ah-msg-head">
+              <span class="ah-dot"></span><strong>Codex</strong>
+              <span class="ah-chip ah-chip-ok">Завершён</span>
+              <span class="ah-time">14:16</span>
+            </div>
+            <div class="ah-clamp">
+              Проверил на ширине 375 и 1280 пикселей. В обоих случаях можно сразу печатать следующий запрос. Обе проверки прошли.
+              Дополнительно прогнал регрессию по каталогу: 48 сценариев, все зелёные. Отчёт приложил файлом, ниже краткая выжимка по каждому блоку сценариев и найденным мелочам.
+            </div>
+            <span class="ah-link">Развернуть</span>
+          </div>
+
+          <div class="ah-composer">
+            <input placeholder="Сообщение агенту" disabled>
+            <span class="ah-btn ah-btn-primary">Отправить</span>
+          </div>
+          <div class="ah-weak ah-small" style="margin-top:5px">Ctrl+Enter для отправки</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Что изменилось</h3>
+  <div class="options" data-multiselect>
+    <div class="option" data-choice="cards" onclick="toggleSelect(this)"><div class="letter">1</div><div class="content"><h3>Карточки сообщений</h3><p>«Вы» и агент визуально отделены; у агента — статус завершения чипом</p></div></div>
+    <div class="option" data-choice="header-actions" onclick="toggleSelect(this)"><div class="letter">2</div><div class="content"><h3>Действия в шапке</h3><p>Главное действие задачи — кнопкой сразу; редкое — в меню «⋯», без ухода в «Параметры»</p></div></div>
+    <div class="option" data-choice="clamp" onclick="toggleSelect(this)"><div class="letter">3</div><div class="content"><h3>Длинные ответы свёрнуты</h3><p>Простыня обрезается до нескольких строк с «Развернуть»; файлы и проверки — чипами</p></div></div>
+    <div class="option" data-choice="composer" onclick="toggleSelect(this)"><div class="letter">4</div><div class="content"><h3>Композер одной строкой</h3><p>Поле и «Отправить» вместе, подсказка ниже — меньше вертикальных прыжков</p></div></div>
+    <div class="option" data-choice="time" onclick="toggleSelect(this)"><div class="letter">5</div><div class="content"><h3>Время сообщений</h3><p>Опционально: сейчас история не хранит даты — потребуется добавить поле в данные задачи</p></div></div>
+  </div>
+  <p class="ah-note">Отметьте кликом, что оставляем (можно несколько). Что не так или чего не хватает — напишите в терминале.</p>
+</div>

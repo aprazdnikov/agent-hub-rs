@@ -1,0 +1,119 @@
+<style>
+  .ah { --canvas:#F8F9F7; --surface:#FFFFFF; --text:#1C2521; --muted:#54645C; --border:#D5DDD7; --accent:#0D644F; --selected:#DCEEE5;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif; color: var(--text); font-size: 13px; line-height: 1.45; }
+  .ah * { box-sizing: border-box; }
+  .ah-win { background: var(--canvas); border: 1px solid var(--border); border-radius: 10px; padding: 18px; max-width: 860px; margin: 0 auto; }
+  .ah-crumb { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  .ah-title { font-size: 20px; font-weight: 700; margin: 0; }
+  .ah-weak { color: var(--muted); }
+  .ah-small { font-size: 11px; }
+  .ah-hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+  .ah-btn { display: inline-block; border: 1px solid var(--border); background: var(--surface); color: var(--text);
+            border-radius: 6px; padding: 5px 12px; font-size: 12px; cursor: pointer; }
+  .ah-btn-primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  .ah-btn-ghost { border-color: transparent; background: transparent; color: var(--muted); }
+  .ah-chip { display: inline-block; border-radius: 999px; padding: 2px 9px; font-size: 11px; font-weight: 600; }
+  .ah-chip-wait { background: #FBF0DC; color: #8A5A00; }
+  .ah-chip-ok { background: var(--selected); color: var(--accent); }
+  .ah-row { display: flex; align-items: center; gap: 8px; }
+  .ah-grow { flex: 1; min-width: 0; }
+  .ah-turn { display: flex; margin-bottom: 12px; }
+  .ah-turn-user { justify-content: flex-end; }
+  .ah-bubble { max-width: 78%; border-radius: 12px; padding: 9px 12px; }
+  .ah-turn-user .ah-bubble { background: var(--selected); border-bottom-right-radius: 4px; }
+  .ah-turn-agent .ah-bubble { background: var(--surface); border: 1px solid var(--border); border-bottom-left-radius: 4px; max-width: 86%; }
+  .ah-msg-head { display: flex; align-items: center; gap: 7px; margin-bottom: 4px; font-size: 12px; }
+  .ah-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--accent); flex: none; }
+  .ah-time { margin-left: auto; color: var(--muted); font-size: 11px; font-weight: 400; padding-left: 10px; }
+  .ah-clamp { position: relative; max-height: 62px; overflow: hidden; }
+  .ah-clamp.ah-open { max-height: none; }
+  .ah-clamp:not(.ah-open)::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 26px;
+                     background: linear-gradient(transparent, var(--surface)); }
+  .ah-link { color: var(--accent); font-size: 12px; font-weight: 600; cursor: pointer; }
+  .ah-filechip { display: inline-block; border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px;
+                 font-size: 11px; color: var(--muted); background: var(--canvas); margin-right: 6px; }
+  .ah-composer { border: 1px solid var(--border); border-radius: 12px; background: var(--surface);
+                 display: flex; align-items: flex-end; padding: 6px 6px 6px 12px; gap: 8px; }
+  .ah-composer:focus-within { border-color: var(--accent); }
+  .ah-composer textarea { border: none; outline: none; flex: 1; font-size: 13px; background: transparent; color: var(--text);
+                          resize: none; font-family: inherit; line-height: 1.45; max-height: 160px; padding: 4px 0; }
+  .ah-note { font-size: 12px; color: var(--muted); margin-top: 10px; }
+</style>
+
+<h2>Чат задачи — вариант 2</h2>
+<p class="subtitle">Ваши сообщения справа, агента — слева. Поле ввода растягивается при наборе (попробуйте напечатать). Всё остальное — как отметили.</p>
+
+<div class="mockup">
+  <div class="mockup-header">Предлагаю · интерактивно</div>
+  <div class="mockup-body">
+    <div class="ah">
+      <div class="ah-win">
+        <div class="ah-crumb">Витрина&nbsp;&nbsp;/&nbsp;&nbsp;#3</div>
+        <div class="ah-row">
+          <div class="ah-grow ah-row">
+            <h3 class="ah-title">Поиск по каталогу</h3>
+            <span class="ah-chip ah-chip-wait">Нужна проверка</span>
+          </div>
+          <span class="ah-btn ah-btn-primary">Открыть результат</span>
+          <span class="ah-btn ah-btn-ghost" title="Параметры, правила, архив…">⋯</span>
+        </div>
+        <div class="ah-weak ah-small" style="margin-top:4px">Codex · локально · память выключена</div>
+        <hr class="ah-hr">
+
+        <div class="ah-turn ah-turn-user">
+          <div class="ah-bubble">
+            <div class="ah-msg-head"><strong>Вы</strong><span class="ah-time">14:02</span></div>
+            После сброса фильтра верни фокус в поле поиска. Проверь сценарий с клавиатуры.
+          </div>
+        </div>
+
+        <div class="ah-turn ah-turn-agent">
+          <div class="ah-bubble">
+            <div class="ah-msg-head">
+              <span class="ah-dot"></span><strong>Codex</strong>
+              <span class="ah-chip ah-chip-ok">Завершён</span>
+              <span class="ah-time">14:05</span>
+            </div>
+            После сброса фильтра курсор возвращается в поле поиска. Добавил тест, который вводит новый запрос с клавиатуры.
+            <div style="margin-top:8px">
+              <span class="ah-filechip">📄 2 файла</span>
+              <span class="ah-filechip">✓ проверки 2/2</span>
+              <span class="ah-link">Результат →</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="ah-turn ah-turn-user">
+          <div class="ah-bubble">
+            <div class="ah-msg-head"><strong>Вы</strong><span class="ah-time">14:11</span></div>
+            Проверь тот же сценарий в узком окне.
+          </div>
+        </div>
+
+        <div class="ah-turn ah-turn-agent">
+          <div class="ah-bubble">
+            <div class="ah-msg-head">
+              <span class="ah-dot"></span><strong>Codex</strong>
+              <span class="ah-chip ah-chip-ok">Завершён</span>
+              <span class="ah-time">14:16</span>
+            </div>
+            <div class="ah-clamp" id="ahClamp">
+              Проверил на ширине 375 и 1280 пикселей. В обоих случаях можно сразу печатать следующий запрос. Обе проверки прошли.
+              Дополнительно прогнал регрессию по каталогу: 48 сценариев, все зелёные. Отчёт приложил файлом, ниже краткая выжимка по каждому блоку сценариев и найденным мелочам.
+            </div>
+            <span class="ah-link" onclick="var c=document.getElementById('ahClamp');c.classList.toggle('ah-open');this.textContent=c.classList.contains('ah-open')?'Свернуть':'Развернуть'">Развернуть</span>
+          </div>
+        </div>
+
+        <div class="ah-composer">
+          <textarea id="ahInput" rows="1" placeholder="Сообщение агенту"
+            oninput="this.style.height='auto';this.style.height=Math.min(this.scrollHeight,160)+'px'"></textarea>
+          <span class="ah-btn ah-btn-primary">Отправить</span>
+        </div>
+        <div class="ah-weak ah-small" style="margin-top:5px">Ctrl+Enter для отправки · поле растёт до 8 строк, дальше — прокрутка</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<p class="ah-note">«Развернуть» у длинного ответа и рост поля ввода — рабочие, попробуйте. Если чат устраивает, покажу следующим экраном «Входящие» и где живут действия без «Параметров».</p>

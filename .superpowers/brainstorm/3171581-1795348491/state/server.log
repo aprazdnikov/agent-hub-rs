@@ -1,0 +1,17 @@
+{"type":"server-started","port":54223,"host":"127.0.0.1","url_host":"localhost","url":"http://localhost:54223/?key=0fb956e9844bb67915e75bcb474319f96e69482c49196416cd950f039863ee12","screen_dir":"/home/aprazdnikov/Projects/aprazdnikov/agent-hub-rs/.superpowers/brainstorm/3171581-1795348491/content","state_dir":"/home/aprazdnikov/Projects/aprazdnikov/agent-hub-rs/.superpowers/brainstorm/3171581-1795348491/state","idle_timeout_ms":14400000}
+{"type":"screen-added","file":"/home/aprazdnikov/Projects/aprazdnikov/agent-hub-rs/.superpowers/brainstorm/3171581-1795348491/content/chat-direction.html"}
+{"source":"user-event","type":"click","text":"1Карточки сообщений«Вы» и агент визуально отделены; у агента — статус завершения чипом","choice":"cards","id":null,"timestamp":1795348949494}
+{"source":"user-event","type":"click","text":"2Действия в шапкеГлавное действие задачи — кнопкой сразу; редкое — в меню «⋯», без ухода в «Параметры»","choice":"header-actions","id":null,"timestamp":1795348971320}
+{"source":"user-event","type":"click","text":"3Длинные ответы свёрнутыПростыня обрезается до нескольких строк с «Развернуть»; файлы и проверки — чипами","choice":"clamp","id":null,"timestamp":1795348975314}
+{"source":"user-event","type":"click","text":"4Композер одной строкойПоле и «Отправить» вместе, подсказка ниже — меньше вертикальных прыжков","choice":"composer","id":null,"timestamp":1795348981583}
+{"source":"user-event","type":"click","text":"5Время сообщенийОпционально: сейчас история не хранит даты — потребуется добавить поле в данные задачи","choice":"time","id":null,"timestamp":1795348999154}
+{"type":"screen-added","file":"/home/aprazdnikov/Projects/aprazdnikov/agent-hub-rs/.superpowers/brainstorm/3171581-1795348491/content/chat-direction-v2.html"}
+{"type":"screen-added","file":"/home/aprazdnikov/Projects/aprazdnikov/agent-hub-rs/.superpowers/brainstorm/3171581-1795348491/content/inbox-direction.html"}
+{"source":"user-event","type":"click","text":"2Принять / на доработку","choice":"accept","id":null,"timestamp":1795350224470}
+{"source":"user-event","type":"click","text":"3Очередь: поставить / снять","choice":"queue","id":null,"timestamp":1795350225627}
+{"source":"user-event","type":"click","text":"4В архив / удалить","choice":"archive","id":null,"timestamp":1795350228012}
+{"source":"user-event","type":"click","text":"5Сменить агента / модель","choice":"agent","id":null,"timestamp":1795350228913}
+{"source":"user-event","type":"click","text":"6Посмотреть контекст запуска","choice":"context","id":null,"timestamp":1795350230914}
+{"type":"screen-added","file":"/home/aprazdnikov/Projects/aprazdnikov/agent-hub-rs/.superpowers/brainstorm/3171581-1795348491/content/sidebar-review.html"}
+{"type":"screen-added","file":"/home/aprazdnikov/Projects/aprazdnikov/agent-hub-rs/.superpowers/brainstorm/3171581-1795348491/content/waiting.html"}
+{"type":"server-stopped","reason":"idle timeout"}
