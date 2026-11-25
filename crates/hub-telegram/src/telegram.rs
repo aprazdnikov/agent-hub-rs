@@ -383,14 +383,34 @@ fn thread(key: TopicKey) -> tg::ThreadId {
     tg::ThreadId(tg::MessageId(key.thread.0))
 }
 
-/// teloxide has no dedicated thread-not-found variant: every such reply lands in
-/// `ApiError::Unknown` as the full description, and the wording (prefix, casing, underscores)
-/// varies, so match on substrings.
-fn thread_not_found(reason: &str) -> bool {
-    let reason = reason.to_ascii_lowercase();
-    ["thread not found", "topic_deleted", "topic_not_found", "message_thread_not_found"]
-        .into_iter()
-        .any(|needle| reason.contains(needle))
+/// Replies for a topic removed in Telegram have no dedicated `ApiError` variant and their
+/// wording drifts across casing, prefixes and separators (`THREAD_NOT_FOUND`,
+/// `message thread not found`, …), so they are recognised by normalised substring matching over
+/// the whole [`teloxide::ApiError`] description rather than only `Unknown`.
+///
+/// The needle list is fixed by normalisation and confirmed against a live Bot API build in
+/// Task 4 (the `live_topic_gone_probe` ignored test, pending the owner); entries awaiting that
+/// live contract are `TOPIC_ID_INVALID` and `THREAD_ID_INVALID`.
+const TOPIC_GONE_MARKERS: &[&str] = &[
+    "thread not found",
+    "message thread not found",
+    "topic not found",
+    "topic deleted",
+    "topic id invalid",
+    "thread id invalid",
+];
+
+/// Lowercases the description and folds `_`, `-` and repeated whitespace into single spaces, so
+/// the underscore/caps forms Telegram returns match the space-separated needles.
+fn normalize_error(reason: &str) -> String {
+    reason.to_lowercase().replace(['_', '-'], " ").split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// `true` when a Bot API error description proves the topic no longer exists. Never fires on
+/// permission or transport wording, so a live topic cannot be dropped on a false positive.
+fn topic_gone(reason: &str) -> bool {
+    let reason = normalize_error(reason);
+    TOPIC_GONE_MARKERS.iter().any(|marker| reason.contains(marker))
 }
 
 impl Messenger for TelegramMessenger {
@@ -399,9 +419,7 @@ impl Messenger for TelegramMessenger {
             match self.topics.delete_forum_topic(tg::ChatId(key.chat.0), thread(key)).await {
                 Ok(_) => Ok(()),
                 // The remote deletion may have succeeded before a timeout or local write failure.
-                Err(RequestError::Api(ApiError::Unknown(reason))) if thread_not_found(&reason) => {
-                    Ok(())
-                }
+                Err(RequestError::Api(err)) if topic_gone(&err.to_string()) => Ok(()),
                 Err(RequestError::RetryAfter(seconds)) => {
                     Err(SendError::RetryAfter(seconds.duration()))
                 }
@@ -426,9 +444,7 @@ impl Messenger for TelegramMessenger {
                 .await
             {
                 Ok(_) => Ok(true),
-                Err(RequestError::Api(ApiError::Unknown(reason))) if thread_not_found(&reason) => {
-                    Ok(false)
-                }
+                Err(RequestError::Api(err)) if topic_gone(&err.to_string()) => Ok(false),
                 Err(RequestError::RetryAfter(seconds)) => {
                     Err(SendError::RetryAfter(seconds.duration()))
                 }
@@ -739,21 +755,31 @@ mod tests {
     use super::*;
 
     #[rstest::rstest]
-    #[case::spaced("Bad Request: message thread not found")]
-    #[case::deleted("Bad Request: TOPIC_DELETED")]
-    #[case::not_found("Bad Request: TOPIC_NOT_FOUND")]
-    #[case::thread("Bad Request: MESSAGE_THREAD_NOT_FOUND")]
+    // The real Bot API replies for a topic removed in Telegram arrive in underscore/caps forms
+    // that the old substring matcher missed; normalisation must catch all of them.
+    #[case::thread_underscore("Bad Request: THREAD_NOT_FOUND")]
+    #[case::message_thread_underscore("Bad Request: MESSAGE_THREAD_NOT_FOUND")]
+    #[case::message_thread_spaced("Bad Request: message thread not found")]
+    #[case::topic_underscore("Bad Request: TOPIC_NOT_FOUND")]
+    #[case::topic_spaced("Bad Request: topic not found")]
+    #[case::deleted_underscore("Bad Request: TOPIC_DELETED")]
+    #[case::topic_id_invalid("Bad Request: TOPIC_ID_INVALID")]
+    #[case::thread_id_invalid("Bad Request: THREAD_ID_INVALID")]
     #[case::prefixed("Bad Request: some prefix message thread not found")]
     #[case::mixed_case("bad request: Message_Thread_Not_Found")]
-    fn stale_thread_reasons_are_detected(#[case] reason: &str) {
-        assert!(thread_not_found(reason));
+    #[case::unknown_display("Unknown error: \"Bad Request: THREAD_NOT_FOUND\"")]
+    fn topic_gone_detects_missing_topic(#[case] reason: &str) {
+        assert!(topic_gone(reason));
     }
 
     #[rstest::rstest]
+    // Permissions and unrelated errors must never read as a missing topic.
+    #[case::admin_required("Forbidden: CHAT_ADMIN_REQUIRED")]
     #[case::rights("Bad Request: not enough rights")]
     #[case::chat("Bad Request: chat not found")]
-    fn other_reasons_are_not_stale_threads(#[case] reason: &str) {
-        assert!(!thread_not_found(reason));
+    #[case::empty_name("Bad Request: TOPIC_NAME_NOT_EMPTY")]
+    fn other_reasons_are_not_gone_topics(#[case] reason: &str) {
+        assert!(!topic_gone(reason));
     }
 
     #[rstest::rstest]
@@ -858,6 +884,8 @@ mod tests {
     #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: message thread not found"}), true)]
     #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_DELETED"}), true)]
     #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: MESSAGE_THREAD_NOT_FOUND"}), true)]
+    #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: THREAD_NOT_FOUND"}), true)]
+    #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_ID_INVALID"}), true)]
     #[case(json!({"ok":false,"error_code":400,"description":"Bad Request: CHAT_ADMIN_REQUIRED"}), false)]
     #[tokio::test]
     async fn topic_deletion_uses_bot_api_once(
@@ -881,6 +909,8 @@ mod tests {
     #[rstest::rstest]
     #[case::exists(json!({"ok":true,"result":true}), Ok(true))]
     #[case::missing(json!({"ok":false,"error_code":400,"description":"Bad Request: message thread not found"}), Ok(false))]
+    #[case::thread_not_found(json!({"ok":false,"error_code":400,"description":"Bad Request: THREAD_NOT_FOUND"}), Ok(false))]
+    #[case::topic_id_invalid(json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_ID_INVALID"}), Ok(false))]
     #[case::deleted(json!({"ok":false,"error_code":400,"description":"Bad Request: TOPIC_DELETED"}), Ok(false))]
     #[case::retry(
         json!({"ok":false,"error_code":429,"description":"Too Many Requests: retry after 2","parameters":{"retry_after":2}}),

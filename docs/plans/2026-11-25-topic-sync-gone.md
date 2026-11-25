@@ -88,19 +88,19 @@
   `topic_gone(&err.to_string())` (покрывает и типизированные варианты, и `Unknown`),
   ветки `RetryAfter`/иной `Api`/`_` сохраняются.
 
-- [ ] **Step 1: Write failing tests** — unit-таблица `#[rstest] topic_gone_detects_missing_topic`
+- [x] **Step 1: Write failing tests** — unit-таблица `#[rstest] topic_gone_detects_missing_topic`
   со строками `"Bad Request: THREAD_NOT_FOUND"`, `"Bad Request: MESSAGE_THREAD_NOT_FOUND"`,
   `"Bad Request: TOPIC_ID_INVALID"`, `"Bad Request: topic not found"`,
   `"Bad Request: TOPIC_DELETED"` и негативы `"Forbidden: CHAT_ADMIN_REQUIRED"`,
   `"Bad Request: not enough rights"`; плюс через `topic_api`: ответ
   `{"ok":false,"error_code":400,"description":"Bad Request: THREAD_NOT_FOUND"}` →
   `delete_topic == Ok(())`, `probe_topic == Ok(false)`.
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-telegram --lib topic_gone` → FAIL (нет функции/кейсов).
-- [ ] **Step 3: Implement** — нормализация (`to_lowercase`, разделители → пробелы, сжатие),
+- [x] **Step 2: Verify RED** — `cargo test -p hub-telegram --lib topic_gone` → FAIL (нет функции/кейсов).
+- [x] **Step 3: Implement** — нормализация (`to_lowercase`, разделители → пробелы, сжатие),
   константный список игл, замена матчеров в `delete_topic`/`probe_topic`.
-- [ ] **Step 4: Verify GREEN** — `cargo test -p hub-telegram --locked` → PASS (в т.ч. старые
+- [x] **Step 4: Verify GREEN** — `cargo test -p hub-telegram --locked` → PASS (в т.ч. старые
   тесты `topic_deletion_uses_bot_api_once`).
-- [ ] **Step 5: Gates + commit** — `fix(telegram): надёжное распознавание удалённой темы в probe и delete`
+- [x] **Step 5: Gates + commit** — `fix(telegram): надёжное распознавание удалённой темы в probe и delete`
 
 ---
 
