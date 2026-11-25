@@ -210,12 +210,12 @@ worktree внутри него и темы Telegram не затрагивают�
   Счётчики для текста модалки: задачи — из уже загружаемого списка задач GUI
   (`tasks` snapshot), темы — из `handle.views` (фильтр `preferences.project.id`).
 
-- [ ] **Step 1: RED** — render-тест: клик «Удалить проект…» открывает модалку; кнопка
+- [x] **Step 1: RED** — render-тест: клик «Удалить проект…» открывает модалку; кнопка
   удаления неактивна без ввода имени; ввод имени → клик шлёт `Command::DeleteProject`.
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-app --lib delete_project_modal` → FAIL.
-- [ ] **Step 3: Implement** (поверх существующего паттерна `confirming`).
-- [ ] **Step 4: GREEN** — `cargo test -p hub-app --locked` → PASS.
-- [ ] **Step 5: Commit** — `feat(gui): подтверждение удаления проекта с описанием каскада`
+- [x] **Step 2: Verify RED** — `cargo test -p hub-app --lib delete_project_modal` → FAIL.
+- [x] **Step 3: Implement** (поверх существующего паттерна `confirming`).
+- [x] **Step 4: GREEN** — `cargo test -p hub-app --locked` → PASS.
+- [x] **Step 5: Commit** — `feat(gui): подтверждение удаления проекта с описанием каскада`
 
 ---
 

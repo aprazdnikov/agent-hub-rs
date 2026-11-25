@@ -183,6 +183,11 @@ impl Preferences {
             project: Some(ProjectOptions { id: id.to_owned(), name: name.to_owned(), options }),
         }
     }
+    /// The bound profile's id, when the topic inherits its options from a project.
+    #[must_use]
+    pub fn project_id(&self) -> Option<&str> {
+        self.project.as_ref().map(|project| project.id.as_str())
+    }
     /// Drops the project binding when it points at `id`; `true` means something was detached.
     #[must_use]
     pub fn detach_project(&mut self, id: &str) -> bool {
