@@ -129,7 +129,7 @@
   тестах round-trip оба направления. Дефолты `AgentRoles::default() = { Codex, Claude }`;
   парсинг строк — как `default_backend` через `choice()` (`settings.rs:1297`).
 
-- [ ] **Step 1: RED** — тесты round-trip `ProjectRules`: отсутствие поля → None (выключено);
+- [x] **Step 1: RED** — тесты round-trip `ProjectRules`: отсутствие поля → None (выключено);
   `workflow = { command = "cargo test" }` → Inherit; старый трёхполевой объект → Custom;
   `{}` и `42` → ошибка разбора книги. `effective_workflow`: None → `None`;
   `Custom(p)` → `Some(Cow::Borrowed(p))`; `Inherit{command}` →
@@ -138,10 +138,10 @@
   с командой > 2048 байт или с `\0` → ошибка. Настройки: секция `[agents]` с
   `implementer`/`reviewer` парсится, неизвестное имя агента → `Field::Role`,
   `Draft::from_settings` round-trip, старый TOML без новых ключей читается.
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-core --lib workflow_choice agents_roles` → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: GREEN** — `cargo test -p hub-core --locked` → PASS.
-- [ ] **Step 5: Commit** — `feat(core): трёхрежимный workflow проекта и общие роли агентов`
+- [x] **Step 2: Verify RED** — `cargo test -p hub-core --lib workflow_choice agents_roles` → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: GREEN** — `cargo test -p hub-core --locked` → PASS.
+- [x] **Step 5: Commit** — `feat(core): трёхрежимный workflow проекта и общие роли агентов`
 
 ---
 

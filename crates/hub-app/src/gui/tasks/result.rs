@@ -491,8 +491,8 @@ fn report(ui: &mut egui::Ui, run: &Run) {
     if run.workflow_report.is_empty() {
         ui.weak("Результатов автоматических проверок пока нет.");
     } else {
-        if let Some(preset) = run.rules.as_ref().and_then(|rules| rules.workflow.as_ref()) {
-            ui.monospace(&preset.command);
+        if let Some(choice) = run.rules.as_ref().and_then(|rules| rules.workflow.as_ref()) {
+            ui.monospace(choice.command());
         }
         for (index, check) in run.workflow_report.checks.iter().enumerate() {
             ui.strong(format!(

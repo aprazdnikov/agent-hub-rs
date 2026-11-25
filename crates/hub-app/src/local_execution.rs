@@ -13,6 +13,7 @@ use hub_core::{
     tasks::{
         RunState, Task,
         service::{Access, TaskService},
+        workflow::WorkflowChoice,
     },
 };
 use hub_telegram::{git::GitRunner, hub::tasks::Request};
@@ -444,11 +445,14 @@ impl Worker {
                 .preview_with_rules(next.as_deref(), &book.rules(&task.project))?;
             let prompt = Prompt::new(text, vec![]).ok_or("Пустое поручение")?;
             let run = book.begin(task.id, task.revision, next.as_deref(), Timestamp::now())?;
-            Ok((
-                run,
-                prompt,
-                book.rules(&task.project).workflow.filter(|p| p.implementer == session.backend),
-            ))
+            // A project that inherits the shared roles waits for the resolution added there.
+            let workflow = match book.rules(&task.project).workflow {
+                Some(WorkflowChoice::Custom(preset)) if preset.implementer == session.backend => {
+                    Some(preset)
+                }
+                Some(WorkflowChoice::Custom(_) | WorkflowChoice::Inherit { .. }) | None => None,
+            };
+            Ok((run, prompt, workflow))
         })?;
         self.view.send_modify(|view| {
             if let Some(view) = view {

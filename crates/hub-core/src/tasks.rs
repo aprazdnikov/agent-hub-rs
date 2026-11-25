@@ -23,7 +23,7 @@ pub struct ProjectRules {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub git: Option<git::GitPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub workflow: Option<workflow::WorkflowPreset>,
+    pub workflow: Option<workflow::WorkflowChoice>,
 }
 impl ProjectRules {
     pub fn validate(&self) -> Result<(), String> {
@@ -51,15 +51,17 @@ impl ProjectRules {
             .map_or("Подготовка Git выключена".to_owned(), |policy| {
                 format!("Подготовка Git обязательна: {}/{}", policy.remote, policy.base)
             });
-        if let Some(plan) = &self.workflow {
-            format!(
+        match &self.workflow {
+            Some(workflow::WorkflowChoice::Custom(plan)) => format!(
                 "{text}\n{git}\nИсправить и проверить для {}: {} → ревью {}.",
                 plan.implementer.name(),
                 plan.command,
                 plan.reviewer.name()
-            )
-        } else {
-            format!("{text}\n{git}")
+            ),
+            Some(workflow::WorkflowChoice::Inherit { command }) => {
+                format!("{text}\n{git}\nИсправить и проверить по общим ролям: {command}.")
+            }
+            None => format!("{text}\n{git}"),
         }
     }
 }

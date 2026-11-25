@@ -449,7 +449,10 @@ impl Executor for ScriptedWorkflow {
 
 #[tokio::test]
 async fn host_workflow_repairs_once_preserves_evidence_and_requires_human_acceptance() {
-    use hub_core::tasks::{ProjectRules, TaskStatus, workflow::WorkflowPreset};
+    use hub_core::tasks::{
+        ProjectRules, TaskStatus,
+        workflow::{WorkflowChoice, WorkflowPreset},
+    };
     for fixable in [true, false] {
         let project = tempfile::tempdir().unwrap();
         let file = if fixable { "ready.txt" } else { "missing.txt" };
@@ -464,11 +467,11 @@ async fn host_workflow_repairs_once_preserves_evidence_and_requires_human_accept
             project.path().into(),
             0,
             ProjectRules {
-                workflow: Some(WorkflowPreset {
+                workflow: Some(WorkflowChoice::Custom(WorkflowPreset {
                     implementer: BackendKind::Qwen,
                     command,
                     reviewer: BackendKind::Claude,
-                }),
+                })),
                 ..Default::default()
             },
         )
@@ -536,7 +539,10 @@ async fn host_workflow_repairs_once_preserves_evidence_and_requires_human_accept
 #[cfg(unix)]
 #[tokio::test]
 async fn stopping_check_does_not_request_a_repair_or_review() {
-    use hub_core::tasks::{ProjectRules, workflow::WorkflowPreset};
+    use hub_core::tasks::{
+        ProjectRules,
+        workflow::{WorkflowChoice, WorkflowPreset},
+    };
     let project = tempfile::tempdir().unwrap();
     let mut book = TaskBook::default();
     let id = book.create(project.path().into(), "qwen", "Stop", "Check cancellation").unwrap();
@@ -544,11 +550,11 @@ async fn stopping_check_does_not_request_a_repair_or_review() {
         project.path().into(),
         0,
         ProjectRules {
-            workflow: Some(WorkflowPreset {
+            workflow: Some(WorkflowChoice::Custom(WorkflowPreset {
                 implementer: BackendKind::Qwen,
                 command: "touch check-started && exec sleep 60".into(),
                 reviewer: BackendKind::Claude,
-            }),
+            })),
             ..Default::default()
         },
     )

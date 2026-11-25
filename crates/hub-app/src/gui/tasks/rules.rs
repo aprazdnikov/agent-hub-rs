@@ -2,7 +2,10 @@
 use eframe::egui;
 use hub_core::{
     domain::BackendKind,
-    tasks::{ProjectRules, workflow::WorkflowPreset},
+    tasks::{
+        ProjectRules,
+        workflow::{WorkflowChoice, WorkflowPreset},
+    },
 };
 use hub_telegram::hub::tasks::Request;
 
@@ -29,13 +32,16 @@ impl Editor {
         let mut enabled = self.draft.workflow.is_some();
         if ui.checkbox(&mut enabled, "Исправить и проверить автоматически").changed()
         {
-            self.draft.workflow = enabled.then(|| WorkflowPreset {
-                implementer: BackendKind::Codex,
-                command: String::new(),
-                reviewer: BackendKind::Claude,
+            self.draft.workflow = enabled.then(|| {
+                WorkflowChoice::Custom(WorkflowPreset {
+                    implementer: BackendKind::Codex,
+                    command: String::new(),
+                    reviewer: BackendKind::Claude,
+                })
             });
         }
-        let Some(plan) = &mut self.draft.workflow else { return };
+        // The inherited mode has no editor of its own until the three-state block lands.
+        let Some(WorkflowChoice::Custom(plan)) = &mut self.draft.workflow else { return };
         ui.small("Применяется к запускам выбранного исполнителя из GUI и Telegram. После ошибки проверки допускается одна попытка исправления.");
         for (label, backend) in
             [("Исполнитель", &mut plan.implementer), ("Ревьюер", &mut plan.reviewer)]
