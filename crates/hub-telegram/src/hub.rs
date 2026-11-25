@@ -178,6 +178,12 @@ pub enum HubMessage {
         key: TopicKey,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// A project deleted in the hub: unbind it from every topic and drop it from the
+    /// recent list. Replies with the number of topics detached.
+    ForgetProject {
+        id: String,
+        reply: oneshot::Sender<Result<usize, String>>,
+    },
     DeletionDone(DeletionDone),
     /// Compare every known topic with Telegram and drop the ones that no longer exist there.
     SyncTopics {
@@ -599,6 +605,9 @@ impl<A: Agents> Hub<A> {
                 self.stop(key);
             }
             HubMessage::DeleteTopic { key, reply } => self.delete_topic(key, reply),
+            HubMessage::ForgetProject { id, reply } => {
+                let _ = reply.send(self.forget_project(&id));
+            }
             HubMessage::DeletionDone(done) => self.finish_deletion(done),
             HubMessage::SyncTopics { reply } => self.sync_topics(reply),
             HubMessage::SyncDone(done) => self.finish_sync(done),
@@ -2879,6 +2888,105 @@ mod tests {
             !world.messenger.calls().iter().any(|call| matches!(call, Call::DeleteTopic(_))),
             "the retry must reuse the proven-missing answer, not delete in Telegram again"
         );
+    }
+
+    fn seeded_topics(root: &std::path::Path) -> Topics {
+        let options = hub_core::options::Options::parse(
+            BackendKind::Claude,
+            &hub_core::options::OptionsDraft { model: "m".to_owned(), mode: String::new() },
+        )
+        .unwrap();
+        let mut topics = Topics::new();
+        for (thread, id) in [(2, "p1"), (3, "p1"), (4, "p2")] {
+            let key = TopicKey { chat: ChatId(-100), thread: ThreadId(thread) };
+            let mut session = TopicSession::fresh(
+                BackendKind::Claude,
+                AbsolutePath::new(root.join("project")).unwrap(),
+            );
+            session.session = SessionId::parse("s-1");
+            session.preferences =
+                hub_core::options::Preferences::for_project(id, "Project", options.clone());
+            topics.insert(key, session);
+        }
+        topics
+    }
+
+    async fn forget_project(world: &World, id: &str) -> Result<usize, String> {
+        let (reply, result) = oneshot::channel();
+        world.send(HubMessage::ForgetProject { id: id.to_owned(), reply }).await;
+        result.await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn forget_project_detaches_topics_without_touching_sessions() {
+        let mut world = world(FakeAgents::default());
+        let mut topics = seeded_topics(world.root.path());
+        topics
+            .get_mut(&TopicKey { chat: ChatId(-100), thread: ThreadId(2) })
+            .unwrap()
+            .preferences
+            .memory = Some(true);
+        *world.store.saved.lock().unwrap() = vec![topics];
+        {
+            let mut recent = world.store.recent.lock().unwrap();
+            recent.remember("p1");
+            recent.remember("p2");
+        }
+        world.restart().await;
+
+        assert_eq!(forget_project(&world, "p1").await.unwrap(), 2);
+        let settings = world.settings.borrow().clone();
+        let stored = world.store.last().unwrap();
+        for thread in [2, 3] {
+            let key = TopicKey { chat: ChatId(-100), thread: ThreadId(thread) };
+            let session = &stored[&key];
+            assert_eq!(session.session.as_ref().map(SessionId::as_str), Some("s-1"));
+            assert_eq!(session.backend, BackendKind::Claude);
+            let effective = session.preferences.resolve(BackendKind::Claude, &settings).unwrap();
+            assert_eq!(effective.model_source, hub_core::options::Source::Global);
+        }
+        assert_eq!(
+            stored[&TopicKey { chat: ChatId(-100), thread: ThreadId(2) }].preferences.memory,
+            Some(true)
+        );
+        let other = stored[&TopicKey { chat: ChatId(-100), thread: ThreadId(4) }].clone();
+        let effective = other.preferences.resolve(BackendKind::Claude, &settings).unwrap();
+        assert_eq!(
+            effective.model_source,
+            hub_core::options::Source::Project("Project".to_owned())
+        );
+        assert_eq!(world.store.recent.lock().unwrap().ids(), ["p2"]);
+        let views = world.handle.views.borrow();
+        let detached =
+            views.iter().find(|view| view.key.thread == ThreadId(2)).expect("topic 2 view");
+        assert_eq!(detached.session.session.as_ref().map(SessionId::as_str), Some("s-1"));
+        drop(views);
+        assert_eq!(forget_project(&world, "p1").await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn forget_project_disk_failure_keeps_topics_and_retries_cleanly() {
+        let mut world = world(FakeAgents::default());
+        *world.store.saved.lock().unwrap() = vec![seeded_topics(world.root.path())];
+        world.store.recent.lock().unwrap().remember("p1");
+        world.restart().await;
+
+        world.store.fail.store(true, Ordering::SeqCst);
+        assert!(forget_project(&world, "p1").await.is_err());
+        let stored = world.store.last().unwrap();
+        let settings = world.settings.borrow().clone();
+        let still = &stored[&TopicKey { chat: ChatId(-100), thread: ThreadId(2) }];
+        let effective = still.preferences.resolve(BackendKind::Claude, &settings).unwrap();
+        assert_eq!(
+            effective.model_source,
+            hub_core::options::Source::Project("Project".to_owned()),
+            "a failed save must leave the bindings as they were"
+        );
+        assert_eq!(world.store.recent.lock().unwrap().ids(), ["p1"]);
+
+        world.store.fail.store(false, Ordering::SeqCst);
+        assert_eq!(forget_project(&world, "p1").await.unwrap(), 2);
+        assert!(world.store.recent.lock().unwrap().ids().is_empty());
     }
 
     #[tokio::test]

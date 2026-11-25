@@ -120,6 +120,31 @@ impl<A: Agents> Hub<A> {
         let _ = reply.send(result);
     }
 
+    /// Unbinds a deleted project from its topics and the recent list. Disk first: a
+    /// failed save leaves the in-memory state untouched, so the cascade can be retried.
+    pub(super) fn forget_project(&mut self, id: &str) -> Result<usize, String> {
+        let mut topics = self.topics.clone();
+        let mut detached = 0;
+        for session in topics.values_mut() {
+            detached += usize::from(session.preferences.detach_project(id));
+        }
+        if detached > 0 {
+            self.store
+                .save(&topics)
+                .map_err(|error| format!("Не удалось сохранить отвязку тем: {error}"))?;
+            self.replace_topics(topics);
+        }
+        let mut recent = self.projects.recent.clone();
+        recent.forget(id);
+        if self.projects.recent.ids() != recent.ids() {
+            self.store
+                .save_recent_projects(&recent)
+                .map_err(|error| format!("Не удалось обновить последние проекты: {error}"))?;
+            self.projects.recent = recent;
+        }
+        Ok(detached)
+    }
+
     fn clean_deleted_topic(&mut self, key: TopicKey) -> Result<(), String> {
         // Keep the row available for a cleanup retry until both files are durable.
         let failed = |err: String| {

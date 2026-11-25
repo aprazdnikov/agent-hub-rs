@@ -1182,6 +1182,7 @@ mod tests {
                             }
                             HubMessage::SyncTopics { .. } => "sync".to_owned(),
                             HubMessage::DeleteTopic { .. }
+                            | HubMessage::ForgetProject { .. }
                             | HubMessage::DeletionDone(_)
                             | HubMessage::SyncDone(_)
                             | HubMessage::TaskResultUnavailable { .. }

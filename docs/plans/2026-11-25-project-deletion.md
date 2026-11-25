@@ -145,13 +145,13 @@ worktree внутри него и темы Telegram не затрагивают�
   состояния (паттерн `clean_deleted_topic`: сбой диска — Err, состояние не изменено); затем
   `self.projects.forget(id)` + `store.save_recent_projects`. `replace_topics` обновляет views.
 
-- [ ] **Step 1: RED** — тест: две темы одного проекта и одна другого → Ok(2), в `store.last()`
+- [x] **Step 1: RED** — тест: две темы одного проекта и одна другого → Ok(2), в `store.last()`
   у двух тем нет `project`, session_id/backend сохранены; сбой `store.fail` → Err и
   темы в прежнем виде; идемпотентный повтор → Ok(0).
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-telegram --lib forget_project` → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: GREEN** — `cargo test -p hub-telegram --locked` → PASS.
-- [ ] **Step 5: Commit** — `feat(telegram): отвязка проекта от тем по команде хаба`
+- [x] **Step 2: Verify RED** — `cargo test -p hub-telegram --lib forget_project` → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: GREEN** — `cargo test -p hub-telegram --locked` → PASS.
+- [x] **Step 5: Commit** — `feat(telegram): отвязка проекта от тем по команде хаба`
 
 ---
 
