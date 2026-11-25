@@ -2689,7 +2689,13 @@ mod tests {
             .unwrap();
         service
             .access(hub_core::tasks::service::Access::Edit, |book, _| {
-                book.begin(id, 1, None, jiff::Timestamp::from_second(1_700_000_000).unwrap())
+                book.begin(
+                    id,
+                    1,
+                    None,
+                    jiff::Timestamp::from_second(1_700_000_000).unwrap(),
+                    &hub_core::settings::AgentRoles::default(),
+                )
             })
             .unwrap();
         *harness.probe.tasks.lock().unwrap() = Some(service.clone());
