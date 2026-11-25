@@ -76,7 +76,7 @@ impl MemoryView {
         };
         let generation = self.generation;
         let project = self.project.clone();
-        let base = home.join(".agent-hub/memory");
+        let base = hub_memory::base_in(home);
         let (send, receive) = mpsc::channel();
         self.pending = Some(receive);
         self.read_started = Some(std::time::Instant::now());

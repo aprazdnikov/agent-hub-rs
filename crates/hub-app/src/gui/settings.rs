@@ -20,7 +20,7 @@ use hub_core::speech::SpeechProvider;
 
 use crate::gui::log::LogAction;
 use crate::gui::look::{add_user, telegram_changed, use_chat};
-use crate::supervisor::Command;
+use crate::supervisor::{Command, Snapshot};
 
 /// Which secret fields are shown in clear text.
 #[derive(Default)]
@@ -47,6 +47,29 @@ pub struct SettingsForm {
     confirming: bool,
     saving: bool,
     submitted: Option<Draft>,
+    deleting_project: Option<PendingDelete>,
+    project_deletion: Option<(String, tokio::sync::oneshot::Receiver<Result<String, String>>)>,
+    project_notice: Option<Result<String, String>>,
+}
+
+/// One open «Удалить проект…» modal: the profile being removed and the confirmation input.
+#[derive(Clone, Default)]
+struct PendingDelete {
+    id: String,
+    name: String,
+    cwd: String,
+    typed: String,
+}
+
+/// Preview of the cascade size: matches exactly the shapes the supervisor will forget,
+/// so the modal counter and the completion summary cannot disagree.
+fn project_task_count(snapshot: &Snapshot, draft: &Draft, home: &Path, cwd: &str) -> usize {
+    let root = hub_core::workspace::expand_home(&draft.workspace_root, home);
+    let shapes = crate::supervisor::task_path_shapes(&root, home, cwd);
+    snapshot
+        .task_index
+        .as_ref()
+        .map_or(0, |rows| rows.iter().filter(|row| shapes.contains(&row.project)).count())
 }
 
 fn project_options(ui: &mut egui::Ui, project: &mut ProjectDraft) {
@@ -233,6 +256,26 @@ impl SettingsForm {
         if let Some(control) = &mut self.autostart {
             control.poll(ctx);
         }
+        if let Some((id, mut receipt)) = self.project_deletion.take() {
+            match receipt.try_recv() {
+                Ok(Ok(summary)) => {
+                    // The profile is gone from saved settings; drop the card from the draft.
+                    self.draft.projects.retain(|saved| saved.id != id);
+                    self.project_notice = Some(Ok(summary));
+                }
+                Ok(Err(error)) => self.project_notice = Some(Err(error)),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => {
+                    self.project_deletion = Some((id, receipt));
+                    ctx.request_repaint_after(std::time::Duration::from_millis(100));
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Closed) => {
+                    self.project_notice = Some(Err(
+                        "Связь с ядром потеряна; повторите удаление после перезапуска приложения."
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
     }
     /// Adopts newly saved settings unless the user is in the middle of editing.
     pub fn sync(&mut self, saved: Option<&Draft>) {
@@ -284,6 +327,7 @@ impl SettingsForm {
         ui: &mut egui::Ui,
         home: &Path,
         sessions: usize,
+        snapshot: &Snapshot,
         send: &mut impl FnMut(Command),
     ) {
         let (errors, parsed) = self.check(home);
@@ -334,6 +378,7 @@ impl SettingsForm {
                     });
             });
         self.confirm(ui.ctx(), sessions, send);
+        self.confirm_delete_project(ui.ctx(), snapshot, home, send);
     }
 
     fn page(&mut self, ui: &mut egui::Ui, errors: &[FieldError], parsed: Option<&Settings>) {
@@ -501,11 +546,27 @@ impl SettingsForm {
         }
     }
 
+    fn project_deletion_state(&self, ui: &mut egui::Ui) {
+        if self.project_deletion.is_some() {
+            ui.label("Удаление проекта…");
+        }
+        match &self.project_notice {
+            Some(Ok(message)) => {
+                ui.label(message);
+            }
+            Some(Err(message)) => {
+                ui.colored_label(ui.visuals().error_fg_color, message);
+            }
+            None => {}
+        }
+    }
+
     fn projects(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
         ui.strong("Профили проектов");
         ui.label("Сохраните каталог, бэкенд и параметры, затем выберите проект через /projects в Telegram.");
         ui.label("Пустые параметры наследуют общие настройки. Смена бэкенда сбрасывает модель и режим профиля.");
         ui.label("Связанные действия запускаются вручную через /actions. Изменения профиля не меняют существующие сессии.");
+        self.project_deletion_state(ui);
         let mut remove = None;
         for (index, project) in self.draft.projects.iter_mut().enumerate() {
             ui.push_id(egui::Id::new(&project.id), |ui| {
@@ -513,7 +574,29 @@ impl SettingsForm {
                     ui.horizontal(|ui| {
                         ui.label("Название");
                         ui.add(input(&mut project.name));
-                        if ui.button("Удалить проект").clicked() {
+                        // Saved profiles cascade through the hub; unsaved cards leave the
+                        // draft directly — there is no hub data behind a new id yet.
+                        let saved = self.synced.as_ref().is_some_and(|synced| {
+                            synced.projects.iter().any(|saved| saved.id == project.id)
+                        });
+                        if saved {
+                            let danger = egui::RichText::new("Удалить проект…")
+                                .color(super::theme::tone_colors(ui, super::theme::Tone::Error).1);
+                            if ui
+                                .add_enabled(
+                                    self.project_deletion.is_none(),
+                                    egui::Button::new(danger),
+                                )
+                                .clicked()
+                            {
+                                self.deleting_project = Some(PendingDelete {
+                                    id: project.id.clone(),
+                                    name: project.name.clone(),
+                                    cwd: project.cwd.clone(),
+                                    typed: String::new(),
+                                });
+                            }
+                        } else if ui.button("Удалить проект").clicked() {
                             remove = Some(index);
                         }
                     });
@@ -982,6 +1065,60 @@ impl SettingsForm {
             self.confirming = false;
         }
     }
+
+    /// Danger-тон и точный ввод названия: каскад необратим, молча он не запускается.
+    fn confirm_delete_project(
+        &mut self,
+        ctx: &egui::Context,
+        snapshot: &Snapshot,
+        home: &Path,
+        send: &mut impl FnMut(Command),
+    ) {
+        let Some(pending) = self.deleting_project.clone() else { return };
+        let tasks = project_task_count(snapshot, &self.draft, home, &pending.cwd);
+        let topics = snapshot
+            .topics
+            .iter()
+            .filter(|view| view.session.preferences.project_id() == Some(pending.id.as_str()))
+            .count();
+        let mut typed = pending.typed.clone();
+        let modal = egui::Modal::new(egui::Id::new("delete-project")).show(ctx, |ui| {
+            ui.heading(format!("Удалить проект «{}» из хаба?", pending.name));
+            ui.label(format!("Каталог: {}", pending.cwd));
+            ui.label("Из хаба удаляются:");
+            ui.label("· профиль настроек и запись в списке последних проектов;");
+            ui.label(format!("· задачи и правила проекта (сейчас: {tasks});"));
+            ui.label("· память проекта в хранилище хаба;");
+            ui.label(format!("· привязка к темам (сейчас: {topics}) — сессии тем сохранятся."));
+            ui.label(format!("Каталог проекта {} не удаляется.", pending.cwd));
+            ui.label("Темы в Telegram и файлы проекта остаются на месте.");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                ui.label("Название для подтверждения");
+                ui.add(input(&mut typed).hint_text(&pending.name));
+            });
+            ui.horizontal(|ui| {
+                if ui.button("Отмена").clicked() {
+                    self.deleting_project = None;
+                }
+                let danger = egui::RichText::new("Удалить безвозвратно")
+                    .color(super::theme::tone_colors(ui, super::theme::Tone::Error).1);
+                if ui.add_enabled(typed == pending.name, egui::Button::new(danger)).clicked() {
+                    let (reply, receipt) = tokio::sync::oneshot::channel();
+                    self.project_deletion = Some((pending.id.clone(), receipt));
+                    self.project_notice = None;
+                    self.deleting_project = None;
+                    send(Command::DeleteProject { id: pending.id.clone(), reply });
+                }
+            });
+        });
+        if modal.should_close() {
+            self.deleting_project = None;
+        }
+        if let Some(current) = &mut self.deleting_project {
+            current.typed = typed;
+        }
+    }
 }
 
 #[must_use]
@@ -1000,6 +1137,7 @@ mod tests {
         events: Vec<egui::Event>,
         commands: &mut Vec<Command>,
     ) -> egui::FullOutput {
+        let snapshot = Snapshot::default();
         let mut output = ctx.run_ui(
             egui::RawInput {
                 screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
@@ -1008,7 +1146,9 @@ mod tests {
             },
             |ui| {
                 egui::CentralPanel::default().frame(egui::Frame::NONE).show(ui, |ui| {
-                    form.show(ui, &home_or_root(), 0, &mut |command| commands.push(command));
+                    form.show(ui, &home_or_root(), 0, &snapshot, &mut |command| {
+                        commands.push(command);
+                    });
                 });
             },
         );
@@ -1071,6 +1211,55 @@ mod tests {
             ..Draft::default()
         }));
         form
+    }
+
+    #[test]
+    fn delete_project_modal_requires_the_typed_name_and_sends_the_command() {
+        let ctx = egui::Context::default();
+        super::super::theme::configure(&ctx);
+        let mut form = SettingsForm::default();
+        let mut saved = Draft {
+            token: "123:test-token".to_owned(),
+            chat: "0".to_owned(),
+            users: "1".to_owned(),
+            workspace_root: home_or_root().display().to_string(),
+            ..Draft::default()
+        };
+        saved.projects = vec![ProjectDraft {
+            options: hub_core::options::OptionsDraft::default(),
+            id: "alfa".to_owned(),
+            name: "Альфа".to_owned(),
+            cwd: "/projects/alfa".to_owned(),
+            backend: "codex".to_owned(),
+            actions: vec![],
+            checks: Vec::new(),
+        }];
+        form.sync(Some(&saved));
+        let mut commands = Vec::new();
+        click_label(&ctx, &mut form, "Проекты", &mut commands);
+        click_label(&ctx, &mut form, "Удалить проект…", &mut commands);
+        let output = render(&ctx, &mut form, egui::vec2(960.0, 900.0), Vec::new(), &mut commands);
+        assert!(has_label(&output, "Удалить безвозвратно"), "modal must open on click");
+        assert!(has_label(&output, "Каталог проекта /projects/alfa не удаляется."));
+        assert!(commands.is_empty());
+        // Without the typed name the destructive button stays inert.
+        click_label(&ctx, &mut form, "Удалить безвозвратно", &mut commands);
+        assert!(commands.is_empty());
+        form.deleting_project.as_mut().unwrap().typed = "альфа".to_owned();
+        click_label(&ctx, &mut form, "Удалить безвозвратно", &mut commands);
+        assert!(commands.is_empty(), "a different case is not the exact name");
+        form.deleting_project.as_mut().unwrap().typed = "Альфа".to_owned();
+        click_label(&ctx, &mut form, "Удалить безвозвратно", &mut commands);
+        let command = commands.pop().expect("delete command sent");
+        let Command::DeleteProject { id, reply } = command else {
+            panic!("expected DeleteProject, got another command");
+        };
+        assert_eq!(id, "alfa");
+        assert_eq!(form.draft.projects.len(), 1, "the card waits for the Ok reply");
+        reply.send(Ok("Проект «Альфа» удалён".to_owned())).unwrap();
+        form.poll(&ctx);
+        assert!(form.draft.projects.is_empty(), "Ok reply removes the saved card");
+        assert!(form.project_notice.as_ref().is_some_and(Result::is_ok));
     }
 
     #[test]
@@ -1278,7 +1467,7 @@ mod tests {
                 )),
                 ..Default::default()
             },
-            |ui| form.show(ui, Path::new("/"), 0, &mut |_| {}),
+            |ui| form.show(ui, Path::new("/"), 0, &Snapshot::default(), &mut |_| {}),
         );
         output.textures_delta.clear();
         let labels: Vec<_> = output
@@ -1359,7 +1548,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    form.show(ui, &std::env::temp_dir(), 0, &mut |_| {
+                    form.show(ui, &std::env::temp_dir(), 0, &Snapshot::default(), &mut |_| {
                         panic!("autostart must not save bot settings")
                     });
                 },
@@ -1572,7 +1761,7 @@ mod tests {
         let mut output =
             ctx.run_ui(egui::RawInput { screen_rect: Some(screen), ..Default::default() }, |ui| {
                 egui::CentralPanel::default().show(ui, |ui| {
-                    form.show(ui, Path::new("/"), 0, &mut |_| {});
+                    form.show(ui, Path::new("/"), 0, &Snapshot::default(), &mut |_| {});
                 });
             });
         output.textures_delta.clear();
@@ -1632,7 +1821,9 @@ mod tests {
                 egui::RawInput { screen_rect: Some(screen), events, ..Default::default() },
                 |ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        form.show(ui, &home, 0, &mut |command| commands.push(command));
+                        form.show(ui, &home, 0, &Snapshot::default(), &mut |command| {
+                            commands.push(command);
+                        });
                     });
                 },
             );
@@ -1751,7 +1942,7 @@ mod tests {
                 egui::RawInput { screen_rect: Some(screen), ..Default::default() },
                 |ui| {
                     egui::CentralPanel::default().show(ui, |ui| {
-                        form.show(ui, Path::new("/"), 0, &mut |_| {});
+                        form.show(ui, Path::new("/"), 0, &Snapshot::default(), &mut |_| {});
                     });
                 },
             );

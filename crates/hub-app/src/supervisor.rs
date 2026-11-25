@@ -69,6 +69,11 @@ pub enum Command {
         key: TopicKey,
         reply: oneshot::Sender<Result<(), String>>,
     },
+    /// Removes a project with all of its hub-side data; the folder itself stays intact.
+    DeleteProject {
+        id: String,
+        reply: oneshot::Sender<Result<String, String>>,
+    },
     SyncTopics {
         reply: oneshot::Sender<Result<String, String>>,
     },
@@ -264,6 +269,9 @@ pub struct Supervisor<C: Connector> {
     save_guard: Option<Arc<crate::instance::InstanceLock>>,
     saving: Option<tokio::task::JoinHandle<SaveJob>>,
     memory_reply: Option<oneshot::Sender<Result<(), String>>>,
+    /// Deferred Ok-reply of `delete_project`: the cascade finished its data steps, and the
+    /// summary is only honest once the settings save that drops the profile has settled.
+    project_reply: Option<(oneshot::Sender<Result<String, String>>, String)>,
     save_slow_at: Option<Instant>,
     stop_during_save: bool,
     home: PathBuf,
@@ -302,6 +310,79 @@ struct SaveJob {
     draft: Draft,
     settings: Settings,
     result: Result<(), String>,
+}
+
+/// How the task book blocks deleting a project: running work cannot be interrupted, a
+/// queued intent is about to start, and only their absence lets the cascade run.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskBlock {
+    None,
+    Active,
+    Queued,
+}
+
+fn task_blocks(book: &hub_core::tasks::TaskBook, shapes: &[std::path::PathBuf]) -> TaskBlock {
+    let mut queued = false;
+    for task in book.tasks() {
+        if !shapes.contains(&task.project) {
+            continue;
+        }
+        if task.active() {
+            return TaskBlock::Active;
+        }
+        queued |= task.queue.as_ref().is_some_and(|entry| entry.error.is_none());
+    }
+    if queued { TaskBlock::Queued } else { TaskBlock::None }
+}
+
+/// The path shapes one saved project can be recorded under: the settings keep the
+/// candidate form, while task creation canonicalizes through the workspace root. The
+/// deletion guard, the task book cleanup and the GUI preview must agree on the same set,
+/// or the modal promises rows the cascade never removes.
+pub(crate) fn task_path_shapes(
+    root: &std::path::Path,
+    home: &std::path::Path,
+    cwd: &str,
+) -> Vec<std::path::PathBuf> {
+    let path = hub_core::workspace::candidate(root, home, Some(cwd));
+    let mut shapes = vec![path.clone()];
+    for shape in [
+        std::fs::canonicalize(&path).ok(),
+        hub_telegram::paths::workspace_root(&path).ok().map(|root| root.as_path().to_path_buf()),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if !shapes.contains(&shape) {
+            shapes.push(shape);
+        }
+    }
+    shapes
+}
+
+/// Everything the cascade needs resolved once: the settings candidate path for the
+/// memory purge, the task book shapes to forget, and the other saved projects whose
+/// shared memory storages must survive.
+struct ProjectPaths {
+    cwd: std::path::PathBuf,
+    task_shapes: Vec<std::path::PathBuf>,
+    living: Vec<std::path::PathBuf>,
+}
+
+impl ProjectPaths {
+    fn resolve(settings: &Settings, home: &std::path::Path, id: &str, cwd_raw: &str) -> Self {
+        let cwd = hub_core::workspace::candidate(&settings.workspace_root, home, Some(cwd_raw));
+        let task_shapes = task_path_shapes(&settings.workspace_root, home, cwd_raw);
+        let living = settings
+            .projects
+            .iter()
+            .filter(|saved| saved.id() != id)
+            .map(|saved| {
+                hub_core::workspace::candidate(&settings.workspace_root, home, Some(saved.cwd()))
+            })
+            .collect();
+        Self { cwd, task_shapes, living }
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -364,6 +445,7 @@ impl<C: Connector> Supervisor<C> {
             save_guard,
             saving: None,
             memory_reply: None,
+            project_reply: None,
             save_slow_at: None,
             stop_during_save: false,
             home,
@@ -728,6 +810,7 @@ impl<C: Connector> Supervisor<C> {
                     let _ = reply.send(Err("Для удаления темы запустите бота.".into()));
                 }
             }
+            Command::DeleteProject { id, reply } => self.delete_project(id, reply).await,
             Command::SyncTopics { reply } => {
                 if let Some(mailbox) = self.mailbox() {
                     if let Err(error) = mailbox.try_send(HubMessage::SyncTopics { reply })
@@ -772,6 +855,150 @@ impl<C: Connector> Supervisor<C> {
         } else {
             let _ = reply.send(Err("Сначала сохраните настройки приложения".into()));
         }
+    }
+
+    /// Idempotent cascade of a deleted project: topics and the recent list unbind via the
+    /// hub actor (its only writer of `topics.json`), the task book forgets tasks and rules,
+    /// memory purges only inside its own base, and the profile goes last through the usual
+    /// settings `save`. Any step failure stops before the profile and says what already ran,
+    /// so pressing the button again resumes the cascade. A vanished project folder stays
+    /// deletable: every step tolerates data that is already gone.
+    async fn delete_project(&mut self, id: String, reply: oneshot::Sender<Result<String, String>>) {
+        let Some(live) = &self.settings else {
+            let _ = reply
+                .send(Err("Удаление недоступно: сначала сохраните настройки приложения.".into()));
+            return;
+        };
+        let settings = Arc::clone(&live.borrow());
+        let Some(project) = settings.projects.iter().find(|saved| saved.id() == id) else {
+            let _ = reply.send(Ok("Профиль проекта уже удалён из настроек.".into()));
+            return;
+        };
+        let name = project.name().to_owned();
+        // One resolver for guard, task book and memory: the settings candidate form, its
+        // canonical folder and the workspace-root form all identify the same project.
+        let paths = ProjectPaths::resolve(&settings, &self.home, &id, project.cwd());
+        let Some(service) = self.connector.task_service() else {
+            let _ = reply.send(Err("Сервис задач недоступен. Перезапустите приложение.".into()));
+            return;
+        };
+        let refusal = match service.inspect(|book| task_blocks(book, &paths.task_shapes)) {
+            Ok(TaskBlock::None) => None,
+            Ok(TaskBlock::Active) => Some(format!(
+                "Есть активные задачи проекта «{name}». Дождитесь завершения или остановите их и повторите удаление."
+            )),
+            // The queue analogue of the topic guard: a queued task is about to run, and
+            // dropping it silently would lose declared work.
+            Ok(TaskBlock::Queued) => Some(format!(
+                "В очереди проекта «{name}» есть незапущенные задачи. Дождитесь их выполнения или снимите их с очереди и повторите удаление."
+            )),
+            Err(error) => Some(format!("Не удалось проверить задачи проекта: {error}")),
+        }
+        // A live git preparation or check holds the service lease; refuse before any step.
+        .or_else(|| {
+            service
+                .reserve()
+                .err()
+                .map(|error| format!("Проект занят: {error}. Дождитесь завершения и повторите удаление."))
+        });
+        if let Some(error) = refusal {
+            let _ = reply.send(Err(error));
+            return;
+        }
+        let (topics, tasks, purged) = match self.forget_project_data(&id, paths, service).await {
+            Ok(counts) => counts,
+            Err((error, done)) => {
+                let _ = reply.send(Err(if done.is_empty() {
+                    error
+                } else {
+                    format!(
+                        "{error} Уже выполнено: {}. Профиль проекта не удалён.",
+                        done.join("; ")
+                    )
+                }));
+                return;
+            }
+        };
+        let mut draft = Draft::from_settings(&settings);
+        draft.projects.retain(|saved| saved.id != id);
+        let memory = if purged.shared {
+            "память оставлена: она общая с другим проектом"
+        } else if purged.had_data {
+            "память удалена"
+        } else {
+            "памяти не было"
+        };
+        let summary = format!(
+            "Проект «{name}» удалён: задач снято — {tasks}, тем отвязано — {topics}, записей реестра памяти снято — {}, {memory}. Профиль удаляется сохранением настроек.",
+            purged.removed_paths
+        );
+        self.save(draft);
+        // The Ok-reply rides on the settings save, the way the memory toggle's does: until
+        // the save settles the profile is not yet gone, and a rejected save must not claim
+        // the project was deleted.
+        if self.saving.is_some() {
+            self.project_reply = Some((reply, summary));
+        } else {
+            let _ = reply.send(Err(format!(
+                "Данные проекта сняты, но сохранение настроек не началось: {}. Повторите удаление после завершения текущего сохранения.",
+                self.state.notice.clone().unwrap_or_else(|| "причина неизвестна".to_owned())
+            )));
+        }
+    }
+
+    /// Data steps of the cascade (topics → tasks → memory), returning their counters or the
+    /// failure plus what had already completed.
+    async fn forget_project_data(
+        &mut self,
+        id: &str,
+        paths: ProjectPaths,
+        service: Arc<hub_core::tasks::service::TaskService>,
+    ) -> Result<(usize, usize, hub_memory::PurgeReport), (String, Vec<String>)> {
+        let Some(mailbox) = self.mailbox() else {
+            return Err(("Для отвязки тем от проекта запустите бота.".to_owned(), Vec::new()));
+        };
+        let (tx, rx) = oneshot::channel();
+        if mailbox.send(HubMessage::ForgetProject { id: id.to_owned(), reply: tx }).await.is_err() {
+            return Err((
+                "Бот остановлен. Повторите удаление после запуска.".to_owned(),
+                Vec::new(),
+            ));
+        }
+        let topics = match rx.await {
+            Ok(Ok(count)) => count,
+            Ok(Err(error)) => return Err((error, Vec::new())),
+            Err(_) => {
+                return Err((
+                    "Бот не ответил на команду отвязки. Повторите удаление.".to_owned(),
+                    Vec::new(),
+                ));
+            }
+        };
+        let done = vec![format!("темы отвязаны — {topics}")];
+        let tasks = match service.access(hub_core::tasks::service::Access::Edit, |book, _busy| {
+            Ok(paths.task_shapes.iter().map(|shape| book.forget_project(shape).0).sum())
+        }) {
+            Ok(removed) => removed,
+            Err(error) => {
+                return Err((format!("Не удалось снять задачи проекта: {error}"), done));
+            }
+        };
+        let done = vec![format!("темы отвязаны — {topics}"), format!("задачи сняты — {tasks}")];
+        let base = hub_memory::base_in(&self.home);
+        let purged = match tokio::task::spawn_blocking(move || {
+            hub_memory::purge(&base, &paths.cwd, &paths.living)
+        })
+        .await
+        {
+            Ok(Ok(report)) => report,
+            Ok(Err(error)) => {
+                return Err((format!("Не удалось удалить память проекта: {error}"), done));
+            }
+            Err(error) => {
+                return Err((format!("Память проекта не проверена: {error}"), done));
+            }
+        };
+        Ok((topics, tasks, purged))
     }
 
     fn handle_local_tasks(
@@ -856,9 +1083,16 @@ impl<C: Connector> Supervisor<C> {
         self.saving = None;
         self.save_slow_at = None;
         let memory_reply = self.memory_reply.take();
+        let project_reply = self.project_reply.take();
         let Ok(SaveJob { store, draft, settings, result }) = outcome else {
             if let Some(reply) = memory_reply {
                 let _ = reply.send(Err("Результат сохранения неизвестен".into()));
+            }
+            if let Some((reply, _)) = project_reply {
+                let _ = reply.send(Err(
+                    "Результат сохранения неизвестен; проверьте список проектов и повторите удаление при необходимости."
+                        .into(),
+                ));
             }
             self.state.save_status = SaveStatus::Uncertain;
             self.notice(Some(
@@ -871,6 +1105,11 @@ impl<C: Connector> Supervisor<C> {
         if let Err(error) = result {
             if let Some(reply) = memory_reply {
                 let _ = reply.send(Err(error.clone()));
+            }
+            if let Some((reply, _)) = project_reply {
+                let _ = reply.send(Err(format!(
+                    "Данные проекта сняты, но профиль удалить не удалось: {error}. Повторите удаление — шаги идемпотентны."
+                )));
             }
             self.notice(Some(error));
             return;
@@ -911,6 +1150,9 @@ impl<C: Connector> Supervisor<C> {
         self.publish();
         if let Some(reply) = memory_reply {
             let _ = reply.send(Ok(()));
+        }
+        if let Some((reply, summary)) = project_reply {
+            let _ = reply.send(Ok(summary));
         }
         if !self.telegram_configured() {
             self.connecting = None;
@@ -1081,6 +1323,7 @@ mod tests {
         counts: StdMutex<VecDeque<oneshot::Receiver<Result<usize, String>>>>,
         starts: StdMutex<VecDeque<oneshot::Receiver<()>>>,
         diagnostics: StdMutex<VecDeque<oneshot::Receiver<crate::diagnostics::Report>>>,
+        forget: StdMutex<VecDeque<Result<usize, String>>>,
     }
 
     struct BlockingLocal;
@@ -1181,6 +1424,12 @@ mod tests {
                                 format!("reset {}/{}", key.chat.0, key.thread.0)
                             }
                             HubMessage::SyncTopics { .. } => "sync".to_owned(),
+                            HubMessage::ForgetProject { id, reply } => {
+                                let outcome =
+                                    recorder.forget.lock().unwrap().pop_front().unwrap_or(Ok(0));
+                                let _ = reply.send(outcome);
+                                format!("forget_project {id}")
+                            }
                             HubMessage::DeleteTopic { .. }
                             | HubMessage::DeletionDone(_)
                             | HubMessage::SyncDone(_)
@@ -2323,5 +2572,367 @@ mod tests {
         harness.send(Command::Save(Box::new(draft("-100", "")))).await;
         send.send(Err("broken".to_owned())).unwrap();
         harness.until("storage error", |s| s.outbox == OutboxStatus::Unavailable).await;
+    }
+
+    fn project_draft(
+        id: &str,
+        name: &str,
+        cwd: &std::path::Path,
+    ) -> hub_core::projects::ProjectDraft {
+        hub_core::projects::ProjectDraft {
+            options: hub_core::options::OptionsDraft::default(),
+            id: id.to_owned(),
+            name: name.to_owned(),
+            cwd: cwd.display().to_string(),
+            backend: "codex".to_owned(),
+            actions: vec![],
+            checks: Vec::new(),
+        }
+    }
+
+    fn project_settings(id: &str, name: &str, cwd: &std::path::Path) -> Settings {
+        let mut form = draft("-100", "");
+        form.projects = vec![project_draft(id, name, cwd)];
+        form.parse(&home()).unwrap()
+    }
+
+    fn created_project(name: &str) -> std::path::PathBuf {
+        let dir = home().join("projects").join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::canonicalize(dir).unwrap()
+    }
+
+    fn seeded_service(tasks_dir: &std::path::Path) -> Arc<hub_core::tasks::service::TaskService> {
+        Arc::new(hub_core::tasks::service::TaskService::new(Box::new(
+            crate::topics::FileTopics::new(tasks_dir.join("topics.json")),
+        )))
+    }
+
+    fn forget_ok(harness: &Harness, count: usize) {
+        harness.probe.forget.lock().unwrap().push_back(Ok(count));
+    }
+
+    #[tokio::test]
+    async fn delete_project_cascade_reaches_every_storage() {
+        let root = tempfile::tempdir().unwrap();
+        let alpha = created_project("cascade-alpha");
+        let beta = created_project("cascade-beta");
+        let mut harness =
+            harness(Ok(Loaded::Ready(project_settings("alpha", "Альфа", &alpha))), &[], false);
+        harness.until("running", running).await;
+        let service = seeded_service(root.path());
+        service
+            .access(hub_core::tasks::service::Access::Edit, |book, _| {
+                book.create(alpha.clone(), "codex", "Правка", "Смотри")?;
+                book.create(alpha.clone(), "codex", "Сборка", "Собирай")?;
+                book.create(beta.clone(), "codex", "Чужая", "Не тронь")?;
+                book.set_rules(alpha.clone(), 0, true, "правила альфы")?;
+                book.set_rules(beta.clone(), 0, true, "правила беты")
+            })
+            .unwrap();
+        *harness.probe.tasks.lock().unwrap() = Some(service.clone());
+        let base = hub_memory::base_in(&home());
+        let store = hub_memory::Store::open(&base, &alpha, "test").unwrap();
+        store
+            .write(hub_memory::WriteRequest {
+                key: "k".into(),
+                expected_revision: 0,
+                kind: hub_memory::EntryKind::Progress,
+                title: "заметка".into(),
+                body: "тело".into(),
+                sources: vec!["test".into()],
+            })
+            .unwrap();
+        let memory_dir = hub_memory::MemoryReader::new(&base, &alpha)
+            .unwrap()
+            .inspect("", 0, 1)
+            .unwrap()
+            .directory;
+        forget_ok(&harness, 2);
+
+        let (reply, result) = oneshot::channel();
+        harness.send(Command::DeleteProject { id: "alpha".to_owned(), reply }).await;
+        let summary = result.await.unwrap().unwrap();
+        assert!(summary.contains("задач снято — 2"), "got: {summary}");
+        assert!(summary.contains("тем отвязано — 2"), "got: {summary}");
+        assert!(summary.contains("память удалена"), "got: {summary}");
+        assert_eq!(*harness.probe.messages.lock().unwrap(), ["forget_project alpha"]);
+
+        let book = service.read().unwrap();
+        assert_eq!(book.tasks().len(), 1);
+        assert_eq!(book.tasks()[0].project, beta);
+        assert_eq!(book.rules(&alpha), hub_core::tasks::ProjectRules::default());
+        assert_eq!(book.rules(&beta).text, "правила беты");
+        assert!(!memory_dir.exists());
+        assert!(alpha.is_dir(), "the project folder itself is never removed");
+        harness
+            .until("profile gone", |s| {
+                s.saved.as_ref().is_some_and(|d| d.projects.iter().all(|p| p.id != "alpha"))
+            })
+            .await;
+        let saved = harness.saved.lock().unwrap();
+        assert!(saved.last().expect("settings saved").projects.is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_project_blocks_while_a_task_is_active() {
+        let root = tempfile::tempdir().unwrap();
+        let busy = created_project("busy-project");
+        let mut harness =
+            harness(Ok(Loaded::Ready(project_settings("busy", "Занятый", &busy))), &[], false);
+        harness.until("running", running).await;
+        let service = seeded_service(root.path());
+        let id = service
+            .access(hub_core::tasks::service::Access::Edit, |book, _| {
+                book.create(busy.clone(), "codex", "Работа", "Пили")
+            })
+            .unwrap();
+        service
+            .access(hub_core::tasks::service::Access::Edit, |book, _| {
+                book.begin(id, 1, None, jiff::Timestamp::from_second(1_700_000_000).unwrap())
+            })
+            .unwrap();
+        *harness.probe.tasks.lock().unwrap() = Some(service.clone());
+        let base = hub_memory::base_in(&home());
+        hub_memory::Store::open(&base, &busy, "test").unwrap();
+        let memory_dir = hub_memory::MemoryReader::new(&base, &busy)
+            .unwrap()
+            .inspect("", 0, 1)
+            .unwrap()
+            .directory;
+
+        let (reply, result) = oneshot::channel();
+        harness.send(Command::DeleteProject { id: "busy".to_owned(), reply }).await;
+        let error = result.await.unwrap().unwrap_err();
+        assert!(error.contains("активные задачи"), "got: {error}");
+        assert!(harness.probe.messages.lock().unwrap().is_empty());
+        assert!(service.read().unwrap().tasks().iter().any(|t| t.project == busy && t.active()));
+        assert!(memory_dir.exists());
+        assert!(harness.saved.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_project_without_memory_or_tasks_is_not_an_error() {
+        let root = tempfile::tempdir().unwrap();
+        let solo = created_project("solo-project");
+        let mut harness =
+            harness(Ok(Loaded::Ready(project_settings("solo", "Одинокий", &solo))), &[], false);
+        harness.until("running", running).await;
+        *harness.probe.tasks.lock().unwrap() = Some(seeded_service(root.path()));
+        forget_ok(&harness, 0);
+
+        let (reply, result) = oneshot::channel();
+        harness.send(Command::DeleteProject { id: "solo".to_owned(), reply }).await;
+        let summary = result.await.unwrap().unwrap();
+        assert!(summary.contains("задач снято — 0"), "got: {summary}");
+        assert!(summary.contains("памяти не было"), "got: {summary}");
+        harness
+            .until("profile gone", |s| {
+                s.saved.as_ref().is_some_and(|d| d.projects.iter().all(|p| p.id != "solo"))
+            })
+            .await;
+    }
+
+    #[tokio::test]
+    async fn delete_project_keeps_memory_shared_with_a_living_neighbour() {
+        let root = tempfile::tempdir().unwrap();
+        let alpha = created_project("share-alpha");
+        let beta = created_project("share-beta");
+        let mut form = draft("-100", "");
+        form.projects =
+            vec![project_draft("alpha", "Альфа", &alpha), project_draft("beta", "Бета", &beta)];
+        let mut harness = harness(Ok(Loaded::Ready(form.parse(&home()).unwrap())), &[], false);
+        harness.until("running", running).await;
+        *harness.probe.tasks.lock().unwrap() = Some(seeded_service(root.path()));
+        let base = hub_memory::base_in(&home());
+        hub_memory::Store::open(&base, &alpha, "test")
+            .unwrap()
+            .write(hub_memory::WriteRequest {
+                key: "key".into(),
+                expected_revision: 0,
+                kind: hub_memory::EntryKind::Progress,
+                title: "общая".into(),
+                body: "тело".into(),
+                sources: vec!["test".into()],
+            })
+            .unwrap();
+        hub_memory::BindingPreview::prepare(&base, &alpha, &beta, hub_memory::BindingMode::Share)
+            .unwrap()
+            .apply()
+            .unwrap();
+        let directory = hub_memory::MemoryReader::new(&base, &beta)
+            .unwrap()
+            .inspect("", 0, 1)
+            .unwrap()
+            .directory;
+        forget_ok(&harness, 0);
+
+        let (reply, result) = oneshot::channel();
+        harness.send(Command::DeleteProject { id: "alpha".to_owned(), reply }).await;
+        let summary = result.await.unwrap().unwrap();
+        assert!(summary.contains("память оставлена"), "got: {summary}");
+        // Б1: the neighbour keeps the shared storage, its record and its data.
+        assert!(directory.exists());
+        assert_eq!(
+            hub_memory::MemoryReader::new(&base, &beta).unwrap().get("key", None).unwrap().revision,
+            1
+        );
+        harness
+            .until("profile gone", |s| {
+                s.saved.as_ref().is_some_and(|d| d.projects.iter().all(|p| p.id != "alpha"))
+            })
+            .await;
+        assert!(
+            harness
+                .saved
+                .lock()
+                .unwrap()
+                .last()
+                .is_some_and(|saved| saved.projects.iter().any(|p| p.id() == "beta"))
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_project_completes_when_the_project_folder_vanished() {
+        let root = tempfile::tempdir().unwrap();
+        let ghost = created_project("ghost-project");
+        let mut harness =
+            harness(Ok(Loaded::Ready(project_settings("ghost", "Призрак", &ghost))), &[], false);
+        harness.until("running", running).await;
+        *harness.probe.tasks.lock().unwrap() = Some(seeded_service(root.path()));
+        let base = hub_memory::base_in(&home());
+        hub_memory::Store::open(&base, &ghost, "test")
+            .unwrap()
+            .write(hub_memory::WriteRequest {
+                key: "key".into(),
+                expected_revision: 0,
+                kind: hub_memory::EntryKind::Progress,
+                title: "снимок".into(),
+                body: "тело".into(),
+                sources: vec!["test".into()],
+            })
+            .unwrap();
+        let directory = hub_memory::MemoryReader::new(&base, &ghost)
+            .unwrap()
+            .inspect("", 0, 1)
+            .unwrap()
+            .directory;
+        std::fs::remove_dir_all(&ghost).unwrap();
+        forget_ok(&harness, 0);
+
+        // Б3: a vanished folder must not make the memory step terminal.
+        let (reply, result) = oneshot::channel();
+        harness.send(Command::DeleteProject { id: "ghost".to_owned(), reply }).await;
+        let summary = result.await.unwrap().unwrap();
+        assert!(summary.contains("память удалена"), "got: {summary}");
+        assert!(!directory.exists());
+        harness
+            .until("profile gone", |s| {
+                s.saved.as_ref().is_some_and(|d| d.projects.iter().all(|p| p.id != "ghost"))
+            })
+            .await;
+        assert!(
+            harness.saved.lock().unwrap().last().is_some_and(|saved| saved.projects.is_empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_project_blocks_while_a_task_is_queued() {
+        let root = tempfile::tempdir().unwrap();
+        let waiting = created_project("queued-project");
+        let mut harness = harness(
+            Ok(Loaded::Ready(project_settings("queued", "Очередной", &waiting))),
+            &[],
+            false,
+        );
+        harness.until("running", running).await;
+        let service = seeded_service(root.path());
+        let id = service
+            .access(hub_core::tasks::service::Access::Edit, |book, _| {
+                book.create(waiting.clone(), "codex", "Очередь", "Жди")
+            })
+            .unwrap();
+        service
+            .access(hub_core::tasks::service::Access::Edit, |book, _| {
+                book.enqueue(id, 1, None, false, None)
+            })
+            .unwrap();
+        *harness.probe.tasks.lock().unwrap() = Some(service.clone());
+        let base = hub_memory::base_in(&home());
+        hub_memory::Store::open(&base, &waiting, "test").unwrap();
+
+        // Н4: a queued task is about to run; the cascade must not drop it silently.
+        let (reply, result) = oneshot::channel();
+        harness.send(Command::DeleteProject { id: "queued".to_owned(), reply }).await;
+        let error = result.await.unwrap().unwrap_err();
+        assert!(error.contains("очереди"), "got: {error}");
+        assert!(harness.probe.messages.lock().unwrap().is_empty());
+        assert!(service.read().unwrap().tasks().iter().any(|task| task.queue.is_some()));
+        assert!(harness.saved.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_project_forgets_tasks_recorded_in_a_noncanonical_path_form() {
+        let root = tempfile::tempdir().unwrap();
+        let real = created_project("shapes-real");
+        let link = home().join("projects").join("shapes-link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let mut harness =
+            harness(Ok(Loaded::Ready(project_settings("shapes", "Формы", &link))), &[], false);
+        harness.until("running", running).await;
+        let service = seeded_service(root.path());
+        service
+            .access(hub_core::tasks::service::Access::Edit, |book, _| {
+                book.create(link.clone(), "codex", "Связка", "Делай").map(|_| ())
+            })
+            .unwrap();
+        *harness.probe.tasks.lock().unwrap() = Some(service.clone());
+        forget_ok(&harness, 0);
+
+        // Н3: the modal counts both spellings, so the cascade must forget both as well.
+        let (reply, result) = oneshot::channel();
+        harness.send(Command::DeleteProject { id: "shapes".to_owned(), reply }).await;
+        let summary = result.await.unwrap().unwrap();
+        assert!(summary.contains("задач снято — 1"), "got: {summary}");
+        assert!(service.read().unwrap().tasks().is_empty());
+    }
+
+    #[tokio::test]
+    async fn delete_project_reports_failure_when_the_settings_save_fails() {
+        let root = tempfile::tempdir().unwrap();
+        let fragile = created_project("fragile-project");
+        let mut harness =
+            harness(Ok(Loaded::Ready(project_settings("fragile", "Хрупкий", &fragile))), &[], true);
+        harness.until("running", running).await;
+        *harness.probe.tasks.lock().unwrap() = Some(seeded_service(root.path()));
+        let base = hub_memory::base_in(&home());
+        hub_memory::Store::open(&base, &fragile, "test")
+            .unwrap()
+            .write(hub_memory::WriteRequest {
+                key: "key".into(),
+                expected_revision: 0,
+                kind: hub_memory::EntryKind::Progress,
+                title: "снимок".into(),
+                body: "тело".into(),
+                sources: vec!["test".into()],
+            })
+            .unwrap();
+        let directory = hub_memory::MemoryReader::new(&base, &fragile)
+            .unwrap()
+            .inspect("", 0, 1)
+            .unwrap()
+            .directory;
+        forget_ok(&harness, 0);
+
+        // Н5: the Ok reply waits for the settings save; a rejected save must not claim
+        // the project is deleted.
+        let (reply, result) = oneshot::channel();
+        harness.send(Command::DeleteProject { id: "fragile".to_owned(), reply }).await;
+        let error = result.await.unwrap().unwrap_err();
+        assert!(error.contains("профиль удалить не удалось"), "got: {error}");
+        assert!(!error.contains("удалён:"), "got: {error}");
+        assert!(!directory.exists(), "the data cascade did run");
+        assert!(harness.saved.lock().unwrap().is_empty());
     }
 }

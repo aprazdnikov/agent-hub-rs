@@ -465,6 +465,16 @@ impl TaskBook {
         }
         Ok(())
     }
+    /// Forgets a project: every task stored under exactly the same path `rules` matches
+    /// on, plus its rule entry. Returns (removed tasks, whether rules were present).
+    #[must_use]
+    pub fn forget_project(&mut self, project: &Path) -> (usize, bool) {
+        let had_rules = self.project_rules.iter().any(|entry| entry.project == project);
+        self.project_rules.retain(|entry| entry.project != project);
+        let before = self.tasks.len();
+        self.tasks.retain(|task| task.project != project);
+        (before - self.tasks.len(), had_rules)
+    }
     pub fn decode(bytes: &[u8]) -> Result<Self, String> {
         if bytes.len() > MAX_READ_BYTES {
             return Err("Файл задач превышает 8 МиБ".into());
@@ -906,3 +916,37 @@ impl TaskBook {
 }
 
 pub mod service;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn path(name: &str) -> PathBuf {
+        PathBuf::from(if cfg!(windows) { r"C:\projects" } else { "/projects" }).join(name)
+    }
+
+    #[test]
+    fn forget_project_removes_tasks_and_rules_of_one_path_only() {
+        let mut book = TaskBook::default();
+        let (a, b, c) = (path("a"), path("b"), path("c"));
+        for title in ["one", "two"] {
+            book.create(a.clone(), "codex", title, "prompt").unwrap();
+        }
+        book.create(b.clone(), "codex", "three", "prompt").unwrap();
+        book.create(c.clone(), "codex", "four", "prompt").unwrap();
+        book.set_rules(a.clone(), 0, true, "правила A").unwrap();
+        book.set_rules(b.clone(), 0, true, "правила B").unwrap();
+
+        assert_eq!(book.forget_project(&a), (2, true));
+        assert_eq!(book.tasks().len(), 2);
+        assert!(book.tasks().iter().all(|task| task.project == b || task.project == c));
+        assert_eq!(book.rules(&a), ProjectRules::default());
+        assert_eq!(book.rules(&b).text, "правила B");
+        // Paths without rules stay a valid no-op result, and repeats are quiet.
+        assert_eq!(book.forget_project(&c), (1, false));
+        assert_eq!(book.forget_project(&a), (0, false));
+        // The trimmed book keeps encoding and decoding through the on-disk format.
+        let bytes = book.encode().unwrap();
+        assert_eq!(TaskBook::decode(&bytes).unwrap(), book);
+    }
+}

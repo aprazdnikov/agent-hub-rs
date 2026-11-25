@@ -54,8 +54,10 @@ worktree внутри него и темы Telegram не затрагивают�
   удаление понятным сообщением; очередь без активных запусков удаляется. → Task 5.
 - `topics.json`: отвязка проекта не меняет session_id/backend/cwd темы — сессия продолжается;
   байт-в-байт round-trip формата сохранён. → Task 3.
-- `hub_memory::purge` не оставляет записей в `.projects` и не задевает чужие digest-каталоги;
-  при занятости (живой MCP-стор) — явная ошибка и повтор. → Task 2.
+- `hub_memory::purge` не оставляет в `.projects` записей удалённого проекта и не трогает
+  хранилища, на которые ссылается другой живой проект (при общей привязке каталог данных
+  освобождает последнее удаление); при занятости (живой MCP-стор или публикация реестра
+  дольше короткого ожидания) — явная ошибка и повтор. → Task 2.
 - Профиль проекта исчезает только после успешных шагов данных; при отказе шаг settings
   не выполнен. → Task 5.
 - GUI: кнопка «Удалить проект» не удаляет молча из черновика; карточка, отсутствующая в
@@ -88,14 +90,14 @@ worktree внутри него и темы Telegram не затрагивают�
   `forget_project` сравнивает `fs-нормализованные` пути так же, как это делает
   `rules(&Path)` (тот же канонический вид); удаляет и `tasks`, и запись `rules`.
 
-- [ ] **Step 1: RED** — тесты: `detach_project` чистит `preferences.project`, не трогает
+- [x] **Step 1: RED** — тесты: `detach_project` чистит `preferences.project`, не трогает
   `overrides`/`memory` и корректно сериализуется обратно (`dump_state/parse_state`);
   `forget_project` удаляет две задачи+правила одного пути и оставляет другой проект;
   повторный вызов → `(0,false)`; `RecentProjects::forget` идемпотентен.
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-core --lib detach_project forget_project` → FAIL.
-- [ ] **Step 3: Implement** — три метода, минимально, без IO.
-- [ ] **Step 4: GREEN** — `cargo test -p hub-core --locked` → PASS.
-- [ ] **Step 5: Commit** — `feat(core): примитивы отвязки и забывания проекта`
+- [x] **Step 2: Verify RED** — `cargo test -p hub-core --lib detach_project forget_project` → FAIL.
+- [x] **Step 3: Implement** — три метода, минимально, без IO.
+- [x] **Step 4: GREEN** — `cargo test -p hub-core --locked` → PASS.
+- [x] **Step 5: Commit** — `feat(core): примитивы отвязки и забывания проекта`
 
 ---
 
@@ -109,25 +111,35 @@ worktree внутри него и темы Telegram не затрагивают�
 **Interfaces:**
 - Produces:
   ```rust
-  /// Полностью убирает проект из памяти хаба: записи реестра `.projects`, ведущие к его
-  /// identity, и каталог данных `base/<digest(identity)>`. Ничего вне base не трогает.
-  pub fn purge(base: &Path, project: &Path) -> Result<PurgeReport, Error>;
-  pub struct PurgeReport { pub removed_paths: usize, pub had_data: bool }
+  /// Полностью убирает проект из памяти хаба: его записи реестра `.projects` и, когда на
+  /// хранилище больше не ссылается ни один живой проект, записи alias-путей и каталог
+  /// данных `base/<digest(identity)>`. `living` — пути остальных сохранённых профилей:
+  /// хранилище, общее с ними, остаётся на месте вместе с их записями. Вне base ничего
+  /// не трогает.
+  pub fn purge(base: &Path, project: &Path, living: &[PathBuf]) -> Result<PurgeReport, Error>;
+  pub struct PurgeReport { pub removed_paths: usize, pub had_data: bool, pub shared: bool }
   ```
-  Шаги: canonicalize(project) (NotFound → `Error::InvalidInput`) → `Location::resolve` →
-  взять блокировку каталога данных (как `lock()` в bindings; живой MCP-стор → `Busy`) →
-  удалить реестровые записи `path → Some(identity)` c совпадающим identity и саму запись
-  `identity` → записать реестр атомарно → удалить каталог `directory()` рекурсивно.
-  Несовпадение префикса `base` после canonicalize → `Error::InvalidInput` (защита от symlink).
+  Шаги: canonicalize(project) — исчезнувший канонический путь продолжается как бывший
+  (каталог не удаляется, реестр чистится; tombstone `Some(None)` move-источника
+  трактуется так же) → блокировка `.projects` тем же lock-файлом, что и
+  `BindingPreview::apply`, с коротким ожиданием → identity = привязка пути либо сам путь →
+  блокировка каталога данных (живой MCP-стор → `Busy`) → если в `living` остался путь,
+  разрешающийся в этот identity: каталог и чужие записи сохраняются (`shared: true`),
+  снимается только собственная запись проекта; иначе — снимаются все записи identity и
+  рекурсивно удаляется каталог, блокировка данных держится до конца удаления.
+  Symlink на digest-каталоге или выход за префикс `base` → `Error::UnsafePath` (защита от
+  подмены).
 
-- [ ] **Step 1: RED** — тесты: проект с записями + move-биндинг (два пути к одному
+- [x] **Step 1: RED** — тесты: проект с записями + move-биндинг (два пути к одному
   identity) → после purge реестр чист, каталог удалён, второй проект цел; повторный
-  purge → `had_data:false, removed_paths:0`; нет каталога данных — только чистка реестра;
-  путь вне base (symlink-ловушка) → ошибка.
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-memory --lib purge` → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: GREEN** — `cargo test -p hub-memory --locked` → PASS.
-- [ ] **Step 5: Commit** — `feat(memory): purge проекта из реестра и хранилища памяти`
+  purge → `had_data:false, removed_paths:0`; два профиля в Share → purge первого сохраняет
+  хранилище, запись и данные второго, purge последнего их освобождает; исчезнувший
+  каталог проекта и move-tombstone → реестр чистится, повтор успешен; занятой реестр и
+  занятый каталог данных → `Busy`; путь вне base (symlink-ловушка) → ошибка.
+- [x] **Step 2: Verify RED** — `cargo test -p hub-memory --lib purge` → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: GREEN** — `cargo test -p hub-memory --locked` → PASS.
+- [x] **Step 5: Commit** — `feat(memory): purge проекта из реестра и хранилища памяти`
 
 ---
 
@@ -145,13 +157,13 @@ worktree внутри него и темы Telegram не затрагивают�
   состояния (паттерн `clean_deleted_topic`: сбой диска — Err, состояние не изменено); затем
   `self.projects.forget(id)` + `store.save_recent_projects`. `replace_topics` обновляет views.
 
-- [ ] **Step 1: RED** — тест: две темы одного проекта и одна другого → Ok(2), в `store.last()`
+- [x] **Step 1: RED** — тест: две темы одного проекта и одна другого → Ok(2), в `store.last()`
   у двух тем нет `project`, session_id/backend сохранены; сбой `store.fail` → Err и
   темы в прежнем виде; идемпотентный повтор → Ok(0).
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-telegram --lib forget_project` → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: GREEN** — `cargo test -p hub-telegram --locked` → PASS.
-- [ ] **Step 5: Commit** — `feat(telegram): отвязка проекта от тем по команде хаба`
+- [x] **Step 2: Verify RED** — `cargo test -p hub-telegram --lib forget_project` → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: GREEN** — `cargo test -p hub-telegram --locked` → PASS.
+- [x] **Step 5: Commit** — `feat(telegram): отвязка проекта от тем по команде хаба`
 
 ---
 
@@ -171,23 +183,31 @@ worktree внутри него и темы Telegram не затрагивают�
   1. найти проект в текущих `Settings` (по `id`); нет — Ok c пометкой «профиль уже удалён».
   2. абсолютный путь: `hub_core::workspace::candidate(&settings.workspace_root, &home, Some(&cwd))`
      — так же, как резолвится при выборе проекта (проверить `projects.rs::confirm`).
-  3. guard активности: через `TaskService::inspect` — есть `RunState::Running`/pending lease/
-     git-задача у задач этого пути → Err «Есть активные задачи проекта…».
+  3. guard активности: через `TaskService::inspect` по всем формам пути проекта
+     (`task_path_shapes`: кандидат, канонический, workspace-root) — есть `RunState::Running`/
+     git-подготовка → «Есть активные задачи…»; есть задача в очереди без ошибки → «В очереди
+     проекта… есть незапущенные задачи…» (аналог guard'а удаления темы); pending lease → Err.
   4. каскад: `HubMessage::ForgetProject` (Task 3) → `tasks.access(Edit, forget_project)` →
      `spawn_blocking(hub_memory::purge)`; ошибки каждого шага аккумулируются в сообщение,
      порядок шагов позволяет повторить каскад кнопкой.
   5. успех шагов данных → черновик из текущих настроек без профиля
      (`Draft::from_settings(&settings)`, удалить `projects[i]`) → существующий `self.save(draft)`;
-     reply Ok(сводка: «Проект удалён: N задач, M тем отвязано, память удалена»).
-  6. результат `save` остаётся штатным (SaveStatus/notice), reply не ждёт записи settings —
-     в сводке указать «профиль снимается сохранением настроек».
+     Ok-reply откладывается до `finish_save` (по образцу `memory_reply`) и несёт сводку
+     («Проект … удалён: N задач, M тем отвязано, снятых записей реестра памяти — K, память
+     удалена/оставлена как общая/не было»).
+  6. если сохранение не началось, отклонено или его результат неизвестен — reply получает
+     различимый Err: данные сняты, профиль не удалён, повтор кнопкой; сам результат `save`
+     остаётся штатным (SaveStatus/notice).
 
-- [ ] **Step 1: RED** — тесты supervisor-harness: каскад зовёт все четыре хранилища (spy),
-  активная задача блокирует без побочных эффектов, отсутствующий memory-каталог не ошибка.
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-app --lib delete_project` → FAIL.
-- [ ] **Step 3: Implement.**
-- [ ] **Step 4: GREEN** — `cargo test -p hub-app --locked` → PASS.
-- [ ] **Step 5: Commit** — `feat(app): каскадное удаление проекта с данными хаба`
+- [x] **Step 1: RED** — тесты supervisor-harness: каскад зовёт все четыре хранилища (spy),
+  активная задача и задача в очереди блокируют без побочных эффектов, исчезнувший каталог
+  проекта не мешает каскаду, живому соседу по Share остаёт общее хранилище, задачи в
+  неканонической форме пути снимаются (счётчик модалки = факт), отклонённое сохранение
+  настроек отвечает ошибкой, а не «удалён».
+- [x] **Step 2: Verify RED** — `cargo test -p hub-app --lib delete_project` → FAIL.
+- [x] **Step 3: Implement.**
+- [x] **Step 4: GREEN** — `cargo test -p hub-app --locked` → PASS.
+- [x] **Step 5: Commit** — `feat(app): каскадное удаление проекта с данными хаба`
 
 ---
 
@@ -210,12 +230,12 @@ worktree внутри него и темы Telegram не затрагивают�
   Счётчики для текста модалки: задачи — из уже загружаемого списка задач GUI
   (`tasks` snapshot), темы — из `handle.views` (фильтр `preferences.project.id`).
 
-- [ ] **Step 1: RED** — render-тест: клик «Удалить проект…» открывает модалку; кнопка
+- [x] **Step 1: RED** — render-тест: клик «Удалить проект…» открывает модалку; кнопка
   удаления неактивна без ввода имени; ввод имени → клик шлёт `Command::DeleteProject`.
-- [ ] **Step 2: Verify RED** — `cargo test -p hub-app --lib delete_project_modal` → FAIL.
-- [ ] **Step 3: Implement** (поверх существующего паттерна `confirming`).
-- [ ] **Step 4: GREEN** — `cargo test -p hub-app --locked` → PASS.
-- [ ] **Step 5: Commit** — `feat(gui): подтверждение удаления проекта с описанием каскада`
+- [x] **Step 2: Verify RED** — `cargo test -p hub-app --lib delete_project_modal` → FAIL.
+- [x] **Step 3: Implement** (поверх существующего паттерна `confirming`).
+- [x] **Step 4: GREEN** — `cargo test -p hub-app --locked` → PASS.
+- [x] **Step 5: Commit** — `feat(gui): подтверждение удаления проекта с описанием каскада`
 
 ---
 
@@ -224,11 +244,11 @@ worktree внутри него и темы Telegram не затрагивают�
 **Files:**
 - Modify: `docs/guide/projects.md`, `docs/guide/settings.md` (раздел проектов), `docs/guide/memory.md`
   (purge памяти), `docs/history.md`-строка не нужна до релиза.
-- [ ] **Step 1:** обновить тексты: как удалить проект, что удаляется, что остаётся;
+- [x] **Step 1:** обновить тексты: как удалить проект, что удаляется, что остаётся;
   сверить якоря ссылок по правилу doc-link (русские заголовки, slug без знаков препинания).
-- [ ] **Step 2:** `cargo test --workspace --locked && cargo clippy --workspace --all-targets
+- [x] **Step 2:** `cargo test --workspace --locked && cargo clippy --workspace --all-targets
   --locked -- -D warnings && cargo fmt --all --check && cargo deny check && git diff --check`.
-- [ ] **Step 3: Commit** — `docs: удаление проекта вместе с данными хаба`
+- [x] **Step 3: Commit** — `docs: удаление проекта вместе с данными хаба`
 
 ## Security Review этого плана
 

@@ -183,6 +183,20 @@ impl Preferences {
             project: Some(ProjectOptions { id: id.to_owned(), name: name.to_owned(), options }),
         }
     }
+    /// The bound profile's id, when the topic inherits its options from a project.
+    #[must_use]
+    pub fn project_id(&self) -> Option<&str> {
+        self.project.as_ref().map(|project| project.id.as_str())
+    }
+    /// Drops the project binding when it points at `id`; `true` means something was detached.
+    #[must_use]
+    pub fn detach_project(&mut self, id: &str) -> bool {
+        if self.project.as_ref().is_some_and(|project| project.id == id) {
+            self.project = None;
+            return true;
+        }
+        false
+    }
     pub fn parse(backend: BackendKind, draft: Option<PreferencesDraft>) -> Result<Self, String> {
         let Some(draft) = draft else {
             return Ok(Self::default());
@@ -415,6 +429,56 @@ mod tests {
         assert!(project.resolve(BackendKind::Qwen, &settings).is_err());
     }
 
+    #[test]
+    fn detach_project_clears_only_the_project_binding() {
+        let mut preferences = Preferences::for_project(
+            "p",
+            "Project",
+            options("project-model", "read-only/on-request"),
+        );
+        preferences.overrides = options("topic-model", "");
+        preferences.memory = Some(false);
+        assert!(preferences.detach_project("p"));
+        assert_eq!(
+            preferences,
+            Preferences {
+                memory: Some(false),
+                overrides: options("topic-model", ""),
+                ..Preferences::default()
+            }
+        );
+        assert!(!preferences.detach_project("p"));
+        let mut other = Preferences::for_project("q", "Other", options("", ""));
+        assert!(!other.detach_project("p"));
+        assert!(other.detach_project("q"));
+        assert_eq!(other, Preferences::default());
+    }
+    #[test]
+    fn detached_preferences_round_trip_without_a_project() {
+        use crate::domain::{AbsolutePath, ChatId, SessionId, ThreadId, TopicKey, TopicSession};
+        let cwd = if cfg!(windows) { r"C:\work".to_owned() } else { "/work".to_owned() };
+        let mut preferences =
+            Preferences::for_project("p", "Project", options("model", "read-only/on-request"));
+        preferences.memory = Some(true);
+        assert!(preferences.detach_project("p"));
+        let key = TopicKey { chat: ChatId(-100), thread: ThreadId(7) };
+        let session = TopicSession {
+            preferences,
+            backend: BackendKind::Codex,
+            cwd: AbsolutePath::new(std::path::PathBuf::from(cwd)).unwrap(),
+            session: SessionId::parse("saved"),
+        };
+        let topics = crate::topics::Topics::from([(key, session)]);
+        let raw = crate::topics::dump_state(&topics).unwrap();
+        let saved: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(saved["topics"][0]["preferences"]["project"].is_null());
+        let restored = crate::topics::parse_state(&raw).unwrap();
+        assert_eq!(restored, topics);
+        let topic = &restored[&key];
+        assert_eq!(topic.session.as_ref().map(SessionId::as_str), Some("saved"));
+        assert_eq!(topic.backend, BackendKind::Codex);
+        assert_eq!(topic.preferences.memory, Some(true));
+    }
     #[test]
     fn options_preferences_round_trip_without_keys_and_reject_wrong_backend() {
         let mut original =

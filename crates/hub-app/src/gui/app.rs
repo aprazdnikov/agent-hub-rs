@@ -285,7 +285,7 @@ impl HubApp {
     }
 
     fn settings(&mut self, ui: &mut egui::Ui, snapshot: &Snapshot, send: &mut impl FnMut(Command)) {
-        self.form.show(ui, &self.home, active(snapshot), send);
+        self.form.show(ui, &self.home, active(snapshot), snapshot, send);
         if !self.form.diagnostics_open() {
             return;
         }
