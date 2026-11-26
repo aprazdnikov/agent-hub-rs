@@ -40,6 +40,12 @@ impl MemoryMcp {
         json!({"name": SERVER_NAME, "command": self.command, "args": self.args, "env": []})
     }
 
+    /// `Pi`'s bridge extension registers this object through `pi.registerMcpServer`.
+    #[must_use]
+    pub fn pi_server(&self) -> Value {
+        json!({"name": SERVER_NAME, "command": self.command, "args": self.args, "env": {}})
+    }
+
     /// Claude Code accepts this stdio definition inside its per-launch `--mcp-config`.
     #[must_use]
     pub fn claude_server(&self) -> Value {

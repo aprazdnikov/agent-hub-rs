@@ -83,6 +83,7 @@ pub const fn agent_title(kind: BackendKind) -> &'static str {
         BackendKind::Qwen => "Qwen Code",
         BackendKind::Hermes => "Hermes",
         BackendKind::Opencode => "OpenCode",
+        BackendKind::Pi => "Pi",
     }
 }
 
@@ -109,6 +110,7 @@ const fn auth_text(auth: AgentAuth) -> &'static str {
         AgentAuth::Qwen(QwenAuth::OwnSetup) => "собственная настройка qwen",
         AgentAuth::Hermes => "собственная настройка Hermes (вход не проверен)",
         AgentAuth::Opencode => "собственная настройка OpenCode (вход не проверен)",
+        AgentAuth::Pi => "собственные подписки Pi (вход не проверен)",
     }
 }
 
@@ -354,5 +356,6 @@ mod tests {
         assert_eq!(agent_title(BackendKind::Qwen), "Qwen Code");
         assert_eq!(agent_title(BackendKind::Hermes), "Hermes");
         assert_eq!(agent_title(BackendKind::Opencode), "OpenCode");
+        assert_eq!(agent_title(BackendKind::Pi), "Pi");
     }
 }

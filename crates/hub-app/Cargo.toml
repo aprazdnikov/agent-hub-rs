@@ -20,6 +20,7 @@ hub-codex.workspace = true
 hub-qwen.workspace = true
 hub-hermes.workspace = true
 hub-opencode.workspace = true
+hub-pi.workspace = true
 hub-core.workspace = true
 hub-agent.workspace = true
 hub-memory.workspace = true

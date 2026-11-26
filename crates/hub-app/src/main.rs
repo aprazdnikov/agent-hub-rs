@@ -43,6 +43,15 @@ fn main() -> ExitCode {
             }
         };
     }
+    if hub_app::cli::requested(command.as_deref().and_then(std::ffi::OsStr::to_str)) {
+        return match hub_app::cli::run(std::env::args().skip(2)) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("agent-hub: {error:#}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

@@ -93,6 +93,7 @@ fn locate_cli(backend: BackendKind, settings: &Settings) -> Result<String, Strin
         BackendKind::Opencode => {
             hub_opencode::version::locate(settings.opencode.cli.as_deref()).ok()
         }
+        BackendKind::Pi => hub_pi::version::locate(settings.pi.cli.as_deref()).ok(),
     }
     .ok_or_else(|| "CLI не найден в настройках или PATH".to_owned())?;
     executable(&path)?;

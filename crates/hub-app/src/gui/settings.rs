@@ -13,8 +13,8 @@ use hub_core::domain::BackendKind;
 use hub_core::projects::{MAX_PROJECTS, ProjectDraft};
 use hub_core::settings::{
     ApiEndpoint, Approval, CodexField, Draft, Field, FieldError, HermesApproval, HermesField,
-    OpencodeField, PermissionMode, ProgressMode, QwenApproval, QwenField, Sandbox, Settings,
-    UpdateCheck,
+    OpencodeField, PermissionMode, PiApproval, PiField, PiThinking, ProgressMode, QwenApproval,
+    QwenField, Sandbox, Settings, UpdateCheck,
 };
 use hub_core::speech::SpeechProvider;
 
@@ -411,6 +411,7 @@ impl SettingsForm {
                 ),
                 AgentPage::Backend(BackendKind::Hermes) => self.hermes(ui, errors),
                 AgentPage::Backend(BackendKind::Opencode) => self.opencode(ui, errors),
+                AgentPage::Backend(BackendKind::Pi) => self.pi(ui, errors),
             },
         }
     }
@@ -1036,6 +1037,64 @@ impl SettingsForm {
         });
         messages(ui, errors, Field::Opencode(OpencodeField::Model));
         ui.label("Вход и провайдеры настраиваются в OpenCode (`opencode auth login`). Хаб запускает `opencode acp`, не меняя его конфигурацию и секреты. Новые сообщения во время работы ждут следующего хода.");
+    }
+
+    fn pi(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
+        ui.heading("Pi");
+        field_row(ui, "Путь к pi", |ui| {
+            ui.add(input(&mut self.draft.pi.cli).hint_text("из PATH"));
+            if ui.button("Выбрать…").clicked()
+                && let Some(path) = pick_file(&self.draft.pi.cli)
+            {
+                self.draft.pi.cli = path;
+            }
+        });
+        messages(ui, errors, Field::Pi(PiField::Cli));
+        field_row(ui, "Модель", |ui| {
+            ui.add(input(&mut self.draft.pi.model).hint_text("провайдер/модель из настроек Pi"));
+        });
+        messages(ui, errors, Field::Pi(PiField::Model));
+        field_row(ui, "Режим", |ui| {
+            egui::ComboBox::from_id_salt("pi_thinking")
+                .selected_text(self.draft.pi.thinking.label())
+                .show_ui(ui, |ui| {
+                    for thinking in PiThinking::ALL {
+                        ui.selectable_value(
+                            &mut self.draft.pi.thinking,
+                            thinking,
+                            thinking.label(),
+                        );
+                    }
+                });
+        });
+        messages(ui, errors, Field::Pi(PiField::Thinking));
+        ui.label(
+            "Режим — это уровень размышлений. Модель объявляет свои уровни сама; недоступный \
+             уровень хаб отклоняет до начала хода и показывает, какие доступны.",
+        );
+        field_row(ui, "Одобрения", |ui| {
+            egui::ComboBox::from_id_salt("pi_approval")
+                .selected_text(self.draft.pi.approval.wire())
+                .show_ui(ui, |ui| {
+                    for approval in PiApproval::ALL {
+                        ui.selectable_value(&mut self.draft.pi.approval, approval, approval.wire());
+                    }
+                });
+        });
+        messages(ui, errors, Field::Pi(PiField::Approval));
+        if self.draft.pi.approval == PiApproval::Yolo {
+            ui.colored_label(
+                ui.visuals().warn_fg_color,
+                "yolo: Pi редактирует файлы и выполняет команды без подтверждения.",
+            );
+        } else {
+            ui.label("Pi сам ничего не спрашивает: хаб подтверждает bash, edit и write.");
+        }
+        ui.label(
+            "Подписки и ключи остаются у Pi (`pi auth login`, `~/.pi/agent/auth.json`) — хаб их \
+             не читает. Через мост хаба агент получает `send_file` и `ask_user`, а сообщение, \
+             пришедшее во время работы, уточняет текущий ход.",
+        );
     }
 
     fn timeouts(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {

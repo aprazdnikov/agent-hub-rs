@@ -59,6 +59,8 @@ Claude: `default`, `acceptEdits`, `plan`, `bypassPermissions`; Qwen: `plan`, `de
 `auto-edit`, `yolo`. Hermes: `default`, `accept_edits`, `dont_ask`, `yolo`. Codex: сочетания
 `read-only`, `workspace-write`, `danger-full-access` с `untrusted`, `on-request`, `never`.
 OpenCode — режим CLI/сессии; менять его режим через эту команду нельзя.
+Pi: `off`, `minimal`, `low`, `medium`, `high`, `xhigh` — уровень размышления; недоступный
+для модели уровень отклоняется.
 
 Каждое поле выбирается независимо: **настройка темы → копия настроек проекта → общие
 настройки**. `/mode inherit` снимает только режим темы. Изменение или удаление профиля

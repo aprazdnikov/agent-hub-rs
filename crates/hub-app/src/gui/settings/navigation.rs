@@ -77,7 +77,8 @@ impl Section {
             | Field::Codex(_)
             | Field::Qwen(_)
             | Field::Hermes(_)
-            | Field::Opencode(_) => Self::Agents,
+            | Field::Opencode(_)
+            | Field::Pi(_) => Self::Agents,
         }
     }
 
@@ -104,6 +105,7 @@ impl AgentPage {
             Field::Qwen(_) => Self::Backend(BackendKind::Qwen),
             Field::Hermes(_) => Self::Backend(BackendKind::Hermes),
             Field::Opencode(_) => Self::Backend(BackendKind::Opencode),
+            Field::Pi(_) => Self::Backend(BackendKind::Pi),
             Field::ApprovalTimeout
             | Field::BackgroundTimeout
             | Field::DefaultBackend

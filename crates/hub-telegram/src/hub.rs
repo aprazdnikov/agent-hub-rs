@@ -4912,7 +4912,7 @@ mod tests {
         world.send(text(Some(7), 3, "/backend gpt")).await;
         eventually("unknown", || {
             world.texts().contains(
-                &"⚠️ Неизвестный бэкенд gpt. Доступны: claude, codex, qwen, hermes, opencode"
+                &"⚠️ Неизвестный бэкенд gpt. Доступны: claude, codex, qwen, hermes, opencode, pi"
                     .to_owned(),
             )
         })

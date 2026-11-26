@@ -99,6 +99,8 @@ pub enum AgentAuth {
     Hermes,
     /// `OpenCode` owns its provider credentials; starting ACP does not prove model sign-in.
     Opencode,
+    /// `Pi` keeps its subscriptions in `~/.pi/agent/auth.json`, which the hub never reads.
+    Pi,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

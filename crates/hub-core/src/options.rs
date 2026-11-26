@@ -1,7 +1,9 @@
 //! Per-topic model and execution mode, without credentials or transport configuration.
 
 use crate::domain::BackendKind;
-use crate::settings::{Approval, HermesApproval, PermissionMode, QwenApproval, Sandbox, Settings};
+use crate::settings::{
+    Approval, HermesApproval, PermissionMode, PiThinking, QwenApproval, Sandbox, Settings,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -29,6 +31,7 @@ pub enum Mode {
     Codex { sandbox: Sandbox, approval: Approval },
     Qwen(QwenApproval),
     Hermes(HermesApproval),
+    Pi(PiThinking),
 }
 impl Mode {
     #[must_use]
@@ -44,6 +47,7 @@ impl Mode {
             BackendKind::Qwen => QwenApproval::ALL.into_iter().map(Self::Qwen).collect(),
             BackendKind::Hermes => HermesApproval::ALL.into_iter().map(Self::Hermes).collect(),
             BackendKind::Opencode => vec![],
+            BackendKind::Pi => PiThinking::ALL.into_iter().map(Self::Pi).collect(),
         }
     }
     #[must_use]
@@ -53,6 +57,7 @@ impl Mode {
             Self::Codex { sandbox, approval } => format!("{}/{}", sandbox.wire(), approval.wire()),
             Self::Qwen(mode) => mode.wire().to_owned(),
             Self::Hermes(mode) => mode.wire().to_owned(),
+            Self::Pi(thinking) => thinking.wire().to_owned(),
         }
     }
     pub fn parse(backend: BackendKind, raw: &str) -> Result<Option<Self>, String> {
@@ -76,6 +81,9 @@ impl Mode {
                 | Self::Codex { approval: Approval::Never, .. }
                 | Self::Qwen(QwenApproval::Yolo)
                 | Self::Hermes(HermesApproval::Yolo)
+                // `Pi` never asks for itself: the hub's bridge gate is an approval mode,
+                // and thinking levels do not switch it off.
+                | Self::Pi(_)
         )
     }
 }
@@ -270,6 +278,9 @@ impl Preferences {
                 (settings.hermes.model.clone(), Some(Mode::Hermes(settings.hermes.approval)))
             }
             BackendKind::Opencode => (settings.opencode.model.clone(), None),
+            // Pi's mode axis is the thinking level the model advertises, and the hub's approval
+            // gate is a setting rather than a per-topic mode.
+            BackendKind::Pi => (settings.pi.model.clone(), Some(Mode::Pi(settings.pi.thinking))),
         };
         let mut model_source = Source::Global;
         let mut execution_source = Source::Global;
@@ -302,6 +313,7 @@ impl Effective {
             BackendKind::Qwen => settings.qwen.model.clone_from(&self.model),
             BackendKind::Hermes => settings.hermes.model.clone_from(&self.model),
             BackendKind::Opencode => settings.opencode.model.clone_from(&self.model),
+            BackendKind::Pi => settings.pi.model.clone_from(&self.model),
         }
         match self.mode {
             Some(Mode::Claude(mode)) => settings.claude.permission_mode = mode,
@@ -311,6 +323,7 @@ impl Effective {
             }
             Some(Mode::Qwen(mode)) => settings.qwen.approval = mode,
             Some(Mode::Hermes(mode)) => settings.hermes.approval = mode,
+            Some(Mode::Pi(thinking)) => settings.pi.thinking = thinking,
             None => {}
         }
     }

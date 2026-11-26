@@ -60,7 +60,8 @@ pub fn format_finished(finished: &Finished) -> String {
         Usage::Codex { tokens }
         | Usage::Qwen { tokens }
         | Usage::Hermes { tokens }
-        | Usage::Opencode { tokens } => tokens.map_or_else(String::new, |tokens| {
+        | Usage::Opencode { tokens }
+        | Usage::Pi { tokens } => tokens.map_or_else(String::new, |tokens| {
             format!(" · токенов в сессии: {}", group_thousands(tokens))
         }),
     };
@@ -204,6 +205,7 @@ const fn backend_title(kind: BackendKind) -> &'static str {
         BackendKind::Qwen => "Qwen",
         BackendKind::Hermes => "Hermes",
         BackendKind::Opencode => "OpenCode",
+        BackendKind::Pi => "Pi",
     }
 }
 

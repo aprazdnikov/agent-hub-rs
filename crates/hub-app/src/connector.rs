@@ -42,6 +42,8 @@ pub enum AgentError {
     Hermes(#[from] hub_hermes::version::CliError),
     #[error(transparent)]
     Opencode(#[from] hub_opencode::version::CliError),
+    #[error(transparent)]
+    Pi(#[from] hub_pi::version::CliError),
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -122,6 +124,7 @@ async fn locate_agent(
         BackendKind::Opencode => {
             hub_opencode::version::locate(configured.as_deref()).map_err(AgentError::from)
         }
+        BackendKind::Pi => hub_pi::version::locate(configured.as_deref()).map_err(AgentError::from),
         BackendKind::Qwen => {
             hub_qwen::version::locate(configured.as_deref()).map_err(AgentError::from)
         }
@@ -139,6 +142,7 @@ async fn check_agent(kind: BackendKind, settings: &Settings) -> Result<AgentStat
         BackendKind::Codex => settings.codex.cli.clone(),
         BackendKind::Hermes => settings.hermes.cli.clone(),
         BackendKind::Opencode => settings.opencode.cli.clone(),
+        BackendKind::Pi => settings.pi.cli.clone(),
         BackendKind::Qwen => settings.qwen.cli.clone(),
     };
     let cli = locate_agent(kind, settings.default_backend, configured).await?;
@@ -169,6 +173,12 @@ async fn check_agent(kind: BackendKind, settings: &Settings) -> Result<AgentStat
             let version = hub_opencode::version::check(&cli).await?;
             // No trial session: OpenCode owns its providers, credentials and session database.
             Ok(AgentState::Ready { version: version.to_string(), auth: Some(AgentAuth::Opencode) })
+        }
+        BackendKind::Pi => {
+            let version = hub_pi::version::check(&cli).await?;
+            // No trial session: `Pi` owns its subscriptions in `~/.pi/agent/auth.json`, and a
+            // probe run would write session files the hub has no business removing.
+            Ok(AgentState::Ready { version: version.to_string(), auth: Some(AgentAuth::Pi) })
         }
         BackendKind::Qwen => {
             let version = hub_qwen::version::check(&cli).await?;

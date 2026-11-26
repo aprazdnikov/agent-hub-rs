@@ -25,6 +25,7 @@
 | [Qwen Code](https://github.com/QwenLM/qwen-code) | 0.25.0, `qwen --version` | Настройте провайдера в `qwen` через `/auth` либо укажите OpenAI-совместимый адрес и ключ в хабе |
 | [Hermes](https://github.com/NousResearch/hermes-agent) | 0.21.5, `hermes acp --version` и `hermes acp --check` | Настройте провайдера через `hermes setup` |
 | [OpenCode](https://opencode.ai) | 1.19.5, `opencode acp --version` | Настройте провайдера через `opencode auth login` |
+| [Pi](https://www.npmjs.com/package/@earendil-works/pi-coding-agent) | 1.6.0, `pi --version` | Подписку Codex входит `pi auth login openai-codex`; ключ Token Plan — в `~/.pi/agent/auth.json`. Хаб эти файлы не читает |
 
 Хаб ищет CLI в `PATH`. Если в терминале команда работает, а хаб не находит
 её, укажите абсолютный путь в **Настройки → Агенты → нужный агент**.

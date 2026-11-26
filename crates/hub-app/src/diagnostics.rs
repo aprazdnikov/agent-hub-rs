@@ -66,6 +66,7 @@ pub async fn check_cli(settings: &hub_core::settings::Settings) -> AgentCheck {
         BackendKind::Qwen => settings.qwen.cli.clone(),
         BackendKind::Hermes => settings.hermes.cli.clone(),
         BackendKind::Opencode => settings.opencode.cli.clone(),
+        BackendKind::Pi => settings.pi.cli.clone(),
     };
     let checked = async move {
         let path =
@@ -87,6 +88,9 @@ pub async fn check_cli(settings: &hub_core::settings::Settings) -> AgentCheck {
             BackendKind::Opencode => {
                 hub_opencode::version::check(&path).await.ok().map(|version| version.to_string())
             }
+            BackendKind::Pi => {
+                hub_pi::version::check(&path).await.ok().map(|version| version.to_string())
+            }
         }
     };
     match tokio::time::timeout(CHECK_TIMEOUT, checked).await {
@@ -104,6 +108,7 @@ fn locate_cli(kind: hub_core::domain::BackendKind, path: Option<&Path>) -> Optio
         BackendKind::Qwen => hub_qwen::version::locate(path).ok(),
         BackendKind::Hermes => hub_hermes::version::locate(path).ok(),
         BackendKind::Opencode => hub_opencode::version::locate(path).ok(),
+        BackendKind::Pi => hub_pi::version::locate(path).ok(),
     }
 }
 

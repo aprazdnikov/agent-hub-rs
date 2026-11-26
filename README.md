@@ -1,6 +1,6 @@
 # Agent Hub
 
-Agent Hub запускает Claude Code, Codex, Qwen Code, Hermes и OpenCode в ваших проектах. У каждой задачи свой чат. Вопросы, запросы разрешений и готовые результаты из разных проектов попадают в одни «Входящие». Начать можно на компьютере, а продолжить — с телефона в Telegram.
+Agent Hub запускает Claude Code, Codex, Qwen Code, Hermes, OpenCode и Pi в ваших проектах. У каждой задачи свой чат. Вопросы, запросы разрешений и готовые результаты из разных проектов попадают в одни «Входящие». Начать можно на компьютере, а продолжить — с телефона в Telegram.
 
 **[Скачать для Windows, macOS и Linux](https://github.com/aprazdnikov/agent-hub-rs/releases/latest)** · [Что нового в 1.1.2](https://github.com/aprazdnikov/agent-hub-rs/releases/tag/v1.1.2) · [Полное руководство](https://github.com/aprazdnikov/agent-hub-rs/blob/v1.1.2/docs/README.md) · [Сайт](https://aprazdnikov.github.io/agent-hub-rs/)
 
@@ -22,6 +22,7 @@ Telegram подключается по желанию. Создайте бота
 | Поставить задачи в очередь или параллельно работать в отдельных Git worktree | [Очередь и рабочие копии](https://github.com/aprazdnikov/agent-hub-rs/blob/v1.1.2/docs/guide/tasks.md#queue) |
 | Передать решения и контекст между агентами, включить память для задачи или темы | [Память проекта](https://github.com/aprazdnikov/agent-hub-rs/blob/v1.1.2/docs/guide/memory.md) |
 | Отправлять файлы и голосовые, восстановить сессию или посмотреть журнал | [Каталог руководств](https://github.com/aprazdnikov/agent-hub-rs/blob/v1.1.2/docs/README.md) |
+| Говорить с агентом в терминале без окна — сервер, SSH, Raspberry Pi | [Консольный режим](docs/guide/console.md) |
 
 Агенты работают с правами вашей учётной записи. Доступные файлы и действия зависят от настроек CLI и проекта. [Права доступа и хранение данных](https://github.com/aprazdnikov/agent-hub-rs/blob/v1.1.2/docs/guide/security.md)
 

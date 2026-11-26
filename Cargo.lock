@@ -1774,6 +1774,7 @@ dependencies = [
  "hub-hermes",
  "hub-memory",
  "hub-opencode",
+ "hub-pi",
  "hub-qwen",
  "hub-telegram",
  "jiff",
@@ -1909,6 +1910,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "hub-pi"
+version = "1.1.2"
+dependencies = [
+ "base64 0.23.1",
+ "futures",
+ "hub-agent",
+ "hub-core",
+ "rstest",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tracing",
+]
+
+[[package]]
 name = "hub-qwen"
 version = "1.1.2"
 dependencies = [
@@ -1941,6 +1960,7 @@ dependencies = [
  "hub-hermes",
  "hub-memory",
  "hub-opencode",
+ "hub-pi",
  "hub-qwen",
  "hyper",
  "hyper-util",

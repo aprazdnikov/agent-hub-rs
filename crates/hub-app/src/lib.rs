@@ -1,6 +1,7 @@
 pub mod actions;
 pub mod atomic;
 pub mod autostart;
+pub mod cli;
 pub mod config;
 pub mod connector;
 pub mod diagnostics;

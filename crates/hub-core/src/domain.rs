@@ -47,11 +47,12 @@ pub enum BackendKind {
     Qwen,
     Hermes,
     Opencode,
+    Pi,
 }
 
 impl BackendKind {
-    pub const ALL: [Self; 5] =
-        [Self::Claude, Self::Codex, Self::Qwen, Self::Hermes, Self::Opencode];
+    pub const ALL: [Self; 6] =
+        [Self::Claude, Self::Codex, Self::Qwen, Self::Hermes, Self::Opencode, Self::Pi];
 
     #[must_use]
     pub const fn name(self) -> &'static str {
@@ -61,6 +62,7 @@ impl BackendKind {
             Self::Qwen => "qwen",
             Self::Hermes => "hermes",
             Self::Opencode => "opencode",
+            Self::Pi => "pi",
         }
     }
 
@@ -281,6 +283,7 @@ pub enum Usage {
     Qwen { tokens: Option<u64> },
     Hermes { tokens: Option<u64> },
     Opencode { tokens: Option<u64> },
+    Pi { tokens: Option<u64> },
 }
 
 /// One agent turn ended; `background` tasks keep running and report in later turns.
@@ -353,11 +356,11 @@ mod tests {
     }
 
     #[test]
-    fn backend_list_includes_hermes_once() {
-        assert_eq!(
-            BackendKind::ALL.into_iter().map(BackendKind::name).collect::<Vec<_>>(),
-            ["claude", "codex", "qwen", "hermes", "opencode"]
-        );
+    fn backend_list_names_every_backend_once() {
+        let names = BackendKind::ALL.into_iter().map(BackendKind::name).collect::<Vec<_>>();
+        assert_eq!(names, ["claude", "codex", "qwen", "hermes", "opencode", "pi"]);
+        let unique = names.iter().collect::<std::collections::HashSet<_>>();
+        assert_eq!(unique.len(), names.len(), "a backend is listed twice");
     }
 
     #[test]

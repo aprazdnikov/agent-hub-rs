@@ -393,6 +393,29 @@ mod tests {
     }
 
     #[test]
+    fn pi_settings_round_trip_without_new_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut form = draft(dir.path());
+        form.default_backend = hub_core::domain::BackendKind::Pi;
+        form.pi = hub_core::settings::PiDraft {
+            cli: dir.path().join("pi").display().to_string(),
+            model: "openai-codex/gpt-5.6-luna".to_owned(),
+            approval: hub_core::settings::PiApproval::Yolo,
+            thinking: hub_core::settings::PiThinking::High,
+        };
+        let settings = form.parse(dir.path()).unwrap();
+        let store = store(dir.path());
+        store.save(&settings).unwrap();
+        let text = std::fs::read_to_string(dir.path().join("settings.toml")).unwrap();
+        assert!(text.contains("[pi]") && text.contains("openai-codex/gpt-5.6-luna"));
+        assert!(text.contains("yolo") && text.contains("high"));
+        match store.load().unwrap() {
+            Loaded::Ready(loaded) => assert_eq!(loaded, settings),
+            other => panic!("expected Ready, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn opencode_settings_round_trip_without_new_secrets() {
         let dir = tempfile::tempdir().unwrap();
         let mut form = draft(dir.path());

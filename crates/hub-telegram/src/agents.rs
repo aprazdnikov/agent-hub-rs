@@ -19,6 +19,7 @@ use hub_core::settings::{ExecutionSettings, Settings};
 use hub_hermes::archive::HermesArchive;
 use hub_hermes::backend::HermesBackend;
 use hub_opencode::backend::OpencodeBackend;
+use hub_pi::backend::PiBackend;
 use hub_qwen::archive::QwenArchive;
 use hub_qwen::backend::QwenBackend;
 use tokio::sync::{mpsc, watch};
@@ -119,6 +120,15 @@ impl HubAgents {
                         Err(error) => refuse(&conversation, error.to_string(), inbox).await,
                     }
                 }
+                BackendKind::Pi => match hub_pi::version::locate(settings.pi.cli.as_deref()) {
+                    Ok(cli) => {
+                        PiBackend::new(cli, settings.pi.clone())
+                            .with_memory(memory)
+                            .run(session, prompt, inbox, conversation)
+                            .await
+                    }
+                    Err(error) => refuse(&conversation, error.to_string(), inbox).await,
+                },
                 BackendKind::Qwen => {
                     match hub_qwen::version::locate(settings.qwen.cli.as_deref()) {
                         Ok(cli) => {
@@ -279,6 +289,15 @@ async fn archive(
                     .to_owned(),
             );
         }
+        BackendKind::Pi => {
+            // Pi keeps sessions as its own JSONL files and reopens them by id; the hub never
+            // copies them, so there is nothing to snapshot here.
+            let cli = hub_pi::version::locate(settings.pi.cli.as_deref())
+                .map_err(|error| error.to_string())?;
+            hub_pi::version::check(&cli).await.map_err(|error| error.to_string())?;
+            return Err("Снимки и перенос сессий Pi не поддерживаются; история остаётся у агента"
+                .to_owned());
+        }
     };
     Ok(archive)
 }
@@ -339,6 +358,11 @@ async fn quotas(settings: &Settings) -> Vec<Outcome> {
             BackendKind::Opencode => {
                 hub_opencode::version::locate(settings.opencode.cli.as_deref()).ok()?;
                 Box::pin(async { Ok(QuotaReport::not_reported(BackendKind::Opencode)) })
+            }
+            BackendKind::Pi => {
+                hub_pi::version::locate(settings.pi.cli.as_deref()).ok()?;
+                // Pi reports tokens per session in the hub's usage line, not subscription limits.
+                Box::pin(async { Ok(QuotaReport::not_reported(BackendKind::Pi)) })
             }
         };
         Some(async move {
@@ -468,6 +492,7 @@ mod tests {
         form.qwen.cli = missing.display().to_string();
         form.hermes.cli = missing.display().to_string();
         form.opencode.cli = missing.display().to_string();
+        form.pi.cli = missing.display().to_string();
         let agents =
             HubAgents::new(watch::Sender::new(Arc::new(form.parse(&root).unwrap())).subscribe());
         for backend in BackendKind::ALL {
@@ -660,6 +685,7 @@ mod tests {
         form.codex.cli.clone_from(&missing);
         form.qwen.cli.clone_from(&missing);
         form.hermes.cli.clone_from(&missing);
+        form.pi.cli.clone_from(&missing);
         form.opencode.cli = missing;
         let agents =
             HubAgents::new(watch::Sender::new(Arc::new(form.parse(&root).unwrap())).subscribe());
@@ -668,7 +694,8 @@ mod tests {
 
         let backends: Vec<_> = outcomes.iter().map(|(backend, _)| *backend).collect();
         assert_eq!(backends, BackendKind::ALL);
-        let [(_, claude), (_, codex), (_, qwen), (_, hermes), (_, opencode)] = outcomes.as_slice()
+        let [(_, claude), (_, codex), (_, qwen), (_, hermes), (_, opencode), (_, pi)] =
+            outcomes.as_slice()
         else {
             panic!("{outcomes:?}");
         };
@@ -684,5 +711,6 @@ mod tests {
         assert_eq!(qwen, &Ok(QuotaReport::not_reported(BackendKind::Qwen)));
         assert_eq!(hermes, &Ok(QuotaReport::not_reported(BackendKind::Hermes)));
         assert_eq!(opencode, &Ok(QuotaReport::not_reported(BackendKind::Opencode)));
+        assert_eq!(pi, &Ok(QuotaReport::not_reported(BackendKind::Pi)));
     }
 }

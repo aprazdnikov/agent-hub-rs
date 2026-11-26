@@ -369,6 +369,93 @@ pub struct OpencodeSettings {
     pub model: Option<String>,
 }
 
+/// Whether the hub interposes on `Pi`'s tool calls. `Pi` itself never asks: tools run silently.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PiApproval {
+    /// The bridge extension confirms `bash`, `edit` and `write` with the user.
+    #[default]
+    Default,
+    /// No bridge gate: the agent edits and runs commands without asking anyone.
+    Yolo,
+}
+
+impl PiApproval {
+    pub const ALL: [Self; 2] = [Self::Default, Self::Yolo];
+
+    #[must_use]
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Yolo => "yolo",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|approval| approval.wire() == raw)
+    }
+}
+
+/// How much reasoning the model is asked for. `Pi` calls it a thinking level, and each model
+/// declares which of these it actually serves.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum PiThinking {
+    Off,
+    Minimal,
+    Low,
+    #[default]
+    Medium,
+    High,
+    Xhigh,
+    Max,
+}
+
+impl PiThinking {
+    pub const ALL: [Self; 7] =
+        [Self::Off, Self::Minimal, Self::Low, Self::Medium, Self::High, Self::Xhigh, Self::Max];
+
+    #[must_use]
+    pub const fn wire(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+        }
+    }
+
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Off => "Без размышлений",
+            Self::Minimal => "Минимальные",
+            Self::Low => "Низкие",
+            Self::Medium => "Средние",
+            Self::High => "Высокие",
+            Self::Xhigh => "Очень высокие",
+            Self::Max => "Максимальные",
+        }
+    }
+
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|thinking| thinking.wire() == raw)
+    }
+}
+
+/// Overrides only; `Pi` keeps its own subscriptions in `~/.pi/agent/auth.json`, which the hub
+/// never reads. `model` is a `Pi` model id: `provider/model` or a bare model name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PiSettings {
+    pub cli: Option<PathBuf>,
+    pub model: Option<String>,
+    pub approval: PiApproval,
+    pub thinking: PiThinking,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Timeouts {
     pub approval: Duration,
@@ -407,6 +494,7 @@ pub struct Settings {
     pub qwen: QwenSettings,
     pub hermes: HermesSettings,
     pub opencode: OpencodeSettings,
+    pub pi: PiSettings,
     pub timeouts: Timeouts,
     pub updates: UpdateCheck,
 }
@@ -433,6 +521,7 @@ pub enum Field {
     Qwen(QwenField),
     Hermes(HermesField),
     Opencode(OpencodeField),
+    Pi(PiField),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -449,6 +538,14 @@ pub enum SpeechField {
 pub enum OpencodeField {
     Cli,
     Model,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PiField {
+    Cli,
+    Model,
+    Approval,
+    Thinking,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -588,6 +685,25 @@ impl OpencodeDraft {
 }
 
 /// The settings form as typed by the user.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PiDraft {
+    pub cli: String,
+    pub model: String,
+    pub approval: PiApproval,
+    pub thinking: PiThinking,
+}
+
+impl PiDraft {
+    fn parse(&self, home: &Path, errors: &mut Vec<FieldError>) -> Option<PiSettings> {
+        let Self { cli, model, approval, thinking } = self;
+        let cli = check(errors, Field::Pi(PiField::Cli), parse_cli(cli, home));
+        let model = check(errors, Field::Pi(PiField::Model), parse_model(model));
+        // The two enums are total: the form cannot carry text that fails to parse.
+        Some(PiSettings { cli: cli?, model: model?, approval: *approval, thinking: *thinking })
+    }
+}
+
+/// The settings form as typed by the user.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Draft {
     pub memory: MemorySettings,
@@ -610,6 +726,7 @@ pub struct Draft {
     pub qwen: QwenDraft,
     pub hermes: HermesDraft,
     pub opencode: OpencodeDraft,
+    pub pi: PiDraft,
     pub approval_timeout: String,
     pub background_timeout: String,
     pub updates: UpdateCheck,
@@ -638,6 +755,7 @@ impl Default for Draft {
             qwen: QwenDraft::default(),
             hermes: HermesDraft::default(),
             opencode: OpencodeDraft::default(),
+            pi: PiDraft::default(),
             approval_timeout: DEFAULT_APPROVAL_TIMEOUT.as_secs().to_string(),
             background_timeout: DEFAULT_BACKGROUND_TIMEOUT.as_secs().to_string(),
             updates: UpdateCheck::Enabled,
@@ -668,6 +786,7 @@ impl fmt::Debug for Draft {
             qwen,
             hermes,
             opencode,
+            pi,
             approval_timeout,
             background_timeout,
             updates,
@@ -693,6 +812,7 @@ impl fmt::Debug for Draft {
             .field("qwen", qwen)
             .field("hermes", hermes)
             .field("opencode", opencode)
+            .field("pi", pi)
             .field("approval_timeout", approval_timeout)
             .field("background_timeout", background_timeout)
             .field("updates", updates)
@@ -732,6 +852,7 @@ impl Draft {
             .ok();
         let hermes = self.hermes.parse(home, &mut errors);
         let opencode = self.opencode.parse(home, &mut errors);
+        let pi = self.pi.parse(home, &mut errors);
         let approval =
             check(&mut errors, Field::ApprovalTimeout, parse_seconds(&self.approval_timeout));
         let background =
@@ -746,11 +867,12 @@ impl Draft {
             Some(endpoint),
             Some(hermes),
             Some(opencode),
+            Some(pi),
             Some(approval),
             Some(background),
         ) = (
-            cli, model, budget, codex, qwen_cli, qwen_model, endpoint, hermes, opencode, approval,
-            background,
+            cli, model, budget, codex, qwen_cli, qwen_model, endpoint, hermes, opencode, pi,
+            approval, background,
         )
         else {
             return Err(errors);
@@ -769,6 +891,7 @@ impl Draft {
             },
             hermes,
             opencode,
+            pi,
             timeouts: Timeouts { approval, background },
         })
     }
@@ -798,6 +921,7 @@ impl Draft {
             .ok();
         let hermes = self.hermes.parse(home, &mut errors);
         let opencode = self.opencode.parse(home, &mut errors);
+        let pi = self.pi.parse(home, &mut errors);
         let speech =
             self.speech.parse(home).map_err(|speech_errors| errors.extend(speech_errors)).ok();
         let approval =
@@ -817,11 +941,12 @@ impl Draft {
             Some(endpoint),
             Some(hermes),
             Some(opencode),
+            Some(pi),
             Some(approval),
             Some(background),
         ) = (
             telegram, root, snapshots, cli, model, budget, codex, qwen_cli, qwen_model, endpoint,
-            hermes, opencode, approval, background,
+            hermes, opencode, pi, approval, background,
         )
         else {
             return Err(errors);
@@ -850,6 +975,7 @@ impl Draft {
             },
             hermes,
             opencode,
+            pi,
             timeouts: Timeouts { approval, background },
             updates: self.updates,
         })
@@ -880,12 +1006,7 @@ impl Draft {
             snapshots_dir: settings.snapshots_dir.display().to_string(),
             default_backend: settings.default_backend,
             roles: settings.roles,
-            cli: settings
-                .claude
-                .cli
-                .as_ref()
-                .map(|cli| cli.display().to_string())
-                .unwrap_or_default(),
+            cli: cli_text(settings.claude.cli.as_deref()),
             model: settings.claude.model.clone().unwrap_or_default(),
             permission_mode: settings.claude.permission_mode,
             budget: settings
@@ -894,12 +1015,7 @@ impl Draft {
                 .map(|budget| budget.amount().to_string())
                 .unwrap_or_default(),
             codex: CodexDraft {
-                cli: settings
-                    .codex
-                    .cli
-                    .as_ref()
-                    .map(|cli| cli.display().to_string())
-                    .unwrap_or_default(),
+                cli: cli_text(settings.codex.cli.as_deref()),
                 model: settings.codex.model.clone().unwrap_or_default(),
                 sandbox: settings.codex.sandbox,
                 approval: settings.codex.approval,
@@ -911,12 +1027,7 @@ impl Draft {
                     .unwrap_or_default(),
             },
             qwen: QwenDraft {
-                cli: settings
-                    .qwen
-                    .cli
-                    .as_ref()
-                    .map(|cli| cli.display().to_string())
-                    .unwrap_or_default(),
+                cli: cli_text(settings.qwen.cli.as_deref()),
                 model: settings.qwen.model.clone().unwrap_or_default(),
                 approval: settings.qwen.approval,
                 base_url: settings
@@ -933,30 +1044,31 @@ impl Draft {
                     .unwrap_or_default(),
             },
             hermes: HermesDraft {
-                cli: settings
-                    .hermes
-                    .cli
-                    .as_ref()
-                    .map(|cli| cli.display().to_string())
-                    .unwrap_or_default(),
+                cli: cli_text(settings.hermes.cli.as_deref()),
                 profile: settings.hermes.profile.clone().unwrap_or_default(),
                 model: settings.hermes.model.clone().unwrap_or_default(),
                 approval: settings.hermes.approval,
             },
             opencode: OpencodeDraft {
-                cli: settings
-                    .opencode
-                    .cli
-                    .as_ref()
-                    .map(|cli| cli.display().to_string())
-                    .unwrap_or_default(),
+                cli: cli_text(settings.opencode.cli.as_deref()),
                 model: settings.opencode.model.clone().unwrap_or_default(),
+            },
+            pi: PiDraft {
+                cli: cli_text(settings.pi.cli.as_deref()),
+                model: settings.pi.model.clone().unwrap_or_default(),
+                approval: settings.pi.approval,
+                thinking: settings.pi.thinking,
             },
             approval_timeout: settings.timeouts.approval.as_secs().to_string(),
             background_timeout: settings.timeouts.background.as_secs().to_string(),
             updates: settings.updates,
         }
     }
+}
+
+/// The CLI path as the form shows it: empty means the operator left the choice to `PATH`.
+fn cli_text(path: Option<&std::path::Path>) -> String {
+    path.map(|path| path.display().to_string()).unwrap_or_default()
 }
 
 fn check<T>(errors: &mut Vec<FieldError>, field: Field, result: Result<T, String>) -> Option<T> {
@@ -1128,6 +1240,8 @@ pub struct SettingsFile {
     pub hermes: HermesFile,
     #[serde(default)]
     pub opencode: OpencodeFile,
+    #[serde(default)]
+    pub pi: PiFile,
     /// Left out when it holds nothing: versions before 0.5.0 refuse an unknown `[snapshots]`.
     #[serde(default, skip_serializing_if = "SnapshotsFile::is_empty")]
     pub snapshots: SnapshotsFile,
@@ -1235,6 +1349,17 @@ pub struct OpencodeFile {
     pub model: Option<String>,
 }
 
+/// `Pi` overrides. Subscriptions stay in the user's own `~/.pi/agent/auth.json`: the hub never
+/// reads, copies or writes it, so a hub settings file can be shared without leaking a login.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PiFile {
+    pub cli: Option<String>,
+    pub model: Option<String>,
+    pub approval: Option<String>,
+    pub thinking: Option<String>,
+}
+
 /// Where `/save` writes snapshots; absent means `~/.agent-hub`.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1325,6 +1450,12 @@ impl SettingsFile {
                 cli: settings.opencode.cli.as_ref().map(|cli| cli.display().to_string()),
                 model: settings.opencode.model.clone(),
             },
+            pi: PiFile {
+                cli: settings.pi.cli.as_ref().map(|cli| cli.display().to_string()),
+                model: settings.pi.model.clone(),
+                approval: Some(settings.pi.approval.wire().to_owned()),
+                thinking: Some(settings.pi.thinking.wire().to_owned()),
+            },
             snapshots: SnapshotsFile {
                 dir: (settings.snapshots_dir != home.join(DEFAULT_SNAPSHOTS_DIR))
                     .then(|| settings.snapshots_dir.display().to_string()),
@@ -1345,49 +1476,8 @@ impl SettingsFile {
     /// The file as a form draft, so file and form share one parser.
     pub fn to_draft(&self, keys: Keys) -> Result<Draft, FieldError> {
         let Keys { token, api_key, qwen_key, speech_key } = keys;
-        let permission_mode = choice(
-            self.claude.permission_mode.as_deref(),
-            PermissionMode::Default,
-            PermissionMode::parse,
-            Field::PermissionMode,
-            "Неизвестный режим",
-        )?;
-        let default_backend = choice(
-            self.agents.default.as_deref(),
-            BackendKind::Claude,
-            BackendKind::parse,
-            Field::DefaultBackend,
-            "Неизвестный бэкенд",
-        )?;
+        let modes = self.modes()?;
         let roles = self.agents.roles()?;
-        let sandbox = choice(
-            self.codex.sandbox.as_deref(),
-            Sandbox::WorkspaceWrite,
-            Sandbox::parse,
-            Field::Codex(CodexField::Sandbox),
-            "Неизвестная песочница",
-        )?;
-        let approval = choice(
-            self.codex.approval.as_deref(),
-            Approval::OnRequest,
-            Approval::parse,
-            Field::Codex(CodexField::Approval),
-            "Неизвестный режим одобрений",
-        )?;
-        let qwen_approval = choice(
-            self.qwen.approval.as_deref(),
-            QwenApproval::Default,
-            QwenApproval::parse,
-            Field::Qwen(QwenField::Approval),
-            "Неизвестный режим одобрений",
-        )?;
-        let hermes_approval = choice(
-            self.hermes.approval.as_deref(),
-            HermesApproval::Default,
-            HermesApproval::parse,
-            Field::Hermes(HermesField::Approval),
-            "Неизвестный режим одобрений",
-        )?;
         let defaults = Draft::default();
         Ok(Draft {
             memory: self.memory,
@@ -1400,23 +1490,23 @@ impl SettingsFile {
             users: self.telegram.users.iter().map(u64::to_string).collect::<Vec<_>>().join(", "),
             workspace_root: self.workspace.root.clone(),
             snapshots_dir: self.snapshots.dir.clone().unwrap_or_default(),
-            default_backend,
+            default_backend: modes.default_backend,
             roles,
             cli: self.claude.cli.clone().unwrap_or_default(),
             model: self.claude.model.clone().unwrap_or_default(),
-            permission_mode,
+            permission_mode: modes.permission_mode,
             budget: self.claude.budget.clone().unwrap_or_default(),
             codex: CodexDraft {
                 cli: self.codex.cli.clone().unwrap_or_default(),
                 model: self.codex.model.clone().unwrap_or_default(),
-                sandbox,
-                approval,
+                sandbox: modes.sandbox,
+                approval: modes.approval,
                 api_key,
             },
             qwen: QwenDraft {
                 cli: self.qwen.cli.clone().unwrap_or_default(),
                 model: self.qwen.model.clone().unwrap_or_default(),
-                approval: qwen_approval,
+                approval: modes.qwen_approval,
                 base_url: self.qwen.base_url.clone().unwrap_or_default(),
                 api_key: qwen_key,
             },
@@ -1424,11 +1514,17 @@ impl SettingsFile {
                 cli: self.hermes.cli.clone().unwrap_or_default(),
                 profile: self.hermes.profile.clone().unwrap_or_default(),
                 model: self.hermes.model.clone().unwrap_or_default(),
-                approval: hermes_approval,
+                approval: modes.hermes_approval,
             },
             opencode: OpencodeDraft {
                 cli: self.opencode.cli.clone().unwrap_or_default(),
                 model: self.opencode.model.clone().unwrap_or_default(),
+            },
+            pi: PiDraft {
+                cli: self.pi.cli.clone().unwrap_or_default(),
+                model: self.pi.model.clone().unwrap_or_default(),
+                approval: modes.pi_approval,
+                thinking: modes.pi_thinking,
             },
             approval_timeout: self
                 .timeouts
@@ -1444,6 +1540,81 @@ impl SettingsFile {
             },
         })
     }
+
+    /// Every mode string of the file, resolved to its enum. An unknown word is a field error
+    /// naming the field, never a silent fallback to the default.
+    fn modes(&self) -> Result<Modes, FieldError> {
+        Ok(Modes {
+            permission_mode: choice(
+                self.claude.permission_mode.as_deref(),
+                PermissionMode::Default,
+                PermissionMode::parse,
+                Field::PermissionMode,
+                "Неизвестный режим",
+            )?,
+            default_backend: choice(
+                self.agents.default.as_deref(),
+                BackendKind::Claude,
+                BackendKind::parse,
+                Field::DefaultBackend,
+                "Неизвестный бэкенд",
+            )?,
+            sandbox: choice(
+                self.codex.sandbox.as_deref(),
+                Sandbox::WorkspaceWrite,
+                Sandbox::parse,
+                Field::Codex(CodexField::Sandbox),
+                "Неизвестная песочница",
+            )?,
+            approval: choice(
+                self.codex.approval.as_deref(),
+                Approval::OnRequest,
+                Approval::parse,
+                Field::Codex(CodexField::Approval),
+                "Неизвестный режим одобрений",
+            )?,
+            qwen_approval: choice(
+                self.qwen.approval.as_deref(),
+                QwenApproval::Default,
+                QwenApproval::parse,
+                Field::Qwen(QwenField::Approval),
+                "Неизвестный режим одобрений",
+            )?,
+            hermes_approval: choice(
+                self.hermes.approval.as_deref(),
+                HermesApproval::Default,
+                HermesApproval::parse,
+                Field::Hermes(HermesField::Approval),
+                "Неизвестный режим одобрений",
+            )?,
+            pi_approval: choice(
+                self.pi.approval.as_deref(),
+                PiApproval::Default,
+                PiApproval::parse,
+                Field::Pi(PiField::Approval),
+                "Неизвестный режим одобрений",
+            )?,
+            pi_thinking: choice(
+                self.pi.thinking.as_deref(),
+                PiThinking::Medium,
+                PiThinking::parse,
+                Field::Pi(PiField::Thinking),
+                "Неизвестный уровень размышлений",
+            )?,
+        })
+    }
+}
+
+/// The mode strings of `settings.toml`, already parsed.
+struct Modes {
+    permission_mode: PermissionMode,
+    default_backend: BackendKind,
+    sandbox: Sandbox,
+    approval: Approval,
+    qwen_approval: QwenApproval,
+    hermes_approval: HermesApproval,
+    pi_approval: PiApproval,
+    pi_thinking: PiThinking,
 }
 
 fn choice<T>(
@@ -2163,6 +2334,101 @@ backend = "codex"
     }
 
     #[test]
+    fn pi_file_section_and_default_are_supported() {
+        let text = "[telegram]\nchat = -100\nusers = [1]\n\
+                    [workspace]\nroot = \"~/w\"\n\
+                    [agents]\ndefault = \"pi\"\n\
+                    [pi]\ncli = \"~/bin/pi\"\nmodel = \"openai-codex/gpt-5.6-luna\"\napproval = \"yolo\"\nthinking = \"high\"\n";
+        let file: SettingsFile = toml::from_str(text).unwrap();
+        let keys = Keys {
+            token: "1:a".to_owned(),
+            api_key: String::new(),
+            speech_key: String::new(),
+            qwen_key: String::new(),
+        };
+        let settings = file.to_draft(keys).unwrap().parse(&home()).unwrap();
+        assert_eq!(
+            (settings.default_backend.name(), settings.pi),
+            (
+                "pi",
+                PiSettings {
+                    cli: Some(home().join("bin/pi")),
+                    model: Some("openai-codex/gpt-5.6-luna".to_owned()),
+                    approval: PiApproval::Yolo,
+                    thinking: PiThinking::High,
+                }
+            )
+        );
+    }
+
+    #[test]
+    fn pi_defaults_keep_the_operators_own_setup() {
+        assert_eq!(
+            draft().parse(&home()).unwrap().pi,
+            PiSettings {
+                cli: None,
+                model: None,
+                approval: PiApproval::Default,
+                thinking: PiThinking::Medium,
+            }
+        );
+    }
+
+    #[test]
+    fn pi_draft_and_file_round_trip() {
+        let input = Draft {
+            default_backend: BackendKind::Pi,
+            pi: PiDraft {
+                cli: " ~/bin/pi ".to_owned(),
+                model: " qwen-token-plan/qwen4-max ".to_owned(),
+                approval: PiApproval::Yolo,
+                thinking: PiThinking::Max,
+            },
+            ..draft()
+        };
+        let settings = input.parse(&home()).unwrap();
+        let text = toml::to_string(&SettingsFile::from_settings(&settings, &home())).unwrap();
+        let file: SettingsFile = toml::from_str(&text).unwrap();
+        let keys = Keys {
+            token: input.token,
+            api_key: String::new(),
+            speech_key: String::new(),
+            qwen_key: String::new(),
+        };
+        assert_eq!(
+            (
+                Draft::from_settings(&settings).parse(&home()).unwrap(),
+                file.to_draft(keys).unwrap().parse(&home()).unwrap(),
+            ),
+            (settings.clone(), settings)
+        );
+    }
+
+    #[rstest]
+    #[case::relative_cli(
+        PiDraft { cli: "pi".to_owned(), ..PiDraft::default() },
+        PiField::Cli
+    )]
+    #[case::spaced_model(
+        PiDraft { model: "bad model".to_owned(), ..PiDraft::default() },
+        PiField::Model
+    )]
+    fn pi_invalid_values_report_their_field(#[case] pi: PiDraft, #[case] field: PiField) {
+        let errors = Draft { pi, ..draft() }.parse(&home()).unwrap_err();
+        assert_eq!(errors.iter().map(|error| error.field).collect::<Vec<_>>(), [Field::Pi(field)]);
+    }
+
+    #[rstest]
+    #[case("api_key")]
+    #[case("profile")]
+    fn pi_file_rejects_unsupported_fields(#[case] name: &str) {
+        let text = format!(
+            "[telegram]\nchat = -100\nusers = [1]\n[workspace]\nroot = \"~/w\"\n[pi]\n{name} = \"x\"\n"
+        );
+        assert!(toml::from_str::<SettingsFile>(&text).is_err());
+    }
+
+    #[test]
     fn debug_output_hides_token() {
         let settings = draft().parse(&home()).unwrap();
         assert!(!format!("{settings:?}").contains("123:abc"));
@@ -2457,6 +2723,7 @@ pub struct ExecutionSettings {
     pub qwen: QwenSettings,
     pub hermes: HermesSettings,
     pub opencode: OpencodeSettings,
+    pub pi: PiSettings,
     pub timeouts: Timeouts,
 }
 impl From<&Settings> for ExecutionSettings {
@@ -2470,6 +2737,7 @@ impl From<&Settings> for ExecutionSettings {
             qwen: settings.qwen.clone(),
             hermes: settings.hermes.clone(),
             opencode: settings.opencode.clone(),
+            pi: settings.pi.clone(),
             timeouts: settings.timeouts,
         }
     }
