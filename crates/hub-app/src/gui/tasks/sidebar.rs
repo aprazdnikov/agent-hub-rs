@@ -1252,7 +1252,10 @@ mod tests {
             "half a period later the running dot is dimmed near the mockup's 0.35"
         );
         screen.snapshot.local_jobs.retain(|job| job.interaction.is_some());
-        let calm = screen.wait_until("Задача с вопросом", 0.0);
+        // Mock time keeps moving forward: a frame fed an earlier clock than the pulse
+        // frame above leaves egui's animation manager mid-tween, and that pins the
+        // repaint delay to zero regardless of the running dots.
+        let calm = screen.wait_until("Задача с вопросом", 1.6);
         assert_eq!(
             repaint_delay(&calm),
             Duration::MAX,
