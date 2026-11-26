@@ -128,6 +128,18 @@ tar -xzf agent-hub-x86_64-unknown-linux-gnu.tar.gz -C "$HOME/.local/opt/agent-hu
 Значок в трее использует StatusNotifierItem. В GNOME для него может понадобиться
 расширение AppIndicator. [Поведение окна и трея](settings.md#окно-и-трей)
 
+<a id="console"></a>
+
+## Запуск без окна
+
+Тот же хаб работает в терминале: `agent-hub --cli` открывает разговор без окна,
+значка в трее и бота Telegram — для сервера, SSH или Raspberry Pi. Настройки
+нужны те же, что и для окна, их заполняют один раз. Команда зависит от того, как
+установлен хаб: в Linux из `.deb` это `agent-hub --cli`, в macOS — бинарник
+внутри `agent-hub.app`, в Windows — WSL. Ключи `--backend` и `--dir`, команды
+разговора и сборку для Raspberry Pi описывает
+[консольный режим](console.md).
+
 <a id="first-task"></a>
 
 ## Первый запуск

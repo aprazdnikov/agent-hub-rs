@@ -43,6 +43,10 @@ fn main() -> ExitCode {
             }
         };
     }
+    if hub_app::cli::help_wanted(command.as_deref().and_then(std::ffi::OsStr::to_str)) {
+        print!("{}", hub_app::cli::help());
+        return ExitCode::SUCCESS;
+    }
     if hub_app::cli::requested(command.as_deref().and_then(std::ffi::OsStr::to_str)) {
         return match hub_app::cli::run(std::env::args().skip(2)) {
             Ok(()) => ExitCode::SUCCESS,

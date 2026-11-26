@@ -37,8 +37,12 @@ use crate::secrets::Keyring;
 /// Ключ, по которому хаб открывается в терминале вместо окна.
 pub const FLAGS: [&str; 2] = ["--cli", "--tui"];
 
-const HELP: &str = concat!(
-    "Команды:\n",
+/// Ключ справки. Он работает и до входа в консольный режим, чтобы `agent-hub --help`
+/// не открывал окно там, где человек ищет, как запустить терминал.
+pub const HELP_FLAGS: [&str; 2] = ["--help", "-h"];
+
+const COMMAND_HELP: &str = concat!(
+    "Команды разговора:\n",
     "  /mode <значение> — режим бэкенда (для Pi — уровень размышления)\n",
     "  /model <провайдер/модель> — модель следующего хода\n",
     "  /status — модель, режим и рабочий каталог\n",
@@ -46,6 +50,45 @@ const HELP: &str = concat!(
     "  /help — эта справка, /quit — выход\n",
     "Обычная строка — сообщение агенту.\n",
 );
+
+/// Справка целиком: как запустить хаб и что вводить в разговоре.
+///
+/// Имена исполнителей берутся из `BackendKind::ALL`, поэтому список не отстаёт,
+/// когда бэкендов становится больше.
+#[must_use]
+pub fn help() -> String {
+    let backends = BackendKind::ALL.map(BackendKind::name).join(", ");
+    let mut text = String::from(concat!(
+        "agent-hub — Claude Code, Codex, Qwen Code, Hermes, OpenCode и Pi в окне и в терминале\n",
+        "\n",
+        "Запуск:\n",
+        "  agent-hub              окно на компьютере\n",
+        "  agent-hub --cli        тот же разговор в терминале, без окна и Telegram (--tui так же)\n",
+        "  agent-hub --autostart  старт при входе в систему (его включает окно)\n",
+        "\n",
+        "Ключи консольного режима:\n",
+        "  --backend <имя>   исполнитель вместо агента из настроек (",
+    ));
+    text.push_str(&backends);
+    text.push_str(")\n");
+    text.push_str(concat!(
+        "  --dir <путь>      рабочий каталог разговора, по умолчанию текущий\n",
+        "  --help, -h        этот текст\n",
+        "\n",
+        "Консольный режим берёт те же настройки, что и окно: `settings.toml` и ключи из\n",
+        "хранилища. Заполнить их нужно заранее — в терминале хаб не просит токен бота.\n",
+        "Подробности: https://github.com/aprazdnikov/agent-hub-rs/blob/main/docs/guide/console.md\n",
+        "\n",
+    ));
+    text.push_str(COMMAND_HELP);
+    text
+}
+
+/// Нужна ли справка по первому аргументу.
+#[must_use]
+pub fn help_wanted(first: Option<&str>) -> bool {
+    first.is_some_and(|arg| HELP_FLAGS.contains(&arg))
+}
 
 /// Нужно ли запускать консольный режим по первому аргументу.
 #[must_use]
@@ -95,7 +138,7 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<Options, String> 
 pub fn run(args: impl IntoIterator<Item = String>) -> anyhow::Result<()> {
     let options = parse(args).map_err(|error| anyhow!(error))?;
     if options.help {
-        print!("{HELP}");
+        print!("{}", help());
         return Ok(());
     }
     let dirs = AppDirs::locate().context("не найден домашний каталог пользователя")?;
@@ -181,7 +224,7 @@ impl Console {
             }
             let Some(line) = self.input.next().await else { break };
             match command(&line) {
-                Command::Help => print!("{HELP}"),
+                Command::Help => print!("{COMMAND_HELP}"),
                 Command::Quit => break,
                 Command::Status => {
                     println!("{}", status(&self.settings, self.backend, &self.root));
@@ -701,6 +744,31 @@ mod tests {
     fn flags_start_the_console(#[case] first: &str, #[case] expected: bool) {
         assert_eq!(requested(Some(first)), expected);
         assert!(!requested(None));
+    }
+
+    #[rstest]
+    #[case("--help", true)]
+    #[case("-h", true)]
+    #[case("--cli", false)]
+    #[case("help", false)]
+    fn help_is_asked_by_its_own_keys(#[case] first: &str, #[case] expected: bool) {
+        assert_eq!(help_wanted(Some(first)), expected);
+        assert!(!help_wanted(None));
+    }
+
+    /// Справка — единственное место, где человек узнаёт, как запустить терминал.
+    #[test]
+    fn help_names_launch_keys_and_every_backend() {
+        let text = help();
+        for key in ["--cli", "--tui", "--backend", "--dir", "--autostart"] {
+            assert!(text.contains(key), "в справке нет ключа {key}");
+        }
+        for kind in BackendKind::ALL {
+            assert!(text.contains(kind.name()), "в справке нет бэкенда {}", kind.name());
+        }
+        for command in ["/mode", "/model", "/status", "/stop", "/quit"] {
+            assert!(text.contains(command), "в справке нет команды {command}");
+        }
     }
 
     #[rstest]
