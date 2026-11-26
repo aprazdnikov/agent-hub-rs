@@ -1740,7 +1740,7 @@ checksum = "df3b46402a9d5adb4c86a0cf463f42e19994e3ee891101b1841f30a545cb49a9"
 
 [[package]]
 name = "hub-agent"
-version = "1.1.2"
+version = "1.2.0"
 dependencies = [
  "futures",
  "http-body-util",
@@ -1761,7 +1761,7 @@ dependencies = [
 
 [[package]]
 name = "hub-app"
-version = "1.1.2"
+version = "1.2.0"
 dependencies = [
  "anyhow",
  "directories",
@@ -1807,7 +1807,7 @@ dependencies = [
 
 [[package]]
 name = "hub-claude"
-version = "1.1.2"
+version = "1.2.0"
 dependencies = [
  "base64 0.23.1",
  "futures",
@@ -1830,7 +1830,7 @@ dependencies = [
 
 [[package]]
 name = "hub-codex"
-version = "1.1.2"
+version = "1.2.0"
 dependencies = [
  "base64 0.23.1",
  "futures",
@@ -1848,7 +1848,7 @@ dependencies = [
 
 [[package]]
 name = "hub-core"
-version = "1.1.2"
+version = "1.2.0"
 dependencies = [
  "jiff",
  "pulldown-cmark",
@@ -1863,7 +1863,7 @@ dependencies = [
 
 [[package]]
 name = "hub-hermes"
-version = "1.1.2"
+version = "1.2.0"
 dependencies = [
  "base64 0.23.1",
  "futures",
@@ -1880,7 +1880,7 @@ dependencies = [
 
 [[package]]
 name = "hub-memory"
-version = "1.1.2"
+version = "1.2.0"
 dependencies = [
  "directories",
  "rustix 1.1.6",
@@ -1894,7 +1894,7 @@ dependencies = [
 
 [[package]]
 name = "hub-opencode"
-version = "1.1.2"
+version = "1.2.0"
 dependencies = [
  "base64 0.23.1",
  "futures",
@@ -1911,7 +1911,7 @@ dependencies = [
 
 [[package]]
 name = "hub-pi"
-version = "1.1.2"
+version = "1.2.0"
 dependencies = [
  "base64 0.23.1",
  "futures",
@@ -1929,7 +1929,7 @@ dependencies = [
 
 [[package]]
 name = "hub-qwen"
-version = "1.1.2"
+version = "1.2.0"
 dependencies = [
  "base64 0.23.1",
  "futures",
@@ -1948,7 +1948,7 @@ dependencies = [
 
 [[package]]
 name = "hub-telegram"
-version = "1.1.2"
+version = "1.2.0"
 dependencies = [
  "dunce",
  "futures",
