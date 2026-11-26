@@ -137,6 +137,13 @@ mod tests {
 
     #[test]
     fn workflow_choice_denormalized_values_break_the_book() {
+        let project_path = if cfg!(windows) { "C:/tmp" } else { "/tmp" };
+        let book_with_workflow = |workflow: &str| {
+            format!(
+                r#"{{"version":1,"next_id":1,"tasks":[],"project_rules":[{{"project":"{project_path}","rules":{{"revision":1,"enabled":false,"text":"x","workflow":{workflow}}}}}]}}"#
+            )
+        };
+
         for raw in [
             "{}",
             "42",
@@ -146,14 +153,11 @@ mod tests {
             r#"{"command":42}"#,
         ] {
             assert!(rules(raw).is_err(), "expected a parse error for workflow {raw}");
-            let book = format!(
-                // Revision 1+ so the only reason the book can fail is the workflow itself.
-                r#"{{"version":1,"next_id":1,"tasks":[],"project_rules":[{{"project":"/tmp","rules":{{"revision":1,"enabled":false,"text":"x","workflow":{raw}}}}}]}}"#
-            );
+            let book = book_with_workflow(raw);
             assert!(TaskBook::decode(book.as_bytes()).is_err(), "expected a broken book for {raw}");
         }
         // Positive control: the bare-command inherit form is a valid book value.
-        let ok = r#"{"version":1,"next_id":1,"tasks":[],"project_rules":[{"project":"/tmp","rules":{"revision":1,"enabled":false,"text":"x","workflow":{"command":"cargo test"}}}]}"#;
+        let ok = book_with_workflow(r#"{"command":"cargo test"}"#);
         assert!(TaskBook::decode(ok.as_bytes()).is_ok(), "a valid inherit form must decode");
     }
 
