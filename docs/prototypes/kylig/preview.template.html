@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="ru">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Agent Hub · Интерактивный макет</title>
+<style>
+html,body,canvas{margin:0;width:100%;height:100%;overflow:hidden;background:#f8f9f7;color:#1c2521}
+canvas{display:block}
+#loading{position:fixed;inset:0;display:grid;place-content:center;gap:16px;justify-items:center;font:16px system-ui;text-align:center;padding:20px}
+#loading[hidden]{display:none}
+#loading[aria-busy=true]::before{content:"";width:24px;height:24px;border:3px solid #d5ddd7;border-top-color:#0d644f;border-radius:50%;animation:spin .9s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+@media(prefers-reduced-motion:reduce){#loading::before{animation:none}}
+@media(prefers-color-scheme:dark){html,body,canvas{background:#171b19;color:#e6ece7}}
+</style>
+<canvas id="hub" aria-label="Интерактивный макет Agent Hub"></canvas>
+<div id="loading" role="status" aria-busy="true">Открываем Agent Hub…</div>
+<script type="module">
+async function unpack(encoded, type) {
+  const compressed = Uint8Array.from(atob(encoded), c => c.charCodeAt(0));
+  const stream = new Blob([compressed]).stream().pipeThrough(new DecompressionStream("gzip"));
+  return new Blob([await new Response(stream).arrayBuffer()], {type});
+}
+const status = document.querySelector("#loading");
+try {
+  const script = await unpack("__JS_GZIP__", "text/javascript");
+  const { default: init, start } = await import(URL.createObjectURL(script));
+  const wasm = await unpack("__WASM_GZIP__", "application/wasm");
+  await init({ module_or_path: await wasm.arrayBuffer() });
+  await start(document.querySelector("#hub"), location.hash);
+  status.hidden = true;
+} catch (error) {
+  status.textContent = "Не удалось открыть макет. Проверьте, что WebGL включён, или запустите нативную версию. " + error;
+  status.setAttribute("aria-busy", "false");
+  console.error(error);
+}
+</script>
+</html>

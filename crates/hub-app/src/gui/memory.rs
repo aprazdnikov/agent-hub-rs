@@ -1,289 +1,463 @@
-//! Memory browser: disk access runs off the egui thread, one request at a time.
+//! Project memory. Reads, previews and mutations use the same backend as Telegram.
+use crate::gui::theme;
 use eframe::egui;
-use hub_telegram::memory::{Request, View, entry_text, read};
+use hub_memory::{AdminAction, ContextPacket, EntryDetails, MemoryOverview, StatusFilter};
+use hub_telegram::memory::lifecycle::{Action, Panel};
+use hub_telegram::memory::{Request, View, read};
+use kylig_ui::{Button, InfoBar, ProgressRing, Severity};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
 
 mod context;
 mod lifecycle;
+mod records;
 
 type ReadResult = (u64, Result<View, String>);
+
+#[derive(Default, Clone, Copy, PartialEq)]
+enum Tab {
+    #[default]
+    Records,
+    Context,
+    Manage,
+}
+
 #[derive(Default)]
 pub struct MemoryView {
     admin: lifecycle::AdminUi,
+    tab: Tab,
+    records: records::Records,
+    context: context::ContextDraft,
     project: PathBuf,
+    workspace_root: Option<PathBuf>,
+    project_picker: Option<Receiver<Option<PathBuf>>>,
     refresh_on_open: bool,
-    query: String,
-    key: String,
-    revision: u32,
-    offset: usize,
+    reopen_revision: Option<(String, Option<u32>)>,
     generation: u64,
     read_started: Option<std::time::Instant>,
-    result: Option<View>,
+    overview: Option<MemoryOverview>,
+    detail: Option<EntryDetails>,
+    packet: Option<(ContextPacket, bool)>,
     error: Option<String>,
+    notice: Option<String>,
     pending: Option<Receiver<ReadResult>>,
+    effect: Option<Effect>,
+    last_export: Option<PathBuf>,
+    progress_label: &'static str,
+    reveal_progress: bool,
 }
+
+enum Effect {
+    Export(PathBuf),
+    Refresh,
+    Reset,
+    Update(AdminAction),
+}
+
+fn request(action: Action) -> Request {
+    Request::Admin(Box::new(action))
+}
+
 impl MemoryView {
+    pub(super) fn set_workspace_root(&mut self, root: Option<PathBuf>) {
+        if self.workspace_root != root {
+            self.workspace_root = root;
+            self.project_picker = None;
+            self.open_project(PathBuf::new());
+        }
+    }
+
     pub(super) fn open_project(&mut self, project: PathBuf) {
         if self.project != project {
             self.project = project;
-            self.query.clear();
-            self.key.clear();
-            self.revision = 0;
-            self.invalidate();
+            self.tab = Tab::Records;
+            self.reopen_revision = None;
+            self.project_picker = None;
+            self.records = records::Records::default();
+            self.admin = lifecycle::AdminUi::default();
+            self.context = context::ContextDraft::default();
+            self.generation = self.generation.wrapping_add(1);
+            self.overview = None;
+            self.detail = None;
+            self.packet = None;
+            self.error = None;
+            self.notice = None;
         }
-        self.refresh_on_open = true;
+        self.refresh_on_open = !self.project.as_os_str().is_empty();
+    }
+
+    pub(super) fn project_picker(
+        &mut self,
+        ui: &mut egui::Ui,
+        known: &std::collections::BTreeMap<PathBuf, String>,
+    ) {
+        ui.heading("Память проекта");
+        ui.weak("Записи агентов, история ревизий и передача контекста.");
+        ui.add_space(12.0);
+        let mut projects = known.clone();
+        if !self.project.as_os_str().is_empty() {
+            projects.entry(self.project.clone()).or_default();
+        }
+        if self.project.as_os_str().is_empty()
+            && self.project_picker.is_none()
+            && let Some(path) = projects.keys().next()
+        {
+            self.open_project(path.clone());
+        }
+        let name = |path: &Path, label: &str| {
+            if label.is_empty() {
+                path.file_name().unwrap_or(path.as_os_str()).to_string_lossy().into_owned()
+            } else {
+                label.to_owned()
+            }
+        };
+        let choices: Vec<_> = projects
+            .into_iter()
+            .map(|(path, label)| {
+                let title = name(&path, &label);
+                let detail = path.display().to_string();
+                theme::Choice::new(path, title, "").with_path(&detail)
+            })
+            .collect();
+        ui.horizontal_wrapped(|ui| {
+            if let Some(value) = theme::detailed_select(
+                ui,
+                "Проект",
+                "Выберите проект",
+                &self.project,
+                &choices,
+                360.0,
+            ) {
+                self.open_project(value.clone());
+            }
+            if ui
+                .add_enabled(self.project_picker.is_none(), Button::new("Выбрать папку…"))
+                .clicked()
+            {
+                let (tx, rx) = mpsc::channel();
+                self.project_picker = Some(rx);
+                let ctx = ui.ctx().clone();
+                std::thread::spawn(move || {
+                    let _ =
+                        tx.send(rfd::FileDialog::new().set_title("Каталог проекта").pick_folder());
+                    ctx.request_repaint();
+                });
+            }
+        });
+        if let Some(picker) = &self.project_picker {
+            match picker.try_recv() {
+                Ok(path) => {
+                    self.project_picker = None;
+                    if let Some(path) = path {
+                        match super::tasks::check_memory_project(
+                            &path,
+                            self.workspace_root.as_deref(),
+                        ) {
+                            Ok(path) => self.open_project(path),
+                            Err(error) => self.error = Some(error),
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => self.project_picker = None,
+                Err(mpsc::TryRecvError::Empty) => {}
+            }
+        }
     }
 
     fn refresh(&mut self, home: &Path) {
         if self.refresh_on_open && self.pending.is_none() {
             self.refresh_on_open = false;
-            self.load(home, Request::List { query: self.query.clone(), offset: 0 });
+            self.load(home, self.records.list(0));
+        } else if self.pending.is_none()
+            && let Some((key, revision)) = self.reopen_revision.take()
+        {
+            self.load(home, request(Action::Details { key, revision }));
         }
     }
 
-    fn invalidate(&mut self) {
-        self.admin.clear_context();
-        self.invalidate_result();
-    }
-    fn invalidate_result(&mut self) {
-        self.admin.clear();
-        self.generation = self.generation.wrapping_add(1);
-        self.result = None;
-        self.error = None;
-        self.offset = 0;
-    }
-    fn load(&mut self, home: &Path, request: Request) {
+    fn load(&mut self, home: &Path, mut next: Request) {
         if self.project.as_os_str().is_empty() {
             self.error = Some("Сначала выберите каталог проекта.".into());
             return;
         }
-        if matches!(&request, Request::Get { key, .. } if key.trim().is_empty()) {
-            self.error = Some("Введите ключ записи или выберите запись из списка.".into());
-            return;
+        if let Request::Get { key, revision } = next {
+            if key.trim().is_empty() {
+                self.error = Some("Введите ключ записи или выберите запись из списка.".into());
+                return;
+            }
+            next = request(Action::Details { key, revision });
         }
         if self.pending.is_some() {
             return;
         }
-        let request = match request {
-            Request::Get { key, revision } => {
-                Request::Admin(Box::new(hub_telegram::memory::lifecycle::Action::Details {
-                    key,
-                    revision,
-                }))
-            }
-            request => request,
+        let Request::Admin(action) = &next else {
+            return;
+        };
+        self.progress_label = match action.as_ref() {
+            Action::Overview { .. } => "Читаем память проекта…",
+            Action::Details { .. } => "Читаем ревизию записи…",
+            Action::Context(_) => "Собираем пакет контекста…",
+            Action::ValidateContext(_) => "Проверяем свежесть пакета…",
+            Action::Export(_) | Action::PrepareReset(_) => "Сохраняем экспорт памяти…",
+            Action::ImportFile(_)
+            | Action::Import { .. }
+            | Action::Compare { .. }
+            | Action::ReopenImport(_) => "Проверяем импорт…",
+            Action::Bind { .. } | Action::Preview(_) => "Готовим предварительный просмотр…",
+            _ => "Применяем изменения…",
+        };
+        self.effect = match action.as_ref() {
+            Action::Export(path) => Some(Effect::Export(path.clone())),
+            Action::Apply(p) => Some(Effect::Update(p.action.clone())),
+            Action::ApplyImport(_) => Some(Effect::Refresh),
+            Action::Reset { .. } | Action::ApplyBinding(_) => Some(Effect::Reset),
+            _ => None,
         };
         let generation = self.generation;
         let project = self.project.clone();
+        let root = self.workspace_root.clone();
         let base = hub_memory::base_in(home);
         let (send, receive) = mpsc::channel();
         self.pending = Some(receive);
+        self.reveal_progress = true;
         self.read_started = Some(std::time::Instant::now());
+        self.error = None;
         std::thread::spawn(move || {
-            let _ = send.send((generation, read(&base, &project, &request)));
+            // Recheck at use time: a folder from the catalogue may have been moved or relinked.
+            let result = super::tasks::check_memory_project(&project, root.as_deref())
+                .and_then(|project| read(&base, &project, &next));
+            let _ = send.send((generation, result));
         });
-    }
-    fn poll(&mut self, ctx: &egui::Context) {
-        if self.pending.is_some()
-            && self.read_started.is_some_and(|at| at.elapsed() > std::time::Duration::from_secs(10))
-        {
-            self.error =
-                Some("Чтение занимает более 10 с; ожидается завершение системной операции".into());
-        }
-        if let Some(rx) = &self.pending {
-            match rx.try_recv() {
-                Ok((generation, result)) => {
-                    self.pending = None;
-                    if generation == self.generation {
-                        match result {
-                            Ok(view) => {
-                                if let View::List(page) = &view {
-                                    self.offset = page.offset;
-                                }
-                                if let View::Admin(panel) = &view
-                                    && let hub_telegram::memory::lifecycle::Panel::ContextReady(
-                                        packet,
-                                    ) = panel.as_ref()
-                                {
-                                    if !self.admin.context_matches(packet) {
-                                        self.error = Some("Поручение изменилось. Соберите пакет заново перед копированием.".into());
-                                        self.result = None;
-                                        return;
-                                    }
-                                    ctx.copy_text(packet.text().to_owned());
-                                }
-                                self.result = Some(view);
-                                self.error = None;
-                            }
-                            Err(error) => self.error = Some(error),
-                        }
-                    }
-                }
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    self.pending = None;
-                    self.error = Some("Чтение прервано".into());
-                }
-                Err(mpsc::TryRecvError::Empty) => {}
-            }
-        }
-        if self.pending.is_some() {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
-        }
-    }
-    fn search_controls(&mut self, ui: &mut egui::Ui) -> Option<Request> {
-        let mut request = None;
-        let can_browse = self.pending.is_none() && !self.project.as_os_str().is_empty();
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Поиск");
-            if ui.text_edit_singleline(&mut self.query).changed() {
-                self.invalidate_result();
-            }
-            if ui.add_enabled(can_browse, egui::Button::new("Найти / обновить")).clicked()
-            {
-                request = Some(Request::List { query: self.query.clone(), offset: self.offset });
-            }
-        });
-        request
     }
 
-    fn tools(&mut self, ui: &mut egui::Ui) -> Option<Request> {
-        let mut request = None;
-        let can_browse = self.pending.is_none() && !self.project.as_os_str().is_empty();
-        ui.horizontal_wrapped(|ui| {
-            ui.label("Ключ");
-            if ui.text_edit_singleline(&mut self.key).changed() {
-                self.revision = 0;
+    fn poll(&mut self, ctx: &egui::Context) {
+        let Some(rx) = &self.pending else {
+            return;
+        };
+        match rx.try_recv() {
+            Ok((generation, result)) => {
+                self.pending = None;
+                if generation == self.generation {
+                    match result {
+                        Ok(View::Admin(panel)) => self.received(ctx, *panel),
+                        Ok(_) => self.error = Some("Неизвестный ответ хранилища.".into()),
+                        Err(error) => self.error = Some(error),
+                    }
+                }
+                self.effect = None;
             }
-            ui.add(egui::DragValue::new(&mut self.revision).range(0..=u32::MAX));
-            ui.small("0 = последняя ревизия");
-            if ui
-                .add_enabled(
-                    can_browse && !self.key.trim().is_empty(),
-                    egui::Button::new("Открыть запись"),
-                )
-                .on_disabled_hover_text("Введите ключ записи или выберите запись из списка.")
-                .clicked()
-            {
-                request = Some(Request::Get {
-                    key: self.key.clone(),
-                    revision: (self.revision > 0).then_some(self.revision),
-                });
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.pending = None;
+                self.error = Some("Чтение прервано".into());
             }
-        });
-        self.admin.controls(ui, self.generation, can_browse, &self.query).or(request)
+            Err(mpsc::TryRecvError::Empty) => {
+                ctx.request_repaint_after(std::time::Duration::from_millis(75));
+            }
+        }
     }
-    fn progress(&self, ui: &mut egui::Ui) {
+
+    fn received(&mut self, ctx: &egui::Context, panel: Panel) {
+        self.error = None;
+        match panel {
+            Panel::Overview(overview) => {
+                if std::mem::take(&mut self.records.report_refresh) {
+                    self.notice = Some(format!(
+                        "Список обновлён. Записей в проекте — {}.",
+                        overview.page.key_count
+                    ));
+                }
+                self.overview = Some(overview);
+            }
+            Panel::Details(detail) => {
+                if self.notice.is_none() {
+                    self.notice = Some(format!(
+                        "Открыта запись {} · r{}",
+                        detail.entry.key, detail.entry.revision
+                    ));
+                }
+                self.detail = Some(detail);
+            }
+            Panel::Context(packet) => {
+                self.notice = Some("Пакет готов к проверке.".into());
+                self.packet = Some((packet, false));
+            }
+            Panel::ContextReady(packet) => {
+                if self.context.matches(&packet) {
+                    ctx.copy_text(packet.text().to_owned());
+                    self.packet = Some((packet, true));
+                    self.notice = Some("Проверенный пакет скопирован.".into());
+                } else {
+                    self.packet = None;
+                    self.error = Some(
+                        "Поручение изменилось. Соберите пакет заново перед копированием.".into(),
+                    );
+                }
+            }
+            Panel::Confirm(preview) => self.admin.confirm_preview(preview),
+            Panel::Notice(text) => {
+                self.notice = Some(text);
+                if let Some(effect) = self.effect.take() {
+                    match effect {
+                        Effect::Export(path) => {
+                            self.last_export = Some(path);
+                            return;
+                        }
+                        Effect::Reset => self.context = context::ContextDraft::default(),
+                        Effect::Update(action) => {
+                            self.context.apply_change(&action);
+                            if let Some(detail) = &self.detail {
+                                let key = &detail.entry.key;
+                                let version = detail.entry.revision;
+                                match action {
+                                    AdminAction::SetStatus { key: changed, .. }
+                                        if changed == *key =>
+                                    {
+                                        self.reopen_revision = Some((changed, Some(version)));
+                                    }
+                                    AdminAction::Prune { revisions }
+                                        if revisions.contains_key(key) =>
+                                    {
+                                        let kept = !revisions
+                                            .get(key)
+                                            .is_some_and(|pruned| pruned.contains(&version));
+                                        self.reopen_revision =
+                                            Some((key.clone(), kept.then_some(version)));
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        Effect::Refresh => {}
+                    }
+                    self.overview = None;
+                    self.packet = None;
+                    self.detail = None;
+                    self.admin.completed();
+                    self.refresh_on_open = true;
+                }
+            }
+            panel => {
+                if let Panel::Reset { receipt, .. } = &panel {
+                    self.last_export = Some(receipt.path().to_owned());
+                }
+                self.admin.receive(panel);
+            }
+        }
+    }
+
+    fn progress(&mut self, ui: &mut egui::Ui) {
         if self.pending.is_some() {
-            ui.label("Загрузка…");
+            let row = ui.horizontal_wrapped(|ui| {
+                ui.add(ProgressRing::indeterminate().size(20.0));
+                ui.strong(self.progress_label);
+                if self.read_started.is_some_and(|at| at.elapsed().as_secs() >= 10) {
+                    ui.weak("Операция занимает более 10 с.");
+                }
+            });
+            if std::mem::take(&mut self.reveal_progress)
+                && !ui.clip_rect().contains_rect(row.response.rect)
+            {
+                row.response.scroll_to_me(None);
+            }
         }
-        if let Some(error) = &self.error {
-            ui.colored_label(ui.visuals().error_fg_color, error);
-            if self.result.is_some() {
-                ui.small("Ниже показан предыдущий результат. Запрошенные данные не получены.");
+        for (severity, message) in
+            [(Severity::Error, &mut self.error), (Severity::Success, &mut self.notice)]
+        {
+            if let Some(text) = message {
+                let mut open = true;
+                InfoBar::new(severity, text.as_str()).open(&mut open).show(ui);
+                if !open {
+                    *message = None;
+                }
             }
         }
     }
+
     pub fn show(&mut self, ui: &mut egui::Ui, home: &Path) {
         self.poll(ui.ctx());
         self.refresh(home);
-        let name = self.project.file_name().unwrap_or(self.project.as_os_str()).to_string_lossy();
-        ui.heading(format!("Память · {name}")).on_hover_text(self.project.display().to_string());
-        ui.add_space(8.0);
-        let mut request = self.search_controls(ui);
-        let tools = ui.collapsing("Инструменты памяти", |ui| self.tools(ui));
-        if let Some(next) = tools.body_returned.flatten() {
-            request = Some(next);
-        }
         self.progress(ui);
-        if self.result.as_ref().is_some_and(|view| !matches!(view, View::List(_)))
-            && ui
-                .add_enabled(self.pending.is_none(), egui::Button::new("К списку записей"))
-                .clicked()
-        {
-            request = Some(Request::List { query: self.query.clone(), offset: self.offset });
+        if self.project.as_os_str().is_empty() {
+            ui.label("Выберите каталог проекта, чтобы открыть его память.");
+            return;
         }
-        match &self.result {
-            Some(View::List(page)) => {
-                ui.weak(format!("Найдено записей: {}", page.matched_count)).on_hover_text(format!(
-                    "{} · {}/500 ключей · {}/8388608 байт",
-                    page.directory.display(),
-                    page.key_count,
-                    page.bytes
-                ));
-                if !page.exists {
-                    ui.label("Хранилище ещё не создано.");
-                } else if page.entries.is_empty() {
-                    ui.label("Записи не найдены.");
-                }
-                for entry in &page.entries {
-                    if ui
-                        .add_enabled(
-                            self.pending.is_none(),
-                            egui::Button::new(format!(
-                                "{} · r{} · {}",
-                                entry.key, entry.revision, entry.title
-                            )),
-                        )
-                        .clicked()
-                    {
-                        self.key.clone_from(&entry.key);
-                        self.revision = 0;
-                        request = Some(Request::Get { key: entry.key.clone(), revision: None });
-                    }
-                }
-                if page.offset > 0 || page.entries.len() < page.matched_count {
-                    ui.horizontal(|ui| {
-                        if ui
-                            .add_enabled(
-                                self.pending.is_none() && page.offset > 0,
-                                egui::Button::new("Назад"),
-                            )
-                            .clicked()
-                        {
-                            self.offset = page.offset.saturating_sub(20);
-                            request = Some(Request::List {
-                                query: self.query.clone(),
-                                offset: self.offset,
-                            });
-                        }
-                        if ui
-                            .add_enabled(
-                                self.pending.is_none()
-                                    && page.offset + page.entries.len() < page.matched_count,
-                                egui::Button::new("Далее"),
-                            )
-                            .clicked()
-                        {
-                            self.offset = page.offset + 20;
-                            request = Some(Request::List {
-                                query: self.query.clone(),
-                                offset: self.offset,
-                            });
-                        }
-                    });
-                }
-            }
-            Some(View::ExportReady { .. }) => {
-                ui.label("Экспорт подготовлен для Telegram.");
-            }
-            Some(View::Admin(panel)) => {
-                ui.add_enabled_ui(self.pending.is_none(), |ui| {
-                    if let Some(next) = self.admin.panel(ui, panel) {
-                        request = Some(next);
+        let picked = self.admin.poll_picker(ui, self.generation);
+        let next = ui
+            .add_enabled_ui(self.pending.is_none() && !self.admin.picking(), |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    for (tab, label) in [
+                        (Tab::Records, "Записи"),
+                        (Tab::Context, "Пакет контекста"),
+                        (Tab::Manage, "Управление"),
+                    ] {
+                        ui.selectable_value(&mut self.tab, tab, label);
                     }
                 });
-            }
-            Some(View::Entry(entry)) => {
-                ui.label(entry_text(entry));
-            }
-            Some(View::Notice(text)) => {
-                ui.label(text);
-            }
-            None => {}
-        }
-        if let Some(request) = request {
-            self.load(home, request);
+                ui.separator();
+                match self.tab {
+                    Tab::Records => {
+                        if let Some(details) = &self.detail {
+                            if ui.add(Button::new("‹ К списку записей")).clicked() {
+                                self.detail = None;
+                                self.notice = None;
+                                (!self.records.exact).then(|| {
+                                    self.records
+                                        .list(self.overview.as_ref().map_or(0, |o| o.page.offset))
+                                })
+                            } else {
+                                self.records.detail(
+                                    ui,
+                                    details,
+                                    &mut self.context,
+                                    &mut self.tab,
+                                    &mut self.notice,
+                                )
+                            }
+                        } else {
+                            self.records.show(
+                                ui,
+                                self.overview.as_ref(),
+                                &mut self.tab,
+                                &mut self.admin,
+                            )
+                        }
+                    }
+                    Tab::Context => {
+                        let build = self.context.controls(ui, &mut self.tab);
+                        if self
+                            .packet
+                            .take_if(|(packet, _)| !self.context.matches(packet))
+                            .is_some()
+                        {
+                            self.notice = None;
+                        }
+                        if self.tab == Tab::Records {
+                            self.detail = None;
+                            self.records.exact = false;
+                        }
+                        let copy = self
+                            .packet
+                            .as_ref()
+                            .and_then(|(packet, ready)| self.context.preview(ui, packet, *ready));
+                        if self.context.procedure(ui) {
+                            self.notice = Some("Процедура скопирована.".into());
+                        }
+                        build.or(copy)
+                    }
+                    Tab::Manage => self.admin.show(
+                        ui,
+                        self.generation,
+                        &self.project,
+                        self.overview.as_ref(),
+                        self.last_export.as_deref(),
+                    ),
+                }
+            })
+            .inner;
+        if let Some(action) = self.admin.confirmation(ui).map(request).or(picked).or(next) {
+            self.notice = None;
+            self.load(home, action);
+            ui.ctx().request_repaint();
         }
     }
 }
@@ -301,219 +475,4 @@ pub(super) fn scope(ui: &mut egui::Ui, label: &str, current: Option<bool>) -> Op
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn empty_project_does_not_start_a_disk_read() {
-        let mut view = MemoryView::default();
-        view.load(Path::new("/"), Request::Get { key: String::new(), revision: None });
-        assert!(view.pending.is_none());
-        assert_eq!(view.error.as_deref(), Some("Сначала выберите каталог проекта."));
-    }
-
-    #[test]
-    fn empty_key_does_not_start_a_disk_read() {
-        let mut view = MemoryView { project: "/project".into(), ..Default::default() };
-        view.load(Path::new("/"), Request::Get { key: String::new(), revision: None });
-        assert!(view.pending.is_none());
-        assert_eq!(
-            view.error.as_deref(),
-            Some("Введите ключ записи или выберите запись из списка.")
-        );
-    }
-
-    #[test]
-    fn switching_projects_during_a_read_loads_only_the_selected_project() {
-        let home = tempfile::tempdir().unwrap();
-        let target = tempfile::tempdir().unwrap();
-        let (tx, rx) = mpsc::channel();
-        let mut view =
-            MemoryView { project: home.path().into(), pending: Some(rx), ..Default::default() };
-        view.open_project(target.path().to_owned());
-        view.refresh(home.path());
-        assert!(view.refresh_on_open);
-        tx.send((0, Ok(View::Notice("old data".into())))).unwrap();
-        view.poll(&egui::Context::default());
-        view.refresh(home.path());
-        let (_, result) =
-            view.pending.as_ref().unwrap().recv_timeout(std::time::Duration::from_secs(5)).unwrap();
-        assert!(
-            matches!(result.unwrap(), View::List(page) if page.project == std::fs::canonicalize(target.path()).unwrap())
-        );
-    }
-
-    #[test]
-    fn pending_navigation_does_not_advance_visible_page() {
-        let ctx = egui::Context::default();
-        let (_tx, rx) = mpsc::channel();
-        let mut view = MemoryView {
-            pending: Some(rx),
-            result: Some(View::List(hub_memory::MemoryPage {
-                bound_projects: Vec::new(),
-                offset: 0,
-                project: PathBuf::from("/repo"),
-                directory: PathBuf::from("/store"),
-                exists: true,
-                bytes: 1,
-                key_count: 60,
-                matched_count: 60,
-                entries: Vec::new(),
-            })),
-            ..Default::default()
-        };
-        let frame = |view: &mut MemoryView, events| {
-            let mut output = ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(1200.0, 900.0),
-                    )),
-                    events,
-                    ..Default::default()
-                },
-                |ui| view.show(ui, Path::new("/")),
-            );
-            output.textures_delta.clear();
-            output
-        };
-        frame(&mut view, Vec::new());
-        let output = frame(&mut view, Vec::new());
-        let position = output
-            .shapes
-            .iter()
-            .find_map(|shape| match &shape.shape {
-                egui::Shape::Text(text) if text.galley.text() == "Далее" => {
-                    Some(text.galley.rect.translate(text.pos.to_vec2()).center())
-                }
-                _ => None,
-            })
-            .unwrap();
-        for pressed in [true, false] {
-            frame(
-                &mut view,
-                vec![
-                    egui::Event::PointerMoved(position),
-                    egui::Event::PointerButton {
-                        pos: position,
-                        button: egui::PointerButton::Primary,
-                        pressed,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-            );
-        }
-        assert_eq!(view.offset, 0);
-    }
-
-    #[test]
-    fn context_selection_survives_search_but_not_project_change() {
-        let ctx = egui::Context::default();
-        let mut view = MemoryView {
-            project: "/repo".into(),
-            result: Some(View::Admin(Box::new(hub_telegram::memory::lifecycle::Panel::Details(
-                hub_memory::EntryDetails {
-                    entry: hub_memory::Entry {
-                        key: "pilot".into(),
-                        revision: 1,
-                        kind: hub_memory::EntryKind::Progress,
-                        title: "Pilot".into(),
-                        body: "body".into(),
-                        sources: vec!["test".into()],
-                        author: "test".into(),
-                        created_at: 0,
-                    },
-                    status: hub_memory::MemoryStatus::Active,
-                    revisions: vec![1],
-                    history_pruned: false,
-                },
-            )))),
-            ..Default::default()
-        };
-        let frame = |view: &mut MemoryView, events| {
-            let mut output = ctx.run_ui(
-                egui::RawInput {
-                    screen_rect: Some(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
-                        egui::vec2(1200.0, 1800.0),
-                    )),
-                    events,
-                    ..Default::default()
-                },
-                |ui| view.show(ui, Path::new("/")),
-            );
-            output.textures_delta.clear();
-            output
-        };
-        frame(&mut view, Vec::new());
-        let output = frame(&mut view, Vec::new());
-        let tools = output
-            .shapes
-            .iter()
-            .find_map(|shape| match &shape.shape {
-                egui::Shape::Text(text) if text.galley.text() == "Инструменты памяти" => {
-                    Some(text.galley.rect.translate(text.pos.to_vec2()).center())
-                }
-                _ => None,
-            })
-            .unwrap();
-        for pressed in [true, false] {
-            frame(
-                &mut view,
-                vec![
-                    egui::Event::PointerMoved(tools),
-                    egui::Event::PointerButton {
-                        pos: tools,
-                        button: egui::PointerButton::Primary,
-                        pressed,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-            );
-        }
-        let output = frame(&mut view, Vec::new());
-        let position = output
-            .shapes
-            .iter()
-            .find_map(|shape| match &shape.shape {
-                egui::Shape::Text(text)
-                    if text.galley.text() == "Добавить ревизию в пакет контекста" =>
-                {
-                    Some(text.galley.rect.translate(text.pos.to_vec2()).center())
-                }
-                _ => None,
-            })
-            .unwrap();
-        for pressed in [true, false] {
-            frame(
-                &mut view,
-                vec![
-                    egui::Event::PointerMoved(position),
-                    egui::Event::PointerButton {
-                        pos: position,
-                        button: egui::PointerButton::Primary,
-                        pressed,
-                        modifiers: egui::Modifiers::NONE,
-                    },
-                ],
-            );
-        }
-        view.invalidate_result();
-        let output = frame(&mut view, Vec::new());
-        assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Text(text) if text.galley.text().contains("Пакет контекста следующему агенту (1/20)"))));
-        view.project = "/other".into();
-        view.invalidate();
-        let output = frame(&mut view, Vec::new());
-        assert!(output.shapes.iter().any(|shape|matches!(&shape.shape,egui::Shape::Text(text) if text.galley.text().contains("Пакет контекста следующему агенту (0/20)"))));
-    }
-
-    #[test]
-    fn changed_project_discards_old_result() {
-        let mut view = MemoryView::default();
-        let (tx, rx) = mpsc::channel();
-        view.pending = Some(rx);
-        view.invalidate();
-        tx.send((0, Ok(View::Notice("old project".into())))).unwrap();
-        view.poll(&egui::Context::default());
-        assert!(view.result.is_none());
-    }
-}
+mod tests;

@@ -17,6 +17,7 @@ const SIZE: u32 = 32;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayAction {
     Open,
+    Updates,
     Toggle,
     Quit,
 }
@@ -33,9 +34,13 @@ pub enum TrayError {
 
 pub struct Tray {
     icon: TrayIcon,
+    status: MenuItem,
     toggle: MenuItem,
     update: MenuItem,
     health: Health,
+    last_status: String,
+    last_toggle: Option<(&'static str, bool)>,
+    last_update: Option<(String, bool)>,
 }
 
 const GREEN: [u8; 3] = [46, 160, 67];
@@ -73,12 +78,21 @@ pub fn app_icon() -> (Vec<u8>, u32) {
 
 impl Tray {
     pub fn create(repaint: Repaint) -> Result<(Self, mpsc::Receiver<TrayAction>), TrayError> {
-        let open = MenuItem::new("Открыть", true, None);
+        let open = MenuItem::new("Открыть окно", true, None);
+        let status = MenuItem::new("Agent Hub", false, None);
         let toggle = MenuItem::new("Запустить бота", false, None);
-        let update = MenuItem::new("Обновлений нет", false, None);
+        let update = MenuItem::new("Обновления ещё не проверялись", false, None);
         let quit = MenuItem::new("Выход", true, None);
         let menu = Menu::new();
-        menu.append_items(&[&open, &toggle, &update, &PredefinedMenuItem::separator(), &quit])?;
+        menu.append_items(&[
+            &status,
+            &PredefinedMenuItem::separator(),
+            &open,
+            &toggle,
+            &update,
+            &PredefinedMenuItem::separator(),
+            &quit,
+        ])?;
         let icon = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("agent-hub")
@@ -91,8 +105,7 @@ impl Tray {
         let ids: [(MenuId, TrayAction); 4] = [
             (open.id().clone(), TrayAction::Open),
             (toggle.id().clone(), TrayAction::Toggle),
-            // Installing is a button in the window, so the item only brings the window up.
-            (update.id().clone(), TrayAction::Open),
+            (update.id().clone(), TrayAction::Updates),
             (quit.id().clone(), TrayAction::Quit),
         ];
         let menu_sender = sender.clone();
@@ -121,7 +134,19 @@ impl Tray {
                 repaint();
             }
         }));
-        Ok((Self { icon, toggle, update, health: Health::Stopped }, actions))
+        Ok((
+            Self {
+                icon,
+                status,
+                toggle,
+                update,
+                health: Health::Stopped,
+                last_status: String::new(),
+                last_toggle: None,
+                last_update: None,
+            },
+            actions,
+        ))
     }
 
     pub fn show(&mut self, snapshot: &Snapshot, updates: &UpdateState) {
@@ -137,8 +162,13 @@ impl Tray {
             }
             self.health = health;
         }
-        if let Err(error) = self.icon.set_tooltip(Some(tooltip(snapshot))) {
-            tracing::warn!(%error, "tray tooltip not updated");
+        let status = tooltip(snapshot);
+        if self.last_status != status {
+            self.status.set_text(&status);
+            if let Err(error) = self.icon.set_tooltip(Some(&status)) {
+                tracing::warn!(%error, "tray tooltip not updated");
+            }
+            self.last_status = status;
         }
         let (text, enabled) = match &snapshot.bot {
             BotStatus::Running { .. } | BotStatus::Starting | BotStatus::Retrying { .. } => {
@@ -147,10 +177,16 @@ impl Tray {
             BotStatus::Stopped | BotStatus::Failed(_) => ("Запустить бота", true),
             BotStatus::Unconfigured => ("Запустить бота", false),
         };
-        self.toggle.set_text(text);
-        self.toggle.set_enabled(enabled);
-        let (text, enabled) = update_item(updates);
-        self.update.set_text(text);
-        self.update.set_enabled(enabled);
+        if self.last_toggle != Some((text, enabled)) {
+            self.toggle.set_text(text);
+            self.toggle.set_enabled(enabled);
+            self.last_toggle = Some((text, enabled));
+        }
+        let update = update_item(updates);
+        if self.last_update.as_ref() != Some(&update) {
+            self.update.set_text(&update.0);
+            self.update.set_enabled(update.1);
+            self.last_update = Some(update);
+        }
     }
 }

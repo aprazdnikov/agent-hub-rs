@@ -4,6 +4,7 @@ use super::{
     UNIX_EPOCH, initial_incarnation,
 };
 use crate::{AdminAction, AdminPreview, EntryDetails, MemoryOverview};
+use std::collections::BTreeMap;
 
 pub(super) fn now() -> Result<i64, Error> {
     SystemTime::now()
@@ -193,8 +194,7 @@ impl MemoryReader {
         limit: usize,
         filter: StatusFilter,
     ) -> Result<MemoryOverview, Error> {
-        let page = self.inspect_filtered(query, offset, limit, filter)?;
-        let snapshot = self.store()?.map(|store| store.load()).transpose()?;
+        let (page, snapshot) = self.inspect_filtered(query, offset, limit, filter)?;
         Ok(MemoryOverview {
             query: query.to_owned(),
             filter,
@@ -203,6 +203,10 @@ impl MemoryReader {
                 Snapshot::token,
             ),
             policy: snapshot.as_ref().map_or(CleanupPolicy::Manual, |s| s.policy),
+            statuses: snapshot.as_ref().map_or_else(BTreeMap::new, |s| {
+                page.entries.iter().map(|entry| (entry.key.clone(), s.status(&entry.key))).collect()
+            }),
+            revision_count: snapshot.as_ref().map_or(0, |s| s.entries.values().map(Vec::len).sum()),
             page,
             tombstone_count: snapshot.as_ref().map_or(0, |s| s.tombstones.len()),
             last_cleanup: snapshot.and_then(|s| s.last_cleanup),

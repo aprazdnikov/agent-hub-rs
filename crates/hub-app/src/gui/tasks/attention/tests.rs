@@ -61,49 +61,6 @@ impl Screen {
             .nth(index)
             .map_or_else(|| panic!("missing {text:?} at {index} in {labels:?}"), |(_, p)| *p)
     }
-    /// Filled rectangles painted by one frame, for layout-size assertions.
-    fn rects(&mut self) -> Vec<(egui::Color32, egui::Rect)> {
-        let output = self.ctx.run_ui(
-            egui::RawInput {
-                events: vec![],
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, self.size)),
-                ..Default::default()
-            },
-            |ui| {
-                self.opened |=
-                    self.view.show_attention(ui, &self.snapshot, &mut |c| self.commands.push(c));
-            },
-        );
-        output
-            .shapes
-            .into_iter()
-            .filter_map(|shape| {
-                if let egui::Shape::Rect(rect) = shape.shape {
-                    let visible = rect.rect.intersect(shape.clip_rect);
-                    if rect.fill != egui::Color32::TRANSPARENT && visible.is_positive() {
-                        return Some((rect.fill, visible));
-                    }
-                }
-                None
-            })
-            .collect()
-    }
-    /// The icon plate behind a header glyph: the filled rect of plate height
-    /// that contains the glyph, asserting that exactly one such rect exists.
-    fn plate(&mut self, glyph: &str) -> egui::Rect {
-        let glyph = self.rect(glyph, 0);
-        let candidates: Vec<egui::Rect> = self
-            .rects()
-            .into_iter()
-            .map(|(_, rect)| rect)
-            .filter(|rect| rect.height() > 20.0 && rect.height() < 40.0)
-            .filter(|rect| rect.contains(glyph.center()))
-            .collect();
-        match candidates.as_slice() {
-            [rect] => *rect,
-            _ => panic!("expected exactly one plate rect around {glyph:?}, got {candidates:?}"),
-        }
-    }
     fn contains(&mut self, text: &str) -> bool {
         self.frame(vec![]).iter().any(|(label, _)| label == text)
     }
@@ -172,7 +129,7 @@ fn parallel_permission_shows_full_request_and_recovers_from_failed_delivery_in_p
     assert_eq!(attention_count(&screen.snapshot), 2);
     assert!(screen.contains("Разрешение"));
     assert!(!screen.contains(full));
-    screen.click("Подробнее", 0);
+    screen.click("Подробнее о запросе", 1);
     assert!(screen.contains(full));
     screen.click("Разрешить один раз", 1);
     let Some(Command::LocalAnswer { token, id, answer: Answer::Allow, reply }) =
@@ -255,7 +212,7 @@ fn oversized_unicode_answer_leaves_denial_available() {
     screen.frame(vec![egui::Event::Text("Я".repeat(9000))]);
     screen.click("Отправить ответ", 0);
     assert!(screen.commands.is_empty());
-    screen.click("Отказаться отвечать", 0);
+    screen.click("Отказаться", 0);
     assert!(matches!(
         screen.commands.pop(),
         Some(Command::LocalAnswer { answer: Answer::Deny, .. })
@@ -271,10 +228,10 @@ fn index_error_keeps_live_decisions_and_scoped_empty_state_can_be_cleared() {
     });
     assert!(screen.contains("Не удалось загрузить задачи. Не удалось прочитать файл."));
     assert!(screen.contains("Вопрос"));
-    assert!(!screen.contains("Всё разобрано."));
+    assert!(!screen.contains("Входящие разобраны"));
     screen.view.inbox.project = Some(std::env::temp_dir().join("Atlas"));
     screen.snapshot.task_index = Ok(Vec::new());
-    assert!(screen.contains("В этом проекте всё разобрано."));
+    assert!(screen.contains("Входящие разобраны"));
     screen.click("Показать все проекты", 0);
     assert!(screen.contains("Вопрос"));
 }
@@ -316,7 +273,7 @@ fn stored_attention_opens_the_corresponding_task_section() {
     let id = book.create(std::env::temp_dir(), "codex", "Исправление", "Проверь").unwrap();
     let task = book.get(id).unwrap();
     for (reason, button, section) in [
-        (Attention::Review, "Проверить", Tab::Summary),
+        (Attention::Review, "Проверить результат", Tab::Summary),
         (Attention::CheckFailed, "Открыть проверку", Tab::Checks),
         (Attention::Interrupted, "Разобрать запуск", Tab::Checks),
         (Attention::AgentFailed, "Разобрать запуск", Tab::Checks),
@@ -331,9 +288,9 @@ fn stored_attention_opens_the_corresponding_task_section() {
         let mut screen = Screen::new(Snapshot { task_index: Ok(vec![row]), ..Default::default() });
         assert!(screen.contains("Подробности задачи"));
         screen.click(button, 0);
-        assert!(screen.opened && screen.view.review_from_inbox);
+        assert!(screen.opened && screen.view.review_from_inbox, "{reason:?}");
         assert_eq!(screen.view.focused, Some(id));
-        assert!(screen.view.result_view.tab(task) == section);
+        assert_eq!(screen.view.result_view.tab(task), section);
     }
 }
 
@@ -348,7 +305,7 @@ fn failed_reply_remains_visible_if_the_request_disappears_before_the_next_frame(
     reply.send(Err("Запрос уже завершён.".into())).unwrap();
     screen.snapshot.local = None;
     assert!(screen.contains("Задача #1 · Запрос уже завершён."));
-    assert!(screen.contains("Всё разобрано."));
+    assert!(screen.contains("Входящие разобраны"));
 }
 
 #[test]
@@ -372,7 +329,7 @@ fn each_question_requires_its_own_answer_and_preserves_order() {
     screen.click("Сохранить", 0);
     screen.click("Отправить ответы", 0);
     assert!(screen.commands.is_empty());
-    screen.click("Ответ или свой вариант", 1);
+    screen.click("Ответ или свой вариант", 0);
     screen.frame(vec![egui::Event::Text("Отчёт по задачам".into())]);
     screen.click("Отправить ответы", 0);
     assert!(
@@ -384,7 +341,7 @@ fn each_question_requires_its_own_answer_and_preserves_order() {
 fn question_card_answers_without_expand_step() {
     let live = question("Hub", 1);
     let mut screen = Screen::new(Snapshot { local: Some(live.clone()), ..Default::default() });
-    assert!(screen.contains("Ждут вашего ответа · 1"));
+    assert!(screen.contains("Ждут вашего ответа"));
     assert!(screen.contains("Вопрос"));
     assert!(screen.contains("Какие версии проверить?"));
     assert!(screen.contains("Отправить ответ"));
@@ -403,12 +360,12 @@ fn permission_card_shows_actions_and_details_toggle() {
     let mut screen = Screen::new(Snapshot { local: Some(live.clone()), ..Default::default() });
     assert!(screen.contains("Разрешить один раз"));
     assert!(screen.contains("Отклонить"));
-    assert!(screen.contains("Подробнее"));
+    assert!(screen.contains("Подробнее о запросе"));
     assert!(!screen.contains(long));
-    screen.click("Подробнее", 0);
+    screen.click("Подробнее о запросе", 0);
     assert!(screen.contains(long));
-    assert!(screen.contains("Свернуть"));
-    screen.click("Свернуть", 0);
+    assert!(screen.contains("Скрыть подробности"));
+    screen.click("Скрыть подробности", 0);
     assert!(!screen.contains(long));
     screen.click("Разрешить один раз", 0);
     assert!(
@@ -426,14 +383,15 @@ fn permission_summary_collapses_by_lines_not_characters() {
         "collapsed summary keeps its first three lines with breaks"
     );
     assert!(!screen.contains(summary));
-    assert!(screen.contains("Подробнее"));
-    screen.click("Подробнее", 0);
+    assert!(screen.contains("Подробнее о запросе"));
+    screen.click("Подробнее о запросе", 0);
     assert!(screen.contains(summary));
     let three = "одна\nдве\nтри";
     let mut short =
         Screen::new(Snapshot { local: Some(permission(2, three)), ..Default::default() });
     assert!(short.contains(three));
-    assert!(!short.contains("Подробнее"), "summaries up to 3 lines stay uncollapsed");
+    short.click("Подробнее о запросе", 0);
+    assert!(short.contains("Скрыть подробности") && short.contains(three));
 }
 
 #[test]
@@ -442,7 +400,7 @@ fn single_line_permission_summary_collapses_by_visual_rows() {
     let mut screen =
         Screen::new(Snapshot { local: Some(permission(1, &long)), ..Default::default() });
     assert!(
-        screen.contains("Подробнее"),
+        screen.contains("Подробнее о запросе"),
         "a single-line command of 504 chars has one logical line but must still be collapsible"
     );
     let monospace = screen
@@ -459,7 +417,7 @@ fn single_line_permission_summary_collapses_by_visual_rows() {
         "collapsed summary must not exceed three visual rows: {collapsed} > {}",
         3.0 * row + 1.0
     );
-    screen.click("Подробнее", 0);
+    screen.click("Подробнее о запросе", 0);
     let expanded = screen.rect(&long, 0).height();
     assert!(expanded > 4.0 * row, "reveal shows the whole command: {expanded}");
 }
@@ -468,7 +426,7 @@ fn single_line_permission_summary_collapses_by_visual_rows() {
 fn answered_live_request_shows_status_only_inline() {
     let live = question("Hub", 1);
     let mut screen = Screen::new(Snapshot { local: Some(live.clone()), ..Default::default() });
-    screen.click("Отказаться отвечать", 0);
+    screen.click("Отказаться", 0);
     let Some(Command::LocalAnswer { reply, .. }) = screen.commands.pop() else {
         panic!("missing answer")
     };
@@ -490,15 +448,15 @@ fn narrow_inbox_stacks_action_below_content() {
     };
     let mut screen = Screen::new(Snapshot { task_index: Ok(vec![row]), ..Default::default() });
     screen.size = egui::vec2(400.0, 600.0);
-    assert!(screen.contains("√"));
-    assert!(screen.contains("Результаты на проверку · 1"));
+    assert!(screen.contains("На проверке"));
+    assert!(screen.contains("Результаты и ошибки"));
     let title = screen.rect("Поиск по каталогу", 0);
-    let action = screen.rect("Проверить", 0);
+    let action = screen.rect("Проверить результат", 0);
     assert!(action.top() >= title.bottom(), "action must stack below the content at 400px");
 }
 
 #[test]
-fn icon_plate_does_not_stretch_the_card_header() {
+fn card_metadata_precedes_the_title_at_each_width() {
     for width in [1000.0, 400.0] {
         let mut book = hub_core::tasks::TaskBook::default();
         let id =
@@ -510,16 +468,14 @@ fn icon_plate_does_not_stretch_the_card_header() {
         };
         let mut screen = Screen::new(Snapshot { task_index: Ok(vec![row]), ..Default::default() });
         screen.size = egui::vec2(width, 800.0);
-        let plate = screen.plate("√");
-        assert!(
-            (24.0..=40.0).contains(&plate.width()),
-            "icon plate stretched to {plate:?} across the card_header at {width}px"
-        );
+        let metadata = screen
+            .frame(vec![])
+            .into_iter()
+            .find(|(text, _)| text.starts_with(&format!("#{id}   ")) && text.ends_with(" / Codex"))
+            .unwrap()
+            .1;
         let title = screen.rect("Поиск по каталогу", 0);
-        assert!(
-            title.width() > 40.0,
-            "title squeezed into a vertical one-character column: {title:?} at {width}px"
-        );
+        assert!(metadata.bottom() <= title.top() && title.width() > 40.0);
     }
 }
 
@@ -529,7 +485,7 @@ fn narrow_inbox_supports_keyboard_and_clicks_in_button_padding() {
     let mut screen =
         Screen::new(Snapshot { local: Some(permission(1, long)), ..Default::default() });
     screen.size = egui::vec2(330.0, 560.0);
-    let target = screen.rect("Подробнее", 0).center();
+    let target = screen.rect("Подробнее о запросе", 0).center();
     let key = |screen: &mut Screen, key| {
         for pressed in [true, false] {
             screen.frame(vec![egui::Event::Key {
@@ -552,11 +508,11 @@ fn narrow_inbox_supports_keyboard_and_clicks_in_button_padding() {
     assert!(focused, "the permission details link must be reachable with Tab");
     key(&mut screen, egui::Key::Enter);
     assert!(screen.contains(long));
-    let beside_text = screen.rect("Свернуть", 0).right_center() + egui::vec2(4.0, 0.0);
+    let beside_text = screen.rect("Скрыть подробности", 0).right_center() + egui::vec2(4.0, 0.0);
     screen.pointer(beside_text, true);
     screen.pointer(beside_text, false);
     assert!(!screen.contains(long), "a click in the link's padding collapses the summary");
-    assert!(screen.contains("Подробнее"));
+    assert!(screen.contains("Подробнее о запросе"));
     assert!(screen.commands.is_empty());
 }
 
@@ -578,7 +534,7 @@ fn review_card_shows_check_and_file_chips() {
     let mut screen = Screen::new(Snapshot { task_index: Ok(vec![row]), ..Default::default() });
     assert!(screen.contains("Проверки · 2/3"));
     assert!(screen.contains("Файлов · 2"));
-    assert!(screen.contains("Результаты на проверку · 1"));
+    assert!(screen.contains("Результаты и ошибки"));
 }
 
 #[test]

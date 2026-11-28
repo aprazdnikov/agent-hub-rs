@@ -9,6 +9,7 @@ use hub_core::domain::AbsolutePath;
 use hub_core::tasks::{Task, TaskFilter, TaskStatus};
 use hub_core::workspace::{candidate, expand_home};
 use hub_telegram::paths::workspace_root;
+use kylig_ui::{IconButton, SourceItem, SourceList, SourceListResponse, SourceSection};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
@@ -29,13 +30,13 @@ pub(super) struct State {
     picker: Option<mpsc::Receiver<Option<PathBuf>>>,
     error: Option<String>,
     drawer: bool,
+    archive: bool,
 }
 
 #[derive(Default)]
 struct Branch {
-    expanded: Option<bool>,
     last_task: Option<u64>,
-    filter: TaskFilter,
+    filter: Option<TaskFilter>,
 }
 
 #[derive(Clone, Default, PartialEq, Eq)]
@@ -51,10 +52,7 @@ impl Sources {
         home: &Path,
     ) -> Self {
         let saved = snapshot.saved.as_ref();
-        let root = saved
-            .map(|draft| draft.workspace_root.trim())
-            .filter(|value| !value.is_empty())
-            .map(|value| expand_home(value, home));
+        let root = configured_project_root(snapshot, home);
         let mut folders: BTreeMap<_, _> = remembered
             .chain(snapshot.topics.iter().map(|topic| topic.session.cwd.as_path().to_owned()))
             .chain(snapshot.task_index.iter().flatten().map(|row| row.project.clone()))
@@ -76,6 +74,23 @@ impl Sources {
             .map(|root| workspace_root(root).map_err(|error| error.to_string()))
             .transpose()
     }
+}
+
+pub(in crate::gui) fn configured_project_root(snapshot: &Snapshot, home: &Path) -> Option<PathBuf> {
+    snapshot
+        .saved
+        .as_ref()
+        .map(|draft| draft.workspace_root.trim())
+        .filter(|value| !value.is_empty())
+        .map(|value| expand_home(value, home))
+}
+
+pub(in crate::gui) fn check_memory_project(
+    path: &Path,
+    root: Option<&Path>,
+) -> Result<PathBuf, String> {
+    let root = root.map(workspace_root).transpose().map_err(|error| error.to_string())?;
+    checked_project(path, root.as_ref())
 }
 
 fn checked_project(path: &Path, root: Option<&AbsolutePath>) -> Result<PathBuf, String> {
@@ -213,7 +228,7 @@ impl<'a> TaskLink<'a> {
     }
 
     fn matches(&self, query: &str, project_matches: bool, filter: TaskFilter) -> bool {
-        let by_id = query.strip_prefix('#').and_then(|id| id.parse().ok()) == Some(self.id);
+        let by_id = !query.is_empty() && format!("#{}", self.id).contains(query);
         filter.includes(self.status, self.archived)
             && (project_matches
                 || by_id
@@ -348,45 +363,15 @@ impl Mark {
     }
 }
 
-fn row_button(
-    ui: &mut egui::Ui,
-    link: &TaskLink<'_>,
-    project: &Path,
-    snapshot: &Snapshot,
-    selected: bool,
-) -> bool {
-    let (mark, state) = link.mark(project, snapshot);
-    let accent = ui.visuals().hyperlink_color;
-    let title = egui::RichText::new(link.title);
-    let title = if selected { title.color(accent).strong() } else { title };
-    let width = ui.available_width();
-    let text = egui::WidgetText::from(title).into_galley_impl(
-        ui.ctx(),
-        ui.style(),
-        egui::text::TextWrapping {
-            max_width: (width - 2.0 * ui.spacing().button_padding.x - 24.0).max(1.0),
-            max_rows: 2,
-            ..Default::default()
-        },
-        egui::TextStyle::Button.into(),
-        egui::Align::Center,
-    );
-    let mark_id = egui::Id::new("task-state");
-    let icon = egui::Atom::custom(mark_id, egui::vec2(11.0, 16.0));
-    let mut detail = format!("#{} · {}", link.id, link.backend);
-    if !state.is_empty() {
-        detail.push_str(" · ");
-        detail.push_str(state);
-    }
-    let button = egui::Button::selectable(selected, (icon, text, egui::Atom::grow()))
-        .gap(6.0)
-        .min_size(egui::vec2(width, 28.0))
-        .atom_ui(ui);
-    if let Some(rect) = button.rect(mark_id) {
-        mark.paint(ui, rect.center());
-    }
-    button.response.on_hover_text(format!("{}\n{detail}", link.title)).clicked()
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Entry<'a> {
+    None,
+    Project(&'a Path, &'static str),
+    Task(&'a Path, u64),
+    Archive(&'a Path),
 }
+
+const MENU_SIZE: f32 = 28.0;
 
 fn project_menu(
     ui: &mut egui::Ui,
@@ -395,7 +380,8 @@ fn project_menu(
     filter: TaskFilter,
     intent: &mut Option<Intent>,
 ) {
-    let menu = ui.add(egui::Button::new("...").frame_when_inactive(false));
+    let label = format!("Действия проекта «{name}»");
+    let menu = ui.add(IconButton::new(kylig_icons::DOTS_THREE, label).size(MENU_SIZE));
     egui::Popup::menu(&menu).show(|ui| {
         ui.spacing_mut().button_padding = egui::vec2(10.0, 5.0);
         if ui.button("Новая задача").clicked() {
@@ -427,62 +413,6 @@ fn project_menu(
             }
         });
     });
-    let label = format!("Действия проекта «{name}»");
-    menu.widget_info(|| egui::WidgetInfo::labeled(egui::WidgetType::Button, true, &label));
-    menu.on_hover_text(label);
-}
-
-const BADGE_RESERVE: f32 = 40.0;
-
-struct ProjectRow<'a> {
-    path: &'a Path,
-    name: &'a str,
-    expanded: bool,
-    filter: TaskFilter,
-}
-
-impl ProjectRow<'_> {
-    fn header(
-        &self,
-        ui: &mut egui::Ui,
-        selected: bool,
-        searching: bool,
-        attention: usize,
-        intent: &mut Option<Intent>,
-    ) -> bool {
-        let toggle = ui.add_enabled(
-            !searching,
-            egui::Button::new("").frame_when_inactive(false).min_size(egui::vec2(25.0, 29.0)),
-        );
-        let mut arrow = toggle.clone();
-        arrow.rect = egui::Rect::from_center_size(toggle.rect.center(), egui::vec2(11.0, 10.0));
-        egui::collapsing_header::paint_default_icon(ui, f32::from(self.expanded), &arrow);
-        let label =
-            format!("{} {}", if self.expanded { "Свернуть" } else { "Развернуть" }, self.name);
-        toggle.widget_info(|| {
-            egui::WidgetInfo::labeled(egui::WidgetType::Button, !searching, &label)
-        });
-        let toggled = toggle.on_hover_text(label).clicked();
-        // The chip (9px padding each side plus a few small digits) joins the fixed menu slot.
-        let badge = f32::from(attention > 0) * BADGE_RESERVE;
-        let width = (ui.available_width() - 37.0 - badge).max(20.0);
-        let text = egui::RichText::new(self.name).strong();
-        let text = if selected { text.color(ui.visuals().hyperlink_color) } else { text };
-        let button =
-            egui::Button::new((text, egui::Atom::grow())).truncate().frame_when_inactive(false);
-        if ui
-            .add_sized([width, 29.0], button)
-            .on_hover_text(self.path.display().to_string())
-            .clicked()
-        {
-            *intent = Some(Intent::Chat(self.path.to_owned(), None));
-        }
-        if attention > 0 {
-            theme::chip(ui, Tone::Accent, &attention.to_string());
-        }
-        project_menu(ui, self.path, self.name, self.filter, intent);
-        toggled
-    }
 }
 
 impl State {
@@ -524,109 +454,156 @@ impl State {
         }
     }
 
-    fn tree(
-        &mut self,
-        ui: &mut egui::Ui,
-        snapshot: &Snapshot,
-        current: Current<'_>,
-    ) -> Option<Intent> {
+    fn task_filter(&self, branch: Option<&Branch>) -> TaskFilter {
+        branch.and_then(|branch| branch.filter).unwrap_or(if self.archive {
+            TaskFilter::Archived
+        } else {
+            TaskFilter::Active
+        })
+    }
+
+    pub(super) fn archived(&self) -> bool {
+        self.archive
+    }
+
+    pub(super) fn filter_for(&self, project: &Path) -> TaskFilter {
+        self.task_filter(self.branches.get(project))
+    }
+
+    fn tree(&self, ui: &mut egui::Ui, snapshot: &Snapshot, current: Current<'_>) -> Option<Intent> {
         let query = self.query.trim().to_lowercase();
         let groups = task_links(snapshot, current);
-        let mut intent = None;
-        let mut matched = false;
+        let mut roots = Vec::new();
+        let mut visible_tasks = BTreeMap::new();
+        let mut selection = Entry::None;
         let first = self.catalog.projects.keys().next();
         for (project, name) in &self.catalog.projects {
             let active = current.project == Some(project.as_path());
-            let project_matches = query.is_empty() || name.to_lowercase().contains(&query);
-            let branch = self.branches.get(project);
-            let filter = branch.map_or(TaskFilter::Active, |b| b.filter);
-            let project_links = groups.get(project.as_path()).map_or(&[][..], Vec::as_slice);
-            let links: Vec<_> = project_links
-                .iter()
-                .filter(|link| link.matches(&query, project_matches, filter))
-                .collect();
-            if !project_matches && links.is_empty() {
-                continue;
+            let project_matches = name.to_lowercase().contains(&query);
+            let filter = self.filter_for(project);
+            let key = Entry::Project(project, filter.label());
+            let links = groups.get(project.as_path()).map_or(&[][..], Vec::as_slice);
+            let mut children = Vec::new();
+            for link in links.iter().filter(|link| link.matches(&query, project_matches, filter)) {
+                let task = Entry::Task(project, link.id);
+                children.push(SourceItem::new(task, link.title).icon(kylig_icons::CHAT_TEXT));
+                visible_tasks.insert((project.as_path(), link.id), link);
+                if active && current.in_tasks && current.focused == Some(link.id) {
+                    selection = task;
+                }
             }
-            matched = true;
-            let expanded = !query.is_empty()
-                || branch
-                    .and_then(|b| b.expanded)
-                    .unwrap_or(active || (current.project.is_none() && first == Some(project)));
-            ui.push_id(project, |ui| {
-                let row = ProjectRow { path: project, name, expanded, filter };
-                let attention_items = attention::project_attention(snapshot, project);
-                if ui
-                    .horizontal(|ui| {
-                        row.header(
-                            ui,
-                            active && current.in_tasks,
-                            !query.is_empty(),
-                            attention_items,
-                            &mut intent,
-                        )
-                    })
-                    .inner
-                {
-                    self.branches.entry(project.clone()).or_default().expanded = Some(!expanded);
+            if children.is_empty() {
+                if !project_matches {
+                    continue;
                 }
-                if expanded {
-                    egui::Frame::new()
-                        .inner_margin(egui::Margin { left: 14, ..egui::Margin::ZERO })
-                        .show(ui, |ui| {
-                            if filter != TaskFilter::Active {
-                                ui.weak(filter.label());
-                            }
-                            if links.is_empty() {
-                                if query.is_empty()
-                                    && filter == TaskFilter::Active
-                                    && !project_links.is_empty()
-                                {
-                                    if ui
-                                        .add(
-                                            egui::Button::new("Показать архив")
-                                                .frame_when_inactive(false),
-                                        )
-                                        .clicked()
-                                    {
-                                        intent = Some(Intent::Filter(
-                                            project.clone(),
-                                            TaskFilter::Archived,
-                                        ));
-                                    }
-                                } else {
-                                    ui.weak(if query.is_empty() && filter == TaskFilter::Active {
-                                        "Задач пока нет"
-                                    } else {
-                                        "Задачи не найдены"
-                                    });
-                                }
-                            }
-                            for link in links {
-                                let selected =
-                                    active && current.in_tasks && current.focused == Some(link.id);
-                                if ui
-                                    .push_id(link.id, |ui| {
-                                        row_button(ui, link, project, snapshot, selected)
-                                    })
-                                    .inner
-                                {
-                                    intent = Some(Intent::Chat(project.clone(), Some(link.id)));
-                                }
-                            }
-                        });
+                if query.is_empty() && filter == TaskFilter::Active && !links.is_empty() {
+                    children.push(
+                        SourceItem::new(Entry::Archive(project), "Показать архив")
+                            .icon(kylig_icons::ARCHIVE),
+                    );
                 }
-            });
-            ui.add_space(3.0);
+            }
+            let default_open = active
+                || !query.is_empty()
+                || self.branches.get(project).is_some_and(|b| b.filter.is_some())
+                || (current.project.is_none() && first == Some(project));
+            let mut root = SourceItem::new(key, name)
+                .icon(kylig_icons::FOLDER)
+                .children(children)
+                .open(default_open);
+            let attention = attention::project_attention(snapshot, project);
+            if attention > 0 {
+                root = root.badge(attention);
+            }
+            if filter != TaskFilter::Active && !self.archive {
+                root = root.detail(filter.label());
+            }
+            if active && current.in_tasks && selection == Entry::None {
+                selection = key;
+            }
+            roots.push(root);
         }
-        if !matched {
-            ui.weak(if self.catalog.projects.is_empty() && self.catalog.pending.is_some() {
-                "Загружаем проекты…"
+        if roots.is_empty() {
+            if self.catalog.projects.is_empty() && self.catalog.pending.is_some() {
+                ui.horizontal(|ui| {
+                    ui.add(kylig_ui::ProgressRing::indeterminate().size(18.0));
+                    ui.weak("Загружаем проекты…");
+                });
             } else if self.catalog.projects.is_empty() {
-                "Проектов пока нет"
+                ui.weak("Проектов пока нет");
             } else {
-                "Задачи не найдены"
-            });
+                ui.weak("Совпадений нет. Измените запрос.");
+            }
+            return None;
+        }
+        let sections = [SourceSection::new("").items(roots)];
+        // Leave a separate hit target for project actions and real-time task indicators.
+        let width = ui.available_width();
+        let height = theme::remaining_height(ui).max(80.0);
+        let list = ui
+            .allocate_ui_with_layout(
+                egui::vec2((width - MENU_SIZE - 3.0).max(1.0), height),
+                egui::Layout::top_down(egui::Align::Min),
+                |ui| {
+                    SourceList::new(&mut selection, &sections)
+                        .id_salt(("projects-tree", &query, self.archive))
+                        .show(ui)
+                },
+            )
+            .inner;
+        self.tree_actions(ui, list, &visible_tasks, snapshot)
+    }
+
+    fn tree_actions(
+        &self,
+        ui: &mut egui::Ui,
+        list: SourceListResponse<Entry<'_>>,
+        tasks: &BTreeMap<(&Path, u64), &TaskLink<'_>>,
+        snapshot: &Snapshot,
+    ) -> Option<Intent> {
+        let right = list.response.rect.right() + 3.0;
+        let mut intent = match list.selected {
+            Some(Entry::Project(path, _)) => Some(Intent::Chat(path.to_owned(), None)),
+            Some(Entry::Task(path, id)) => Some(Intent::Chat(path.to_owned(), Some(id))),
+            Some(Entry::Archive(path)) => {
+                Some(Intent::Filter(path.to_owned(), TaskFilter::Archived))
+            }
+            _ => None,
+        };
+        for (key, rect) in list.item_rects {
+            let accessory = egui::Rect::from_min_size(
+                egui::pos2(right, rect.top()),
+                egui::vec2(MENU_SIZE, rect.height()),
+            );
+            match key {
+                Entry::Project(path, _) if rect.height() >= MENU_SIZE - 1.0 => {
+                    let Some(name) = self.catalog.projects.get(path) else { continue };
+                    let mut controls = ui.new_child(
+                        egui::UiBuilder::new().id_salt(("project-menu", path)).max_rect(accessory),
+                    );
+                    project_menu(&mut controls, path, name, self.filter_for(path), &mut intent);
+                    ui.interact(
+                        rect,
+                        ui.scope_id().with(("project-path", path)),
+                        egui::Sense::hover(),
+                    )
+                    .on_hover_text(path.display().to_string());
+                }
+                Entry::Task(path, id) => {
+                    let Some(link) = tasks.get(&(path, id)) else { continue };
+                    let (mark, state) = link.mark(path, snapshot);
+                    if rect.height() >= 10.0 {
+                        mark.paint(ui, accessory.center());
+                    }
+                    ui.interact(
+                        rect.union(accessory),
+                        ui.scope_id().with(("task-detail", path, id)),
+                        egui::Sense::hover(),
+                    )
+                    .on_hover_text(format!("{}\n#{id} · {} · {state}", link.title, link.backend));
+                }
+                _ => {}
+            }
         }
         intent
     }
@@ -637,45 +614,47 @@ impl State {
         snapshot: &Snapshot,
         current: Current<'_>,
     ) -> Option<Intent> {
-        ui.spacing_mut().button_padding = egui::vec2(8.0, 5.0);
-        ui.spacing_mut().item_spacing = egui::vec2(3.0, 3.0);
-        ui.spacing_mut().interact_size.y = 29.0;
-        ui.strong("Проекты");
-        ui.add_space(6.0);
-        ui.add(
-            egui::TextEdit::singleline(&mut self.query)
-                .id_salt("tree-search")
-                .desired_width(f32::INFINITY)
-                .char_limit(256)
-                .margin(egui::Margin::symmetric(8, 5))
-                .hint_text("Найти задачу"),
-        )
-        .on_hover_text("Название проекта или задачи, текст поручения, #номер задачи");
-        ui.add_space(6.0);
-        let max_height = (ui.available_height() - 88.0).max(52.0);
-        let mut intent = egui::ScrollArea::vertical()
-            .id_salt("tree-projects")
-            .max_height(max_height)
-            .auto_shrink([false, true])
-            .show(ui, |ui| self.tree(ui, snapshot, current))
-            .inner;
-        ui.add_space(8.0);
-        if ui.button("+  Новая задача").clicked() {
-            let project = current
-                .project
-                .filter(|path| self.catalog.projects.contains_key(*path))
-                .or_else(|| self.catalog.projects.keys().next().map(PathBuf::as_path));
-            intent = Some(Intent::New(project.map(Path::to_owned)));
-        }
-        if ui
-            .add_enabled(
-                self.picker.is_none(),
-                egui::Button::new("Открыть папку…").frame_when_inactive(false),
-            )
-            .clicked()
-        {
-            self.pick(ui.ctx());
-        }
+        let mut intent = None;
+        ui.horizontal(|ui| {
+            ui.heading("Проекты");
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add(kylig_ui::IconButton::new(kylig_icons::PLUS, "Новая задача")).clicked()
+                {
+                    let project = current
+                        .project
+                        .filter(|p| self.catalog.projects.contains_key(*p))
+                        .or_else(|| self.catalog.projects.keys().next().map(PathBuf::as_path));
+                    intent = Some(Intent::New(project.map(Path::to_owned)));
+                }
+                if !self.catalog.projects.is_empty()
+                    && ui
+                        .add_enabled(
+                            self.picker.is_none(),
+                            kylig_ui::IconButton::new(kylig_icons::FOLDER_OPEN, "Открыть папку…"),
+                        )
+                        .clicked()
+                {
+                    self.pick(ui.ctx());
+                }
+            });
+        });
+        ui.horizontal_wrapped(|ui| {
+            for (archive, label) in [(false, "Текущие"), (true, "Архив")] {
+                if ui.selectable_label(self.archive == archive, label).clicked() {
+                    self.archive = archive;
+                    for branch in self.branches.values_mut() {
+                        branch.filter = None;
+                    }
+                }
+            }
+        });
+        kylig_ui::SearchField::new(&mut self.query)
+            .id_salt("tree-search")
+            .placeholder("Найти задачу или проект")
+            .width(ui.available_width())
+            .show(ui)
+            .response
+            .on_hover_text("Название проекта или задачи, текст поручения, #номер задачи");
         if let Some(error) = self
             .error
             .as_ref()
@@ -684,7 +663,17 @@ impl State {
         {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
-        intent
+        if self.catalog.projects.is_empty()
+            && ui
+                .add_enabled(
+                    self.picker.is_none(),
+                    kylig_ui::Button::new("Открыть папку…").icon(kylig_icons::FOLDER_OPEN),
+                )
+                .clicked()
+        {
+            self.pick(ui.ctx());
+        }
+        intent.or_else(|| self.tree(ui, snapshot, current))
     }
 }
 
@@ -706,7 +695,6 @@ impl TasksView {
         self.leave_review();
         self.page = Page::Task;
         let branch = self.sidebar.branches.entry(project.to_owned()).or_default();
-        branch.expanded = Some(true);
         self.focused = id.or(branch.last_task);
         branch.last_task = self.focused;
         self.result_view.select(tab, self.focused);
@@ -714,7 +702,9 @@ impl TasksView {
 
     pub(super) fn navigate(&mut self, project: &Path, id: Option<u64>, tab: Tab) {
         self.sidebar.query.clear();
-        self.sidebar.branches.entry(project.to_owned()).or_default().filter = TaskFilter::Active;
+        self.sidebar.archive = false;
+        self.sidebar.drawer = false;
+        self.sidebar.branches.entry(project.to_owned()).or_default().filter = None;
         self.select_project_task(project, id, tab);
     }
 
@@ -723,8 +713,7 @@ impl TasksView {
             Intent::Chat(p, _) | Intent::Memory(p) | Intent::Rules(p) | Intent::New(Some(p)) => p,
             Intent::Filter(path, filter) => {
                 let branch = self.sidebar.branches.entry(path.clone()).or_default();
-                branch.filter = *filter;
-                branch.expanded = Some(true);
+                branch.filter = Some(*filter);
                 return Ok(None);
             }
             Intent::New(None) => {
@@ -739,19 +728,32 @@ impl TasksView {
         self.select_project_task(&project, task, Tab::Chat);
         match intent {
             Intent::Memory(_) => return Ok(Some(SidebarAction::Memory(project))),
-            Intent::Rules(_) => self.page = Page::Rules,
+            Intent::Rules(_) => self.open_rules(),
             Intent::New(_) => self.page = Page::New,
             Intent::Filter(..) | Intent::Chat(..) => {}
         }
         Ok(Some(SidebarAction::Tasks))
     }
 
-    pub(in crate::gui) fn project_navigation(
+    pub(in crate::gui) fn current_project(&self) -> Option<&Path> {
+        let scope = self.scope.as_ref().map(|(_, path, _)| path.as_path());
+        if self.local_mode == Some(true) {
+            self.local_project.opened()
+        } else {
+            scope.or_else(|| self.local_project.opened())
+        }
+    }
+
+    pub(in crate::gui) fn project_choices(
         &mut self,
-        ui: &mut egui::Ui,
+        ctx: &egui::Context,
         snapshot: &Snapshot,
-        in_tasks: bool,
-    ) -> Option<SidebarAction> {
+    ) -> &BTreeMap<PathBuf, String> {
+        self.refresh_projects(ctx, snapshot);
+        &self.sidebar.catalog.projects
+    }
+
+    pub(super) fn refresh_projects(&mut self, ctx: &egui::Context, snapshot: &Snapshot) {
         let project = self.scope.as_ref().map(|(_, path, _)| path.as_path());
         let local = self.local_project.opened();
         self.sidebar.catalog.update(
@@ -764,8 +766,17 @@ impl TasksView {
                     .chain(project.into_iter().chain(local).map(Path::to_owned)),
                 self.sidebar.home.get_or_insert_with(crate::gui::home_or_root),
             ),
-            ui.ctx(),
+            ctx,
         );
+    }
+
+    fn project_navigation(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: &Snapshot,
+    ) -> Option<SidebarAction> {
+        let project = self.scope.as_ref().map(|(_, path, _)| path.as_path());
+        let local = self.local_project.opened();
         let selected = if self.local_mode == Some(true) { local } else { project.or(local) };
         let current = Current {
             project: selected,
@@ -775,52 +786,10 @@ impl TasksView {
                 && self.refreshed.is_some()
                 && (self.error.is_none() || !self.tasks.is_empty()))
             .then_some(self.tasks.as_slice()),
-            in_tasks: in_tasks && self.page == Page::Task,
+            in_tasks: self.page == Page::Task,
         };
         let picked = self.sidebar.picked(ui.ctx()).map(|project| Intent::Chat(project, None));
-        let frame = egui::Frame::new()
-            .fill(ui.visuals().faint_bg_color)
-            .inner_margin(egui::Margin::symmetric(10, 12));
-        let intent = if ui.available_width() < 660.0 {
-            egui::Panel::top("compact-project-navigation")
-                .frame(
-                    egui::Frame::new()
-                        .fill(ui.visuals().faint_bg_color)
-                        .inner_margin(egui::Margin::symmetric(9, 3)),
-                )
-                .show(ui, |ui| {
-                    if ui.button("Проекты").clicked() {
-                        self.sidebar.drawer = true;
-                    }
-                });
-            if self.sidebar.drawer {
-                let rect = ui.available_rect_before_wrap();
-                let id = egui::Id::new("project-drawer");
-                let area = egui::Modal::default_area(id).anchor(
-                    egui::Align2::LEFT_TOP,
-                    egui::vec2(0.0, rect.top() - ui.ctx().content_rect().top()),
-                );
-                let modal = egui::Modal::new(id).frame(frame).area(area).show(ui.ctx(), |ui| {
-                    ui.set_width((rect.width() - 40.0).clamp(140.0, 280.0));
-                    ui.set_max_height((rect.height() - 32.0).max(160.0));
-                    self.sidebar.contents(ui, snapshot, current)
-                });
-                if modal.should_close() {
-                    self.sidebar.drawer = false;
-                }
-                modal.inner
-            } else {
-                None
-            }
-        } else {
-            self.sidebar.drawer = false;
-            egui::Panel::left("task-project-navigation")
-                .default_size(226.0)
-                .size_range(176.0..=320.0)
-                .frame(frame)
-                .show(ui, |ui| self.sidebar.contents(ui, snapshot, current))
-                .inner
-        };
+        let intent = self.sidebar.contents(ui, snapshot, current);
         match self.apply_navigation(&picked.or(intent)?) {
             Ok(action) => {
                 self.sidebar.error = None;
@@ -834,6 +803,79 @@ impl TasksView {
                 None
             }
         }
+    }
+    fn layout(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: &Snapshot,
+        mut body: impl FnMut(&mut Self, &mut egui::Ui),
+    ) -> Option<SidebarAction> {
+        self.refresh_projects(ui.ctx(), snapshot);
+        if ui.available_width() < 770.0 {
+            ui.horizontal_wrapped(|ui| {
+                let label = if self.sidebar.drawer {
+                    "Закрыть список"
+                } else {
+                    "Проекты и задачи"
+                };
+                if ui.add(kylig_ui::Button::new(label).icon(kylig_icons::FOLDERS).ghost()).clicked()
+                {
+                    self.sidebar.drawer = !self.sidebar.drawer;
+                }
+                if !self.sidebar.drawer
+                    && self.page == Page::Task
+                    && let (Some(project), Some(id)) = (self.current_project(), self.focused)
+                {
+                    let name = self.sidebar.catalog.projects.get(project).map_or_else(
+                        || project.file_name().unwrap_or(project.as_os_str()).to_string_lossy(),
+                        |name| name.as_str().into(),
+                    );
+                    ui.weak(format!("{name} / #{id}"));
+                }
+            });
+            if self.sidebar.drawer {
+                self.project_navigation(ui, snapshot)
+            } else {
+                body(self, ui);
+                None
+            }
+        } else {
+            self.sidebar.drawer = false;
+            let mut action = None;
+            theme::workspace_panes(ui, "task-panes", |ui, sidebar| {
+                if sidebar {
+                    action = self.project_navigation(ui, snapshot);
+                } else {
+                    body(self, ui);
+                }
+            });
+            action
+        }
+    }
+
+    pub(in crate::gui) fn show_workspace(
+        &mut self,
+        ui: &mut egui::Ui,
+        snapshot: &Snapshot,
+        send: &mut impl FnMut(super::Command),
+    ) -> Option<SidebarAction> {
+        self.layout(ui, snapshot, |tasks, ui| {
+            if tasks.page == Page::Task
+                && tasks.local_mode.is_none()
+                && tasks.selected.is_none()
+                && tasks.current_project().is_none()
+            {
+                if let Some(project) = tasks.sidebar.catalog.projects.keys().next().cloned() {
+                    if let Err(error) = tasks.apply_navigation(&Intent::Chat(project, None)) {
+                        tasks.sidebar.error = Some(error);
+                    }
+                } else if tasks.sidebar.catalog.pending.is_some() {
+                    ui.add(kylig_ui::ProgressRing::indeterminate().size(22.0));
+                    return;
+                }
+            }
+            tasks.show(ui, snapshot, send);
+        })
     }
 }
 
@@ -949,7 +991,7 @@ mod tests {
                     ..Default::default()
                 },
                 |ui| {
-                    if let Some(action) = self.view.project_navigation(ui, &self.snapshot, true) {
+                    if let Some(action) = self.view.layout(ui, &self.snapshot, |_, _| {}) {
                         self.last = Some(action);
                     }
                 },
@@ -1001,6 +1043,32 @@ mod tests {
     }
 
     #[test]
+    fn opening_tasks_uses_the_first_resolved_project_without_replacing_a_new_task_draft() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("Atlas");
+        std::fs::create_dir(&project).unwrap();
+        let snapshot = Snapshot { saved: Some(settings(root.path())), ..Default::default() };
+        let mut screen = Screen::themed(snapshot);
+        screen.wait_until("Атлас", 1.0);
+        let draw_workspace = |screen: &mut Screen| {
+            let mut output = screen.ctx.run_ui(egui::RawInput::default(), |ui| {
+                screen.view.show_workspace(ui, &screen.snapshot, &mut |_| {});
+            });
+            output.textures_delta.clear();
+        };
+        screen.view.page = Page::New;
+        screen.view.prompt = "Черновик".into();
+        draw_workspace(&mut screen);
+        assert!(screen.view.current_project().is_none());
+        assert_eq!(screen.view.prompt, "Черновик");
+        screen.view = TasksView::default();
+        screen.wait_until("Атлас", 1.0);
+        draw_workspace(&mut screen);
+        let expected = checked_project(&project, None).unwrap();
+        assert_eq!(screen.view.current_project(), Some(expected.as_path()));
+    }
+
+    #[test]
     fn tree_search_archive_and_project_menu_target_the_right_folder() {
         let root = tempfile::tempdir().unwrap();
         let atlas = root.path().join("Atlas");
@@ -1029,7 +1097,7 @@ mod tests {
         screen.view.navigate(&atlas, None, Tab::Chat);
         screen.view.set_scope(Some((None, atlas.clone(), BackendKind::Codex)));
         screen.view.refreshed = Some(Instant::now());
-        screen.click("Найти задачу", 0);
+        screen.click("Найти задачу или проект", 0);
         screen.draw(vec![egui::Event::Text("СОБРАТЬ".into())]);
         screen.click("Первая", 0);
         assert_eq!(screen.last, Some(SidebarAction::Tasks));
@@ -1038,13 +1106,13 @@ mod tests {
         screen.view.tasks = book.tasks().to_vec();
         screen.view.refreshed = Some(Instant::now());
         screen.view.sidebar.query.clear();
-        screen.click("...", 1);
+        screen.click(kylig_icons::DOTS_THREE, 1);
         screen.click("Фильтр задач", 0);
-        screen.click("Архив", 0);
-        assert_eq!(screen.view.sidebar.branches[&hub].filter, TaskFilter::Archived);
+        screen.click("Архив", 1);
+        assert_eq!(screen.view.sidebar.branches[&hub].filter, Some(TaskFilter::Archived));
         screen.click("Старый отчёт", 0);
         assert_eq!(screen.view.focused, Some(archived));
-        screen.click("...", 0);
+        screen.click(kylig_icons::DOTS_THREE, 0);
         screen.click("Память проекта", 0);
         assert_eq!(screen.last, Some(SidebarAction::Memory(atlas.clone())));
         assert_eq!(screen.view.local_project.opened(), Some(atlas.as_path()));
@@ -1069,7 +1137,7 @@ mod tests {
         tx.send(Some(path.clone())).unwrap();
         screen.draw(Vec::new());
         assert_eq!(screen.last, Some(SidebarAction::Tasks));
-        screen.click("...", 0);
+        screen.click(kylig_icons::DOTS_THREE, 0);
         screen.click("Память проекта", 0);
         assert_eq!(screen.last, Some(SidebarAction::Memory(path)));
     }
@@ -1143,6 +1211,34 @@ mod tests {
                     .unwrap(),
                 ]),
             }),
+        }
+    }
+
+    #[test]
+    fn project_and_task_icons_follow_their_rows_in_both_layouts_and_themes() {
+        let project = tempfile::tempdir().unwrap();
+        let path = checked_project(project.path(), None).unwrap();
+        let name = path.file_name().unwrap().to_str().unwrap();
+        let mut book = TaskBook::default();
+        let id = book.create(path.clone(), "codex", "Разобрать журнал", "Собрать").unwrap();
+        let snapshot = Snapshot {
+            task_index: Ok(vec![TaskRow::from(book.get(id).unwrap())]),
+            ..Default::default()
+        };
+        let mut screen = Screen::themed(snapshot);
+        for width in [1024.0, 640.0] {
+            screen.width = width;
+            screen.view.sidebar.drawer = width < 770.0;
+            screen.wait_until("Разобрать журнал", 1.0);
+            for theme in [egui::Theme::Light, egui::Theme::Dark] {
+                let labels = text_labels(&screen.frame(Vec::new(), 2.0, Some(theme)));
+                let position = |label| labels.iter().find(|(text, _)| text == label).unwrap().1;
+                let folder = position(kylig_icons::FOLDER);
+                let chat = position(kylig_icons::CHAT_TEXT);
+                assert!(folder.x < position(name).x && (folder.y - position(name).y).abs() < 2.0);
+                assert!(chat.x > folder.x && chat.x < position("Разобрать журнал").x);
+                assert!((chat.y - position("Разобрать журнал").y).abs() < 2.0);
+            }
         }
     }
 
@@ -1228,7 +1324,9 @@ mod tests {
             ..Default::default()
         });
         let accent = egui::Color32::from_rgb(13, 100, 79);
-        let settled = screen.wait_until("Рабочая задача", 0.0);
+        let _ = screen.wait_until("Рабочая задача", 0.0);
+        // Let the search field and split divider settle before measuring the task pulse.
+        let settled = screen.wait_until("Рабочая задача", 1.6);
         assert!(
             dots(&settled).iter().any(|dot| dot.fill == accent),
             "the pulse starts at full opacity"
@@ -1240,13 +1338,13 @@ mod tests {
             if Duration::from_millis(400) <= delay && delay <= Duration::from_millis(500) {
                 break;
             }
-            delay = repaint_delay(&screen.wait_until("Рабочая задача", 0.0));
+            delay = repaint_delay(&screen.wait_until("Рабочая задача", 1.6));
         }
         assert!(
             Duration::from_millis(400) <= delay && delay <= Duration::from_millis(500),
             "a running task schedules the next pulse frame, got {delay:?}"
         );
-        let faded = screen.wait_until("Рабочая задача", 0.8);
+        let faded = screen.wait_until("Рабочая задача", 2.4);
         assert!(
             dots(&faded).iter().any(|dot| (70..=110).contains(&dot.fill.a())),
             "half a period later the running dot is dimmed near the mockup's 0.35"
@@ -1255,7 +1353,7 @@ mod tests {
         // Mock time keeps moving forward: a frame fed an earlier clock than the pulse
         // frame above leaves egui's animation manager mid-tween, and that pins the
         // repaint delay to zero regardless of the running dots.
-        let calm = screen.wait_until("Задача с вопросом", 1.6);
+        let calm = screen.wait_until("Задача с вопросом", 3.2);
         assert_eq!(
             repaint_delay(&calm),
             Duration::MAX,
@@ -1306,7 +1404,7 @@ mod tests {
             "the clean project shows no badge"
         );
         // The chip must not push the project menu out of the row.
-        screen.click("...", 0);
+        screen.click(kylig_icons::DOTS_THREE, 0);
         let menu = screen.draw(Vec::new());
         assert!(
             menu.iter().any(|(text, _)| text == "Новая задача"),
@@ -1339,7 +1437,7 @@ mod tests {
             last: None,
         };
         assert!(!screen.draw(Vec::new()).iter().any(|(label, _)| label == "Доступная задача"));
-        screen.click("Проекты", 0);
+        screen.click("Проекты и задачи", 0);
         screen.click("Показать архив", 0);
         assert!(screen.view.sidebar.drawer);
         screen.click("Доступная задача", 0);

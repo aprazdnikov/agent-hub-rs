@@ -3,6 +3,10 @@
 use eframe::egui;
 use hub_core::domain::BackendKind;
 use hub_core::settings::{Field, FieldError};
+use kylig_ui::{
+    Chip, DepthSelect, Segmented, Select, SelectItem, SourceItem, SourceList, SourceSection,
+    TabsOptions,
+};
 
 use crate::gui::look::agent_title;
 
@@ -46,16 +50,14 @@ impl Section {
 
     pub const fn description(self) -> &'static str {
         match self {
-            Self::Telegram => {
-                "Подключение бота и пользователи, которым разрешено запускать задачи."
-            }
-            Self::Workspace => "Папка для работы агентов и место хранения снимков сессий.",
-            Self::Agents => "Общие параметры и настройки каждого агента.",
-            Self::Projects => "Готовые профили каталогов, агентов и проверок ресурсов.",
-            Self::Actions => "Команды для ручного запуска из Telegram.",
-            Self::Speech => "Распознавание аудио для постановки задач агентам.",
-            Self::Application => "Системная тема, автозапуск и проверка новых версий.",
-            Self::Diagnostics => "Состояние подключений и журнал приложения.",
+            Self::Telegram => "Бот и участники, которым разрешено запускать задачи.",
+            Self::Workspace => "Хранилище проектов и снимков сессий.",
+            Self::Agents => "Роли, модели и разрешения для запуска.",
+            Self::Projects => "Каталоги, агенты, команды и проверки ресурсов проектов.",
+            Self::Actions => "Именованные команды для запуска через /actions в Telegram.",
+            Self::Speech => "Распознавание аудио в голосовых задачах.",
+            Self::Application => "Оформление, запуск при входе и обновления приложения.",
+            Self::Diagnostics => "Подключения, доступность агентов и журнал приложения.",
         }
     }
 
@@ -129,85 +131,144 @@ impl AgentPage {
         }
     }
 
-    pub fn show(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
-        ui.horizontal_wrapped(|ui| {
-            for page in std::iter::once(Self::General).chain(BackendKind::ALL.map(Self::Backend)) {
-                let count = errors
-                    .iter()
-                    .filter(|error| Self::for_field(error.field) == Some(page))
-                    .count();
-                let label = if count == 0 {
-                    page.title().to_owned()
-                } else {
-                    format!("{} ({count})", page.title())
-                };
-                ui.selectable_value(self, page, label);
-            }
-        });
+    const fn summary(self) -> &'static str {
+        match self {
+            Self::General => "Роли и время ожидания",
+            Self::Backend(BackendKind::Claude) => "Разрешения и бюджет",
+            Self::Backend(BackendKind::Codex) => "Песочница и одобрения",
+            Self::Backend(BackendKind::Qwen) => "Подключение API",
+            Self::Backend(BackendKind::Hermes) => "Профиль и одобрения",
+            Self::Backend(BackendKind::Opencode) => "Команда запуска и модель",
+            Self::Backend(BackendKind::Pi) => "Модель и размышления",
+        }
     }
-}
 
-pub fn show(ui: &mut egui::Ui, section: &mut Section, errors: &[FieldError]) {
-    if ui.available_width() < 760.0 {
-        ui.horizontal(|ui| {
-            ui.strong("Настройки");
-            egui::ComboBox::from_id_salt("settings_section")
-                .selected_text(section.label(errors))
-                .width(240.0)
-                .show_ui(ui, |ui| {
-                    for page in Section::ALL {
-                        ui.selectable_value(section, page, page.label(errors));
-                    }
+    pub fn show(&mut self, ui: &mut egui::Ui, errors: &[FieldError]) {
+        let pages = std::iter::once(Self::General)
+            .chain(BackendKind::ALL.map(Self::Backend))
+            .collect::<Vec<_>>();
+        let width = ui.available_width();
+        let wide = width >= 570.0;
+        let stack_width = if wide { (width * 0.47).min(420.0) } else { width };
+        let render = |ui: &mut egui::Ui| {
+            let mut index = pages.iter().position(|page| page == self).unwrap_or_default();
+            let card_width = (stack_width - 48.0 - ui.spacing().item_spacing.x * 1.5).max(1.0);
+            DepthSelect::new(&mut index, pages.len())
+                .id_salt("agent-editor-stack")
+                .visible(3)
+                .offset(9.0)
+                .looping(true)
+                .wheel(false)
+                .card_radius(10.0)
+                .card_size(egui::vec2(card_width, 92.0))
+                .card_fill(ui.visuals().widgets.inactive.weak_bg_fill)
+                .show(ui, |ui, index| {
+                    let Some(page) = pages.get(index) else { return };
+                    ui.style_mut().interaction.selectable_labels = false;
+                    ui.spacing_mut().item_spacing = egui::vec2(8.0, 6.0);
+                    ui.horizontal(|ui| {
+                        let icon = if *page == Self::General {
+                            kylig_icons::SLIDERS_HORIZONTAL
+                        } else {
+                            kylig_icons::TERMINAL_WINDOW
+                        };
+                        ui.add(
+                            kylig_icons::Icon::new(icon)
+                                .size(20.0)
+                                .color(ui.visuals().selection.stroke.color),
+                        );
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(page.title()).strong().size(22.0))
+                                .truncate(),
+                        );
+                    });
+                    ui.add(egui::Label::new(egui::RichText::new(page.summary()).weak()).truncate());
                 });
-        });
-        ui.add_space(12.0);
-    } else {
-        egui::Panel::left("settings_navigation")
-            .exact_size(218.0)
-            .resizable(false)
-            .frame(egui::Frame::new().fill(ui.visuals().panel_fill).inner_margin(16))
-            .show(ui, |ui| {
-                egui::ScrollArea::vertical().id_salt("settings_navigation_scroll").show(ui, |ui| {
-                    ui.add_space(4.0);
-                    ui.label(egui::RichText::new("Настройки").size(20.0).strong());
-                    ui.add_space(22.0);
-                    for page in Section::ALL {
-                        if matches!(page, Section::Projects | Section::Application) {
-                            ui.add_space(16.0);
-                            ui.weak(if page == Section::Projects {
-                                "Рабочие процессы"
-                            } else {
-                                "Приложение"
-                            });
-                            ui.add_space(4.0);
-                        }
+            if let Some(page) = pages.get(index) {
+                *self = *page;
+            }
+            ui.vertical(|ui| {
+                ui.spacing_mut().item_spacing.y = 6.0;
+                ui.strong("Выбрать редактор");
+                ui.horizontal_wrapped(|ui| {
+                    ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                    for &page in &pages {
                         let count = errors
                             .iter()
-                            .filter(|error| Section::for_field(error.field) == page)
+                            .filter(|error| Self::for_field(error.field) == Some(page))
                             .count();
-                        let label = egui::RichText::new(page.title());
-                        let label = if count > 0 {
-                            label.color(ui.visuals().error_fg_color)
+                        let label = if count == 0 {
+                            page.title().into()
                         } else {
-                            label
+                            format!("{} ({count})", page.title())
                         };
-                        ui.horizontal(|ui| {
-                            if ui
-                                .add_sized(
-                                    [ui.available_width() - 24.0, 34.0],
-                                    egui::Button::selectable(*section == page, "").left_text(label),
-                                )
-                                .clicked()
-                            {
-                                *section = page;
-                            }
-                            if count > 0 {
-                                ui.colored_label(ui.visuals().error_fg_color, count.to_string())
-                                    .on_hover_text("Есть поля, которые нужно исправить");
-                            }
-                        });
+                        if Chip::new(label).selected(*self == page).show(ui).response.clicked() {
+                            *self = page;
+                        }
                     }
                 });
             });
+        };
+        if wide {
+            ui.horizontal(render);
+        } else {
+            ui.vertical(render);
+        }
     }
+}
+
+pub fn agent_choice(ui: &mut egui::Ui, label: &str, selected: &mut BackendKind) {
+    ui.push_id(label, |ui| {
+        ui.spacing_mut().item_spacing.y = 6.0;
+        ui.label(label);
+        if ui.available_width() >= 450.0 {
+            Segmented::new(selected, BackendKind::ALL.map(|kind| (kind, agent_title(kind))))
+                .options(TabsOptions { padding: 10.0, ..Default::default() })
+                .show(ui);
+        } else {
+            ui.horizontal_wrapped(|ui| {
+                ui.spacing_mut().item_spacing = egui::vec2(6.0, 6.0);
+                for kind in BackendKind::ALL {
+                    if Chip::new(agent_title(kind))
+                        .selected(*selected == kind)
+                        .show(ui)
+                        .response
+                        .clicked()
+                    {
+                        *selected = kind;
+                    }
+                }
+            });
+        }
+    });
+}
+
+pub fn compact(ui: &mut egui::Ui, section: &mut Section, errors: &[FieldError]) {
+    ui.horizontal_wrapped(|ui| {
+        ui.heading("Настройки");
+        let items = Section::ALL.map(|page| SelectItem::new(page, page.label(errors)));
+        ui.add(
+            Select::new(section, &items)
+                .id_salt("settings-sections")
+                .search(false)
+                .width(ui.available_width().min(230.0)),
+        );
+    });
+}
+
+pub fn sidebar(ui: &mut egui::Ui, section: &mut Section, errors: &[FieldError]) {
+    let group = |label, pages: &[Section]| {
+        SourceSection::new(label).collapsible(false).items(pages.iter().map(|&page| {
+            let item = SourceItem::new(page, page.title());
+            let count =
+                errors.iter().filter(|error| Section::for_field(error.field) == page).count();
+            if count > 0 { item.badge(count) } else { item }
+        }))
+    };
+    let sections = [
+        group("Подключения", &[Section::Telegram, Section::Workspace, Section::Agents]),
+        group("Рабочие процессы", &[Section::Projects, Section::Actions, Section::Speech]),
+        group("Приложение", &[Section::Application, Section::Diagnostics]),
+    ];
+    SourceList::new(section, &sections).id_salt("settings-navigation").show(ui);
 }

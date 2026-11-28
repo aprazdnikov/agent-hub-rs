@@ -8,56 +8,17 @@ use crate::{
     local_execution::{Interaction, Kind, Live},
 };
 use eframe::egui;
-use hub_core::domain::{BackendKind, ToolRequest};
+use hub_core::domain::BackendKind;
 use std::{
     borrow::Cow,
     collections::BTreeMap,
     path::{Path, PathBuf},
-    sync::Arc,
 };
 use uuid::Uuid;
 
 #[derive(Default)]
 pub(super) struct Inbox {
     project: Option<PathBuf>,
-    details: Option<(Uuid, Uuid)>,
-}
-
-/// Spec «Входящие»: collapsed permission summary shows up to 3 visual rows.
-const SUMMARY_LINES: usize = 3;
-
-/// Visual rows a monospace permission summary takes at the width `decision`
-/// renders it — a single long command line wraps into several rows, so the
-/// collapse decision must count rows, not logical lines.
-fn summary_rows(ui: &egui::Ui, summary: &str) -> usize {
-    let mut job = egui::WidgetText::from(egui::RichText::new(summary).monospace()).into_layout_job(
-        ui.style(),
-        egui::FontSelection::Default,
-        egui::Align::Min,
-    );
-    Arc::make_mut(&mut job).wrap.max_width = ui.available_width();
-    ui.fonts_mut(|fonts| fonts.layout_job(Arc::unwrap_or_clone(job))).rows.len()
-}
-
-fn clamp_lines(summary: &str) -> String {
-    let mut lines = summary.lines();
-    let head = lines.by_ref().take(SUMMARY_LINES).collect::<Vec<_>>().join("\n");
-    if lines.next().is_some() { format!("{head}…") } else { head }
-}
-
-/// Request as rendered: collapsed permission cards show the logically clamped
-/// summary so the visual `max_rows` clamp never hides a revealed tail from tests.
-fn shown_request(request: &Interaction, collapsed: bool) -> Cow<'_, Interaction> {
-    match &request.kind {
-        Kind::Permission(tool) if collapsed => Cow::Owned(Interaction {
-            id: request.id,
-            kind: Kind::Permission(ToolRequest {
-                tool: tool.tool.clone(),
-                summary: clamp_lines(&tool.summary),
-            }),
-        }),
-        Kind::Permission(_) | Kind::Questions(_) => Cow::Borrowed(request),
-    }
 }
 
 pub(super) fn jobs(snapshot: &Snapshot) -> impl Iterator<Item = &Live> {
@@ -122,33 +83,40 @@ fn project_label<'a>(path: &'a Path, projects: &Projects<'a>) -> Cow<'a, str> {
 }
 
 impl Inbox {
-    fn heading(&mut self, ui: &mut egui::Ui, projects: &Projects<'_>) {
-        let width = ui.available_width().min(1040.0);
-        let filter = |ui: &mut egui::Ui| {
-            let selected =
-                self.project.as_deref().map_or(Cow::Borrowed("Все проекты"), |project| {
-                    project_label(project, projects)
-                });
-            egui::ComboBox::from_id_salt("inbox_project")
-                .width((width * 0.42).min(205.0))
-                .selected_text(selected.as_ref())
-                .truncate()
-                .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.project, None, "Все проекты");
-                    for &project in projects.keys() {
-                        ui.selectable_value(
-                            &mut self.project,
-                            Some(project.to_path_buf()),
-                            project_label(project, projects).as_ref(),
-                        )
-                        .on_hover_text(project.display().to_string());
+    fn empty(&mut self, ui: &mut egui::Ui) -> bool {
+        theme::card(ui)
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                ui.heading("Входящие разобраны");
+                ui.label("Здесь появятся новые вопросы и готовые результаты.");
+                ui.horizontal_wrapped(|ui| {
+                    if self.project.is_some()
+                        && ui.add(kylig_ui::Button::new("Показать все проекты")).clicked()
+                    {
+                        self.project = None;
                     }
-                });
-        };
-        ui.horizontal_wrapped(|ui| {
-            ui.heading("Входящие");
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), filter);
-        });
+                    ui.add(kylig_ui::Button::new("К задачам проекта")).clicked()
+                })
+                .inner
+            })
+            .inner
+    }
+
+    fn heading(&mut self, ui: &mut egui::Ui, projects: &Projects<'_>) {
+        ui.heading("Входящие");
+        ui.weak("Вопросы агентов и результаты, которые ждут вашего решения.");
+        ui.add_space(12.0);
+        let choices = std::iter::once(theme::Choice::new(None, "Все проекты", ""))
+            .chain(projects.iter().map(|(&project, name)| {
+                theme::Choice::new(Some(project.to_owned()), name.to_string(), "")
+                    .with_path(&project.to_string_lossy())
+            }))
+            .collect::<Vec<_>>();
+        if let Some(value) =
+            theme::detailed_select(ui, "Проект", "Все проекты", &self.project, &choices, 360.0)
+        {
+            self.project.clone_from(value);
+        }
         ui.add_space(8.0);
     }
 }
@@ -165,7 +133,6 @@ impl<'a> Item<'a> {
         self,
         ui: &mut egui::Ui,
         project: &str,
-        inbox: &mut Inbox,
         panel: &mut local::Panel,
         send: &mut impl FnMut(Command),
     ) -> Option<(&'a TaskRow, Tab)> {
@@ -173,52 +140,34 @@ impl<'a> Item<'a> {
             Self::Request(live, request, row) => {
                 let key = (live.token, request.id);
                 ui.push_id(key, |ui| {
-                    let (glyph, chip_label, tone) = match &request.kind {
-                        Kind::Questions(_) => ("?", "Вопрос", Tone::Accent),
-                        Kind::Permission(_) => ("!", "Разрешение", Tone::Warning),
+                    let (status, severity) = match &request.kind {
+                        Kind::Questions(_) => ("Вопрос", kylig_ui::Severity::Info),
+                        Kind::Permission(_) => ("Разрешение", kylig_ui::Severity::Warning),
                     };
                     let title = row.map_or_else(
                         || Cow::Owned(format!("Задача #{}", live.id)),
                         |r| Cow::Borrowed(r.title.as_str()),
                     );
                     theme::card(ui).show(ui, |ui| {
-                        let collapsible = matches!(&request.kind, Kind::Permission(tool)
-                            if summary_rows(ui, &tool.summary) > SUMMARY_LINES);
-                        let collapsed = collapsible && inbox.details != Some(key);
-                        let shown = shown_request(request, collapsed);
+                        ui.set_width(ui.available_width());
                         card_header(
                             ui,
-                            Header {
-                                project,
-                                path: &live.project,
-                                row,
-                                title: &title,
-                                glyph,
-                                tone,
-                                end: HeaderEnd::Chip(chip_label),
-                            },
+                            live.id,
+                            project,
+                            &live.project,
+                            row,
+                            &title,
+                            (status, severity),
                         );
                         ui.add_space(6.0);
-                        panel.decision(ui, live, &shown, collapsed.then_some(SUMMARY_LINES), send);
-                        if collapsible
-                            && ui
-                                .link(if collapsed {
-                                    "Подробнее"
-                                } else {
-                                    "Свернуть"
-                                })
-                                .clicked()
-                        {
-                            inbox.details = collapsed.then_some(key);
-                            ui.ctx().request_repaint();
-                        }
+                        panel.decision(ui, live, request, send);
                     });
                 });
                 None
             }
             Self::Task(row, reason) => {
                 let (action, tab) = match reason {
-                    Attention::Review => ("Проверить", Tab::Summary),
+                    Attention::Review => ("Проверить результат", Tab::Summary),
                     Attention::CheckFailed => ("Открыть проверку", Tab::Checks),
                     Attention::AgentFailed | Attention::Interrupted => {
                         ("Разобрать запуск", Tab::Checks)
@@ -226,32 +175,40 @@ impl<'a> Item<'a> {
                     Attention::Git => ("Проверить Git", Tab::Parameters),
                     Attention::Queue => ("Открыть очередь", Tab::Parameters),
                 };
-                let (glyph, tone) = match reason {
-                    Attention::Review => ("√", Tone::Accent),
-                    Attention::CheckFailed | Attention::AgentFailed | Attention::Interrupted => {
-                        ("!", Tone::Error)
+                let (status, severity) = match reason {
+                    Attention::Review => ("На проверке", kylig_ui::Severity::Info),
+                    Attention::CheckFailed | Attention::AgentFailed => {
+                        (reason.label(), kylig_ui::Severity::Error)
                     }
-                    Attention::Git | Attention::Queue => ("!", Tone::Warning),
+                    Attention::Git => ("Подготовка Git", kylig_ui::Severity::Warning),
+                    Attention::Queue | Attention::Interrupted => {
+                        (reason.label(), kylig_ui::Severity::Warning)
+                    }
                 };
                 let summary = if row.summary.is_empty() { reason.label() } else { &row.summary };
                 ui.push_id((&row.project, row.id), |ui| {
                     theme::card(ui)
                         .show(ui, |ui| {
-                            let clicked = card_header(
+                            ui.set_width(ui.available_width());
+                            card_header(
                                 ui,
-                                Header {
-                                    project,
-                                    path: &row.project,
-                                    row: Some(row),
-                                    title: &row.title,
-                                    glyph,
-                                    tone,
-                                    end: HeaderEnd::Action(action),
-                                },
+                                row.id,
+                                project,
+                                &row.project,
+                                Some(row),
+                                &row.title,
+                                (status, severity),
                             );
+                            ui.add(egui::Label::new(summary).wrap());
                             review_chips(ui, row, reason);
-                            ui.add(egui::Label::new(egui::RichText::new(summary).weak()).wrap());
-                            clicked
+                            ui.add_space(4.0);
+                            let button = kylig_ui::Button::new(action);
+                            ui.add(if reason == Attention::Review {
+                                button.primary()
+                            } else {
+                                button
+                            })
+                            .clicked()
                         })
                         .inner
                 })
@@ -276,94 +233,28 @@ fn review_chips(ui: &mut egui::Ui, row: &TaskRow, reason: Attention) {
     });
 }
 
-struct Header<'a> {
-    project: &'a str,
-    path: &'a Path,
-    row: Option<&'a TaskRow>,
-    title: &'a str,
-    glyph: &'a str,
-    tone: Tone,
-    end: HeaderEnd<'a>,
-}
-
-enum HeaderEnd<'a> {
-    Chip(&'a str),
-    Action(&'a str),
-}
-
-fn icon_plate(ui: &mut egui::Ui, glyph: &str, tone: Tone) {
-    let (bg, fg) = theme::tone_colors(ui, tone);
-    egui::Frame::new().fill(bg).corner_radius(8).show(ui, |ui| {
-        // A fixed box, not just a minimum: `centered_and_justified` inside a
-        // horizontal row otherwise stretches the frame across the whole card.
-        ui.allocate_ui_with_layout(
-            egui::vec2(26.0, 26.0),
-            egui::Layout::centered_and_justified(egui::Direction::TopDown),
-            |ui| {
-                ui.add(
-                    egui::Label::new(egui::RichText::new(glyph).strong().color(fg))
-                        .selectable(false),
-                );
-            },
-        );
+fn card_header(
+    ui: &mut egui::Ui,
+    id: u64,
+    project: &str,
+    path: &Path,
+    row: Option<&TaskRow>,
+    title: &str,
+    (status, severity): (&str, kylig_ui::Severity),
+) {
+    ui.horizontal_wrapped(|ui| {
+        ui.add(kylig_ui::Badge::dot().severity(severity));
+        ui.small(status);
+        let mut metadata = format!("#{id}   {project}");
+        if let Some(row) = row {
+            let agent = BackendKind::parse(&row.backend)
+                .map_or(row.backend.as_str(), |kind| agent_title(kind));
+            metadata.push_str(" / ");
+            metadata.push_str(agent);
+        }
+        ui.weak(metadata).on_hover_text(path.display().to_string());
     });
-}
-
-fn card_header(ui: &mut egui::Ui, header: Header<'_>) -> bool {
-    let Header { project, path, row, title, glyph, tone, end } = header;
-    let metadata = row.map_or_else(
-        || project.to_owned(),
-        |r| {
-            let agent = match BackendKind::parse(&r.backend) {
-                Some(kind) => agent_title(kind),
-                None => r.backend.as_str(),
-            };
-            format!("{project} · {agent}")
-        },
-    );
-    let details = |ui: &mut egui::Ui| {
-        ui.spacing_mut().item_spacing.y = 3.0;
-        ui.add(egui::Label::new(egui::RichText::new(title).strong()).wrap());
-        ui.add(egui::Label::new(egui::RichText::new(&metadata).small().weak()).truncate())
-            .on_hover_text(path.display().to_string());
-    };
-    let grow = |ui: &mut egui::Ui| {
-        ui.set_width(ui.available_width());
-        details(ui);
-    };
-    match end {
-        HeaderEnd::Chip(label) => {
-            ui.horizontal(|ui| {
-                icon_plate(ui, glyph, tone);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    theme::chip(ui, tone, label);
-                    ui.vertical(grow);
-                });
-            });
-            false
-        }
-        HeaderEnd::Action(action) => {
-            let narrow = ui.available_width() < 440.0;
-            if narrow {
-                ui.horizontal(|ui| {
-                    icon_plate(ui, glyph, tone);
-                    ui.vertical(grow);
-                });
-                ui.button(action).clicked()
-            } else {
-                ui.horizontal(|ui| {
-                    icon_plate(ui, glyph, tone);
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let clicked = ui.button(action).clicked();
-                        ui.vertical(grow);
-                        clicked
-                    })
-                    .inner
-                })
-                .inner
-            }
-        }
-    }
+    ui.add(egui::Label::new(egui::RichText::new(title).size(18.0).strong()).wrap());
 }
 
 impl TasksView {
@@ -373,10 +264,8 @@ impl TasksView {
         snapshot: &Snapshot,
         send: &mut impl FnMut(Command),
     ) -> bool {
+        self.refresh_projects(ui.ctx(), snapshot);
         self.local_panel.sync(ui, snapshot);
-        if self.inbox.details.is_some_and(|key| !has_request(snapshot, key)) {
-            self.inbox.details = None;
-        }
         ui.set_max_width(ui.available_width().min(1040.0));
         let projects: Projects<'_> = snapshot
             .task_index
@@ -389,6 +278,7 @@ impl TasksView {
             .chain(self.sidebar.projects().map(|(path, name)| (path, Cow::Borrowed(name))))
             .collect();
         self.inbox.heading(ui, &projects);
+        self.confirmation(ui, self.inbox.project.as_deref());
         let visible: Vec<_> = items(snapshot)
             .filter(|item| self.inbox.project.as_deref().is_none_or(|p| p == item.project()))
             .collect();
@@ -410,56 +300,52 @@ impl TasksView {
         let mut open_chat = false;
         egui::ScrollArea::vertical().id_salt(("inbox_items", &self.inbox.project)).show(ui, |ui| {
             ui.set_width(ui.available_width());
-            let is_review = |item: &Item| matches!(item, Item::Task(_, Attention::Review));
-            let review_count = visible.iter().filter(|item| is_review(item)).count();
-            for ((results, heading), count) in
-                [(false, "Ждут вашего ответа"), (true, "Результаты на проверку")]
-                    .into_iter()
-                    .zip([visible.len() - review_count, review_count])
+            let (requests, results): (Vec<_>, Vec<_>) =
+                visible.iter().copied().partition(|item| matches!(item, Item::Request(..)));
+            for (is_request, group, heading) in
+                [(true, &requests, "Ждут вашего ответа"), (false, &results, "Результаты и ошибки")]
             {
-                if count == 0 {
+                if group.is_empty() {
                     continue;
                 }
-                ui.label(egui::RichText::new(format!("{heading} · {count}")).strong().weak());
-                ui.separator();
-                for item in visible.iter().copied().filter(|item| is_review(item) == results) {
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    ui.label(egui::RichText::new(heading).size(18.0).strong());
+                    ui.weak(group.len().to_string());
+                });
+                let mut card = |ui: &mut egui::Ui, item: Item<'_>| {
                     ui.add_space(6.0);
                     let project = project_label(item.project(), &projects);
-                    if let Some(row) =
-                        item.show(ui, &project, &mut self.inbox, &mut self.local_panel, send)
-                    {
-                        target = Some(row);
+                    if let Some((row, tab)) = item.show(ui, &project, &mut self.local_panel, send) {
+                        target = Some((row.project.clone(), row.id, tab));
+                    }
+                };
+                if is_request && group.len() == 2 && ui.available_width() >= 780.0 {
+                    ui.columns(2, |columns| {
+                        for (ui, item) in columns.iter_mut().zip(group) {
+                            card(ui, *item);
+                        }
+                    });
+                } else {
+                    for &item in group {
+                        card(ui, item);
                     }
                 }
-                ui.add_space(10.0);
             }
             if visible.is_empty() && snapshot.task_index.is_ok() {
-                ui.label(if self.inbox.project.is_some() {
-                    "В этом проекте всё разобрано."
-                } else {
-                    "Всё разобрано."
-                });
-                ui.horizontal_wrapped(|ui| {
-                    if self.inbox.project.is_some() && ui.button("Показать все проекты").clicked()
-                    {
-                        self.inbox.project = None;
-                    }
-                    open_chat = ui
-                        .button(if self.focused.is_some() {
-                            "Вернуться в чат"
-                        } else {
-                            "Открыть задачи"
-                        })
-                        .clicked();
-                });
+                ui.add_space(16.0);
+                open_chat = self.inbox.empty(ui);
             }
         });
-        if let Some((row, tab)) = target {
-            self.navigate(&row.project, Some(row.id), tab);
+        if let Some((project, id, tab)) = target {
+            self.navigate(&project, Some(id), tab);
             self.review_from_inbox = true;
             return true;
         }
         if open_chat {
+            if let Some(project) = self.inbox.project.clone() {
+                self.navigate(&project, None, Tab::Chat);
+            }
             self.leave_review();
             self.page = super::Page::Task;
             self.result_view.select(Tab::Chat, self.focused);

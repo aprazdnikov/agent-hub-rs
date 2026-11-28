@@ -11,10 +11,10 @@
   <meta property="og:title" content="agent-hub — ИИ-агенты в одном окне">
   <meta property="og:description" content="Ставьте задачи, отвечайте агентам и проверяйте их работу в настольном приложении для Windows, macOS и Linux.">
   <meta property="og:url" content="https://aprazdnikov.github.io/agent-hub-rs/">
-  <meta property="og:image" content="https://aprazdnikov.github.io/agent-hub-rs/screenshots/inbox.png">
-  <meta property="og:image:width" content="960">
-  <meta property="og:image:height" content="640">
-  <meta property="og:image:alt" content="Входящие в agent-hub с вопросом агента и результатом на проверку">
+  <meta property="og:image" content="https://aprazdnikov.github.io/agent-hub-rs/screenshots/task-chat.png">
+  <meta property="og:image:width" content="1180">
+  <meta property="og:image:height" content="790">
+  <meta property="og:image:alt" content="Чат задачи в Agent Hub 1.3.0 с деревом проектов, поручением и ответом Codex">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="color-scheme" content="light dark">
   <link rel="icon" type="image/png" href="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAAhUlEQVR42u2X2Q0AIAhDncglXNRNdQQpFKmJJP6pfXhwtPaS9TmWZZSIpsBExUMQLHEXBFscgjhtcrIQREQYAUkXd0Eg4oy5JgD0fpF1sPfoi4dOgem96xTY3lv3+AAf4B2Akm94NRCVh2LZZHQ1HZcXJBIlmURRKlGWSzQmEq2ZRHOabRu3HzmKKHXLhQAAAABJRU5ErkJggg==">
@@ -192,7 +192,7 @@
     .download:hover { background: var(--accent-hover); color: var(--on-accent); }
     .platforms { color: var(--muted); font-size: .93rem; }
 
-    /* A single native radio group keeps both previews usable with a keyboard and without scripts. */
+    /* A single native radio group keeps the previews usable with a keyboard and without scripts. */
     .gallery {
       position: relative;
       display: grid;
@@ -225,21 +225,29 @@
     }
 
     .choices label:hover { background: #326351; }
+    #screen-chat:checked ~ .choices [for="screen-chat"],
     #screen-inbox:checked ~ .choices [for="screen-inbox"],
-    #screen-chat:checked ~ .choices [for="screen-chat"] {
+    #screen-changes:checked ~ .choices [for="screen-changes"],
+    #screen-agents:checked ~ .choices [for="screen-agents"] {
       background: var(--on-stage);
       border-color: var(--on-stage);
       color: var(--stage);
     }
 
-    #screen-inbox:focus-visible ~ .choices [for="screen-inbox"],
     #screen-chat:focus-visible ~ .choices [for="screen-chat"],
+    #screen-inbox:focus-visible ~ .choices [for="screen-inbox"],
+    #screen-changes:focus-visible ~ .choices [for="screen-changes"],
+    #screen-agents:focus-visible ~ .choices [for="screen-agents"],
     .preview:focus-visible {
       outline: 3px solid var(--on-stage-focus);
       outline-offset: 3px;
     }
 
-    #screen-inbox:checked ~ .chat, #screen-chat:checked ~ .inbox { display: none; }
+    .gallery > .screen-note, .gallery > .shot { display: none; }
+    #screen-chat:checked ~ .chat,
+    #screen-inbox:checked ~ .inbox,
+    #screen-changes:checked ~ .changes,
+    #screen-agents:checked ~ .agents { display: block; }
     .screen-note { grid-area: note; max-width: 32em; }
     .screen-note h2 { max-width: 15em; font-size: clamp(1.6rem, 2.8vw, 2.5rem); }
     .screen-note p { margin-top: .85rem; color: var(--stage-muted); line-height: 1.5; }
@@ -312,7 +320,7 @@
     @media (max-width: 58rem) {
       .hero { grid-template-columns: 1fr 1fr; }
       .gallery {
-        grid-template-columns: max-content minmax(0, 1fr);
+        grid-template-columns: minmax(0, .9fr) minmax(0, 1fr);
         grid-template-areas: "choices note" "shot shot";
         grid-template-rows: auto auto;
         align-items: start;
@@ -347,8 +355,10 @@
     }
 
     @media (forced-colors: active) {
+      #screen-chat:checked ~ .choices [for="screen-chat"],
       #screen-inbox:checked ~ .choices [for="screen-inbox"],
-      #screen-chat:checked ~ .choices [for="screen-chat"] { border: 2px solid Highlight; }
+      #screen-changes:checked ~ .choices [for="screen-changes"],
+      #screen-agents:checked ~ .choices [for="screen-agents"] { border: 2px solid Highlight; }
       .download { border: 1px solid ButtonText; }
     }
   </style>
@@ -358,7 +368,7 @@
   <header class="wrap masthead">
     <div class="identity">
       <a class="brand" href="#main"><span class="brand-mark" aria-hidden="true"></span>agent-hub</a>
-      <span class="version">v1.2.0</span>
+      <a class="version" href="https://github.com/aprazdnikov/agent-hub-rs/releases/tag/v1.3.0" aria-label="Что нового в версии 1.3.0">v1.3.0</a>
     </div>
     <nav aria-label="Основная навигация">
       <ul>
@@ -384,29 +394,53 @@
     <section id="interface" aria-label="Интерфейс приложения">
       <fieldset class="gallery">
         <legend class="visually-hidden">Выберите экран приложения</legend>
-        <input class="visually-hidden" type="radio" name="screen" id="screen-inbox" checked>
-        <input class="visually-hidden" type="radio" name="screen" id="screen-chat">
+        <input class="visually-hidden" type="radio" name="screen" id="screen-chat" checked>
+        <input class="visually-hidden" type="radio" name="screen" id="screen-inbox">
+        <input class="visually-hidden" type="radio" name="screen" id="screen-changes">
+        <input class="visually-hidden" type="radio" name="screen" id="screen-agents">
         <div class="choices">
-          <label for="screen-inbox">Входящие</label>
           <label for="screen-chat">Чат задачи</label>
+          <label for="screen-inbox">Входящие</label>
+          <label for="screen-changes">Изменения</label>
+          <label for="screen-agents">Агенты</label>
         </div>
-        <div class="screen-note inbox">
-          <h2>Что ждёт решения</h2>
-          <p>При запуске открываются «Входящие». Ответьте на вопрос агента, разрешите действие или проверьте готовый результат. Фильтр покажет задачи выбранного проекта.</p>
-        </div>
-        <figure class="shot inbox">
-          <a class="preview" href="screenshots/inbox.png">
-            <img src="screenshots/inbox.png" width="960" height="640" alt="Входящие с вопросом агента и результатом другой задачи на проверку">
-            <span>Открыть снимок целиком</span>
-          </a>
-        </figure>
         <div class="screen-note chat">
           <h2>Переписка по задаче</h2>
-          <p>Выберите задачу в дереве проектов слева. В чате сохраняются поручения и ответы. Откройте результат, чтобы посмотреть файлы и оставить замечание к строке изменений.</p>
+          <p>Выберите задачу в дереве проектов. В чате видны поручение, ответ агента и ссылка на результат. Здесь же можно отправить уточнение.</p>
         </div>
         <figure class="shot chat">
           <a class="preview" href="screenshots/task-chat.png">
-            <img src="screenshots/task-chat.png" width="960" height="640" alt="Дерево проектов слева и чат выбранной задачи с ответом агента и полем сообщения">
+            <img src="screenshots/task-chat.png" width="1180" height="790" alt="Поручение справа и ответ Codex слева в чате задачи «Поиск по каталогу»">
+            <span>Открыть снимок целиком</span>
+          </a>
+        </figure>
+        <div class="screen-note inbox">
+          <h2>Что ждёт решения</h2>
+          <p>Ответьте на вопрос агента, разрешите действие или проверьте результат. Фильтр по проекту поможет найти нужную карточку.</p>
+        </div>
+        <figure class="shot inbox">
+          <a class="preview" href="screenshots/inbox.png">
+            <img src="screenshots/inbox.png" width="1180" height="790" alt="Во входящих результат из проекта Atlas ждёт проверки, а запуск в проекте Orbit завершился с ошибкой">
+            <span>Открыть снимок целиком</span>
+          </a>
+        </figure>
+        <div class="screen-note changes">
+          <h2>Проверка результата</h2>
+          <p>Откройте изменения в результате задачи. Выберите строку, чтобы оставить замечание, затем примите работу или отправьте её на доработку.</p>
+        </div>
+        <figure class="shot changes">
+          <a class="preview" href="screenshots/changes.png">
+            <img src="screenshots/changes.png" width="1180" height="790" alt="Удалённые и добавленные строки в файле поиска, кнопки принятия результата и возврата на доработку">
+            <span>Открыть снимок целиком</span>
+          </a>
+        </figure>
+        <div class="screen-note agents">
+          <h2>Кто выполняет задачу</h2>
+          <p>Выберите карточку агента, чтобы настроить его параметры. В общих настройках назначьте исполнителя и ревьюера для новых задач.</p>
+        </div>
+        <figure class="shot agents">
+          <a class="preview" href="screenshots/agents.png">
+            <img src="screenshots/agents.png" width="1180" height="790" alt="Стопка карточек настроек агентов, выбор исполнителя и ревьюера по умолчанию">
             <span>Открыть снимок целиком</span>
           </a>
         </figure>

@@ -1,5 +1,5 @@
 //! Task review tabs and annotations against the saved patch of a particular attempt.
-use crate::gui::theme::{Tone, bubble, chip, tab, tone_colors};
+use crate::gui::theme::{self, Tone, bubble, chip, tone_colors};
 use eframe::egui;
 use hub_core::tasks::{Run, RunState, Task};
 use jiff::{Timestamp, Zoned, tz::TimeZone};
@@ -23,11 +23,95 @@ pub(super) struct View {
     anchor: Option<String>,
     note: String,
     run: Option<u32>,
+    history_attempt: Option<u32>,
     file_error: Option<String>,
+    preview: Option<FilePreview>,
+    auto_previewed: bool,
     expanded: BTreeSet<u32>,
     /// The «…» menu landed on Parameters and wants the next-run context open; consumed there.
     context_open: bool,
 }
+struct FilePreview {
+    key: String,
+    name: String,
+    reply: std::sync::mpsc::Receiver<Result<String, String>>,
+    content: Option<Result<String, String>>,
+}
+
+impl FilePreview {
+    fn open(
+        file: &hub_core::tasks::ResultFile,
+        path: std::path::PathBuf,
+        ctx: egui::Context,
+    ) -> std::io::Result<Self> {
+        let (send, reply) = std::sync::mpsc::channel();
+        std::thread::Builder::new().name("task-file-preview".into()).spawn(move || {
+            let result = read_preview(&path).map_err(|err| err.to_string());
+            let _ = send.send(result);
+            ctx.request_repaint();
+        })?;
+        Ok(Self { key: file.key.clone(), name: file.name.clone(), reply, content: None })
+    }
+
+    fn show(&mut self, ui: &mut egui::Ui) {
+        if self.content.is_none() {
+            self.content = match self.reply.try_recv() {
+                Ok(result) => Some(result),
+                Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    Some(Err("Не удалось прочитать файл.".into()))
+                }
+            };
+        }
+        match &self.content {
+            None => {
+                ui.add(kylig_ui::ProgressRing::indeterminate().size(18.0));
+            }
+            Some(Err(error)) => {
+                ui.colored_label(ui.visuals().error_fg_color, error);
+            }
+            Some(Ok(text)) => {
+                ui.horizontal(|ui| {
+                    ui.weak("Содержимое файла");
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        copy_button(ui, text, "Скопировать файл");
+                    });
+                });
+                egui::ScrollArea::vertical()
+                    .id_salt(("file-preview", &self.key, &self.name))
+                    .max_height(240.0)
+                    .show(ui, |ui| {
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(text).monospace())
+                                .wrap()
+                                .selectable(true),
+                        );
+                    });
+            }
+        }
+    }
+}
+
+const PREVIEW_BYTE_LIMIT: u64 = 256 * 1024;
+
+fn read_preview(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let folder =
+        path.parent().ok_or_else(|| std::io::Error::other("Каталог вложения недоступен."))?;
+    if !std::fs::symlink_metadata(folder)?.is_dir() || !std::fs::symlink_metadata(path)?.is_file() {
+        return Err(std::io::Error::other("Сохранённый файл недоступен."));
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?.take(PREVIEW_BYTE_LIMIT + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > PREVIEW_BYTE_LIMIT {
+        return Err(std::io::Error::other(
+            "Файл больше 256 КиБ. Откройте его во внешнем приложении.",
+        ));
+    }
+    String::from_utf8(bytes)
+        .map_err(|_| std::io::Error::other("Файл содержит данные в другой кодировке."))
+}
+
 impl View {
     pub(super) fn select(&mut self, tab: Tab, task: Option<u64>) {
         *self = Self { task, tab, ..Default::default() };
@@ -65,103 +149,151 @@ impl View {
         let run = Self::review_run(task)?;
         if self.run != Some(run.id) {
             self.file_error = None;
+            self.preview = None;
+            self.auto_previewed = false;
             self.anchor = None;
             self.note.clear();
             self.run = Some(run.id);
         }
-        if let Some(target) = self.tab_bar(ui, task, run) {
-            self.tab = target;
-        }
-        match self.tab {
-            Tab::Summary => {
-                summary(ui, run);
-                None
-            }
-            Tab::Changes => self.changes(ui, task, run, next, editable),
-            Tab::Checks => {
-                report(ui, run);
-                None
-            }
-            Tab::Files => {
-                if run.files.is_empty() {
-                    ui.weak("Сохранённых файлов нет.");
-                } else {
-                    self.files(ui, run);
+        self.tab_bar(ui, task);
+        ui.add_space(8.0);
+        theme::card(ui)
+            .show(ui, |ui| {
+                ui.set_min_width(ui.available_width());
+                match self.tab {
+                    Tab::Summary => {
+                        summary(ui, run);
+                        None
+                    }
+                    Tab::Changes => self.changes(ui, task, run, next, editable),
+                    Tab::Checks => {
+                        report(ui, run);
+                        None
+                    }
+                    Tab::Files => {
+                        if run.files.is_empty() {
+                            ui.weak("Сохранённых файлов нет.");
+                        } else {
+                            self.files(ui, run);
+                        }
+                        None
+                    }
+                    Tab::History => {
+                        self.history(ui, task);
+                        None
+                    }
+                    // Chat and Parameters render their own screens; review bodies exist only for these five.
+                    Tab::Chat | Tab::Parameters => None,
                 }
-                None
-            }
-            Tab::History => {
-                self.history(ui, task);
-                None
-            }
-            // Chat and Parameters render their own screens; review bodies exist only for these five.
-            Tab::Chat | Tab::Parameters => None,
-        }
+            })
+            .inner
     }
-    /// The section tabs from the spec «Экран результата»; clicks move `tab` directly, so the
-    /// row keeps annotations, the line note and the diff anchor that `select` would reset.
-    fn tab_bar(&self, ui: &mut egui::Ui, task: &Task, run: &Run) -> Option<Tab> {
-        let checks = &run.workflow_report.checks;
-        let passed = checks.iter().filter(|check| check.passed).count();
-        let diff_files = run.diff.lines().filter(|line| line.starts_with("diff --git ")).count();
-        let tabs = [
-            (Tab::Summary, "Сводка".to_owned()),
-            (Tab::Changes, format!("Изменения · {diff_files} {}", file_count_word(diff_files))),
-            (Tab::Checks, format!("Проверки · {passed}/{}", checks.len())),
-            (Tab::Files, format!("Файлы · {}", run.files.len())),
-            (Tab::History, format!("История · {}", task.runs.len())),
+    fn tab_bar(&mut self, ui: &mut egui::Ui, task: &Task) {
+        const SECTIONS: [(Tab, &str); 5] = [
+            (Tab::Summary, "Сводка"),
+            (Tab::Changes, "Изменения"),
+            (Tab::Checks, "Проверки"),
+            (Tab::Files, "Файлы"),
+            (Tab::History, "История"),
         ];
-        let mut chosen = None;
-        ui.horizontal_wrapped(|ui| {
-            for (target, label) in &tabs {
-                if tab(ui, self.tab == *target, label).clicked() {
-                    chosen = Some(*target);
-                }
+        if ui.available_width() > 500.0 {
+            let mut index = SECTIONS.iter().position(|(tab, _)| *tab == self.tab).unwrap_or(0);
+            kylig_ui::Tabs::new(&mut index, SECTIONS.map(|(_, label)| label))
+                .id_salt(("review", task.id))
+                .variant(kylig_ui::TabsVariant::Underline)
+                .show(ui);
+            if let Some((tab, _)) = SECTIONS.get(index) {
+                self.tab = *tab;
             }
-        });
-        chosen
-    }
-    fn history(&mut self, ui: &mut egui::Ui, task: &Task) {
-        for attempt in task.runs.iter().rev() {
-            ui.collapsing(
-                format!(
-                    "Попытка {} · {} · {}",
-                    attempt.id,
-                    attempt.state.label(),
-                    attempt.backend.as_deref().unwrap_or(&task.backend)
-                ),
-                |ui| {
-                    ui.label(&attempt.step);
-                    if let Some(described) = attempt.described_rules() {
-                        ui.label(described);
-                    }
-                    if !attempt.diagnostic.is_empty() {
-                        ui.label(&attempt.diagnostic);
-                    }
-                    ui.label(if attempt.result.is_empty() {
-                        "Сохранённого ответа нет"
-                    } else {
-                        &attempt.result
-                    });
-                    self.files(ui, attempt);
-                    if !attempt.workflow_report.is_empty() {
-                        report(ui, attempt);
-                    }
-                    if !attempt.diff.is_empty() {
-                        ui.collapsing("Сохранённые изменения", |ui| {
-                            ui.monospace(&attempt.diff);
-                        });
-                    }
-                },
+        } else {
+            let choices = SECTIONS.map(|(tab, label)| kylig_ui::SelectItem::new(tab, label));
+            ui.add(
+                kylig_ui::Select::new(&mut self.tab, &choices)
+                    .id_salt(("review.compact", task.id))
+                    .options(kylig_ui::TextFieldOptions {
+                        animate: ui.style().animation_time > 0.0,
+                        ..Default::default()
+                    })
+                    .label("Раздел результата")
+                    .width(ui.available_width()),
             );
         }
     }
+
+    fn history(&mut self, ui: &mut egui::Ui, task: &Task) {
+        let Some(latest) = task.runs.last() else { return };
+        let caption = |attempt: &Run| {
+            format!(
+                "Попытка {} · {}",
+                attempt.id,
+                display_agent(attempt.backend.as_deref().unwrap_or(&task.backend))
+            )
+        };
+        let mut id = self.history_attempt.unwrap_or(latest.id);
+        if task.runs.len() > 1 {
+            let choices: Vec<_> = task
+                .runs
+                .iter()
+                .rev()
+                .map(|run| theme::Choice::new(run.id, caption(run), run.state.label()))
+                .collect();
+            if let Some(value) = theme::detailed_select(ui, "Попытка", "", &id, &choices, 300.0)
+            {
+                id = *value;
+            }
+            self.history_attempt = (id != latest.id).then_some(id);
+        } else {
+            ui.strong(caption(latest));
+        }
+        let attempt = task.runs.iter().find(|run| run.id == id).unwrap_or(latest);
+        ui.push_id(attempt.id, |ui| {
+            ui.small(attempt.state.label());
+            ui.add_space(6.0);
+            ui.horizontal(|ui| {
+                ui.weak("Поручение");
+                copy_button(ui, &attempt.step, "Скопировать поручение");
+            });
+            ui.add(egui::Label::new(&attempt.step).selectable(true).wrap());
+            if let Some(described) = attempt.described_rules() {
+                ui.label(described);
+            }
+            if !attempt.diagnostic.is_empty() {
+                ui.colored_label(ui.visuals().error_fg_color, &attempt.diagnostic);
+            }
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.weak("Итог попытки");
+                if !attempt.result.is_empty() {
+                    copy_button(ui, &attempt.result, "Скопировать результат");
+                }
+            });
+            ui.add(
+                egui::Label::new(if attempt.result.is_empty() {
+                    "Сохранённого ответа нет"
+                } else {
+                    &attempt.result
+                })
+                .wrap()
+                .selectable(true),
+            );
+            self.files(ui, attempt);
+            if !attempt.workflow_report.is_empty() {
+                report(ui, attempt);
+            }
+            if !attempt.diff.is_empty() {
+                ui.collapsing("Сохранённые изменения", |ui| {
+                    ui.monospace(&attempt.diff);
+                });
+            }
+        });
+    }
     pub(super) fn transcript(ui: &mut egui::Ui, task: &Task, view: &mut Self) {
+        ui.add_space(8.0);
         for run in &task.runs {
-            user_bubble(ui, &run.step, run.started_at);
-            ui.add_space(12.0);
-            agent_bubble(ui, task, run, view);
-            ui.add_space(12.0);
+            ui.push_id((run.id, "user"), |ui| user_bubble(ui, &run.step, run.started_at));
+            ui.add_space(6.0);
+            ui.push_id((run.id, "agent"), |ui| agent_bubble(ui, task, run, view));
+            ui.add_space(6.0);
         }
     }
     fn files(&mut self, ui: &mut egui::Ui, run: &Run) {
@@ -170,7 +302,8 @@ impl View {
         }
         for file in &run.files {
             ui.horizontal_wrapped(|ui| {
-                ui.label(&file.name);
+                ui.add(kylig_icons::Icon::new(kylig_icons::FILE_TEXT).size(18.0));
+                ui.strong(&file.name);
                 ui.weak(format!("{} байт", file.bytes));
                 let openable = std::path::Path::new(&file.name)
                     .extension()
@@ -180,14 +313,53 @@ impl View {
                             .iter()
                             .any(|v| ext.eq_ignore_ascii_case(v))
                     });
-                let open = openable && ui.button("Открыть файл").clicked();
-                let reveal = ui.button("В папке").clicked();
-                if open || reveal {
+                let text_file = std::path::Path::new(&file.name)
+                    .extension()
+                    .and_then(|v| v.to_str())
+                    .is_some_and(|ext| {
+                        ["txt", "md", "log", "csv", "json", "diff", "patch"]
+                            .iter()
+                            .any(|v| ext.eq_ignore_ascii_case(v))
+                    });
+                let expanded =
+                    self.preview.as_ref().is_some_and(|p| p.key == file.key && p.name == file.name);
+                let mut preview = text_file
+                    && ui
+                        .add(kylig_ui::Button::new(if expanded {
+                            "Свернуть файл"
+                        } else {
+                            "Прочитать файл"
+                        }))
+                        .clicked();
+                if preview && expanded {
+                    self.preview = None;
+                    preview = false;
+                }
+                if !self.auto_previewed
+                    && self.tab == Tab::Files
+                    && run.files.len() == 1
+                    && text_file
+                    && file.bytes <= PREVIEW_BYTE_LIMIT
+                    && !expanded
+                {
+                    self.auto_previewed = true;
+                    preview = true;
+                }
+                let open = openable && ui.add(kylig_ui::Button::new("Открыть файл")).clicked();
+                let reveal = ui.add(kylig_ui::Button::new("В папке")).clicked();
+                if open || reveal || preview {
                     self.file_error = crate::dirs::AppDirs::locate()
                         .ok_or_else(|| "Каталог данных недоступен".to_owned())
                         .and_then(|dirs| {
                             let folder = dirs.task_files().join(&file.key);
                             let path = folder.join(&file.name);
+                            if preview {
+                                self.preview = Some(
+                                    FilePreview::open(file, path, ui.ctx().clone())
+                                        .map_err(|e| e.to_string())?,
+                                );
+                                return Ok(());
+                            }
                             if !path.is_file() {
                                 return Err("Сохранённый файл отсутствует на диске".into());
                             }
@@ -199,6 +371,11 @@ impl View {
             });
             if !file.caption.is_empty() {
                 ui.label(&file.caption);
+            }
+            if let Some(preview) =
+                self.preview.as_mut().filter(|p| p.key == file.key && p.name == file.name)
+            {
+                preview.show(ui);
             }
         }
         if let Some(error) = &self.file_error {
@@ -217,71 +394,75 @@ impl View {
             ui.weak("Для этой попытки снимок изменений отсутствует.");
             return None;
         }
+        ui.horizontal(|ui| {
+            ui.strong(format!("Попытка {}", run.id));
+            copy_button(ui, &run.diff, "Скопировать изменения");
+        });
+        let mut step = None;
+        let width = ui.available_width();
         egui::ScrollArea::both().id_salt(("patch", task.id, run.id)).max_height(300.0).show(
             ui,
             |ui| {
                 let mut cursor = Lines::default();
                 for (i, line) in run.diff.lines().enumerate() {
-                    if let Some((path, side, n)) = cursor.step(line) {
-                        let anchor = format!("{path}:{n} ({side}), попытка {}\n{line}", run.id);
+                    if let Some((path, side, number)) = cursor.step(line) {
+                        let anchor =
+                            format!("{path}:{number} ({side}), попытка {}\n{line}", run.id);
                         let tone = if line.starts_with('+') { Tone::Accent } else { Tone::Error };
-                        let color = tone_colors(ui, tone).1;
-                        let text =
-                            egui::RichText::new(format!("{n:>4}  {line}")).monospace().color(color);
+                        let text = egui::RichText::new(format!("{number:>4}  {line}"))
+                            .monospace()
+                            .color(tone_colors(ui, tone).1);
                         ui.push_id(i, |ui| {
+                            let selected = self.anchor.as_ref() == Some(&anchor);
                             if ui
-                                .selectable_label(self.anchor.as_ref() == Some(&anchor), text)
-                                .on_hover_text("Добавить замечание к строке")
+                                .selectable_label(selected, text)
+                                .on_hover_text(format!("Добавить замечание к строке {number}"))
                                 .clicked()
                             {
-                                self.anchor = Some(anchor);
+                                self.anchor = (!selected).then(|| anchor.clone());
+                                self.note.clear();
+                            }
+                            if self.anchor.as_ref() == Some(&anchor) {
+                                ui.add(
+                                    kylig_ui::TextArea::new(&mut self.note)
+                                        .id_salt("annotation")
+                                        .label(format!("Замечание к строке {number}"))
+                                        .max_chars(2048)
+                                        .rows(2)
+                                        .width(width),
+                                );
+                                let draft = annotate(next, &anchor, &self.note);
+                                if ui
+                                    .add_enabled(
+                                        editable && draft.is_some(),
+                                        kylig_ui::Button::new("Добавить в следующий шаг"),
+                                    )
+                                    .clicked()
+                                {
+                                    step = draft;
+                                    self.anchor = None;
+                                    self.note.clear();
+                                } else if draft.is_none() && !self.note.trim().is_empty() {
+                                    ui.label("Следующий шаг с замечанием превышает 16 КиБ.");
+                                }
                             }
                         });
                     } else {
-                        ui.monospace(line);
+                        ui.add(
+                            egui::Label::new(egui::RichText::new(line).monospace().weak())
+                                .selectable(true),
+                        );
                     }
                 }
             },
         );
-        if let Some(anchor) = &self.anchor {
-            ui.label(anchor);
-            ui.add(
-                egui::TextEdit::multiline(&mut self.note)
-                    .char_limit(2048)
-                    .desired_rows(2)
-                    .hint_text("Замечание к строке"),
-            );
-            let step = annotate(next, anchor, &self.note);
-            if ui
-                .add_enabled(
-                    editable && step.is_some(),
-                    egui::Button::new("Добавить в следующий шаг"),
-                )
-                .clicked()
-            {
-                self.anchor = None;
-                self.note.clear();
-                return step;
-            }
-            if step.is_none() && !self.note.trim().is_empty() {
-                ui.label("Следующий шаг с замечанием превышает 16 КиБ.");
-            }
-        }
-        None
+        step
     }
 }
 // Agent answers longer than this many lines start collapsed in the chat (design spec «Чат задачи»).
 const RESULT_CLAMP_LINES: usize = 8;
 // Height of the transparent→surface band fading the clamped body into the bubble (mockup: 26px).
 const RESULT_FADE_HEIGHT: f32 = 26.0;
-
-fn state_tone(state: RunState) -> Tone {
-    match state {
-        RunState::Completed => Tone::Accent,
-        RunState::Running => Tone::Neutral,
-        RunState::Failed | RunState::Interrupted => Tone::Error,
-    }
-}
 
 /// `HH:MM` in the system zone; `None` (old books, recovered runs) hides the time entirely.
 pub(super) fn format_time(ts: Option<Timestamp>) -> Option<String> {
@@ -295,13 +476,22 @@ fn time_hover_date(ts: Option<Timestamp>) -> Option<String> {
     (zoned.date() != Zoned::now().date()).then(|| zoned.strftime("%d.%m.%Y").to_string())
 }
 
-/// Small weak clock text; `flush` pushes it to the right edge of the enclosing row
-/// (design spec «время справа»), a no-op when no timestamp is known.
-fn time_label(ui: &mut egui::Ui, ts: Option<Timestamp>, flush: bool) {
-    if flush && format_time(ts).is_some() {
-        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| time_text(ui, ts));
-    } else {
+fn display_agent(backend: &str) -> &str {
+    hub_core::domain::BackendKind::parse(backend)
+        .map_or(backend, |kind| crate::gui::look::agent_title(kind))
+}
+
+fn bubble_actions(ui: &mut egui::Ui, ts: Option<Timestamp>, copy: Option<&str>, flush: bool) {
+    let actions = |ui: &mut egui::Ui| {
+        if let Some(text) = copy {
+            copy_button(ui, text, "Скопировать сообщение");
+        }
         time_text(ui, ts);
+    };
+    if flush {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), actions);
+    } else {
+        actions(ui);
     }
 }
 
@@ -315,77 +505,99 @@ fn time_text(ui: &mut egui::Ui, ts: Option<Timestamp>) {
     }
 }
 
-fn user_bubble(ui: &mut egui::Ui, step: &str, started_at: Option<Timestamp>) {
+/// Measure with an independent child UI so measuring never adds a blank row to the transcript.
+fn chat_bubble(ui: &mut egui::Ui, user: bool, mut contents: impl FnMut(&mut egui::Ui, bool)) {
     let row = ui.available_rect_before_wrap();
-    let cap = row.width() * 0.78;
-    // Measure the natural bubble width against the cap with a packed header, then draw
-    // at exactly that width so the time can be flush right without widening the bubble:
-    // frames only shrink-wrap while laid out left-to-right. The measuring copy stays
-    // invisible (egui makes it disabled too) so it paints nothing and cannot steal
-    // hover, tooltips or text-cursor state from the drawn bubble.
-    let width = ui
-        .scope_builder(
-            egui::UiBuilder::new().invisible().max_rect(egui::Rect::from_min_size(
-                ui.cursor().min,
-                egui::vec2(cap, f32::INFINITY),
-            )),
-            |ui| user_contents(ui, step, started_at, false),
-        )
-        .response
-        .rect
-        .width();
+    let cap = (row.width() * if user { 0.76 } else { 0.84 }).min(600.0);
+    let mut measure = ui.new_child(
+        egui::UiBuilder::new()
+            .id_salt("bubble_measure")
+            .invisible()
+            .max_rect(egui::Rect::from_min_size(row.min, egui::vec2(cap, f32::INFINITY))),
+    );
+    contents(&mut measure, false);
+    let width = measure.min_rect().width().max(150.0).min(cap);
+    let left = if user { row.right() - width } else { row.left() };
     ui.scope_builder(
         egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
-            egui::pos2(row.max.x - width, row.min.y),
+            egui::pos2(left, row.top()),
             egui::vec2(width, f32::INFINITY),
         )),
-        |ui| user_contents(ui, step, started_at, true),
+        |ui| contents(ui, true),
     );
+}
+
+fn copy_button(ui: &mut egui::Ui, text: &str, label: &str) {
+    let id = ui.next_auto_id().with("copied");
+    let now = ui.input(|input| input.time);
+    let copied = ui.data(|d| d.get_temp::<f64>(id)).is_some_and(|until| now < until);
+    let (icon, label) = if copied {
+        (kylig_icons::CHECK, "Скопировано")
+    } else {
+        (kylig_icons::COPY, label)
+    };
+    if ui
+        .add(
+            kylig_ui::IconButton::new(icon, label)
+                .size(24.0)
+                .icon_size(14.0)
+                .variant(kylig_ui::ButtonVariant::Ghost),
+        )
+        .clicked()
+    {
+        ui.ctx().copy_text(text.to_owned());
+        ui.data_mut(|d| d.insert_temp(id, now + 1.5));
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(1500));
+    }
+}
+
+fn user_bubble(ui: &mut egui::Ui, step: &str, started_at: Option<Timestamp>) {
+    chat_bubble(ui, true, |ui, flush| user_contents(ui, step, started_at, flush));
 }
 
 fn user_contents(ui: &mut egui::Ui, step: &str, started_at: Option<Timestamp>, flush_time: bool) {
     bubble(ui, true).show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 3.0;
         ui.horizontal(|ui| {
-            ui.strong("Вы");
-            time_label(ui, started_at, flush_time);
+            ui.spacing_mut().item_spacing.x = 5.0;
+            ui.add(
+                kylig_icons::Icon::new(kylig_icons::USER)
+                    .size(15.0)
+                    .color(ui.visuals().hyperlink_color),
+            );
+            ui.label(egui::RichText::new("Вы").strong().small());
+            bubble_actions(ui, started_at, Some(step), flush_time);
         });
         ui.add(egui::Label::new(step).wrap().selectable(true));
     });
 }
 
 fn agent_bubble(ui: &mut egui::Ui, task: &Task, run: &Run, view: &mut View) {
-    let row = ui.available_rect_before_wrap();
-    let cap = row.width() * 0.86;
-    let top = row.min.y;
-    let width = ui
-        .scope_builder(
-            egui::UiBuilder::new().invisible().max_rect(egui::Rect::from_min_size(
-                ui.cursor().min,
-                egui::vec2(cap, f32::INFINITY),
-            )),
-            |ui| agent_contents(ui, task, run, view, false),
-        )
-        .response
-        .rect
-        .width();
-    ui.scope_builder(
-        egui::UiBuilder::new().max_rect(egui::Rect::from_min_size(
-            egui::pos2(row.min.x, top),
-            egui::vec2(width, f32::INFINITY),
-        )),
-        |ui| agent_contents(ui, task, run, view, true),
-    );
+    chat_bubble(ui, false, |ui, flush| agent_contents(ui, task, run, view, flush));
 }
 
 fn agent_contents(ui: &mut egui::Ui, task: &Task, run: &Run, view: &mut View, flush_time: bool) {
     bubble(ui, false).show(ui, |ui| {
+        ui.spacing_mut().item_spacing.y = 3.0;
         ui.horizontal(|ui| {
-            let (dot, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::HOVER);
-            let accent = ui.visuals().hyperlink_color;
-            ui.painter().circle_filled(dot.center(), 4.0, accent);
-            ui.strong(run.backend.as_deref().unwrap_or(&task.backend));
-            chip(ui, state_tone(run.state), run.state.label());
-            time_label(ui, run.finished_at, flush_time);
+            ui.spacing_mut().item_spacing.x = 5.0;
+            ui.add(
+                kylig_icons::Icon::new(kylig_icons::ROBOT)
+                    .size(15.0)
+                    .color(ui.visuals().hyperlink_color),
+            );
+            ui.label(
+                egui::RichText::new(display_agent(run.backend.as_deref().unwrap_or(&task.backend)))
+                    .strong()
+                    .small(),
+            )
+            .on_hover_text(run.state.label());
+            bubble_actions(
+                ui,
+                run.finished_at,
+                (!run.result.is_empty()).then_some(run.result.as_str()),
+                flush_time,
+            );
         });
         if !run.result.is_empty() {
             let long = run.result.lines().count() > RESULT_CLAMP_LINES;
@@ -424,16 +636,29 @@ fn agent_contents(ui: &mut egui::Ui, task: &Task, run: &Run, view: &mut View, fl
         let checks = &run.workflow_report.checks;
         let latest = Some(run) == View::review_run(task);
         if !run.files.is_empty() || !checks.is_empty() || latest {
-            ui.horizontal(|ui| {
-                if !run.files.is_empty() {
-                    chip(ui, Tone::Neutral, &format!("Файлов · {}", run.files.len()));
+            ui.horizontal_wrapped(|ui| {
+                if latest && ui.link("Открыть результат").clicked() {
+                    view.select(Tab::Summary, Some(task.id));
                 }
                 if !checks.is_empty() {
                     let passed = checks.iter().filter(|check| check.passed).count();
-                    chip(ui, Tone::Neutral, &format!("Проверки · {passed}/{}", checks.len()));
+                    let label = format!("Проверки {passed}/{}", checks.len());
+                    if latest {
+                        if ui.link(label).clicked() {
+                            view.select(Tab::Checks, Some(task.id));
+                        }
+                    } else {
+                        chip(ui, Tone::Neutral, &label);
+                    }
                 }
-                if latest && ui.link("Результат ›").clicked() {
-                    view.select(Tab::Summary, Some(task.id));
+                if !run.files.is_empty() {
+                    if latest {
+                        if ui.link(format!("Файлов · {}", run.files.len())).clicked() {
+                            view.select(Tab::Files, Some(task.id));
+                        }
+                    } else {
+                        chip(ui, Tone::Neutral, &format!("Файлов · {}", run.files.len()));
+                    }
                 }
             });
         }
@@ -461,6 +686,12 @@ fn annotate(next: &str, anchor: &str, note: &str) -> Option<String> {
     (step.len() <= 16 * 1024).then_some(step)
 }
 fn summary(ui: &mut egui::Ui, run: &Run) {
+    ui.horizontal(|ui| {
+        ui.strong(format!("Попытка {}", run.id));
+        if !run.result.is_empty() {
+            copy_button(ui, &run.result, "Скопировать результат");
+        }
+    });
     ui.add(
         egui::Label::new(if run.result.is_empty() { run.state.label() } else { &run.result })
             .wrap()
@@ -470,11 +701,15 @@ fn summary(ui: &mut egui::Ui, run: &Run) {
         ui.colored_label(ui.visuals().error_fg_color, &run.diagnostic);
     }
     let checks = &run.workflow_report.checks;
-    if run.files.is_empty() && checks.is_empty() {
+    let changed = run.diff.lines().filter(|line| line.starts_with("diff --git ")).count();
+    if run.files.is_empty() && checks.is_empty() && changed == 0 {
         return;
     }
     ui.add_space(6.0);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
+        if changed > 0 {
+            ui.weak(format!("Изменения · {changed} {}", file_count_word(changed)));
+        }
         if !run.files.is_empty() {
             chip(ui, Tone::Neutral, &format!("Файлов · {}", run.files.len()));
         }
@@ -495,12 +730,26 @@ fn report(ui: &mut egui::Ui, run: &Run) {
             ui.monospace(command);
         }
         for (index, check) in run.workflow_report.checks.iter().enumerate() {
-            ui.strong(format!(
-                "Проверка {} · {}",
-                index + 1,
-                if check.passed { "прошла" } else { "не прошла" }
-            ));
-            ui.monospace(&check.output);
+            ui.horizontal(|ui| {
+                ui.add(kylig_ui::Badge::dot().severity(if check.passed {
+                    kylig_ui::Severity::Success
+                } else {
+                    kylig_ui::Severity::Error
+                }));
+                ui.label(format!(
+                    "Проверка {} · {}",
+                    index + 1,
+                    if check.passed { "прошла" } else { "не прошла" }
+                ));
+                if !check.output.is_empty() {
+                    copy_button(ui, &check.output, "Скопировать вывод проверки");
+                }
+            });
+            ui.add(
+                egui::Label::new(egui::RichText::new(&check.output).monospace())
+                    .selectable(true)
+                    .wrap(),
+            );
         }
         if !run.workflow_report.review.is_empty() {
             ui.strong("Ревью");
@@ -689,6 +938,51 @@ mod tests {
     }
 
     #[test]
+    fn attachment_preview_copies_the_stored_text() {
+        let ctx = egui::Context::default();
+        kylig_icons::install_weights(&ctx, &[kylig_icons::Weight::Regular]);
+        let task = tabs_fixture();
+        let mut view = View::default();
+        view.select(Tab::Files, Some(task.id));
+        let _ = frame(&ctx, &mut view, &task, vec![]);
+        let folder = tempfile::tempdir().unwrap();
+        let file = &task.runs[0].files[0];
+        let path = folder.path().join(&file.name);
+        let report = "Результаты проверки\n2 теста пройдены";
+        std::fs::write(&path, report).unwrap();
+        view.preview = Some(FilePreview::open(file, path, ctx.clone()).unwrap());
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let copy = loop {
+            let out = frame(&ctx, &mut view, &task, vec![]);
+            if labels(&out).contains(&report) {
+                break out
+                    .shapes
+                    .iter()
+                    .find_map(|shape| match &shape.shape {
+                        egui::Shape::Text(text) if text.galley.text() == kylig_icons::COPY => {
+                            Some(text.galley.rect.translate(text.pos.to_vec2()).center())
+                        }
+                        _ => None,
+                    })
+                    .expect("copy action for the loaded file");
+            }
+            assert!(std::time::Instant::now() < until);
+            std::thread::yield_now();
+        };
+        let pointer = |pressed| egui::Event::PointerButton {
+            pos: copy,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        };
+        frame(&ctx, &mut view, &task, vec![egui::Event::PointerMoved(copy), pointer(true)]);
+        let output = frame(&ctx, &mut view, &task, vec![pointer(false)]);
+        assert!(output.platform_output.commands.iter().any(
+            |command| matches!(command, egui::OutputCommand::CopyText(body) if body == report)
+        ));
+    }
+
+    #[test]
     fn review_tabs_switch_sections_one_at_a_time() {
         let task = tabs_fixture();
         let ctx = egui::Context::default();
@@ -698,7 +992,7 @@ mod tests {
         frame(&ctx, &mut view, &task, vec![]);
         let out = frame(&ctx, &mut view, &task, vec![]);
         let texts = labels(&out);
-        for tab in ["Сводка", "Изменения · 1 файл", "Проверки · 1/2", "Файлы · 1", "История · 1"]
+        for tab in ["Сводка", "Изменения", "Проверки", "Файлы", "История"]
         {
             assert!(texts.contains(&tab), "missing tab {tab}");
         }
@@ -712,7 +1006,7 @@ mod tests {
             !texts.iter().any(|text| text.starts_with("Проверка 1")),
             "checks stay hidden outside Проверки"
         );
-        click(&ctx, &mut view, &task, "Файлы · 1");
+        click(&ctx, &mut view, &task, "Файлы");
         let out = frame(&ctx, &mut view, &task, vec![]);
         let texts = labels(&out);
         assert!(texts.contains(&"report.txt"), "Файлы lists the saved files");
@@ -721,7 +1015,7 @@ mod tests {
             !texts.iter().any(|text| text.contains("новая строка")),
             "Файлы does not draw the diff"
         );
-        click(&ctx, &mut view, &task, "Изменения · 1 файл");
+        click(&ctx, &mut view, &task, "Изменения");
         let out = frame(&ctx, &mut view, &task, vec![]);
         let texts = labels(&out);
         assert!(
@@ -730,7 +1024,7 @@ mod tests {
         );
         assert!(!texts.contains(&"report.txt"), "Изменения does not draw the file list");
         assert_eq!(view.tab(&task), Tab::Changes);
-        click(&ctx, &mut view, &task, "Проверки · 1/2");
+        click(&ctx, &mut view, &task, "Проверки");
         let out = frame(&ctx, &mut view, &task, vec![]);
         let texts = labels(&out);
         assert!(texts.contains(&"Проверка 1 · прошла"));
@@ -739,15 +1033,94 @@ mod tests {
             !texts.iter().any(|text| text.contains("новая строка")),
             "Проверки does not draw the diff"
         );
-        click(&ctx, &mut view, &task, "История · 1");
+        click(&ctx, &mut view, &task, "История");
         let out = frame(&ctx, &mut view, &task, vec![]);
         let texts = labels(&out);
         assert!(texts.iter().any(|text| text.starts_with("Попытка 1 ·")));
-        assert!(!texts.contains(&"report.txt"), "history bodies stay collapsed");
+        assert!(
+            texts.contains(&"report.txt") && texts.contains(&"Итог попытки"),
+            "history opens the latest attempt"
+        );
         click(&ctx, &mut view, &task, "Сводка");
         let out = frame(&ctx, &mut view, &task, vec![]);
         let texts = labels(&out);
         assert!(texts.contains(&"Итог попытки"), "Сводка returns with the result label");
+    }
+
+    #[test]
+    fn history_opens_the_latest_attempt_and_can_show_an_earlier_one() {
+        let mut task = tabs_fixture();
+        let mut later = task.runs.last().unwrap().clone();
+        later.id += 1;
+        later.step = "Второй шаг".into();
+        later.result = "Второй ответ".into();
+        task.runs.push(later);
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let mut view = View::default();
+        view.select(Tab::History, Some(task.id));
+        let output = frame(&ctx, &mut view, &task, vec![]);
+        assert!(labels(&output).contains(&"Второй ответ"));
+        click(&ctx, &mut view, &task, "Попытка 2 · Qwen Code");
+        click(&ctx, &mut view, &task, "Попытка 1 · Qwen Code");
+        let output = frame(&ctx, &mut view, &task, vec![]);
+        assert!(labels(&output).contains(&"Итог попытки"));
+        assert!(!labels(&output).contains(&"Второй ответ"));
+    }
+
+    #[test]
+    fn narrow_review_exposes_all_sections_in_a_menu() {
+        let task = tabs_fixture();
+        let ctx = egui::Context::default();
+        ctx.all_styles_mut(|style| style.animation_time = 0.0);
+        let mut view = View::default();
+        view.select(Tab::Summary, Some(task.id));
+        let mut render = |events: Vec<egui::Event>| {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    events,
+                    screen_rect: Some(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(390.0, 740.0),
+                    )),
+                    ..Default::default()
+                },
+                |ui| {
+                    view.show(ui, &task, "", true);
+                },
+            );
+            output.textures_delta.clear();
+            output
+        };
+        let output = render(vec![]);
+        assert!(
+            labels(&output).contains(&"Раздел результата") && !labels(&output).contains(&"История")
+        );
+        for target in ["Сводка", "Проверки"] {
+            let output = render(vec![]);
+            let position = output
+                .shapes
+                .iter()
+                .find_map(|s| match &s.shape {
+                    egui::Shape::Text(t) if t.galley.text() == target => {
+                        Some(t.visual_bounding_rect().center())
+                    }
+                    _ => None,
+                })
+                .expect("visible menu choice");
+            for pressed in [true, false] {
+                render(vec![
+                    egui::Event::PointerMoved(position),
+                    egui::Event::PointerButton {
+                        pos: position,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::NONE,
+                    },
+                ]);
+            }
+        }
+        assert!(labels(&render(vec![])).contains(&"Проверка 2 · не прошла"));
     }
 
     #[test]
@@ -780,7 +1153,7 @@ mod tests {
         let mut view = View::default();
         view.select(Tab::History, Some(task.id));
         frame(&ctx, &mut view, &task, vec![]);
-        click(&ctx, &mut view, &task, "Попытка 1 · Запуск завершён · hermes");
+
         let out = frame(&ctx, &mut view, &task, vec![]);
         let texts = labels(&out);
         assert!(

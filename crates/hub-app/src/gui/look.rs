@@ -52,6 +52,7 @@ pub fn tooltip(snapshot: &Snapshot) -> String {
         BotStatus::Starting => "agent-hub — подключение…".to_owned(),
         BotStatus::Retrying { .. } => "agent-hub — повтор подключения".to_owned(),
         BotStatus::Stopped => "agent-hub — остановлен".to_owned(),
+        BotStatus::Unconfigured if snapshot.local_only => "agent-hub — локальный режим".to_owned(),
         BotStatus::Unconfigured => "agent-hub — не настроен".to_owned(),
         BotStatus::Failed(_) => "agent-hub — ошибка".to_owned(),
     }
@@ -150,6 +151,7 @@ pub fn telegram_changed(saved: Option<&Draft>, draft: &Draft) -> bool {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BannerAction {
+    Check,
     Install,
     Restart,
     Release,
@@ -163,8 +165,22 @@ pub struct Banner {
 
 #[must_use]
 pub fn banner(state: &UpdateState) -> Option<Banner> {
+    match state {
+        UpdateState::Idle
+        | UpdateState::Checking
+        | UpdateState::Current
+        | UpdateState::CheckFailed(_) => None,
+        _ => Some(update_details(state)),
+    }
+}
+
+#[must_use]
+pub fn update_details(state: &UpdateState) -> Banner {
     let (text, action) = match state {
-        UpdateState::Idle => return None,
+        UpdateState::Idle => ("Обновления ещё не проверялись.".into(), Some(BannerAction::Check)),
+        UpdateState::Checking => ("Проверяем обновления…".into(), None),
+        UpdateState::Current => ("Доступных обновлений нет.".into(), Some(BannerAction::Check)),
+        UpdateState::CheckFailed(reason) => (reason.clone(), Some(BannerAction::Check)),
         UpdateState::Available(version) => {
             (format!("Доступна версия {version}"), Some(BannerAction::Install))
         }
@@ -181,17 +197,22 @@ pub fn banner(state: &UpdateState) -> Option<Banner> {
             (format!("Обновление не установлено: {reason}"), Some(BannerAction::Install))
         }
     };
-    Some(Banner { text, action })
+    Banner { text, action }
 }
 
 /// The tray item's text and whether it is clickable (it opens the window).
 #[must_use]
 pub fn update_item(state: &UpdateState) -> (String, bool) {
     match state {
-        UpdateState::Idle | UpdateState::Failed(_) => ("Обновлений нет".to_owned(), false),
-        UpdateState::Available(version)
-        | UpdateState::ManualAvailable(version)
-        | UpdateState::Installing(version) => (format!("Доступно обновление v{version}"), true),
+        UpdateState::Idle => ("Обновления ещё не проверялись".to_owned(), false),
+        UpdateState::Current => ("Обновлений нет".to_owned(), false),
+        UpdateState::Checking => ("Проверка обновлений…".to_owned(), false),
+        UpdateState::CheckFailed(_) => ("Ошибка проверки обновлений · Подробнее".to_owned(), true),
+        UpdateState::Failed(_) => ("Ошибка обновления · Подробнее".to_owned(), true),
+        UpdateState::Available(version) | UpdateState::ManualAvailable(version) => {
+            (format!("Доступно обновление v{version}"), true)
+        }
+        UpdateState::Installing(version) => (format!("Устанавливается v{version}…"), true),
         UpdateState::Installed(version) => (format!("Перезапустите для v{version}"), true),
     }
 }
@@ -326,7 +347,11 @@ mod tests {
     }
 
     #[rstest]
-    #[case(UpdateState::Idle, ("Обновлений нет", false))]
+    #[case(UpdateState::Idle, ("Обновления ещё не проверялись", false))]
+    #[case(UpdateState::Current, ("Обновлений нет", false))]
+    #[case(UpdateState::CheckFailed("сеть".into()), ("Ошибка проверки обновлений · Подробнее", true))]
+    #[case(UpdateState::Failed("сеть".to_owned()), ("Ошибка обновления · Подробнее", true))]
+    #[case(UpdateState::Installing(v("0.2.0")), ("Устанавливается v0.2.0…", true))]
     #[case(UpdateState::Available(v("0.2.0")), ("Доступно обновление v0.2.0", true))]
     #[case(UpdateState::ManualAvailable(v("0.2.0")), ("Доступно обновление v0.2.0", true))]
     #[case(UpdateState::Installed(v("0.2.0")), ("Перезапустите для v0.2.0", true))]

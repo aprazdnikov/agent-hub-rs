@@ -135,7 +135,7 @@ fn run() -> anyhow::Result<()> {
             hub_app::gui::follow_system_theme(&core, creation.egui_ctx.clone());
             let context = creation.egui_ctx.clone();
             let repaint: Repaint = Arc::new(move || context.request_repaint());
-            logs.on_change(Arc::clone(&repaint));
+            logs.on_change(deferred_log_repaint(&core, Arc::clone(&repaint)));
             let supervisor = Supervisor::new(SupervisorSetup {
                 connector,
                 store: Box::new(store),
@@ -208,6 +208,20 @@ fn restart_allowed(requested: bool, save_status: hub_app::supervisor::SaveStatus
         )
 }
 
+// Font fallback and rendering can log while holding the egui context lock. Notify the
+// event loop from the runtime after the log callback returns, coalescing bursts of lines.
+fn deferred_log_repaint(core: &tokio::runtime::Handle, repaint: Repaint) -> Repaint {
+    let (sender, mut receiver) = mpsc::channel(1);
+    core.spawn(async move {
+        while let Some(()) = receiver.recv().await {
+            repaint();
+        }
+    });
+    Arc::new(move || {
+        let _ = sender.try_send(());
+    })
+}
+
 fn window_options() -> eframe::NativeOptions {
     eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -272,6 +286,25 @@ fn window_icon() -> egui::IconData {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn rendering_can_log_without_reentering_the_egui_context() {
+        let ctx = eframe::egui::Context::default();
+        let (woke, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let notify = super::deferred_log_repaint(
+            &tokio::runtime::Handle::current(),
+            std::sync::Arc::new(move || {
+                let _ = woke.send(());
+            }),
+        );
+        ctx.memory_mut(|_| {
+            notify();
+            notify();
+            assert!(received.try_recv().is_err());
+        });
+        assert_eq!(received.recv().await, Some(()));
+        assert!(received.try_recv().is_err());
+    }
+
     use super::*;
     use hub_app::supervisor::SaveStatus;
 

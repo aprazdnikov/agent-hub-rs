@@ -25,6 +25,7 @@ struct Editor {
     task: u64,
     answers: Vec<QuestionDraft>,
     sent: bool,
+    permission_details: bool,
     pending: Option<oneshot::Receiver<Result<(), String>>>,
     error: Option<String>,
     feedback_until: Option<Instant>,
@@ -95,26 +96,24 @@ impl Panel {
                         "В теме проекта за этой задачей можно следить командой /task follow {}",
                         live.id,
                     ));
-                    if live.active && ui.button("Остановить локальную работу").clicked()
+                    if live.active
+                        && ui.add(kylig_ui::Button::new("Остановить локальную работу")).clicked()
                     {
                         send(Command::LocalStop(live.token));
                     }
                 });
                 if let Some(request) = &live.interaction {
-                    self.decision(ui, live, request, None, send);
+                    self.decision(ui, live, request, send);
                 }
             });
         });
     }
 
-    /// `max_rows` clamps the permission summary to that many visual rows;
-    /// the collapsed inbox card passes `Some(SUMMARY_LINES)` (spec line 79).
     pub(super) fn decision(
         &mut self,
         ui: &mut egui::Ui,
         live: &Live,
         request: &Interaction,
-        max_rows: Option<usize>,
         send: &mut impl FnMut(Command),
     ) {
         if !live.active {
@@ -134,27 +133,51 @@ impl Panel {
                 .add_enabled_ui(!editor.sent, |ui| match &request.kind {
                     Kind::Permission(tool) => {
                         ui.strong(format!("Разрешить действие «{}»?", tool.tool));
+                        let clamp = !editor.permission_details
+                            && summary_rows(ui, &tool.summary) > SUMMARY_LINES;
+                        let summary =
+                            if clamp { clamp_lines(&tool.summary) } else { tool.summary.clone() };
                         egui::ScrollArea::vertical()
                             .id_salt("permission_details")
                             .max_height(160.0)
                             .show(ui, |ui| {
                                 let mut job = egui::WidgetText::from(
-                                    egui::RichText::new(&tool.summary).monospace(),
+                                    egui::RichText::new(summary).monospace(),
                                 )
                                 .into_layout_job(
                                     ui.style(),
                                     egui::FontSelection::Default,
                                     egui::Align::Min,
                                 );
-                                if let Some(rows) = max_rows {
-                                    Arc::make_mut(&mut job).wrap.max_rows = rows;
+                                if clamp {
+                                    Arc::make_mut(&mut job).wrap.max_rows = SUMMARY_LINES;
                                 }
                                 ui.add(egui::Label::new(job).wrap().selectable(true));
                             });
+                        if ui
+                            .link(if editor.permission_details {
+                                "Скрыть подробности"
+                            } else {
+                                "Подробнее о запросе"
+                            })
+                            .clicked()
+                        {
+                            editor.permission_details = !editor.permission_details;
+                        }
+                        if editor.permission_details {
+                            ui.label(format!(
+                                "Разрешение на один вызов инструмента «{}» для задачи #{}.",
+                                tool.tool, live.id
+                            ));
+                            ui.monospace(live.project.display().to_string());
+                        }
+                        ui.add_space(4.0);
                         ui.horizontal_wrapped(|ui| {
-                            if ui.button("Разрешить один раз").clicked() {
+                            if theme::primary_button(ui, true, "Разрешить один раз").clicked()
+                            {
                                 Some(Answer::Allow)
-                            } else if ui.button("Отклонить").clicked() {
+                            } else if ui.add(kylig_ui::Button::new("Отклонить")).clicked()
+                            {
                                 Some(Answer::Deny)
                             } else {
                                 None
@@ -175,10 +198,13 @@ impl Panel {
                 ui.ctx().request_repaint();
             }
             if editor.sent {
-                ui.small(if editor.pending.is_some() {
-                    "Отправляем ответ…"
-                } else {
-                    "Ответ получен."
+                ui.horizontal(|ui| {
+                    if editor.pending.is_some() {
+                        ui.add(kylig_ui::ProgressRing::indeterminate().size(16.0));
+                        ui.small("Отправляем ответ…");
+                    } else {
+                        ui.small("Ответ получен.");
+                    }
                 });
             }
         });
@@ -235,9 +261,9 @@ impl Editor {
             } else {
                 "Отправить ответы"
             };
-            if ui.add_enabled(ready, egui::Button::new(label)).clicked() {
+            if theme::primary_button(ui, ready, label).clicked() {
                 Some(Answer::Text(answers))
-            } else if ui.button("Отказаться отвечать").clicked() {
+            } else if ui.add(kylig_ui::Button::new("Отказаться")).clicked() {
                 Some(Answer::Deny)
             } else {
                 None
@@ -267,9 +293,9 @@ impl QuestionDraft {
                     {
                         if question.selection() == Selection::Single {
                             self.choices.clear();
-                            self.text.clear();
-                        }
-                        if selected {
+                            self.choices.insert(index);
+                            self.text.clone_from(&option.label);
+                        } else if selected {
                             self.choices.remove(&index);
                         } else {
                             self.choices.insert(index);
@@ -280,12 +306,12 @@ impl QuestionDraft {
         }
         if ui
             .add(
-                egui::TextEdit::multiline(&mut self.text)
+                kylig_ui::TextArea::new(&mut self.text)
                     .id_salt("answer")
-                    .desired_rows(2)
-                    .desired_width(f32::INFINITY)
-                    .char_limit(MAX_ANSWER)
-                    .hint_text("Ответ или свой вариант"),
+                    .rows(1)
+                    .max_rows(Some(4))
+                    .width(ui.available_width())
+                    .placeholder("Ответ или свой вариант"),
             )
             .changed()
             && question.selection() == Selection::Single
@@ -295,6 +321,9 @@ impl QuestionDraft {
     }
 
     fn answer(&self, question: &Question) -> String {
+        if question.selection() == Selection::Single {
+            return self.text.trim().to_owned();
+        }
         self.choices
             .iter()
             .filter_map(|&index| question.options().get(index).map(|option| option.label.as_str()))
@@ -302,4 +331,26 @@ impl QuestionDraft {
             .collect::<Vec<_>>()
             .join(", ")
     }
+}
+
+/// Spec «Входящие»: collapsed permission summary shows up to 3 visual rows.
+const SUMMARY_LINES: usize = 3;
+
+/// Visual rows a monospace permission summary takes at the width `decision`
+/// renders it — a single long command line wraps into several rows, so the
+/// collapse decision must count rows, not logical lines.
+fn summary_rows(ui: &egui::Ui, summary: &str) -> usize {
+    let mut job = egui::WidgetText::from(egui::RichText::new(summary).monospace()).into_layout_job(
+        ui.style(),
+        egui::FontSelection::Default,
+        egui::Align::Min,
+    );
+    Arc::make_mut(&mut job).wrap.max_width = ui.available_width();
+    ui.fonts_mut(|fonts| fonts.layout_job(Arc::unwrap_or_clone(job))).rows.len()
+}
+
+fn clamp_lines(summary: &str) -> String {
+    let mut lines = summary.lines();
+    let head = lines.by_ref().take(SUMMARY_LINES).collect::<Vec<_>>().join("\n");
+    if lines.next().is_some() { format!("{head}…") } else { head }
 }

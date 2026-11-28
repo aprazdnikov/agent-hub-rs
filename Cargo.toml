@@ -1,11 +1,11 @@
 [workspace]
 resolver = "3"
-members = ["crates/hub-core", "crates/hub-memory", "crates/hub-agent", "crates/hub-claude", "crates/hub-codex", "crates/hub-qwen", "crates/hub-hermes", "crates/hub-opencode", "crates/hub-pi", "crates/hub-telegram", "crates/hub-app"]
+members = ["crates/hub-core", "crates/hub-memory", "crates/hub-agent", "crates/hub-claude", "crates/hub-codex", "crates/hub-qwen", "crates/hub-hermes", "crates/hub-opencode", "crates/hub-pi", "crates/hub-telegram", "crates/hub-app", "docs/prototypes/kylig"]
 
 [workspace.package]
-version = "1.2.0"
+version = "1.3.0"
 edition = "2024"
-rust-version = "1.96"
+rust-version = "1.98"
 license = "MIT"
 repository = "https://github.com/aprazdnikov/agent-hub-rs"
 publish = false
@@ -23,7 +23,10 @@ hub-pi = { path = "crates/hub-pi" }
 hub-telegram = { path = "crates/hub-telegram" }
 anyhow = "1.0"
 directories = "6.0"
-eframe = { version = "0.36", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
+egui = { version = "0.37", default-features = false, features = ["monochrome_emoji_fonts"] }
+kylig-ui = "0.12.1"
+kylig-icons = "0.12.1"
+eframe = { version = "0.37", default-features = false, features = ["default_fonts", "glow", "wayland", "x11"] }
 keyring = "4.2"
 rfd = "0.17"
 toml = "1.1"

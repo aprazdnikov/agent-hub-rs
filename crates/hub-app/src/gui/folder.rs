@@ -166,8 +166,8 @@ impl Opener {
         }
     }
 
-    pub fn error(&self) -> Option<&str> {
-        self.error.as_deref()
+    pub fn take_error(&mut self) -> Option<String> {
+        self.error.take()
     }
 
     pub fn is_pending(&self) -> bool {
@@ -245,7 +245,7 @@ mod tests {
             spawn(Command::new(missing), OsStr::new("target"))
         });
         drain(&mut opener, &ctx);
-        assert!(opener.error().unwrap().contains("project"));
+        assert!(opener.take_error().unwrap().contains("project"));
         opener.start(
             Destination::Topic(TopicKey {
                 chat: hub_core::domain::ChatId(1),
@@ -254,7 +254,7 @@ mod tests {
             &ctx,
         );
         drain(&mut opener, &ctx);
-        assert!(opener.error().unwrap().contains("невозможно построить ссылку"));
+        assert!(opener.take_error().unwrap().contains("невозможно построить ссылку"));
     }
 
     #[test]
@@ -272,7 +272,7 @@ mod tests {
             second.store(true, std::sync::atomic::Ordering::SeqCst);
             Err(io::Error::other("must not run"))
         });
-        assert!(opener.error().is_some());
+        assert!(opener.take_error().is_some());
         release.send(()).unwrap();
         drain(&mut opener, &ctx);
         assert!(!called.load(std::sync::atomic::Ordering::SeqCst));

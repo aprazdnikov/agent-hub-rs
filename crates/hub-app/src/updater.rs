@@ -33,6 +33,9 @@ pub enum UpdateError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum UpdateState {
     Idle,
+    Checking,
+    Current,
+    CheckFailed(String),
     Available(Version),
     ManualAvailable(Version),
     Installing(Version),
@@ -43,6 +46,7 @@ pub enum UpdateState {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UpdateCommand {
+    Check,
     Install,
 }
 
@@ -108,37 +112,32 @@ pub async fn run<S: Source, I: Installer>(
     loop {
         tokio::select! {
             command = commands.recv() => match command {
+                Some(UpdateCommand::Check) => updater.check(true).await,
                 Some(UpdateCommand::Install) => updater.install().await,
                 None => return,
             },
-            _ = ticks.tick() => updater.check().await,
+            _ = ticks.tick() => updater.check(false).await,
         }
     }
 }
 
 impl<S: Source, I: Installer> Updater<S, I> {
-    async fn check(&mut self) {
-        let installed = matches!(*self.state.borrow(), UpdateState::Installed(_));
-        let enabled = wanted(&self.checks.borrow()) == UpdateCheck::Enabled;
-        if installed || !enabled {
+    async fn check(&mut self, manual: bool) {
+        if matches!(*self.state.borrow(), UpdateState::Installed(_))
+            || (!manual && wanted(&self.checks.borrow()) == UpdateCheck::Disabled)
+        {
             return;
         }
-        let answer = tokio::time::timeout(CHECK_TIMEOUT, self.source.latest()).await;
-        let raw = match answer {
-            Ok(Ok(raw)) => raw,
-            Ok(Err(error)) => {
-                tracing::warn!(%error, "update check failed");
-                return;
-            }
-            Err(_elapsed) => {
-                tracing::warn!("update check timed out");
-                return;
-            }
-        };
-        let release = match parse_release(&raw) {
+        if manual {
+            self.publish(UpdateState::Checking);
+        }
+        let release = match self.latest_release().await {
             Ok(release) => release,
             Err(error) => {
                 tracing::warn!(%error, "update check failed");
+                if manual {
+                    self.publish(UpdateState::CheckFailed(error.to_string()));
+                }
                 return;
             }
         };
@@ -147,7 +146,7 @@ impl<S: Source, I: Installer> Updater<S, I> {
             if release.version > self.current {
                 self.publish(UpdateState::ManualAvailable(release.version));
             } else {
-                self.publish(UpdateState::Idle);
+                self.publish(UpdateState::Current);
             }
             return;
         }
@@ -157,8 +156,15 @@ impl<S: Source, I: Installer> Updater<S, I> {
                 tracing::info!(version = %found.version, "update available");
                 self.publish(UpdateState::Available(found.version));
             }
-            None => self.publish(UpdateState::Idle),
+            None => self.publish(UpdateState::Current),
         }
+    }
+
+    async fn latest_release(&self) -> Result<crate::updates::Release, UpdateError> {
+        let raw = tokio::time::timeout(CHECK_TIMEOUT, self.source.latest())
+            .await
+            .map_err(|_| UpdateError::Check("время ожидания истекло".into()))??;
+        parse_release(&raw).map_err(|error| UpdateError::Check(error.to_string()))
     }
 
     async fn install(&mut self) {
@@ -172,6 +178,9 @@ impl<S: Source, I: Installer> Updater<S, I> {
         let ready = match *self.state.borrow() {
             UpdateState::Available(_) | UpdateState::Failed(_) => true,
             UpdateState::Idle
+            | UpdateState::Checking
+            | UpdateState::Current
+            | UpdateState::CheckFailed(_)
             | UpdateState::ManualAvailable(_)
             | UpdateState::Installing(_)
             | UpdateState::Installed(_) => false,
@@ -369,7 +378,7 @@ mod tests {
         let harness = harness(Ok(release("v0.1.0")), "", UpdateCheck::Enabled);
         tokio::time::sleep(CHECK_EVERY + Duration::from_secs(1)).await;
         assert_eq!(checks(&harness), 2);
-        assert_eq!(*harness.state.borrow(), UpdateState::Idle);
+        assert_eq!(*harness.state.borrow(), UpdateState::Current);
     }
 
     #[tokio::test(start_paused = true)]
@@ -377,6 +386,18 @@ mod tests {
         let harness = harness(Ok(release("v0.2.0")), "", UpdateCheck::Disabled);
         tokio::time::sleep(CHECK_EVERY * 2).await;
         assert_eq!(checks(&harness), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn manual_check_reports_failure_and_can_retry_with_daily_checks_off() {
+        let mut harness = harness(Err("offline".into()), "", UpdateCheck::Disabled);
+        harness.commands.send(UpdateCommand::Check).await.unwrap();
+        until(&mut harness.state, |s| matches!(s, UpdateState::CheckFailed(_))).await;
+        *harness.source.latest.lock().unwrap() = Some(Ok(release("v0.1.0")));
+        harness.commands.send(UpdateCommand::Check).await.unwrap();
+        until(&mut harness.state, |s| matches!(s, UpdateState::Current)).await;
+        assert_eq!(checks(&harness), 2);
+        assert_eq!(harness.source.downloads.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test(start_paused = true)]

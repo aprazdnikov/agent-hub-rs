@@ -53,20 +53,27 @@ impl Mode {
 pub(super) struct Editor {
     pub saved: ProjectRules,
     draft: ProjectRules,
+    previous_workflow: Option<WorkflowChoice>,
+    custom_roles: Option<(BackendKind, BackendKind)>,
+    previous_git: Option<hub_core::tasks::git::GitPolicy>,
 }
 impl Editor {
     pub fn dirty(&self) -> bool {
         self.draft != self.saved
     }
     pub fn observe(&mut self, rules: ProjectRules) {
-        if !self.dirty() {
-            self.draft = rules.clone();
+        if !self.dirty() && self.saved != rules {
+            self.accept(rules);
+            return;
         }
         self.saved = rules;
     }
     pub fn accept(&mut self, rules: ProjectRules) {
         self.draft = rules.clone();
         self.saved = rules;
+        self.previous_workflow = None;
+        self.custom_roles = None;
+        self.previous_git = None;
     }
     fn workflow_settings(
         &mut self,
@@ -74,16 +81,33 @@ impl Editor {
         project: &std::path::Path,
         roles: AgentRoles,
     ) {
-        ui.label("Исправить и проверить автоматически");
         let current = Mode::of(self.draft.workflow.as_ref());
         let mut picked = current;
-        ui.horizontal_wrapped(|ui| {
-            for mode in Mode::ALL {
-                ui.selectable_value(&mut picked, mode, mode.label());
-            }
-        });
+        let modes = Mode::ALL.map(|mode| kylig_ui::SelectItem::new(mode, mode.label()));
+        ui.add(
+            kylig_ui::Select::new(&mut picked, &modes)
+                .id_salt(("workflow_mode", project))
+                .options(kylig_ui::TextFieldOptions {
+                    animate: ui.style().animation_time > 0.0,
+                    ..Default::default()
+                })
+                .label("Исправить и проверить автоматически")
+                .width(ui.available_width().min(320.0)),
+        );
         if picked != current {
-            self.draft.workflow = picked.chosen(self.draft.workflow.as_ref());
+            if let Some(WorkflowChoice::Custom(plan)) = &self.draft.workflow {
+                self.custom_roles = Some((plan.implementer, plan.reviewer));
+            }
+            if let Some(previous) = self.draft.workflow.take() {
+                self.previous_workflow = Some(previous);
+            }
+            self.draft.workflow = picked.chosen(self.previous_workflow.as_ref());
+            if let (Some(WorkflowChoice::Custom(plan)), Some((implementer, reviewer))) =
+                (&mut self.draft.workflow, self.custom_roles)
+            {
+                plan.implementer = implementer;
+                plan.reviewer = reviewer;
+            }
         }
         match &mut self.draft.workflow {
             None => {}
@@ -95,10 +119,11 @@ impl Editor {
                 ));
                 ui.label("Доверенная команда проверки");
                 ui.add(
-                    egui::TextEdit::singleline(command)
+                    kylig_ui::TextField::new(command)
                         .id_salt(("workflow_command", project))
-                        .hint_text("cargo test")
-                        .char_limit(2048),
+                        .placeholder("cargo test")
+                        .max_chars(2048)
+                        .width(ui.available_width()),
                 );
                 ui.small("Ревьюер меняется для новых запусков сразу после правки общих ролей; запущенная попытка доигрывает старую конфигурацию.");
             }
@@ -107,20 +132,15 @@ impl Editor {
                 for (label, backend) in
                     [("Исполнитель", &mut plan.implementer), ("Ревьюер", &mut plan.reviewer)]
                 {
-                    egui::ComboBox::from_id_salt((project, label))
-                        .selected_text(format!("{label}: {}", backend.name()))
-                        .show_ui(ui, |ui| {
-                            for candidate in BackendKind::ALL {
-                                ui.selectable_value(backend, candidate, candidate.name());
-                            }
-                        });
+                    crate::gui::settings::agent_choice(ui, label, backend);
                 }
                 ui.label("Доверенная команда проверки на этом компьютере");
                 ui.add(
-                    egui::TextEdit::singleline(&mut plan.command)
+                    kylig_ui::TextField::new(&mut plan.command)
                         .id_salt(("workflow_command_custom", project))
-                        .hint_text("cargo test")
-                        .char_limit(2048),
+                        .placeholder("cargo test")
+                        .max_chars(2048)
+                        .width(ui.available_width()),
                 );
             }
         }
@@ -141,41 +161,43 @@ impl Editor {
         ));
         ui.small("Общие для всех задач этого каталога. Подготовка Git выполняется приложением отдельно, до первого запуска.");
         ui.add_enabled_ui(!saving, |ui| {
-                ui.checkbox(&mut self.draft.enabled, "Добавлять правила к каждому запуску");
-                ui.add(egui::TextEdit::multiline(&mut self.draft.text)
-                    .id_salt(("project_rules_text", project)).desired_rows(4).desired_width(f32::INFINITY)
-                    .hint_text("Например: перед новой задачей обновлять базовую ветку Dev и создавать рабочую ветку от неё.").char_limit(16384));
-            });
-        ui.add_enabled_ui(!saving, |ui| {
-                let mut enabled = self.draft.git.is_some();
-                if ui.checkbox(&mut enabled, "Требовать подготовку Git перед новой задачей").changed() {
-                    self.draft.git = enabled.then(|| hub_core::tasks::git::GitPolicy { remote: "origin".into(), base: String::new() });
+            ui.add(kylig_ui::Checkbox::new(&mut self.draft.enabled, "Добавлять правила к каждому запуску"));
+            ui.add(kylig_ui::TextArea::new(&mut self.draft.text)
+                .label("Инструкции проекта")
+                .id_salt(("project_rules_text", project)).rows(4).width(ui.available_width())
+                .placeholder("Например: перед новой задачей обновлять базовую ветку Dev и создавать рабочую ветку от неё.")
+                .max_chars(16384));
+            self.workflow_settings(ui, project, roles);
+            let mut enabled = self.draft.git.is_some();
+            if ui.add(kylig_ui::Checkbox::new(&mut enabled, "Требовать подготовку Git перед новой задачей")).changed() {
+                if enabled {
+                    self.draft.git = Some(self.previous_git.take().unwrap_or_else(|| hub_core::tasks::git::GitPolicy { remote: "origin".into(), base: String::new() }));
+                } else {
+                    self.previous_git = self.draft.git.take();
                 }
-                if let Some(git) = &mut self.draft.git {
-                    ui.label("Remote (имя, не URL)");
-                    ui.add(egui::TextEdit::singleline(&mut git.remote).id_salt(("git_remote", project)).char_limit(80));
-                    ui.label("Базовая ветка — точное имя, например Dev или master");
-                    ui.add(egui::TextEdit::singleline(&mut git.base).id_salt(("git_base", project)).char_limit(160));
-                    ui.small("Перед новой задачей: чистый каталог › fetch › fast-forward базы › новая ветка. Без stash, reset и push.");
-                }
-            });
-        ui.add_enabled_ui(!saving, |ui| self.workflow_settings(ui, project, roles));
+            }
+            if let Some(git) = &mut self.draft.git {
+                ui.add(kylig_ui::TextField::new(&mut git.remote).label("Remote (имя, не URL)").id_salt(("git_remote", project)).width(ui.available_width()).max_chars(80));
+                ui.add(kylig_ui::TextField::new(&mut git.base).label("Базовая ветка — точное имя, например Dev или master").id_salt(("git_base", project)).width(ui.available_width()).max_chars(160));
+                ui.small("Перед новой задачей: чистый каталог › fetch › fast-forward базы › новая ветка. Без stash, reset и push.");
+            }
+        });
         if self.draft.revision != self.saved.revision {
             ui.label("Правила изменены в другой сессии. Ваш черновик сохранён на экране; скопируйте нужный текст и загрузите актуальную редакцию.");
         } else if self.dirty() {
-            ui.label("Есть несохранённые изменения. Сохраните или загрузите сохранённую редакцию перед запуском.");
+            ui.weak("Есть несохранённые изменения.");
         }
         if let Err(error) = self.draft.validate() {
             ui.label(error);
         }
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             if ui
                 .add_enabled(
                     !blocked
                         && self.dirty()
                         && self.draft.revision == self.saved.revision
                         && self.draft.validate().is_ok(),
-                    egui::Button::new("Сохранить правила"),
+                    kylig_ui::Button::new("Сохранить правила").primary(),
                 )
                 .clicked()
             {
@@ -199,7 +221,12 @@ impl Editor {
             if ui
                 .add_enabled(
                     !saving && self.dirty(),
-                    egui::Button::new("Загрузить сохранённую редакцию"),
+                    kylig_ui::Button::new(if self.draft.revision == self.saved.revision {
+                        "Отменить изменения"
+                    } else {
+                        "Загрузить сохранённую редакцию"
+                    })
+                    .ghost(),
                 )
                 .clicked()
             {
@@ -305,6 +332,9 @@ mod tests {
         editor.observe(rules(None));
         let mut requests = Vec::new();
         let output = render(&ctx, &mut editor, roles, Vec::new(), &mut requests);
+        assert!(has_text(&output, "Выключено"));
+        click(&ctx, &mut editor, roles, "Выключено", &mut requests);
+        let output = render(&ctx, &mut editor, roles, Vec::new(), &mut requests);
         for state in ["Выключено", "Наследовать общие роли", "Свой выбор"]
         {
             assert!(has_text(&output, state), "missing segment {state}");
@@ -360,6 +390,7 @@ mod tests {
         let mut editor = Editor::default();
         editor.observe(rules(Some(WorkflowChoice::Inherit { command: "cargo test".into() })));
         let mut requests = Vec::new();
+        click(&ctx, &mut editor, roles, "Наследовать общие роли", &mut requests);
         click(&ctx, &mut editor, roles, "Свой выбор", &mut requests);
         assert_eq!(
             editor.draft,
@@ -370,9 +401,10 @@ mod tests {
             })))
         );
         let output = render(&ctx, &mut editor, roles, Vec::new(), &mut requests);
-        assert!(has_text(&output, "Исполнитель: codex"));
-        assert!(has_text(&output, "Ревьюер: claude"));
+        assert!(has_text(&output, "Исполнитель") && has_text(&output, "Codex"));
+        assert!(has_text(&output, "Ревьюер") && has_text(&output, "Claude Code"));
         assert!(!has_text(&output, "Исполнитель: qwen · Ревьюер: hermes (общие роли)"));
+        click(&ctx, &mut editor, roles, "Свой выбор", &mut requests);
         click(&ctx, &mut editor, roles, "Выключено", &mut requests);
         assert_eq!(editor.draft, rules(None));
         let output = render(&ctx, &mut editor, roles, Vec::new(), &mut requests);

@@ -59,6 +59,9 @@ pub struct MemoryOverview {
     pub token: SnapshotToken,
     pub policy: CleanupPolicy,
     pub page: MemoryPage,
+    /// Administrative metadata for the entries on this page.
+    pub statuses: BTreeMap<String, MemoryStatus>,
+    pub revision_count: usize,
     pub tombstone_count: usize,
     pub last_cleanup: Option<CleanupSummary>,
 }

@@ -518,7 +518,7 @@ impl MemoryReader {
     }
 
     pub fn inspect(&self, query: &str, offset: usize, limit: usize) -> Result<MemoryPage, Error> {
-        self.inspect_filtered(query, offset, limit, StatusFilter::Active)
+        self.inspect_filtered(query, offset, limit, StatusFilter::Active).map(|(page, _)| page)
     }
 
     fn inspect_filtered(
@@ -527,7 +527,7 @@ impl MemoryReader {
         offset: usize,
         limit: usize,
         filter: StatusFilter,
-    ) -> Result<MemoryPage, Error> {
+    ) -> Result<(MemoryPage, Option<Snapshot>), Error> {
         if query.len() > 512 || !(1..=20).contains(&limit) {
             return Err(Error::InvalidInput("query must be <=512 bytes and limit 1..20"));
         }
@@ -542,7 +542,7 @@ impl MemoryReader {
             matched_count: 0,
             entries: Vec::new(),
         };
-        let Some(store) = self.store()? else { return Ok(page) };
+        let Some(store) = self.store()? else { return Ok((page, None)) };
         let (snapshot, bytes) = store.load_with_size()?;
         page.exists = bytes > 0;
         page.bytes = bytes;
@@ -580,7 +580,7 @@ impl MemoryReader {
                 created_at: entry.created_at,
             })
             .collect();
-        Ok(page)
+        Ok((page, Some(snapshot)))
     }
 }
 

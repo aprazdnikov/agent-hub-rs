@@ -3,101 +3,46 @@
 #[cfg(target_os = "linux")]
 pub mod linux;
 
-use eframe::egui::{self, Color32, FontId, Stroke, TextStyle, Theme};
+mod choice;
+pub(super) use choice::{Choice, detailed_select};
+mod layout;
+pub(super) use layout::{dialog, remaining_height, workspace_panes};
+mod palette;
+pub use palette::configure;
 
-pub fn configure(ctx: &egui::Context) {
-    ctx.set_theme(egui::ThemePreference::System);
-    for theme in [Theme::Light, Theme::Dark] {
-        ctx.style_mut_of(theme, |style| {
-            let (canvas, surface, text, muted, border, accent, selected) = match theme {
-                Theme::Light => (
-                    Color32::from_rgb(248, 249, 247),
-                    Color32::WHITE,
-                    Color32::from_rgb(28, 37, 33),
-                    Color32::from_rgb(84, 100, 92),
-                    Color32::from_rgb(213, 221, 215),
-                    Color32::from_rgb(13, 100, 79),
-                    Color32::from_rgb(220, 238, 229),
-                ),
-                Theme::Dark => (
-                    Color32::from_rgb(23, 27, 25),
-                    Color32::from_rgb(31, 37, 34),
-                    Color32::from_rgb(230, 236, 231),
-                    Color32::from_rgb(169, 185, 175),
-                    Color32::from_rgb(65, 78, 70),
-                    Color32::from_rgb(142, 218, 185),
-                    Color32::from_rgb(43, 68, 55),
-                ),
-            };
-            style.text_styles.insert(TextStyle::Heading, FontId::proportional(26.0));
-            style.text_styles.insert(TextStyle::Body, FontId::proportional(14.0));
-            style.text_styles.insert(TextStyle::Button, FontId::proportional(14.0));
-            style.text_styles.insert(TextStyle::Small, FontId::proportional(12.0));
-            style.text_styles.insert(TextStyle::Monospace, FontId::monospace(13.0));
-            style.spacing.item_spacing = egui::vec2(8.0, 6.0);
-            style.spacing.button_padding = egui::vec2(12.0, 7.0);
-            style.spacing.interact_size.y = 32.0;
-            style.spacing.combo_width = 160.0;
-            style.visuals.panel_fill = surface;
-            style.visuals.window_fill = surface;
-            style.visuals.extreme_bg_color = canvas;
-            style.visuals.faint_bg_color = canvas;
-            style.visuals.text_edit_bg_color = Some(canvas);
-            style.visuals.weak_text_color = Some(muted);
-            style.visuals.selection.bg_fill = selected;
-            style.visuals.selection.stroke = Stroke::new(1.0, accent);
-            style.visuals.hyperlink_color = accent;
-            style.visuals.window_stroke = Stroke::new(1.0, border);
-            style.visuals.window_corner_radius = 10.into();
-            style.visuals.menu_corner_radius = 8.into();
-            let widgets = &mut style.visuals.widgets;
-            for widget in [
-                &mut widgets.noninteractive,
-                &mut widgets.inactive,
-                &mut widgets.hovered,
-                &mut widgets.active,
-                &mut widgets.open,
-            ] {
-                widget.bg_fill = surface;
-                widget.weak_bg_fill = surface;
-                widget.bg_stroke = Stroke::new(1.0, border);
-                widget.fg_stroke = Stroke::new(1.0, text);
-                widget.corner_radius = 6.into();
-                widget.expansion = 0.0;
-            }
-            widgets.hovered.bg_fill = selected;
-            widgets.hovered.weak_bg_fill = selected;
-            widgets.hovered.bg_stroke = Stroke::new(1.0, accent);
-            widgets.active.bg_fill = selected;
-            widgets.active.weak_bg_fill = selected;
-            widgets.active.bg_stroke = Stroke::new(2.0, accent);
-            widgets.open.bg_fill = selected;
-            widgets.open.weak_bg_fill = selected;
-        });
-    }
-}
+#[cfg(test)]
+use egui::Theme;
+use egui::{Color32, Stroke};
 
-/// Keep the full button hit area and its inner margin in every interaction state.
-pub(super) fn tab(ui: &mut egui::Ui, selected: bool, text: &str) -> egui::Response {
-    let response = ui.add(egui::Button::selectable(selected, text).frame_when_inactive(false));
-    if selected {
-        ui.painter().hline(
-            response.rect.x_range().shrink(4.0),
-            response.rect.bottom() + 1.0,
-            Stroke::new(2.0, ui.visuals().hyperlink_color),
+/// A keyboard-focusable section selector with the same label for screen readers.
+pub(super) fn nav_chip(
+    ui: &mut egui::Ui,
+    selected: bool,
+    text: &str,
+    icon: &str,
+) -> egui::Response {
+    let response = kylig_ui::Chip::new(text)
+        .icon(icon)
+        .selected(selected)
+        .color(ui.visuals().hyperlink_color)
+        .show(ui)
+        .response;
+    response.widget_info(|| {
+        egui::WidgetInfo::selected(egui::Role::Button, ui.is_enabled(), selected, text)
+    });
+    if response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect,
+            16,
+            Stroke::new(1.5, ui.visuals().hyperlink_color),
+            egui::StrokeKind::Inside,
         );
     }
     response
 }
 
 pub(super) fn primary_button(ui: &mut egui::Ui, enabled: bool, text: &str) -> egui::Response {
-    let text = egui::RichText::new(text).color(ui.visuals().panel_fill);
-    let button = egui::Button::new(text).fill(ui.visuals().hyperlink_color);
-    ui.add_enabled(enabled, button)
-}
-
-pub fn surface(ui: &egui::Ui) -> egui::Frame {
-    egui::Frame::group(ui.style()).fill(ui.visuals().panel_fill).inner_margin(20).corner_radius(10)
+    ui.add_enabled(enabled, kylig_ui::Button::new(text).primary())
 }
 
 /// Semantic color pair for status surfaces; resolved per active theme.
@@ -160,45 +105,31 @@ pub(super) fn chip(ui: &mut egui::Ui, tone: Tone, text: &str) -> egui::Response 
 
 const CHIP_MARGIN: egui::Margin = egui::Margin::symmetric(9, 2);
 
-/// Width a [`chip`] takes for this text, so a neighbour can truncate instead of
-/// pushing the chip out of the row. Must stay in sync with [`chip`].
-#[must_use]
-pub(super) fn chip_width(ui: &egui::Ui, text: &str) -> f32 {
-    let job = egui::WidgetText::from(egui::RichText::new(text).small()).into_layout_job(
-        ui.style(),
-        egui::FontSelection::Default,
-        egui::Align::Min,
-    );
-    let text_width =
-        ui.fonts_mut(|fonts| fonts.layout_job(std::sync::Arc::unwrap_or_clone(job))).size().x;
-    text_width + 2.0 * f32::from(CHIP_MARGIN.left)
-}
-
-pub(super) fn card(ui: &egui::Ui) -> egui::Frame {
-    egui::Frame::new()
-        .fill(ui.visuals().panel_fill)
-        .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
-        .corner_radius(10)
-        .inner_margin(egui::Margin::symmetric(14, 12))
+pub(super) fn card(ui: &egui::Ui) -> kylig_ui::Card {
+    kylig_ui::Card::new()
+        .options(kylig_ui::CardOptions {
+            radius: 10.0,
+            padding: if ui.available_width() < 420.0 { 18.0 } else { 24.0 },
+            fill: Some(ui.visuals().panel_fill),
+            border: Some(ui.visuals().widgets.noninteractive.bg_stroke.color),
+            shadow: egui::epaint::Shadow::NONE,
+            ..Default::default()
+        })
+        .width(ui.available_width())
 }
 
 pub(super) fn bubble(ui: &egui::Ui, user: bool) -> egui::Frame {
-    // The 4px corner at the sender's lower edge reads as the bubble tail (design spec «Чат задачи»).
-    let corner_radius = if user {
-        egui::CornerRadius { nw: 12, ne: 12, sw: 12, se: 4 }
+    let radius = egui::CornerRadius::same(15);
+    let (corners, fill) = if user {
+        (egui::CornerRadius { se: 3, ..radius }, ui.visuals().selection.bg_fill)
     } else {
-        egui::CornerRadius { nw: 12, ne: 12, sw: 4, se: 12 }
+        (egui::CornerRadius { sw: 3, ..radius }, ui.visuals().panel_fill)
     };
-    let frame = egui::Frame::new()
-        .corner_radius(corner_radius)
-        .inner_margin(egui::Margin::symmetric(12, 9));
-    if user {
-        frame.fill(ui.visuals().selection.bg_fill)
-    } else {
-        frame
-            .fill(ui.visuals().panel_fill)
-            .stroke(egui::Stroke::new(1.0, ui.visuals().widgets.noninteractive.bg_stroke.color))
-    }
+    egui::Frame::new()
+        .fill(fill)
+        .stroke(ui.visuals().window_stroke)
+        .corner_radius(corners)
+        .inner_margin(egui::Margin::symmetric(13, 8))
 }
 
 #[cfg(test)]
@@ -219,7 +150,7 @@ mod tests {
                 Vec::new()
             };
             let mut output = ctx.run_ui(egui::RawInput { events, ..Default::default() }, |ui| {
-                let response = tab(ui, false, "Темы Telegram");
+                let response = nav_chip(ui, false, "Темы Telegram", kylig_icons::CHATS);
                 rect = response.rect;
                 if pass == 1 {
                     assert!(response.hovered());
@@ -250,9 +181,9 @@ mod tests {
         configure(&ctx);
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             let user = bubble(ui, true);
-            assert_eq!(user.corner_radius, egui::CornerRadius { nw: 12, ne: 12, sw: 12, se: 4 });
+            assert_eq!(user.corner_radius, egui::CornerRadius { nw: 15, ne: 15, sw: 15, se: 3 });
             let agent = bubble(ui, false);
-            assert_eq!(agent.corner_radius, egui::CornerRadius { nw: 12, ne: 12, sw: 4, se: 12 });
+            assert_eq!(agent.corner_radius, egui::CornerRadius { nw: 15, ne: 15, sw: 3, se: 15 });
         });
         output.textures_delta.clear();
     }
@@ -276,9 +207,9 @@ mod tests {
                     error_fgs.push(tone_colors(ui, Tone::Error).1);
                     review_colors.push(review_color(ui));
                     assert!(chip(ui, Tone::Warning, "Нужна проверка").rect.width() > 0.0);
-                    card(ui).show(ui, |ui| {
-                        ui.label("карточка");
-                    });
+                    let width = ui.available_width();
+                    let rendered = card(ui).show(ui, |ui| ui.label("карточка"));
+                    assert!((rendered.response.rect.width() - width).abs() < 1.0);
                     bubble(ui, true).show(ui, |ui| {
                         ui.label("вы");
                     });
@@ -296,20 +227,13 @@ mod tests {
 
     #[test]
     fn gui_labels_use_only_covered_glyphs() {
-        // egui draws a character with no glyph in the installed font as the box '◻'.
-        // The bundled proportional family lacks several symbols, so any label using one
-        // showed that square; the GUI switched those labels to covered equivalents:
-        // '⚠'→'!', '✓'→'√', '→'→'›', '←'→'‹', '⋯'→'…', '▶'→'⏵'.
-        // This pins the font coverage behind that swap: the glyphs now in labels must be
-        // covered, and the removed ones must stay uncovered (so they are never reintroduced).
+        // Labels must work with the bundled fonts even when no system fonts are available.
         let ctx = egui::Context::default();
         configure(&ctx);
         let used = [
             '…', '›', '‹', '√', '⏵', '⏹', '!', '?', '·', '№', '⌘', '«', '»', '–', '—', '•', '○',
             '„', '“',
         ];
-        // '●' was tried for the topics icon plate and found uncovered; the plate uses '•'.
-        let removed = ['⚠', '✓', '→', '←', '⋯', '▶', '●'];
         let drawn: String = used.iter().copied().collect();
         let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
             ui.label(drawn.as_str());
@@ -320,13 +244,6 @@ mod tests {
             assert!(
                 ctx.fonts_mut(|fonts| fonts.has_glyph(&font, ch)),
                 "label glyph {ch} (U+{:04X}) is missing from the proportional font",
-                u32::from(ch),
-            );
-        }
-        for ch in removed {
-            assert!(
-                !ctx.fonts_mut(|fonts| fonts.has_glyph(&font, ch)),
-                "{ch} (U+{:04X}) has no glyph and was replaced; keep it out of GUI labels",
                 u32::from(ch),
             );
         }

@@ -81,7 +81,7 @@ impl Control {
         if self.state.is_none() && self.pending.is_none() {
             self.request(Action::Inspect, ui.ctx());
         }
-        ui.heading("Автозапуск приложения");
+        ui.strong("Автозапуск приложения");
         match &self.state {
             Some(Ok(State::Enabled)) => {
                 ui.label("Включён в настройках ОС");
@@ -103,25 +103,26 @@ impl Control {
             ui.colored_label(ui.visuals().error_fg_color, error);
         }
         let available = self.pending.is_none() && self.registration.is_ok();
-        ui.horizontal(|ui| {
-            if ui
-                .add_enabled(
-                    available && self.state != Some(Ok(State::Enabled)),
-                    egui::Button::new("Включить"),
-                )
-                .clicked()
-            {
-                self.request(Action::Enable, ui.ctx());
+        ui.horizontal_wrapped(|ui| {
+            let (label, action) = if self.state == Some(Ok(State::Enabled)) {
+                ("Выключить", Action::Disable)
+            } else {
+                ("Включить", Action::Enable)
+            };
+            if ui.add_enabled(available, kylig_ui::Button::new(label)).clicked() {
+                self.request(action, ui.ctx());
             }
-            if ui.add_enabled(available, egui::Button::new("Выключить")).clicked() {
+            if matches!(self.state, Some(Ok(State::NeedsAttention(_)) | Err(_)))
+                && ui.add_enabled(available, kylig_ui::Button::new("Выключить")).clicked()
+            {
                 self.request(Action::Disable, ui.ctx());
             }
-            if ui.add_enabled(available, egui::Button::new("Проверить состояние")).clicked()
+            if ui.add_enabled(available, kylig_ui::Button::new("Проверить состояние")).clicked()
             {
                 self.request(Action::Inspect, ui.ctx());
             }
             if self.pending.is_some() {
-                ui.spinner();
+                ui.add(kylig_ui::ProgressRing::indeterminate().size(20.0));
                 ui.label("Обращение к ОС…");
             }
         });

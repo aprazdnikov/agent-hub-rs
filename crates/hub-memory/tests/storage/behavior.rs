@@ -417,7 +417,9 @@ fn byte_limit_refuses_growth_and_preserves_last_snapshot() -> TestResult {
         match store.write(next) {
             Ok(_) => {}
             Err(Error::LimitExceeded(_)) => {
-                assert!(fs::read(fixture.data()?)? == before);
+                // A failing assertion should not print two multi-megabyte snapshots.
+                let unchanged = fs::read(fixture.data()?)? == before;
+                assert!(unchanged, "a refused write changed the snapshot");
                 refused = true;
                 break;
             }

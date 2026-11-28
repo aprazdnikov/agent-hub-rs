@@ -85,7 +85,7 @@ impl Control {
     }
 
     pub fn show(&mut self, ui: &mut egui::Ui) {
-        ui.strong("Масштаб интерфейса");
+        ui.label("Масштаб интерфейса");
         let mut percent = self.draft.percent();
         ui.horizontal_wrapped(|ui| {
             if ui.add(egui::Slider::new(&mut percent, 75..=150).step_by(5.0).suffix("%")).changed()
@@ -94,7 +94,7 @@ impl Control {
                 self.draft = scale;
                 self.draft.apply(ui.ctx());
             }
-            if ui.button("Сбросить до 100%").clicked() {
+            if ui.add(kylig_ui::Button::new("Сбросить до 100%")).clicked() {
                 self.draft = Scale::default();
                 self.draft.apply(ui.ctx());
             }
@@ -104,7 +104,7 @@ impl Control {
             if ui
                 .add_enabled(
                     changed || self.warning.is_some(),
-                    egui::Button::new("Сохранить масштаб"),
+                    kylig_ui::Button::new("Сохранить масштаб"),
                 )
                 .clicked()
             {
@@ -122,7 +122,7 @@ impl Control {
                     }
                 }
             }
-            if ui.add_enabled(changed, egui::Button::new("Отменить масштаб")).clicked()
+            if ui.add_enabled(changed, kylig_ui::Button::new("Отменить масштаб")).clicked()
             {
                 self.draft = self.saved;
                 self.draft.apply(ui.ctx());
